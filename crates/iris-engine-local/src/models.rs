@@ -174,39 +174,66 @@ impl ModelCatalog {
 /// stable per-user cache, else `./.iris-models`.
 ///
 /// Resolution order after the env override:
-/// 1. `$LOCALAPPDATA/Iris/models` (native Windows)
-/// 2. `$USERPROFILE/AppData/Local/Iris/models` (Windows without LocalAppData)
-/// 3. `$HOME/.cache/iris/models` (Unix / XDG)
-/// 4. `./.iris-models` (last resort; cwd-relative)
+/// - **Windows:** `$LOCALAPPDATA/Iris/models`, then
+///   `$USERPROFILE/AppData/Local/Iris/models`, then `$HOME/.cache/iris/models`
+/// - **Unix:** `$HOME/.cache/iris/models` only (Windows env vars are ignored so
+///   WSL/inherited `LOCALAPPDATA`/`USERPROFILE` cannot redirect the cache)
+/// - Last resort on every OS: `./.iris-models` (cwd-relative)
 pub fn default_model_dir() -> PathBuf {
-    resolve_model_dir(
-        std::env::var(DEFAULT_MODEL_DIR_ENV).ok().as_deref(),
-        std::env::var("LOCALAPPDATA").ok().as_deref(),
-        std::env::var("USERPROFILE").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
+    #[cfg(windows)]
+    {
+        resolve_model_dir(
+            std::env::var(DEFAULT_MODEL_DIR_ENV).ok().as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+            std::env::var("USERPROFILE").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_model_dir(
+            std::env::var(DEFAULT_MODEL_DIR_ENV).ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
 }
 
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|p| !p.is_empty())
+}
+
+#[cfg(windows)]
 fn resolve_model_dir(
     iris_model_dir: Option<&str>,
     localappdata: Option<&str>,
     userprofile: Option<&str>,
     home: Option<&str>,
 ) -> PathBuf {
-    if let Some(p) = iris_model_dir.map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(p) = non_empty(iris_model_dir) {
         return PathBuf::from(p);
     }
-    if let Some(local) = localappdata.map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(local) = non_empty(localappdata) {
         return PathBuf::from(local).join("Iris").join("models");
     }
-    if let Some(profile) = userprofile.map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(profile) = non_empty(userprofile) {
         return PathBuf::from(profile)
             .join("AppData")
             .join("Local")
             .join("Iris")
             .join("models");
     }
-    if let Some(home) = home.map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(home) = non_empty(home) {
+        return PathBuf::from(home).join(".cache").join("iris").join("models");
+    }
+    PathBuf::from(".iris-models")
+}
+
+#[cfg(not(windows))]
+fn resolve_model_dir(iris_model_dir: Option<&str>, home: Option<&str>) -> PathBuf {
+    if let Some(p) = non_empty(iris_model_dir) {
+        return PathBuf::from(p);
+    }
+    if let Some(home) = non_empty(home) {
         return PathBuf::from(home).join(".cache").join("iris").join("models");
     }
     PathBuf::from(".iris-models")
@@ -329,6 +356,33 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Removes `path` on drop unless [`TempFileGuard::persist`] was called.
+struct TempFileGuard {
+    path: PathBuf,
+    persist: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persist: false,
+        }
+    }
+
+    fn persist(mut self) {
+        self.persist = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.persist {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> Result<()> {
     // Unique temp name so concurrent ensure_model calls do not clobber each other.
     // `Path::with_extension` only replaces the *last* suffix, which is wrong for
@@ -369,6 +423,8 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
     let mut reader = resp.into_reader();
     let mut file = File::create(&tmp)
         .with_context(|| format!("creating temp {}", tmp.display()))?;
+    // Clean up the temp on every failure path unless rename (or concurrent win) succeeds.
+    let tmp_guard = TempFileGuard::new(tmp.clone());
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded = 0u64;
     loop {
@@ -387,13 +443,14 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
 
     // If another thread already placed the final file, drop our temp and win.
     if dest.is_file() {
-        let _ = fs::remove_file(&tmp);
+        // Guard drop removes the temp.
         return Ok(());
     }
 
     fs::rename(&tmp, dest).with_context(|| {
         format!("renaming {} → {}", tmp.display(), dest.display())
     })?;
+    tmp_guard.persist();
     Ok(())
 }
 
@@ -462,10 +519,16 @@ mod tests {
         assert!(!dir.as_os_str().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn resolve_model_dir_prefers_windows_paths_before_home_and_cwd() {
         assert_eq!(
-            resolve_model_dir(Some("/custom"), Some("C:/Local"), Some("C:/Users/x"), Some("/home/x")),
+            resolve_model_dir(
+                Some("/custom"),
+                Some("C:/Local"),
+                Some("C:/Users/x"),
+                Some("/home/x"),
+            ),
             PathBuf::from("/custom")
         );
         assert_eq!(
@@ -491,6 +554,32 @@ mod tests {
         assert_eq!(
             resolve_model_dir(Some("  "), None, None, None),
             PathBuf::from(".iris-models")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_model_dir_uses_home_only_on_unix() {
+        assert_eq!(
+            resolve_model_dir(Some("/custom"), Some("/home/x")),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(
+            resolve_model_dir(None, Some("/home/x")),
+            PathBuf::from("/home/x").join(".cache").join("iris").join("models")
+        );
+        assert_eq!(
+            resolve_model_dir(None, None),
+            PathBuf::from(".iris-models")
+        );
+        assert_eq!(
+            resolve_model_dir(Some("  "), None),
+            PathBuf::from(".iris-models")
+        );
+        // Inherited Windows env vars are not consulted on Unix (see default_model_dir).
+        assert_eq!(
+            resolve_model_dir(None, Some("/home/x")),
+            PathBuf::from("/home/x").join(".cache").join("iris").join("models")
         );
     }
 

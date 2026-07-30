@@ -53,7 +53,7 @@ Models are **lazy-downloaded from Hugging Face** on first use into a configurabl
 directory:
 
 - Env: `IRIS_MODEL_DIR`
-- Default: `~/.cache/iris/models`
+- Default: `%LOCALAPPDATA%\Iris\models` on Windows; `~/.cache/iris/models` on Unix; `./.iris-models` last resort
 - API: `ensure_model` / `ZipformerPaths::ensure` / `WhisperPaths::ensure`
 - Progress hooks: `ProgressFn` callback `(bytes_done, total_opt)`
 - Integrity: expected size (±1%); optional SHA-256 when catalogued

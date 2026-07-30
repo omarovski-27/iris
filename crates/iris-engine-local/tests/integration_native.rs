@@ -3,7 +3,7 @@
 //! **Not run in default CI.** Requires:
 //! 1. Built with `--features native`
 //! 2. Env `IRIS_LOCAL_MODELS=1`
-//! 3. Network on first run (~132 MB into `$IRIS_MODEL_DIR` or `~/.cache/iris/models`)
+//! 3. Network on first run (~132 MB into `$IRIS_MODEL_DIR`, or the OS default cache)
 //!
 //! ```bash
 //! IRIS_LOCAL_MODELS=1 cargo test -p iris-engine-local --features native \

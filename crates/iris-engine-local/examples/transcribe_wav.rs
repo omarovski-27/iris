@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Env:
-//! - `IRIS_MODEL_DIR` — model cache (default `~/.cache/iris/models`)
+//! - `IRIS_MODEL_DIR` — model cache (default `%LOCALAPPDATA%\Iris\models` on Windows, `~/.cache/iris/models` on Unix)
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
