@@ -18,6 +18,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -280,13 +281,7 @@ fn ensure_model_with_download(
                     error = %err,
                     "removing corrupt model cache entry for re-download"
                 );
-                fs::remove_file(&dest).with_context(|| {
-                    format!(
-                        "removing corrupt model {} at {} (verify failed: {err:#})",
-                        spec.id.as_str(),
-                        dest.display()
-                    )
-                })?;
+                remove_corrupt_cache(&dest, spec, &err)?;
             }
         }
     }
@@ -328,6 +323,22 @@ pub fn ensure_models(
     ids.iter()
         .map(|&id| ensure_model(id, model_dir, progress))
         .collect()
+}
+
+/// Remove a cache entry that failed verification. `NotFound` is success so a
+/// concurrent `ensure_model` that already cleaned up does not abort repair.
+fn remove_corrupt_cache(dest: &Path, spec: &ModelSpec, err: &anyhow::Error) -> Result<()> {
+    match fs::remove_file(dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "removing corrupt model {} at {} (verify failed: {err:#})",
+                spec.id.as_str(),
+                dest.display()
+            )
+        }),
+    }
 }
 
 fn verify_existing(path: &Path, spec: &ModelSpec) -> Result<()> {
@@ -415,21 +426,29 @@ impl Drop for TempFileGuard {
     }
 }
 
-fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> Result<()> {
+fn download_temp_path(dest: &Path) -> PathBuf {
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     // Unique temp name so concurrent ensure_model calls do not clobber each other.
     // `Path::with_extension` only replaces the *last* suffix, which is wrong for
-    // names like `foo.int8.onnx` — append a process/random suffix instead.
-    let tmp = dest.with_file_name(format!(
-        "{}.part.{}-{:x}",
+    // names like `foo.int8.onnx` — append pid/seq/time instead.
+    dest.with_file_name(format!(
+        "{}.part.{}-{}-{:x}",
         dest.file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("model"),
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+        seq,
+        nanos
+    ))
+}
+
+fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> Result<()> {
+    let tmp = download_temp_path(dest);
 
     tracing::info!(
         model = spec.id.as_str(),
@@ -674,6 +693,33 @@ mod tests {
         let path = result.expect("offline re-download via hook");
         assert_eq!(path, dest);
         verify_existing(&dest, spec).unwrap();
+    }
+
+    #[test]
+    fn download_temp_paths_are_unique_within_process() {
+        let dest = PathBuf::from("models/foo.int8.onnx");
+        let a = download_temp_path(&dest);
+        let b = download_temp_path(&dest);
+        assert_ne!(a, b);
+        assert!(a
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .starts_with("foo.int8.onnx.part."));
+    }
+
+    #[test]
+    fn remove_corrupt_cache_ignores_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ModelCatalog::get(ModelId::ZipformerTokens);
+        let missing = dir.path().join("already-gone.bin");
+        let err = anyhow::anyhow!("verify failed");
+        remove_corrupt_cache(&missing, spec, &err).unwrap();
+
+        let present = dir.path().join("bad.bin");
+        fs::write(&present, b"x").unwrap();
+        remove_corrupt_cache(&present, spec, &err).unwrap();
+        assert!(!present.exists());
     }
 
     #[test]
