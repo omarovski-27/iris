@@ -186,13 +186,10 @@ mod tests {
         let mut session = engine.start().unwrap();
         session.feed(&vec![0i16; SAMPLE_RATE as usize / 2]).unwrap();
         session.finalize().unwrap();
-        let fin = session
-            .partials()
-            .try_iter()
-            .find_map(|e| match e {
-                LocalEvent::Final(t) => Some(t),
-                _ => None,
-            });
+        let fin = session.partials().try_iter().find_map(|e| match e {
+            LocalEvent::Final(t) => Some(t),
+            _ => None,
+        });
         assert_eq!(fin.as_deref(), Some(DEFAULT_TRANSCRIPT));
     }
 }

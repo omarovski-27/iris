@@ -59,11 +59,14 @@ fn mock_engine_feed_arbitrary_frame_sizes() {
     // Odd sizes including empty.
     session.feed(&[]).unwrap();
     session.feed(&[1, 2, 3]).unwrap();
-    session.feed(&vec![0i16; 1]).unwrap();
+    session.feed(&[0i16; 1]).unwrap();
     session.feed(&vec![100i16; 777]).unwrap();
     session.feed(&vec![0i16; 16_000]).unwrap();
     session.finalize().unwrap();
-    let got_final = session.partials().try_iter().any(|e| matches!(e, LocalEvent::Final(_)));
+    let got_final = session
+        .partials()
+        .try_iter()
+        .any(|e| matches!(e, LocalEvent::Final(_)));
     assert!(got_final);
 }
 

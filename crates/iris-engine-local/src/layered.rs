@@ -348,7 +348,10 @@ mod tests {
             .filter(|e| matches!(e, LocalEvent::Final(_)))
             .count();
         assert_eq!(errors, 1, "expected exactly one Error, got {events:?}");
-        assert_eq!(finals, 0, "must not emit Final after streaming Error: {events:?}");
+        assert_eq!(
+            finals, 0,
+            "must not emit Final after streaming Error: {events:?}"
+        );
     }
 
     struct FeedFailStreamEngine;
@@ -403,7 +406,10 @@ mod tests {
             .filter(|e| matches!(e, LocalEvent::Final(_)))
             .count();
         assert_eq!(errors, 1, "expected exactly one Error, got {events:?}");
-        assert_eq!(finals, 0, "must not emit Final after feed Error: {events:?}");
+        assert_eq!(
+            finals, 0,
+            "must not emit Final after feed Error: {events:?}"
+        );
 
         let fin_err = session.finalize().unwrap_err();
         assert!(

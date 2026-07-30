@@ -231,7 +231,10 @@ fn resolve_model_dir(
             .join("models");
     }
     if let Some(home) = non_empty(home) {
-        return PathBuf::from(home).join(".cache").join("iris").join("models");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("iris")
+            .join("models");
     }
     PathBuf::from(".iris-models")
 }
@@ -242,7 +245,10 @@ fn resolve_model_dir(iris_model_dir: Option<&str>, home: Option<&str>) -> PathBu
         return PathBuf::from(p);
     }
     if let Some(home) = non_empty(home) {
-        return PathBuf::from(home).join(".cache").join("iris").join("models");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("iris")
+            .join("models");
     }
     PathBuf::from(".iris-models")
 }
@@ -342,8 +348,7 @@ fn remove_corrupt_cache(dest: &Path, spec: &ModelSpec, err: &anyhow::Error) -> R
 }
 
 fn verify_existing(path: &Path, spec: &ModelSpec) -> Result<()> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let len = meta.len();
     // Allow ±1% size drift for LFS/CDN variance, but reject obvious corruption.
     let min = spec.expected_bytes.saturating_mul(99) / 100;
@@ -438,9 +443,7 @@ fn download_temp_path(dest: &Path) -> PathBuf {
     // names like `foo.int8.onnx` — append pid/seq/time instead.
     dest.with_file_name(format!(
         "{}.part.{}-{}-{:x}",
-        dest.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model"),
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("model"),
         std::process::id(),
         seq,
         nanos
@@ -483,8 +486,7 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
         .or(Some(spec.expected_bytes));
 
     let mut reader = resp.into_reader();
-    let file = File::create(&tmp)
-        .with_context(|| format!("creating temp {}", tmp.display()))?;
+    let file = File::create(&tmp).with_context(|| format!("creating temp {}", tmp.display()))?;
     let mut tmp_guard = TempFileGuard::new(tmp.clone(), file);
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded = 0u64;
@@ -514,9 +516,8 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
         return Ok(());
     }
 
-    fs::rename(&tmp, dest).with_context(|| {
-        format!("renaming {} → {}", tmp.display(), dest.display())
-    })?;
+    fs::rename(&tmp, dest)
+        .with_context(|| format!("renaming {} → {}", tmp.display(), dest.display()))?;
     tmp_guard.persist();
     Ok(())
 }
@@ -612,7 +613,10 @@ mod tests {
         );
         assert_eq!(
             resolve_model_dir(None, None, None, Some("/home/x")),
-            PathBuf::from("/home/x").join(".cache").join("iris").join("models")
+            PathBuf::from("/home/x")
+                .join(".cache")
+                .join("iris")
+                .join("models")
         );
         assert_eq!(
             resolve_model_dir(None, None, None, None),
@@ -633,12 +637,12 @@ mod tests {
         );
         assert_eq!(
             resolve_model_dir(None, Some("/home/x")),
-            PathBuf::from("/home/x").join(".cache").join("iris").join("models")
+            PathBuf::from("/home/x")
+                .join(".cache")
+                .join("iris")
+                .join("models")
         );
-        assert_eq!(
-            resolve_model_dir(None, None),
-            PathBuf::from(".iris-models")
-        );
+        assert_eq!(resolve_model_dir(None, None), PathBuf::from(".iris-models"));
         assert_eq!(
             resolve_model_dir(Some("  "), None),
             PathBuf::from(".iris-models")
@@ -646,7 +650,10 @@ mod tests {
         // Inherited Windows env vars are not consulted on Unix (see default_model_dir).
         assert_eq!(
             resolve_model_dir(None, Some("/home/x")),
-            PathBuf::from("/home/x").join(".cache").join("iris").join("models")
+            PathBuf::from("/home/x")
+                .join(".cache")
+                .join("iris")
+                .join("models")
         );
     }
 

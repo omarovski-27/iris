@@ -28,7 +28,10 @@ use iris_engine_local::layered::LayeredLocalEngine;
 use iris_engine_local::models::{default_model_dir, ProgressFn};
 
 #[derive(Parser, Debug)]
-#[command(name = "transcribe_wav", about = "Local Iris STT demo: stream partials then finalize")]
+#[command(
+    name = "transcribe_wav",
+    about = "Local Iris STT demo: stream partials then finalize"
+)]
 struct Args {
     /// Path to a 16 kHz mono (or stereo) WAV file.
     wav: PathBuf,
@@ -48,8 +51,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let pcm = read_wav_pcm16(&args.wav)
-        .with_context(|| format!("reading {}", args.wav.display()))?;
+    let pcm =
+        read_wav_pcm16(&args.wav).with_context(|| format!("reading {}", args.wav.display()))?;
     let duration_s = pcm.len() as f64 / iris_engine_local::SAMPLE_RATE as f64;
     println!(
         "iris-engine-local example\n  wav      {}\n  duration {:.2}s ({} samples)\n  engine   {}\n",
@@ -86,8 +89,7 @@ fn main() -> Result<()> {
 
     let fin_start = Instant::now();
     session.finalize()?;
-    let mut final_text = String::new();
-    loop {
+    let final_text = loop {
         match session.partials().try_recv() {
             Ok(LocalEvent::Partial(t)) => {
                 if first_partial_ms.is_none() {
@@ -99,10 +101,7 @@ fn main() -> Result<()> {
                     session_start.elapsed().as_millis()
                 );
             }
-            Ok(LocalEvent::Final(t)) => {
-                final_text = t;
-                break;
-            }
+            Ok(LocalEvent::Final(t)) => break t,
             Ok(LocalEvent::Error(e)) => bail!("engine error: {e}"),
             Ok(LocalEvent::Ready) => {}
             Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -115,7 +114,7 @@ fn main() -> Result<()> {
                 bail!("event channel closed without Final");
             }
         }
-    }
+    };
     let finalize_ms = fin_start.elapsed().as_millis() as u64;
 
     println!();
@@ -186,14 +185,13 @@ fn build_native(model_dir: Option<&Path>) -> Result<LayeredLocalEngine> {
         eprintln!();
 
         let streaming = StreamingEngine::zipformer(StreamingConfig::from_paths(z_paths))?;
-        let finalizer = iris_engine_local::WhisperFinalizer::load(
-            iris_engine_local::FinalizerConfig {
+        let finalizer =
+            iris_engine_local::WhisperFinalizer::load(iris_engine_local::FinalizerConfig {
                 model_path: w_paths.model,
                 vad_path: w_paths.vad,
                 language: Some("en".into()),
                 num_threads: 4,
-            },
-        )?;
+            })?;
 
         return Ok(LayeredLocalEngine::new(LayeredLocalEngineConfig {
             streaming: Arc::new(streaming),

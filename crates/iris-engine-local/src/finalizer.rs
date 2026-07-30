@@ -12,9 +12,9 @@
 use anyhow::Result;
 
 #[cfg(feature = "whisper")]
-use anyhow::Context;
-#[cfg(feature = "whisper")]
 use crate::audio::pcm16_to_f32;
+#[cfg(feature = "whisper")]
+use anyhow::Context;
 
 /// Configuration for the whisper batch finalizer.
 #[derive(Debug, Clone)]
@@ -155,9 +155,8 @@ impl BatchFinalizer for WhisperFinalizer {
             .create_state()
             .map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
 
-        let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
-            best_of: 1,
-        });
+        let mut params =
+            whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
         if let Some(lang) = &self.language {
             params.set_language(Some(lang.as_str()));
         }

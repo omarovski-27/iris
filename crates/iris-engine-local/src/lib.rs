@@ -43,13 +43,14 @@ pub mod streaming;
 
 pub use audio::{pcm16_to_f32, read_wav_pcm16, sample_rate, SAMPLE_RATE};
 pub use engine::{LocalEngine, LocalEvent, LocalSession};
-pub use finalizer::{BatchFinalizer, FinalizerConfig, MockFinalizer};
 #[cfg(feature = "whisper")]
 pub use finalizer::WhisperFinalizer;
+pub use finalizer::{BatchFinalizer, FinalizerConfig, MockFinalizer};
 pub use layered::{LayeredLocalEngine, LayeredLocalEngineConfig};
 pub use mock::{MockLocalEngine, MockLocalEngineConfig};
 pub use models::{
-    ensure_model, ensure_models, ModelCatalog, ModelId, ModelSpec, ProgressFn, DEFAULT_MODEL_DIR_ENV,
+    ensure_model, ensure_models, ModelCatalog, ModelId, ModelSpec, ProgressFn,
+    DEFAULT_MODEL_DIR_ENV,
 };
 pub use streaming::{MockStreamingEngine, StreamingConfig, StreamingEngine};
 

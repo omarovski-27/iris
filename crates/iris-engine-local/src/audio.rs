@@ -25,8 +25,8 @@ pub fn pcm16_to_f32(pcm: &[i16]) -> Vec<f32> {
 /// and non-16 kHz audio is rejected (callers should resample upstream — Iris
 /// already normalises capture to 16 kHz).
 pub fn read_wav_pcm16(path: &Path) -> Result<Vec<i16>> {
-    let reader = WavReader::open(path)
-        .with_context(|| format!("opening WAV {}", path.display()))?;
+    let reader =
+        WavReader::open(path).with_context(|| format!("opening WAV {}", path.display()))?;
     let spec = reader.spec();
     if spec.sample_rate != SAMPLE_RATE {
         bail!(

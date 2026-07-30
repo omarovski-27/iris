@@ -198,8 +198,7 @@ impl LocalSession for ZipformerSession {
             return Ok(());
         }
         let samples = pcm16_to_f32(pcm);
-        self.stream
-            .accept_waveform(SAMPLE_RATE as i32, &samples);
+        self.stream.accept_waveform(SAMPLE_RATE as i32, &samples);
         self.decode_ready();
         Ok(())
     }
