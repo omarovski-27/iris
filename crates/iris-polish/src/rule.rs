@@ -45,7 +45,7 @@ pub const STUTTER_WORDS: &[&str] = &[
 /// Words whose trailing period does not end a sentence.
 const ABBREVIATIONS: &[&str] = &[
     "e.g", "i.e", "etc", "vs", "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "approx", "fig",
-    "inc", "ltd", "cf", "al", "no",
+    "inc", "ltd", "cf", "al",
 ];
 
 /// Characters treated as leading punctuation on a token.
@@ -568,6 +568,9 @@ fn ends_sentence(token: &Token) -> bool {
     if !token.suffix.chars().any(|c| ".!?".contains(c)) {
         return false;
     }
+    if token.word.contains('.') && !token.suffix.chars().any(|c| "!?".contains(c)) {
+        return false;
+    }
     let lower = token.lower();
     if ABBREVIATIONS.contains(&lower.as_str()) {
         return false;
@@ -824,6 +827,17 @@ mod tests {
     fn does_not_split_sentences_on_abbreviations() {
         assert_eq!(polish("use etc. sparingly"), "Use etc. sparingly.");
         assert_eq!(polish("ask dr. patel"), "Ask dr. patel.");
+    }
+
+    #[test]
+    fn capitalizes_after_bare_no() {
+        assert_eq!(polish("no. they left"), "No. They left.");
+    }
+
+    #[test]
+    fn does_not_split_sentences_on_dotted_acronyms() {
+        assert_eq!(polish("the U.S. economy"), "The U.S. economy.");
+        assert_eq!(polish("a Ph.D. in physics"), "A Ph.D. in physics.");
     }
 
     #[test]
