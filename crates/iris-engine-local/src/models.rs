@@ -19,9 +19,16 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+
+/// TCP connect timeout for model downloads.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-read stall timeout while streaming a model body (large artefacts OK as
+/// long as bytes keep arriving).
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Env var: override the default model cache directory.
 pub const DEFAULT_MODEL_DIR_ENV: &str = "IRIS_MODEL_DIR";
@@ -250,6 +257,16 @@ pub fn ensure_model(
     model_dir: &Path,
     progress: Option<&ProgressFn>,
 ) -> Result<PathBuf> {
+    ensure_model_with_download(id, model_dir, progress, download_to)
+}
+
+/// Core ensure path with an injectable downloader (used by offline unit tests).
+fn ensure_model_with_download(
+    id: ModelId,
+    model_dir: &Path,
+    progress: Option<&ProgressFn>,
+    download: impl FnOnce(&Path, &ModelSpec, Option<&ProgressFn>) -> Result<()>,
+) -> Result<PathBuf> {
     let spec = ModelCatalog::get(id);
     let dest = model_dir.join(spec.relative_path);
     if dest.is_file() {
@@ -277,7 +294,7 @@ pub fn ensure_model(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating model dir {}", parent.display()))?;
     }
-    match download_to(&dest, spec, progress) {
+    match download(&dest, spec, progress) {
         Ok(()) => {}
         Err(e) => {
             // Another concurrent ensure_model may have won the race.
@@ -421,10 +438,21 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
         "downloading model"
     );
 
-    let resp = ureq::get(spec.url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout_read(DOWNLOAD_READ_TIMEOUT)
+        .build();
+    let resp = agent
+        .get(spec.url)
         .set("User-Agent", "iris-engine-local/0.1")
         .call()
-        .with_context(|| format!("GET {}", spec.url))?;
+        .map_err(|err| {
+            let kind = err.kind();
+            anyhow::Error::new(err).context(format!(
+                "GET {} failed ({kind:?}; connect ≤ {:?}, read stall ≤ {:?})",
+                spec.url, DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT
+            ))
+        })?;
 
     if !(200..300).contains(&resp.status()) {
         bail!("download {} returned HTTP {}", spec.url, resp.status());
@@ -442,7 +470,13 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded = 0u64;
     loop {
-        let n = reader.read(&mut buf).context("reading download body")?;
+        let n = reader.read(&mut buf).with_context(|| {
+            format!(
+                "reading download body for {} (read stall ≤ {:?})",
+                spec.id.as_str(),
+                DOWNLOAD_READ_TIMEOUT
+            )
+        })?;
         if n == 0 {
             break;
         }
@@ -618,19 +652,52 @@ mod tests {
         let dest = dir.path().join(spec.relative_path);
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, b"too-small").unwrap();
-        // Offline or online: corrupt entry must not remain after ensure_model.
-        let result = ensure_model(ModelId::ZipformerTokens, dir.path(), None);
-        match result {
-            Ok(path) => {
-                assert_eq!(path, dest);
-                verify_existing(&dest, spec).unwrap();
-            }
-            Err(_) => {
+
+        // Offline: inject a downloader so this unit never touches the network.
+        let result = ensure_model_with_download(
+            ModelId::ZipformerTokens,
+            dir.path(),
+            None,
+            |dest, spec, _progress| {
+                // Corrupt cache must already be gone before download starts.
                 assert!(
                     !dest.is_file(),
-                    "corrupt model file must be removed when re-download fails"
+                    "corrupt cache should be removed before download"
                 );
-            }
-        }
+                // Write a correctly sized stand-in (no SHA pinned on this artefact).
+                let bytes = vec![0u8; spec.expected_bytes as usize];
+                fs::write(dest, bytes).unwrap();
+                Ok(())
+            },
+        );
+
+        let path = result.expect("offline re-download via hook");
+        assert_eq!(path, dest);
+        verify_existing(&dest, spec).unwrap();
+    }
+
+    #[test]
+    fn ensure_model_removes_corrupt_cache_when_download_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ModelCatalog::get(ModelId::ZipformerTokens);
+        let dest = dir.path().join(spec.relative_path);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"too-small").unwrap();
+
+        let err = ensure_model_with_download(
+            ModelId::ZipformerTokens,
+            dir.path(),
+            None,
+            |_dest, _spec, _progress| bail!("simulated download failure"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("simulated download failure"),
+            "{err}"
+        );
+        assert!(
+            !dest.is_file(),
+            "corrupt model file must stay removed when re-download fails"
+        );
     }
 }
