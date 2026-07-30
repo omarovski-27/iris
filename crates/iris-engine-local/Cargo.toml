@@ -1,0 +1,48 @@
+[package]
+name = "iris-engine-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local (offline/private) speech-to-text engines for Iris: streaming Zipformer partials + batch finalizer"
+readme = "README.md"
+keywords = ["speech-to-text", "asr", "offline", "dictation", "whisper"]
+categories = ["multimedia::audio"]
+
+[features]
+default = []
+# Official first-party sherpa-onnx streaming Zipformer (ghost-text partials).
+streaming = ["dep:sherpa-onnx"]
+# whisper.cpp via whisper-rs (batch transcript of record) + Silero VAD gate.
+whisper = ["dep:whisper-rs"]
+# Both native engines.
+native = ["streaming", "whisper"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ureq.workspace = true
+tracing.workspace = true
+
+# Optional native engines — not pulled in default/CI offline builds.
+sherpa-onnx = { version = "1.13.4", optional = true }
+whisper-rs = { version = "0.16.0", optional = true }
+
+[dev-dependencies]
+clap.workspace = true
+tempfile = "3"
+
+[[example]]
+name = "transcribe_wav"
+path = "examples/transcribe_wav.rs"
+required-features = []
+
+[package.metadata.docs.rs]
+features = []
