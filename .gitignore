@@ -1,0 +1,23 @@
+# Rust
+target/
+# (Cargo.lock stays tracked — this is a binary project)
+
+# Node / frontend
+node_modules/
+dist/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Local env / keys
+.env
+*.local
