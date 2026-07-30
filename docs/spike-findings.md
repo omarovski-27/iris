@@ -115,9 +115,8 @@ user is looking at. `SendInput` from a thread on any other desktop returns
 that is what it returns. There is therefore no sandbox: any automated injection
 test types into somebody's live session.
 
-So `--self-test` does not test injection. It is opt-in behind
-`--injection-test`, and injection is verified by the interactive checklist in
-`crates/iris-spike/README.md`. This is a real limitation, not an oversight, and
+So `--self-test` does not test injection at all; the interactive checklist in
+`crates/iris-spike/README.md` is the sole verification path for it. This is a real limitation, not an oversight, and
 it applies to any future CI for this project.
 
 ## 5. Smaller findings

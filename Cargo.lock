@@ -739,7 +739,6 @@ dependencies = [
  "crossbeam-channel",
  "iris-core",
  "serde_json",
- "windows",
 ]
 
 [[package]]

@@ -28,8 +28,9 @@ desktop, including a purpose-created private one). There is no sandbox: any
 automated injection test types into whoever is using the machine. This has
 already disrupted real work once during development.
 
-`iris-spike --self-test` therefore skips injection; `--injection-test` opts in
-and is for a human sitting at the machine. Injection logic that *can* be tested
+`iris-spike --self-test` therefore never runs injection; the interactive
+checklist in `crates/iris-spike/README.md` is the sole verification path for
+it. Injection logic that *can* be tested
 without the OS lives in `iris-core/src/text.rs` (UTF-16, surrogate pairs,
 control characters) and is unit-tested.
 

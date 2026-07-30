@@ -90,12 +90,12 @@ keystrokes is, structurally, what a keylogger does. Real-time protection may
 flag it. This is inherent to the product and will need code signing before
 release.
 
-**Do not run the injection checks unattended.** `--self-test` skips text
-injection by default. Windows only delivers synthetic keystrokes on the desktop
-the user is actually looking at — it returns `ERROR_ACCESS_DENIED` on any other
-desktop — so there is no sandbox for it: the check types into whatever session
-is live. `--injection-test` opts in, and should only be used when you are at the
-machine and expecting text to appear. See `docs/spike-findings.md`.
+**Text injection has no automated check.** `--self-test` never runs it.
+Windows only delivers synthetic keystrokes on the desktop the user is actually
+looking at — it returns `ERROR_ACCESS_DENIED` on any other desktop — so there
+is no sandbox for it: any automated check would type into whatever session is
+live. Injection is verified by the interactive checklist in
+`crates/iris-spike/README.md`. See `docs/spike-findings.md`.
 
 ## Cross-compiling isn't the same as testing on Windows
 

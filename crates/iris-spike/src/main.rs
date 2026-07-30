@@ -82,15 +82,6 @@ pub struct Args {
     #[arg(long)]
     pub self_test: bool,
 
-    /// Include the text-injection checks in `--self-test`.
-    ///
-    /// Off by default, and deliberately so: Windows only delivers synthetic
-    /// keystrokes on the desktop the user is looking at, so this check types
-    /// into whatever session is live. Only pass it when you are at the machine
-    /// and expect text to appear.
-    #[arg(long)]
-    pub injection_test: bool,
-
     /// Diagnostics on stderr.
     #[arg(long, short)]
     pub verbose: bool,

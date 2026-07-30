@@ -175,6 +175,10 @@ async fn pump(
 
     let mut acc = Transcript::default();
     let mut closing = false;
+    // A socket failure mid-session ends the loop rather than the function:
+    // the segments already finalised are the user's words, and `conclude`
+    // still gets to return them.
+    let mut failure: Option<anyhow::Error> = None;
 
     loop {
         tokio::select! {
@@ -182,16 +186,22 @@ async fn pump(
             // never get back, whereas a response can wait a few microseconds.
             biased;
 
-            cmd = audio.recv(), if !closing => match cmd {
-                Some(Command::Audio(bytes)) => {
-                    socket.send(Message::Binary(bytes.into())).await
-                        .context("sending audio to Deepgram")?;
-                }
-                // `finish()` or a dropped session: ask Deepgram to flush.
-                Some(Command::Finish) | None => {
-                    closing = true;
-                    socket.send(Message::Text(r#"{"type":"CloseStream"}"#.into())).await
-                        .context("closing the Deepgram stream")?;
+            cmd = audio.recv(), if !closing => {
+                let sent = match cmd {
+                    Some(Command::Audio(bytes)) => {
+                        socket.send(Message::Binary(bytes.into())).await
+                            .context("sending audio to Deepgram")
+                    }
+                    // `finish()` or a dropped session: ask Deepgram to flush.
+                    Some(Command::Finish) | None => {
+                        closing = true;
+                        socket.send(Message::Text(r#"{"type":"CloseStream"}"#.into())).await
+                            .context("closing the Deepgram stream")
+                    }
+                };
+                if let Err(e) = sent {
+                    failure = Some(e);
+                    break;
                 }
             },
 
@@ -215,21 +225,35 @@ async fn pump(
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(anyhow::Error::new(e).context("Deepgram socket")),
+                    Some(Err(e)) => {
+                        failure = Some(anyhow::Error::new(e).context("Deepgram socket"));
+                        break;
+                    }
                 }
             }
         }
     }
 
-    let text = acc.finished_text();
-    if text.is_empty() {
-        let _ = events.send(TranscriptEvent::Error(
-            "Deepgram returned no transcript (silence, or audio was not reaching the mic)".into(),
-        ));
-    } else {
-        let _ = events.send(TranscriptEvent::Final(text));
+    if let Some(e) = &failure {
+        vlog!("deepgram session failed; salvaging the transcript: {e:#}");
     }
+    let _ = events.send(conclude(&acc, failure.map(|e| format!("{e:#}"))));
     Ok(())
+}
+
+/// The single terminal event for a session, however it ended: the transcript
+/// when there is one — even after a socket failure, matching what the
+/// finalise-timeout path already does — and an error only when there is
+/// genuinely nothing to return.
+fn conclude(acc: &Transcript, failure: Option<String>) -> TranscriptEvent {
+    let text = acc.finished_text();
+    match (text.is_empty(), failure) {
+        (false, _) => TranscriptEvent::Final(text),
+        (true, Some(err)) => TranscriptEvent::Error(err),
+        (true, None) => TranscriptEvent::Error(
+            "Deepgram returned no transcript (silence, or audio was not reaching the mic)".into(),
+        ),
+    }
 }
 
 /// Accumulates Deepgram's segmented results into one transcript.
@@ -362,6 +386,40 @@ mod tests {
         assert!(t.absorb("not json").is_none());
         assert!(t.absorb(r#"{"type":"SpeechStarted"}"#).is_none());
         assert!(!t.done);
+    }
+
+    #[test]
+    fn a_socket_failure_still_returns_the_accumulated_transcript() {
+        let mut t = Transcript::default();
+        t.absorb(&results("the quick brown fox.", true));
+        t.absorb(&results("and then", false));
+        assert_eq!(
+            conclude(&t, Some("Deepgram socket: connection reset".into())),
+            TranscriptEvent::Final("the quick brown fox. and then".into())
+        );
+    }
+
+    #[test]
+    fn a_socket_failure_with_nothing_transcribed_is_an_error() {
+        match conclude(
+            &Transcript::default(),
+            Some("Deepgram socket: connection reset".into()),
+        ) {
+            TranscriptEvent::Error(msg) => assert!(msg.contains("connection reset")),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clean_session_concludes_on_content_alone() {
+        let mut t = Transcript::default();
+        t.absorb(&results("hello.", true));
+        assert_eq!(conclude(&t, None), TranscriptEvent::Final("hello.".into()));
+
+        match conclude(&Transcript::default(), None) {
+            TranscriptEvent::Error(msg) => assert!(msg.contains("no transcript")),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]

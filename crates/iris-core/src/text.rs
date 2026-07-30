@@ -14,6 +14,17 @@ pub enum KeyUnit {
     Virtual(u16),
 }
 
+impl KeyUnit {
+    /// Whether a `SendInput` batch may end after this unit.
+    ///
+    /// A high surrogate is the first half of an astral character, and Windows
+    /// only reassembles the pair when both halves arrive in one batch (see
+    /// [`plan`]), so a batch must never be cut between them.
+    pub fn may_end_batch(&self) -> bool {
+        !matches!(self, KeyUnit::Unicode(u) if (0xD800..0xDC00).contains(u))
+    }
+}
+
 /// `VK_RETURN`. `KEYEVENTF_UNICODE` with U+000D inserts a control character in
 /// some controls instead of committing a line, so newlines go through the
 /// virtual key.
@@ -108,6 +119,44 @@ mod tests {
         assert_eq!(prepare("  hello world \n", false), "hello world");
         assert_eq!(prepare("  hello world \n", true), "hello world ");
         assert_eq!(prepare("   ", true), "", "empty stays empty");
+    }
+
+    #[test]
+    fn a_batch_may_not_end_on_a_high_surrogate() {
+        let pair = plan("😀");
+        assert!(
+            !pair[0].may_end_batch(),
+            "high surrogate must keep its pair"
+        );
+        assert!(pair[1].may_end_batch());
+        assert!(KeyUnit::Unicode(b'a' as u16).may_end_batch());
+        assert!(KeyUnit::Unicode(0x65E5).may_end_batch());
+        assert!(KeyUnit::Virtual(VK_RETURN).may_end_batch());
+    }
+
+    #[test]
+    fn batching_on_the_predicate_never_splits_a_surrogate_pair() {
+        // Mirrors `inject::send_keystrokes`: two events per unit, flush once
+        // the batch is full *and* the last unit allows it. The text is laid
+        // out so the limit lands exactly on the high surrogate.
+        let max_events = 8;
+        let mut batches: Vec<Vec<KeyUnit>> = Vec::new();
+        let mut current = Vec::new();
+        for unit in plan("abc😀d") {
+            current.push(unit);
+            if current.len() * 2 >= max_events && unit.may_end_batch() {
+                batches.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 5, "the pair rode along in one batch");
+        for batch in &batches {
+            assert!(batch.last().unwrap().may_end_batch());
+        }
     }
 
     #[test]

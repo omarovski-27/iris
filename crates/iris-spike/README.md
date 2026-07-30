@@ -104,8 +104,8 @@ the engine path produces a transcript from the WAV fixture.
 It does **not** test text injection. Windows only delivers synthetic keystrokes
 on the desktop the user is looking at — it returns `ERROR_ACCESS_DENIED`
 anywhere else — so an automated injection test necessarily types into whoever is
-using the machine. `--injection-test` opts in; only pass it when you are sitting
-at the machine and expecting text to appear.
+using the machine. The interactive checklist below is the sole verification
+path for injection.
 
 ## Interactive test checklist
 

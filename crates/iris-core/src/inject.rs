@@ -69,7 +69,7 @@ fn imp(_text: &str, _method: Method) -> Result<()> {
 #[cfg(windows)]
 mod win {
     use anyhow::{bail, Context, Result};
-    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
@@ -114,7 +114,7 @@ mod win {
             inputs.push(key_event(vk, scan, extra));
             inputs.push(key_event(vk, scan, extra | KEYEVENTF_KEYUP));
 
-            if inputs.len() >= BATCH {
+            if inputs.len() >= BATCH && unit.may_end_batch() {
                 flush(&mut inputs)?;
             }
         }
@@ -192,14 +192,18 @@ mod win {
                     GlobalAlloc(GMEM_MOVEABLE, bytes).context("allocating clipboard memory")?;
                 let ptr = GlobalLock(handle);
                 if ptr.is_null() {
+                    let _ = GlobalFree(Some(handle));
                     bail!("locking clipboard memory failed");
                 }
                 std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
                 let _ = GlobalUnlock(handle);
-                // SetClipboardData takes ownership of the block on success, so
-                // it must not be freed here.
-                SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0)))
-                    .context("setting clipboard text")?;
+                // SetClipboardData takes ownership of the block only on
+                // success, so it must not be freed there — but every failure
+                // path from the allocation onwards must free it.
+                if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))) {
+                    let _ = GlobalFree(Some(handle));
+                    return Err(anyhow::Error::new(e).context("setting clipboard text"));
+                }
                 Ok(())
             })();
             let _ = CloseClipboard();
