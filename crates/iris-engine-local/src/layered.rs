@@ -90,6 +90,7 @@ impl LocalEngine for LayeredLocalEngine {
             started: Instant::now(),
             first_partial_at: None,
             finished: false,
+            stream_failed: false,
             timings: SessionTimings::default(),
         }))
     }
@@ -104,6 +105,7 @@ struct LayeredSession {
     started: Instant,
     first_partial_at: Option<Instant>,
     finished: bool,
+    stream_failed: bool,
     timings: SessionTimings,
 }
 
@@ -124,16 +126,22 @@ impl LayeredSession {
                 // Streaming Final is discarded — batch finalizer is the source of truth.
                 LocalEvent::Final(_) => {}
                 LocalEvent::Error(e) => {
+                    self.stream_failed = true;
                     let _ = self.tx.send(LocalEvent::Error(e));
                 }
             }
         }
     }
+
+    fn emit_error(&mut self, msg: String) {
+        self.stream_failed = true;
+        let _ = self.tx.send(LocalEvent::Error(msg));
+    }
 }
 
 impl LocalSession for LayeredSession {
     fn feed(&mut self, pcm: &[i16]) -> Result<()> {
-        if self.finished {
+        if self.finished || self.stream_failed {
             return Ok(());
         }
         self.buffer.extend_from_slice(pcm);
@@ -152,10 +160,23 @@ impl LocalSession for LayeredSession {
         }
         self.finished = true;
 
+        if self.stream_failed {
+            anyhow::bail!("streaming layer failed");
+        }
+
         let t0 = Instant::now();
         // Flush streaming layer (measures "ghost text settled" latency).
-        self.stream.finalize()?;
+        let stream_result = self.stream.finalize();
         self.pump_stream_partials();
+        if let Err(e) = stream_result {
+            if !self.stream_failed {
+                self.emit_error(format!("{e:#}"));
+            }
+            return Err(e);
+        }
+        if self.stream_failed {
+            anyhow::bail!("streaming layer failed");
+        }
         self.timings.streaming_finalize_ms = Some(t0.elapsed().as_millis() as u64);
 
         // Transcript of record from the batch finalizer (VAD-gated when real).
@@ -163,8 +184,7 @@ impl LocalSession for LayeredSession {
         let text = match self.finalizer.transcribe(&self.buffer) {
             Ok(t) => t,
             Err(e) => {
-                let msg = format!("{e:#}");
-                let _ = self.tx.send(LocalEvent::Error(msg.clone()));
+                self.emit_error(format!("{e:#}"));
                 return Err(e);
             }
         };
@@ -236,6 +256,7 @@ pub fn run_layered(
 mod tests {
     use super::*;
     use crate::audio::read_wav_pcm16;
+    use crate::engine::{LocalEngine, LocalEvent, LocalSession};
     use crate::{silence_fixture, speech_fixture};
 
     #[test]
@@ -256,5 +277,74 @@ mod tests {
             final_text, "",
             "silence fixture must produce empty transcript of record"
         );
+    }
+
+    /// Streaming engine that emits Error from finalize and must not be followed
+    /// by a batch Final on the layered channel.
+    struct FailingStreamEngine;
+
+    struct FailingStreamSession {
+        tx: Sender<LocalEvent>,
+        rx: Receiver<LocalEvent>,
+        finished: bool,
+    }
+
+    impl LocalEngine for FailingStreamEngine {
+        fn name(&self) -> &'static str {
+            "failing-stream"
+        }
+
+        fn start(&self) -> Result<Box<dyn LocalSession>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(LocalEvent::Ready);
+            Ok(Box::new(FailingStreamSession {
+                tx,
+                rx,
+                finished: false,
+            }))
+        }
+    }
+
+    impl LocalSession for FailingStreamSession {
+        fn feed(&mut self, _pcm: &[i16]) -> Result<()> {
+            Ok(())
+        }
+
+        fn partials(&self) -> &Receiver<LocalEvent> {
+            &self.rx
+        }
+
+        fn finalize(&mut self) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.finished = true;
+            let _ = self.tx.send(LocalEvent::Error("stream boom".into()));
+            anyhow::bail!("stream boom")
+        }
+    }
+
+    #[test]
+    fn layered_streaming_error_is_terminal_no_final() {
+        let engine = LayeredLocalEngine::new(LayeredLocalEngineConfig {
+            streaming: Arc::new(FailingStreamEngine),
+            finalizer: Arc::new(MockFinalizer::default()),
+        });
+        let mut session = engine.start().unwrap();
+        session.feed(&[1, 2, 3, 4]).unwrap();
+        let err = session.finalize().unwrap_err();
+        assert!(err.to_string().contains("stream boom"), "{err}");
+
+        let events: Vec<_> = session.partials().try_iter().collect();
+        let errors = events
+            .iter()
+            .filter(|e| matches!(e, LocalEvent::Error(_)))
+            .count();
+        let finals = events
+            .iter()
+            .filter(|e| matches!(e, LocalEvent::Final(_)))
+            .count();
+        assert_eq!(errors, 1, "expected exactly one Error, got {events:?}");
+        assert_eq!(finals, 0, "must not emit Final after streaming Error: {events:?}");
     }
 }

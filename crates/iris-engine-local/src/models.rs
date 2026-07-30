@@ -170,16 +170,44 @@ impl ModelCatalog {
     }
 }
 
-/// Resolve the model directory: explicit path, else `$IRIS_MODEL_DIR`, else
-/// `$HOME/.cache/iris/models` (or `./.iris-models` if HOME is unset).
+/// Resolve the model directory: explicit path, else `$IRIS_MODEL_DIR`, else a
+/// stable per-user cache, else `./.iris-models`.
+///
+/// Resolution order after the env override:
+/// 1. `$LOCALAPPDATA/Iris/models` (native Windows)
+/// 2. `$USERPROFILE/AppData/Local/Iris/models` (Windows without LocalAppData)
+/// 3. `$HOME/.cache/iris/models` (Unix / XDG)
+/// 4. `./.iris-models` (last resort; cwd-relative)
 pub fn default_model_dir() -> PathBuf {
-    if let Ok(p) = std::env::var(DEFAULT_MODEL_DIR_ENV) {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+    resolve_model_dir(
+        std::env::var(DEFAULT_MODEL_DIR_ENV).ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn resolve_model_dir(
+    iris_model_dir: Option<&str>,
+    localappdata: Option<&str>,
+    userprofile: Option<&str>,
+    home: Option<&str>,
+) -> PathBuf {
+    if let Some(p) = iris_model_dir.map(str::trim).filter(|p| !p.is_empty()) {
+        return PathBuf::from(p);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache/iris/models");
+    if let Some(local) = localappdata.map(str::trim).filter(|p| !p.is_empty()) {
+        return PathBuf::from(local).join("Iris").join("models");
+    }
+    if let Some(profile) = userprofile.map(str::trim).filter(|p| !p.is_empty()) {
+        return PathBuf::from(profile)
+            .join("AppData")
+            .join("Local")
+            .join("Iris")
+            .join("models");
+    }
+    if let Some(home) = home.map(str::trim).filter(|p| !p.is_empty()) {
+        return PathBuf::from(home).join(".cache").join("iris").join("models");
     }
     PathBuf::from(".iris-models")
 }
@@ -198,8 +226,25 @@ pub fn ensure_model(
     let spec = ModelCatalog::get(id);
     let dest = model_dir.join(spec.relative_path);
     if dest.is_file() {
-        verify_existing(&dest, spec)?;
-        return Ok(dest);
+        match verify_existing(&dest, spec) {
+            Ok(()) => return Ok(dest),
+            Err(err) => {
+                // Truncated/corrupt cache must not permanently block ensure_model.
+                tracing::warn!(
+                    model = spec.id.as_str(),
+                    path = %dest.display(),
+                    error = %err,
+                    "removing corrupt model cache entry for re-download"
+                );
+                fs::remove_file(&dest).with_context(|| {
+                    format!(
+                        "removing corrupt model {} at {} (verify failed: {err:#})",
+                        spec.id.as_str(),
+                        dest.display()
+                    )
+                })?;
+            }
+        }
     }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
@@ -210,14 +255,24 @@ pub fn ensure_model(
         Err(e) => {
             // Another concurrent ensure_model may have won the race.
             if dest.is_file() {
-                verify_existing(&dest, spec)?;
-                return Ok(dest);
+                match verify_existing(&dest, spec) {
+                    Ok(()) => return Ok(dest),
+                    Err(verify_err) => {
+                        let _ = fs::remove_file(&dest);
+                        return Err(e).context(verify_err);
+                    }
+                }
             }
             return Err(e);
         }
     }
-    verify_existing(&dest, spec)?;
-    Ok(dest)
+    match verify_existing(&dest, spec) {
+        Ok(()) => Ok(dest),
+        Err(err) => {
+            let _ = fs::remove_file(&dest);
+            Err(err).context("downloaded model failed verification; removed bad file")
+        }
+    }
 }
 
 /// Ensure every id in `ids` is present. Returns paths in the same order.
@@ -408,16 +463,71 @@ mod tests {
     }
 
     #[test]
-    fn ensure_model_rejects_wrong_size_file() {
+    fn resolve_model_dir_prefers_windows_paths_before_home_and_cwd() {
+        assert_eq!(
+            resolve_model_dir(Some("/custom"), Some("C:/Local"), Some("C:/Users/x"), Some("/home/x")),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(
+            resolve_model_dir(None, Some("C:/Local"), Some("C:/Users/x"), Some("/home/x")),
+            PathBuf::from("C:/Local").join("Iris").join("models")
+        );
+        assert_eq!(
+            resolve_model_dir(None, None, Some("C:/Users/x"), Some("/home/x")),
+            PathBuf::from("C:/Users/x")
+                .join("AppData")
+                .join("Local")
+                .join("Iris")
+                .join("models")
+        );
+        assert_eq!(
+            resolve_model_dir(None, None, None, Some("/home/x")),
+            PathBuf::from("/home/x").join(".cache").join("iris").join("models")
+        );
+        assert_eq!(
+            resolve_model_dir(None, None, None, None),
+            PathBuf::from(".iris-models")
+        );
+        assert_eq!(
+            resolve_model_dir(Some("  "), None, None, None),
+            PathBuf::from(".iris-models")
+        );
+    }
+
+    #[test]
+    fn verify_existing_rejects_wrong_size_file() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ModelCatalog::get(ModelId::ZipformerTokens);
         let dest = dir.path().join(spec.relative_path);
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, b"too-small").unwrap();
-        let err = ensure_model(ModelId::ZipformerTokens, dir.path(), None).unwrap_err();
+        let err = verify_existing(&dest, spec).unwrap_err();
         assert!(
             err.to_string().contains("size") || err.to_string().contains("expected"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn ensure_model_removes_corrupt_cache_before_redownload() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ModelCatalog::get(ModelId::ZipformerTokens);
+        let dest = dir.path().join(spec.relative_path);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"too-small").unwrap();
+        // Offline or online: corrupt entry must not remain after ensure_model.
+        let result = ensure_model(ModelId::ZipformerTokens, dir.path(), None);
+        match result {
+            Ok(path) => {
+                assert_eq!(path, dest);
+                verify_existing(&dest, spec).unwrap();
+            }
+            Err(_) => {
+                assert!(
+                    !dest.is_file(),
+                    "corrupt model file must be removed when re-download fails"
+                );
+            }
+        }
     }
 }

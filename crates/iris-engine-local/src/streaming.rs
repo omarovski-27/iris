@@ -137,7 +137,6 @@ impl ZipformerEngine {
         model.tokens = Some(config.tokens.to_string_lossy().into_owned());
         model.num_threads = config.num_threads;
         model.provider = Some(config.provider);
-        model.model_type = Some("zipformer2".into());
 
         let mut cfg = OnlineRecognizerConfig::default();
         cfg.model_config = model;

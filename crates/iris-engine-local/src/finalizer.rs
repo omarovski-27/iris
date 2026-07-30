@@ -68,7 +68,7 @@ impl BatchFinalizer for MockFinalizer {
 #[cfg(feature = "whisper")]
 pub struct WhisperFinalizer {
     ctx: whisper_rs::WhisperContext,
-    vad_path: std::path::PathBuf,
+    vad: std::sync::Mutex<whisper_rs::WhisperVadContext>,
     language: Option<String>,
     num_threads: i32,
 }
@@ -76,15 +76,27 @@ pub struct WhisperFinalizer {
 #[cfg(feature = "whisper")]
 impl WhisperFinalizer {
     pub fn load(config: FinalizerConfig) -> Result<Self> {
+        use whisper_rs::{WhisperVadContext, WhisperVadContextParams};
+
         let params = whisper_rs::WhisperContextParameters::default();
         let ctx = whisper_rs::WhisperContext::new_with_params(
             config.model_path.to_str().context("model path UTF-8")?,
             params,
         )
         .map_err(|e| anyhow::anyhow!("loading whisper model: {e:?}"))?;
+
+        let mut vad_params = WhisperVadContextParams::default();
+        vad_params.set_n_threads(config.num_threads);
+        vad_params.set_use_gpu(false);
+        let vad = WhisperVadContext::new(
+            config.vad_path.to_str().context("vad path UTF-8")?,
+            vad_params,
+        )
+        .map_err(|e| anyhow::anyhow!("loading Silero VAD: {e:?}"))?;
+
         Ok(Self {
             ctx,
-            vad_path: config.vad_path,
+            vad: std::sync::Mutex::new(vad),
             language: config.language.or_else(|| Some("en".into())),
             num_threads: config.num_threads,
         })
@@ -92,19 +104,12 @@ impl WhisperFinalizer {
 
     /// Run Silero VAD; return concatenated speech samples, or empty if none.
     fn gate_with_vad(&self, samples: &[f32]) -> Result<Vec<f32>> {
-        use whisper_rs::{WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
+        use whisper_rs::WhisperVadParams;
 
-        let mut vad_params = WhisperVadContextParams::default();
-        vad_params.set_n_threads(self.num_threads);
-        vad_params.set_use_gpu(false);
-
-        let mut vad = WhisperVadContext::new(
-            self.vad_path
-                .to_str()
-                .context("vad path UTF-8")?,
-            vad_params,
-        )
-        .map_err(|e| anyhow::anyhow!("loading Silero VAD: {e:?}"))?;
+        let mut vad = self
+            .vad
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Silero VAD mutex poisoned"))?;
 
         let segs = vad
             .segments_from_samples(WhisperVadParams::new(), samples)

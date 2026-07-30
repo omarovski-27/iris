@@ -57,7 +57,13 @@ pub trait LocalSession: Send {
     /// Events from the engine (Ready / Partial / Final / Error).
     fn partials(&self) -> &Receiver<LocalEvent>;
 
-    /// End of speech. No more `feed` calls will come. Non-blocking: the final
-    /// transcript arrives on [`LocalSession::partials`].
+    /// End of speech. No more `feed` calls will come.
+    ///
+    /// May block on batch work (e.g. Whisper finalization). Engines may deliver
+    /// [`LocalEvent::Final`] on [`LocalSession::partials`] before this returns
+    /// (typical for batch engines) or shortly afterward on a worker thread
+    /// (allowed for mocks / deferred delivery). Callers must not assume this is
+    /// non-blocking and should avoid invoking it on a real-time audio callback
+    /// thread when a batch finalizer is in use.
     fn finalize(&mut self) -> Result<()>;
 }

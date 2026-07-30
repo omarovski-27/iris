@@ -19,7 +19,9 @@ pub struct MockLocalEngineConfig {
     pub transcript: String,
     /// How much fed audio each additional word represents.
     pub audio_per_word: Duration,
-    /// Simulated finalisation cost between `finalize()` and `Final`.
+    /// Optional deferred delivery of `Final` after `finalize()` returns.
+    /// Zero (default) delivers `Final` before `finalize` returns, matching
+    /// batch engines. Non-zero spawns a sleeper thread for timing tests only.
     pub finalize_delay: Duration,
 }
 

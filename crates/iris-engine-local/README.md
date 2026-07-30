@@ -105,7 +105,9 @@ pub trait LocalEngine: Send + Sync {
 pub trait LocalSession: Send {
     fn feed(&mut self, pcm: &[i16]) -> Result<()>;      // 16 kHz mono PCM16, any frame size
     fn partials(&self) -> &Receiver<LocalEvent>;
-    fn finalize(&mut self) -> Result<()>;               // Final arrives on partials()
+    // May block on batch work (Whisper). Final is often already on partials()
+    // when finalize returns; do not call from a real-time audio callback.
+    fn finalize(&mut self) -> Result<()>;
 }
 ```
 
