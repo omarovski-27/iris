@@ -15,6 +15,33 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 
 Early development. Windows first; macOS and Linux planned.
 
+The **latency spike** is in: a working end-to-end pipeline (global hotkey →
+WASAPI capture → streaming transcription → text injection) with latency
+instrumentation throughout. No GUI yet.
+
+```bash
+# See what it measures — no API key, no microphone, runs anywhere
+cargo run --release --bin iris-harness -- --engine mock
+```
+
+## Layout
+
+| | |
+| --- | --- |
+| `crates/iris-core` | the pipeline: audio, the `Engine` trait, injection, latency |
+| `crates/iris-spike` | `iris-spike` (the app) and `iris-harness` (measurement) |
+
+Everything except microphone capture, the hotkey hook and text injection is
+platform-independent, so the tests and the latency harness run anywhere.
+
+## Docs
+
+- [`crates/iris-spike/README.md`](crates/iris-spike/README.md) — running the
+  spike, and how to read the latency report
+- [`docs/spike-findings.md`](docs/spike-findings.md) — measured latency, where
+  the budget goes, architecture recommendation
+- [`docs/dev-windows.md`](docs/dev-windows.md) — building for Windows from WSL2
+
 ## License
 
 MIT
