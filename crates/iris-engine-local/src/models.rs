@@ -356,27 +356,42 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Removes `path` on drop unless [`TempFileGuard::persist`] was called.
+/// Owns the download temp path and open handle; removes the path on drop unless
+/// [`TempFileGuard::persist`] was called. Drops the file handle before unlink.
 struct TempFileGuard {
     path: PathBuf,
+    file: Option<File>,
     persist: bool,
 }
 
 impl TempFileGuard {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, file: File) -> Self {
         Self {
             path,
+            file: Some(file),
             persist: false,
         }
     }
 
+    fn file_mut(&mut self) -> Result<&mut File> {
+        self.file
+            .as_mut()
+            .context("download temp file already closed")
+    }
+
+    fn close_file(&mut self) {
+        self.file.take();
+    }
+
     fn persist(mut self) {
+        self.file.take();
         self.persist = true;
     }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
+        self.file.take();
         if !self.persist {
             let _ = fs::remove_file(&self.path);
         }
@@ -421,10 +436,9 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
         .or(Some(spec.expected_bytes));
 
     let mut reader = resp.into_reader();
-    let mut file = File::create(&tmp)
+    let file = File::create(&tmp)
         .with_context(|| format!("creating temp {}", tmp.display()))?;
-    // Clean up the temp on every failure path unless rename (or concurrent win) succeeds.
-    let tmp_guard = TempFileGuard::new(tmp.clone());
+    let mut tmp_guard = TempFileGuard::new(tmp.clone(), file);
     let mut buf = [0u8; 64 * 1024];
     let mut downloaded = 0u64;
     loop {
@@ -432,14 +446,14 @@ fn download_to(dest: &Path, spec: &ModelSpec, progress: Option<&ProgressFn>) -> 
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n])?;
+        tmp_guard.file_mut()?.write_all(&buf[..n])?;
         downloaded += n as u64;
         if let Some(cb) = progress {
             cb(downloaded, total);
         }
     }
-    file.flush()?;
-    drop(file);
+    tmp_guard.file_mut()?.flush()?;
+    tmp_guard.close_file();
 
     // If another thread already placed the final file, drop our temp and win.
     if dest.is_file() {

@@ -145,7 +145,10 @@ impl LocalSession for LayeredSession {
             return Ok(());
         }
         self.buffer.extend_from_slice(pcm);
-        self.stream.feed(pcm)?;
+        if let Err(e) = self.stream.feed(pcm) {
+            self.emit_error(format!("{e:#}"));
+            return Err(e);
+        }
         self.pump_stream_partials();
         Ok(())
     }
@@ -346,5 +349,71 @@ mod tests {
             .count();
         assert_eq!(errors, 1, "expected exactly one Error, got {events:?}");
         assert_eq!(finals, 0, "must not emit Final after streaming Error: {events:?}");
+    }
+
+    struct FeedFailStreamEngine;
+
+    struct FeedFailStreamSession {
+        rx: Receiver<LocalEvent>,
+    }
+
+    impl LocalEngine for FeedFailStreamEngine {
+        fn name(&self) -> &'static str {
+            "feed-fail-stream"
+        }
+
+        fn start(&self) -> Result<Box<dyn LocalSession>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(LocalEvent::Ready);
+            Ok(Box::new(FeedFailStreamSession { rx }))
+        }
+    }
+
+    impl LocalSession for FeedFailStreamSession {
+        fn feed(&mut self, _pcm: &[i16]) -> Result<()> {
+            anyhow::bail!("feed boom")
+        }
+
+        fn partials(&self) -> &Receiver<LocalEvent> {
+            &self.rx
+        }
+
+        fn finalize(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn layered_feed_error_is_terminal_no_final() {
+        let engine = LayeredLocalEngine::new(LayeredLocalEngineConfig {
+            streaming: Arc::new(FeedFailStreamEngine),
+            finalizer: Arc::new(MockFinalizer::default()),
+        });
+        let mut session = engine.start().unwrap();
+        let err = session.feed(&[1, 2, 3, 4]).unwrap_err();
+        assert!(err.to_string().contains("feed boom"), "{err}");
+
+        let events: Vec<_> = session.partials().try_iter().collect();
+        let errors = events
+            .iter()
+            .filter(|e| matches!(e, LocalEvent::Error(_)))
+            .count();
+        let finals = events
+            .iter()
+            .filter(|e| matches!(e, LocalEvent::Final(_)))
+            .count();
+        assert_eq!(errors, 1, "expected exactly one Error, got {events:?}");
+        assert_eq!(finals, 0, "must not emit Final after feed Error: {events:?}");
+
+        let fin_err = session.finalize().unwrap_err();
+        assert!(
+            fin_err.to_string().contains("streaming layer failed"),
+            "{fin_err}"
+        );
+        let after: Vec<_> = session.partials().try_iter().collect();
+        assert!(
+            after.iter().all(|e| !matches!(e, LocalEvent::Final(_))),
+            "finalize must not emit Final after feed Error: {after:?}"
+        );
     }
 }
