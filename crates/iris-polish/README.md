@@ -120,8 +120,8 @@ Deterministic, dependency-free, fully unit-tested, idempotent. In order:
    `that`, `had`, `is`, and `so` are excluded: "the thing that that guy said",
    "he had had enough", and "it was so so close" are all real English.
 5. **Casing** — capitalise sentence starts and the pronoun `i`. Never *lowercase*
-   anything. Abbreviations (`etc.`, `e.g.`) and initials (`J. Smith`) do not end
-   sentences.
+   anything. Abbreviations (`etc.`, `e.g.`), dotted acronyms (`U.S.`, `Ph.D.`),
+   and initials (`J. Smith`) do not end sentences.
 6. **Terminal punctuation** — append `.` when the utterance ends bare; promote a
    stray trailing comma to a period.
 
@@ -375,8 +375,8 @@ cd crates/iris-polish && cargo build
 ```
 
 There is no workspace root manifest in the repository yet; when one lands, adding
-`crates/iris-polish` to its `members` is the only change needed. `Cargo.lock` is
-not tracked here for that reason — the workspace root will own it.
+`crates/iris-polish` to its `members` is the only change needed. Until then the
+crate tracks its own `Cargo.lock` so standalone builds stay reproducible.
 
 Windows is the primary target. `x86_64-pc-windows-gnu` cross-compiles cleanly
 because the TLS stack is pinned to rustls with the pure-Rust `ring` provider

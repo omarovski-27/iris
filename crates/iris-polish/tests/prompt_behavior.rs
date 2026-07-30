@@ -57,7 +57,10 @@ async fn rule_polisher_satisfies_every_shared_property() {
         }
         for expectation in baseline_expectations() {
             if let Err(why) = expectation.check(case.raw, &output) {
-                failures.push(format!("case {:?}: baseline {expectation:?}: {why}", case.name));
+                failures.push(format!(
+                    "case {:?}: baseline {expectation:?}: {why}",
+                    case.name
+                ));
             }
         }
     }
@@ -96,7 +99,11 @@ async fn the_corpus_rejects_a_bad_polisher() {
     let mut caught = 0;
 
     for case in CASES {
-        let output = liar.polish(&PolishRequest::new(case.raw)).await.unwrap().text;
+        let output = liar
+            .polish(&PolishRequest::new(case.raw))
+            .await
+            .unwrap()
+            .text;
         if case.check_shared(&output).is_err() {
             caught += 1;
         }
@@ -116,11 +123,11 @@ async fn a_well_behaved_polisher_passes_check_all() {
     // A stand-in for the ideal model: exactly what the rules produce, with the
     // llm_only cases hand-corrected the way a model should handle them.
     let ideal = MockPolisher::table([
+        ("so, you know, we should ship it", "So we should ship it."),
         (
-            "so, you know, we should ship it",
-            "So we should ship it.",
+            "i went to the, i went to the office",
+            "I went to the office.",
         ),
-        ("i went to the, i went to the office", "I went to the office."),
         ("did the nightly build pass", "Did the nightly build pass?"),
         (
             "um so uh i was thinking, you know, we could uh cache the the result \
@@ -131,11 +138,19 @@ async fn a_well_behaved_polisher_passes_check_all() {
     let rules = RulePolisher::default();
 
     for case in CASES {
-        let mocked = ideal.polish(&PolishRequest::new(case.raw)).await.unwrap().text;
+        let mocked = ideal
+            .polish(&PolishRequest::new(case.raw))
+            .await
+            .unwrap()
+            .text;
         // Anything not in the table falls through to the rule engine's answer,
         // which is what a model should agree with on those cases.
         let output = if mocked == case.raw {
-            rules.polish(&PolishRequest::new(case.raw)).await.unwrap().text
+            rules
+                .polish(&PolishRequest::new(case.raw))
+                .await
+                .unwrap()
+                .text
         } else {
             mocked
         };

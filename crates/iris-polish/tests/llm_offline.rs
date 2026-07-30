@@ -234,8 +234,12 @@ async fn accepts_ordinary_cleanup() {
 #[tokio::test]
 async fn guards_can_be_relaxed() {
     let config = LlmConfig::new("k").with_guards(OutputGuards::permissive());
-    let polisher = LlmPolisher::with_transport(config, StubTransport::returning("Anything at all."));
-    let out = polisher.polish(&PolishRequest::new("x y z 1")).await.unwrap();
+    let polisher =
+        LlmPolisher::with_transport(config, StubTransport::returning("Anything at all."));
+    let out = polisher
+        .polish(&PolishRequest::new("x y z 1"))
+        .await
+        .unwrap();
     assert_eq!(out.text, "Anything at all.");
 }
 
@@ -324,10 +328,8 @@ async fn reports_how_long_it_took() {
 
 #[tokio::test]
 async fn dropping_the_future_cancels_the_request() {
-    let transport = StubTransport::after(
-        Stub::Content("too late".into()),
-        Duration::from_millis(500),
-    );
+    let transport =
+        StubTransport::after(Stub::Content("too late".into()), Duration::from_millis(500));
     let config = LlmConfig::new("k").with_timeout(Duration::from_secs(60));
     let polisher = LlmPolisher::with_transport(config, transport.clone());
     let request = PolishRequest::new("cancel me");
@@ -345,9 +347,7 @@ async fn dropping_the_future_cancels_the_request() {
 }
 
 /// Poll a future exactly once, returning `None` if it is not ready.
-async fn poll_once<F: std::future::Future>(
-    mut future: std::pin::Pin<&mut F>,
-) -> Option<F::Output> {
+async fn poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
     use std::future::poll_fn;
     use std::task::Poll;
 

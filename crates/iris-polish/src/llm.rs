@@ -114,10 +114,14 @@ impl LlmConfig {
         }
         if let Some(raw) = read_env(ENV_TIMEOUT_MS) {
             let ms: u64 = raw.parse().map_err(|_| {
-                PolishError::Config(format!("{ENV_TIMEOUT_MS} must be a whole number of milliseconds, got {raw:?}"))
+                PolishError::Config(format!(
+                    "{ENV_TIMEOUT_MS} must be a whole number of milliseconds, got {raw:?}"
+                ))
             })?;
             if ms == 0 {
-                return Err(PolishError::Config(format!("{ENV_TIMEOUT_MS} must be greater than zero")));
+                return Err(PolishError::Config(format!(
+                    "{ENV_TIMEOUT_MS} must be greater than zero"
+                )));
             }
             config.timeout = Duration::from_millis(ms);
         }
@@ -176,7 +180,9 @@ impl LlmConfig {
             )));
         }
         if self.timeout.is_zero() {
-            return Err(PolishError::Config("timeout must be greater than zero".into()));
+            return Err(PolishError::Config(
+                "timeout must be greater than zero".into(),
+            ));
         }
         Ok(())
     }
@@ -368,7 +374,8 @@ fn sanitize_output(raw: &str, input: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The future returned by [`ChatTransport::post_json`].
-pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<String, PolishError>> + Send + 'a>>;
+pub type TransportFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, PolishError>> + Send + 'a>>;
 
 /// The HTTP layer, behind a trait so tests never touch a socket.
 ///
@@ -377,8 +384,12 @@ pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<String, Polish
 /// exercised too, not stubbed over.
 pub trait ChatTransport: Send + Sync + fmt::Debug {
     /// POST `body` as `application/json` with a bearer token; return the response body.
-    fn post_json<'a>(&'a self, url: &'a str, api_key: &'a str, body: &'a str)
-        -> TransportFuture<'a>;
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        api_key: &'a str,
+        body: &'a str,
+    ) -> TransportFuture<'a>;
 
     /// Open a connection ahead of time.
     ///
@@ -444,10 +455,9 @@ impl ChatTransport for ReqwestTransport {
                 .map_err(|e| PolishError::Transport(e.to_string()))?;
 
             let status = response.status();
-            let text = response
-                .text()
-                .await
-                .map_err(|e| PolishError::Transport(format!("could not read response body: {e}")))?;
+            let text = response.text().await.map_err(|e| {
+                PolishError::Transport(format!("could not read response body: {e}"))
+            })?;
 
             if !status.is_success() {
                 return Err(PolishError::HttpStatus {
@@ -514,7 +524,9 @@ fn extract_content(body: &str) -> Result<String, PolishError> {
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
     {
-        return Err(PolishError::Response(format!("endpoint reported: {message}")));
+        return Err(PolishError::Response(format!(
+            "endpoint reported: {message}"
+        )));
     }
 
     let content = value
@@ -700,9 +712,7 @@ mod tests {
             Err(PolishError::Config(_))
         ));
         assert!(matches!(
-            LlmConfig::new("k")
-                .with_timeout(Duration::ZERO)
-                .validate(),
+            LlmConfig::new("k").with_timeout(Duration::ZERO).validate(),
             Err(PolishError::Config(_))
         ));
         assert!(LlmConfig::new("k").validate().is_ok());
@@ -765,12 +775,17 @@ mod tests {
     #[test]
     fn permissive_guards_accept_anything() {
         let guards = OutputGuards::permissive();
-        assert!(guards.check("hi", "an entirely different and much longer sentence 7").is_ok());
+        assert!(guards
+            .check("hi", "an entirely different and much longer sentence 7")
+            .is_ok());
     }
 
     #[test]
     fn sanitizer_strips_code_fences() {
-        assert_eq!(sanitize_output("```\nHello there.\n```", "hello there"), "Hello there.");
+        assert_eq!(
+            sanitize_output("```\nHello there.\n```", "hello there"),
+            "Hello there."
+        );
         assert_eq!(
             sanitize_output("```text\nHello there.\n```", "hello there"),
             "Hello there."
@@ -783,12 +798,18 @@ mod tests {
             sanitize_output("Here is the cleaned text:\nHello there.", "hello there"),
             "Hello there."
         );
-        assert_eq!(sanitize_output("Output: Hello there.", "hello there"), "Hello there.");
+        assert_eq!(
+            sanitize_output("Output: Hello there.", "hello there"),
+            "Hello there."
+        );
     }
 
     #[test]
     fn sanitizer_strips_added_quotes_but_keeps_dictated_ones() {
-        assert_eq!(sanitize_output("\"Hello there.\"", "hello there"), "Hello there.");
+        assert_eq!(
+            sanitize_output("\"Hello there.\"", "hello there"),
+            "Hello there."
+        );
         assert_eq!(
             sanitize_output("\"Hello there.\"", "\"hello there\""),
             "\"Hello there.\""
@@ -802,7 +823,10 @@ mod tests {
 
     #[test]
     fn sanitizer_leaves_clean_output_alone() {
-        assert_eq!(sanitize_output("Hello there.", "hello there"), "Hello there.");
+        assert_eq!(
+            sanitize_output("Hello there.", "hello there"),
+            "Hello there."
+        );
     }
 
     #[test]

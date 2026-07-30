@@ -110,8 +110,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[tokio::test]
 async fn posts_a_bearer_authenticated_json_request() {
-    let (base_url, received) =
-        one_shot_server("HTTP/1.1 200 OK", completion("So it works.")).await;
+    let (base_url, received) = one_shot_server("HTTP/1.1 200 OK", completion("So it works.")).await;
 
     let config = LlmConfig::new("secret-key")
         .with_base_url(base_url)
@@ -126,7 +125,9 @@ async fn posts_a_bearer_authenticated_json_request() {
 
     let received = received.await.unwrap();
     assert!(
-        received.request_line.starts_with("POST /v1/chat/completions "),
+        received
+            .request_line
+            .starts_with("POST /v1/chat/completions "),
         "{}",
         received.request_line
     );
@@ -196,7 +197,10 @@ async fn a_server_that_never_answers_hits_the_budget() {
     // Either the crate's own timer or reqwest's fires first; both are correct,
     // and both must be well inside a second.
     assert!(
-        matches!(err, PolishError::BudgetExceeded { .. } | PolishError::Transport(_)),
+        matches!(
+            err,
+            PolishError::BudgetExceeded { .. } | PolishError::Transport(_)
+        ),
         "{err:?}"
     );
     assert!(elapsed < Duration::from_secs(1), "waited {elapsed:?}");
@@ -219,7 +223,10 @@ async fn a_refused_connection_is_a_transport_error() {
         .unwrap_err();
 
     assert!(
-        matches!(err, PolishError::Transport(_) | PolishError::BudgetExceeded { .. }),
+        matches!(
+            err,
+            PolishError::Transport(_) | PolishError::BudgetExceeded { .. }
+        ),
         "{err:?}"
     );
     assert!(err.is_transient());

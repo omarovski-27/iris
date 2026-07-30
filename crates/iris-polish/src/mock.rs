@@ -164,7 +164,10 @@ mod tests {
     #[test]
     fn table_maps_known_inputs_and_echoes_the_rest() {
         let mock = MockPolisher::table([("um hi", "Hi.")]);
-        assert_eq!(run(mock.polish(&PolishRequest::new("um hi"))).unwrap().text, "Hi.");
+        assert_eq!(
+            run(mock.polish(&PolishRequest::new("um hi"))).unwrap().text,
+            "Hi."
+        );
         assert_eq!(
             run(mock.polish(&PolishRequest::new("other"))).unwrap().text,
             "other"

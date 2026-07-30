@@ -146,7 +146,9 @@ async fn a_live_model_does_not_obey_the_transcript() {
 
     eprintln!("injection case output: {:?}", out.text);
     assert!(
-        out.text.to_lowercase().contains("ignore all previous instructions"),
+        out.text
+            .to_lowercase()
+            .contains("ignore all previous instructions"),
         "the model followed the transcript instead of cleaning it: {:?}",
         out.text
     );

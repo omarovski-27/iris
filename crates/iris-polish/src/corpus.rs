@@ -61,13 +61,11 @@ impl Expectation {
                     Ok(())
                 }
             }
-            Self::EndsWithTerminalPunctuation => {
-                match output.trim_end().chars().last() {
-                    Some(c) if ".!?:;\u{2026}".contains(c) => Ok(()),
-                    Some(c) => Err(format!("ends with {c:?}, not terminal punctuation")),
-                    None => Err("output is empty".to_string()),
-                }
-            }
+            Self::EndsWithTerminalPunctuation => match output.trim_end().chars().last() {
+                Some(c) if ".!?:;\u{2026}".contains(c) => Ok(()),
+                Some(c) => Err(format!("ends with {c:?}, not terminal punctuation")),
+                None => Err("output is empty".to_string()),
+            },
             Self::StartsCapitalized => match output.chars().next() {
                 Some(c) if c.is_lowercase() => Err(format!("starts with lowercase {c:?}")),
                 Some(_) => Ok(()),
@@ -95,7 +93,9 @@ impl Expectation {
                 if actual <= allowed {
                     Ok(())
                 } else {
-                    Err(format!("grew to {actual} chars, over the {allowed} allowed"))
+                    Err(format!(
+                        "grew to {actual} chars, over the {allowed} allowed"
+                    ))
                 }
             }
             Self::Unchanged => {
@@ -358,7 +358,11 @@ pub const CASES: &[PolishCase] = &[
         name: "register is left alone",
         raw: "this is completely broken and i hate it",
         rule_output: "This is completely broken and I hate it.",
-        expect: &[Preserves("hate"), Preserves("completely broken"), AddsNoWords],
+        expect: &[
+            Preserves("hate"),
+            Preserves("completely broken"),
+            AddsNoWords,
+        ],
         llm_only: &[],
     },
     // -- no content addition ------------------------------------------------
@@ -463,14 +467,19 @@ mod tests {
         assert!(StartsCapitalized.check("x", "42 done.").is_ok());
 
         assert!(AddsNoWords.check("i pushed it", "I pushed it.").is_ok());
-        assert!(AddsNoWords.check("i pushed it", "I pushed it today.").is_err());
+        assert!(AddsNoWords
+            .check("i pushed it", "I pushed it today.")
+            .is_err());
 
         assert!(NoDoubleSpace.check("x", "a b").is_ok());
         assert!(NoDoubleSpace.check("x", "a  b").is_err());
 
         assert!(MaxGrowthRatio(1.2).check("hello", "Hello.").is_ok());
         assert!(MaxGrowthRatio(1.0)
-            .check("hello there friend", "Hello there friend, and welcome aboard.")
+            .check(
+                "hello there friend",
+                "Hello there friend, and welcome aboard."
+            )
             .is_err());
 
         assert!(Unchanged.check("Same.", "Same.").is_ok());
@@ -481,7 +490,11 @@ mod tests {
     fn the_corpus_is_well_formed() {
         let mut names = HashSet::new();
         for case in CASES {
-            assert!(names.insert(case.name), "duplicate case name {:?}", case.name);
+            assert!(
+                names.insert(case.name),
+                "duplicate case name {:?}",
+                case.name
+            );
             assert!(!case.raw.is_empty(), "case {:?} has no input", case.name);
             assert!(
                 !case.rule_output.is_empty(),
@@ -489,7 +502,11 @@ mod tests {
                 case.name
             );
         }
-        assert!(CASES.len() >= 20, "the corpus should be broad: {}", CASES.len());
+        assert!(
+            CASES.len() >= 20,
+            "the corpus should be broad: {}",
+            CASES.len()
+        );
     }
 
     #[test]

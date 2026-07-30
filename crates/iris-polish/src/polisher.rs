@@ -11,7 +11,8 @@ use crate::{PolishError, PolishRequest, Polished};
 /// Boxed rather than `async fn` in the trait so that `dyn Polisher` works: Iris
 /// picks its polisher at runtime from configuration, so trait objects are the
 /// whole point.
-pub type PolishFuture<'a> = Pin<Box<dyn Future<Output = Result<Polished, PolishError>> + Send + 'a>>;
+pub type PolishFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Polished, PolishError>> + Send + 'a>>;
 
 /// Turns a raw transcript into text worth inserting.
 ///

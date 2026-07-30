@@ -621,10 +621,7 @@ fn ensure_terminal_punctuation(tokens: &mut [Token]) {
     while last.suffix.ends_with(',') {
         last.suffix.pop();
     }
-    let terminated = last
-        .suffix
-        .chars()
-        .any(|c| TERMINATORS.contains(c));
+    let terminated = last.suffix.chars().any(|c| TERMINATORS.contains(c));
     if !terminated {
         last.suffix.push('.');
     }
@@ -701,7 +698,10 @@ mod tests {
     #[test]
     fn keeps_a_comma_that_was_not_just_a_fence() {
         // Only the filler's own comma goes; the clause comma stays.
-        assert_eq!(polish("when it lands, um send me a link"), "When it lands, send me a link.");
+        assert_eq!(
+            polish("when it lands, um send me a link"),
+            "When it lands, send me a link."
+        );
     }
 
     #[test]
@@ -733,7 +733,10 @@ mod tests {
     fn ambiguous_words_are_never_treated_as_filler() {
         assert_eq!(polish("I like it so well"), "I like it so well.");
         assert_eq!(polish("right, I mean that"), "Right, I mean that.");
-        assert_eq!(polish("basically actually true"), "Basically actually true.");
+        assert_eq!(
+            polish("basically actually true"),
+            "Basically actually true."
+        );
     }
 
     #[test]
@@ -784,7 +787,10 @@ mod tests {
     fn collapses_doubled_function_words() {
         assert_eq!(polish("the the fix landed"), "The fix landed.");
         assert_eq!(polish("I I tried that"), "I tried that.");
-        assert_eq!(polish("we we should go to to lunch"), "We should go to lunch.");
+        assert_eq!(
+            polish("we we should go to to lunch"),
+            "We should go to lunch."
+        );
     }
 
     #[test]
@@ -815,7 +821,10 @@ mod tests {
     #[test]
     fn capitalizes_the_pronoun_i() {
         assert_eq!(polish("then i left"), "Then I left.");
-        assert_eq!(polish("i'm done and i've checked"), "I'm done and I've checked.");
+        assert_eq!(
+            polish("i'm done and i've checked"),
+            "I'm done and I've checked."
+        );
     }
 
     #[test]
@@ -888,7 +897,10 @@ mod tests {
 
     #[test]
     fn protected_token_at_sentence_start_is_not_recased() {
-        assert_eq!(polish("done. wgpu_device failed"), "Done. wgpu_device failed.");
+        assert_eq!(
+            polish("done. wgpu_device failed"),
+            "Done. wgpu_device failed."
+        );
     }
 
     // -- terminal punctuation ----------------------------------------------
