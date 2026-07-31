@@ -81,27 +81,28 @@ hold for any new engine.
 `Dictation` (`iris-core/src/dictation.rs`) is the portable driver shared by the
 live Windows pipeline and the CI harness, so latency measured in CI is
 comparable to latency measured on a desk. `Dictation::events()` is the seam the
-overlay UI hangs off. `Dictation::start_with_session` takes an already-open
-`Session` instead of opening one — see `App::prewarm` below.
+overlay UI hangs off.
 
 Measured latency numbers, the budget breakdown, and open risks:
 `docs/spike-findings.md`.
 
 **A short hold can end before Deepgram says anything at all.** Connect + first
 result is ~1-3 s; a hold shorter than that has nothing streamed back when the
-key comes up, so the entire transcript depends on one post-`Finalize` flush.
-`deepgram.rs`'s `pump` tracks `sent_secs` (audio actually forwarded) against
-`Transcript::covered_secs` (Deepgram's own reported `start + duration`) and
-withholds `CloseStream` until they converge, so a slow-to-respond Deepgram
-still gets to finish transcribing already-sent audio instead of having the
-socket pulled out from under it. See the module doc for the full mechanism and
-`a_hold_shorter_than_first_response_does_not_abandon_the_backlog` for the
-adversarial-fake-server regression test. `App` (`iris-app/src/app.rs`)
-attacks the same latency from the other side: `App::prewarm` opens the next
-session right after each dictation (and once at startup) so a network
-engine's connect cost overlaps idle time instead of the next hold; `capture`
-consumes it via `Dictation::start_with_session` when it is fresh enough
-(`PREWARM_STALE_AFTER`), falling back to opening fresh otherwise.
+key comes up, so the entire transcript depends on one post-`Finalize` flush,
+and sending `CloseStream` immediately after `Finalize` can pull the socket out
+from under that flush before Deepgram gets to it. `deepgram.rs`'s `pump` waits
+for `from_finalize` — a boolean Deepgram itself sets on the Results message
+that answers a `Finalize`, live-verified to arrive (usually 200-550ms) for any
+session that was sent real audio, including holds under 0.5s and holds
+containing only silence — before sending `CloseStream`; `FINALIZE_ACK_TIMEOUT`
+is a bounded safety net under that for protocol failure only. Three earlier
+designs (unbounded coverage-catch-up, a fixed ceiling, a stall detector) were
+tried and rejected first — see the module doc's history for why an inferred
+"Deepgram is probably done" always loses to this authoritative signal. Session
+prewarming was also tried and dropped: a live idle probe found Deepgram closes
+an unused connection in roughly 12-15s (see Sharp edges), far short of real
+gaps between dictations, so it protected against a race that barely occurred
+in practice.
 
 ## Sharp edges
 
@@ -117,6 +118,10 @@ consumes it via `Dictation::start_with_session` when it is fresh enough
   actually tracking. `"audio_secs":0.0` on an errored record is consistent
   with *some* audio having been captured before the failure, not proof that
   literally none was — don't over-read that field on error rows.
+- Deepgram closes an idle websocket connection (no audio sent) in roughly
+  12-15s, live-measured. Relevant to any future connection-reuse idea: it
+  only pays off within that window of the last dictation, not across the
+  minutes-apart gaps typical of real desktop use.
 
 ## Maintaining this file
 
