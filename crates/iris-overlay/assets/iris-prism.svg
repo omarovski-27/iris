@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Iris">
+  <title>Iris</title>
+  <!--
+    The captain-approved mark: a prism triangle. White light enters the apex,
+    the spectrum leaves the base. Taken from the Prism direction's 256 px icon
+    (c-prism/index.html, section 04) and made self-contained.
+
+    At small sizes the rays and the outline drop out and the mark reads as a
+    filled wedge; renderers targeting 16-32 px should use the `wedge` path
+    alone rather than scaling this whole file down.
+  -->
+  <defs>
+    <linearGradient id="iris-spectrum" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF6B8A"/>
+      <stop offset=".25" stop-color="#FFB86B"/>
+      <stop offset=".5" stop-color="#6BFFB8"/>
+      <stop offset=".75" stop-color="#6BCBFF"/>
+      <stop offset="1" stop-color="#8B7BFF"/>
+    </linearGradient>
+    <linearGradient id="iris-sheen" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity=".25"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="iris-plate" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#141822"/>
+      <stop offset="1" stop-color="#0A0C12"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="64" height="64" rx="14" ry="14" fill="url(#iris-plate)"/>
+
+  <!-- light in -->
+  <path d="M32 6 L32 17" stroke="#EDEFF5" stroke-width="2" stroke-linecap="round" opacity=".7"/>
+
+  <!-- the prism -->
+  <path d="M32 11 L52 50 L12 50 Z" fill="none" stroke="#2A3140" stroke-width="3" stroke-linejoin="round"/>
+  <path id="wedge" d="M32 18 L45 45 L19 45 Z" fill="url(#iris-spectrum)" opacity=".9"/>
+  <path d="M32 18 L45 45 L19 45 Z" fill="url(#iris-sheen)"/>
+
+  <!-- spectrum out -->
+  <path d="M21 49 L15 57" stroke="#FF6B8A" stroke-width="2" stroke-linecap="round"/>
+  <path d="M28 49 L25 58" stroke="#6BFFB8" stroke-width="2" stroke-linecap="round"/>
+  <path d="M36 49 L39 58" stroke="#6BCBFF" stroke-width="2" stroke-linecap="round"/>
+  <path d="M43 49 L49 57" stroke="#8B7BFF" stroke-width="2" stroke-linecap="round"/>
+</svg>

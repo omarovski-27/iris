@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/iris-core", "crates/iris-spike", "crates/iris-engine-local"]
+members = ["crates/iris-core", "crates/iris-spike", "crates/iris-engine-local", "crates/iris-overlay"]
 
 [workspace.package]
 version = "0.1.0"

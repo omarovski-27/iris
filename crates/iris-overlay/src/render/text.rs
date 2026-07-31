@@ -1,0 +1,519 @@
+//! Text for the timer, the latency figure and the engine chip.
+//!
+//! All three are mono in the Prism mockup (`--mono: "Cascadia Mono"`), so the
+//! pill needs exactly one face. Cascadia Mono is the font the design spec names
+//! and it is SIL OFL 1.1, so it ships in-crate rather than being looked up in
+//! the system font stack: the overlay then rasterises identically on Windows and
+//! in the headless Linux tests, which is what makes a rendered PNG a usable
+//! review artefact.
+//!
+//! See `assets/fonts/OFL.txt` for the licence.
+
+use std::collections::HashMap;
+
+use fontdue::{Font, FontSettings, Metrics};
+use tiny_skia::{Pixmap, PremultipliedColorU8};
+
+use crate::theme::Rgba;
+
+/// Cascadia Mono Regular, SIL OFL 1.1. Copyright Microsoft Corporation.
+const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-Regular.ttf");
+
+/// How the glyph coverage is coloured.
+#[derive(Clone, Copy, Debug)]
+pub enum TextPaint {
+    /// One flat colour.
+    Solid(Rgba),
+    /// A left-to-right ramp across the whole run — the mockup paints the
+    /// latency figure with `linear-gradient(90deg, mint, sky)` clipped to text.
+    Gradient(Rgba, Rgba),
+}
+
+/// Horizontal alignment of a run against the x coordinate it is drawn at.
+///
+/// Only the two the pill actually uses: the engine chip is centred under the
+/// capsule, and the telemetry readout is right-aligned so its digits do not
+/// walk as the value changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    /// `x` is the centre of the run.
+    Center,
+    /// `x` is the right edge of the run.
+    Right,
+}
+
+struct Glyph {
+    metrics: Metrics,
+    bitmap: Vec<u8>,
+}
+
+/// A font plus a rasterised-glyph cache.
+///
+/// The cache is keyed on character and eighth-of-a-pixel size, so a steady
+/// state costs one hash lookup per glyph per frame and no rasterisation at all.
+pub struct FontAtlas {
+    font: Font,
+    glyphs: HashMap<(char, u32), Glyph>,
+}
+
+impl std::fmt::Debug for FontAtlas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontAtlas")
+            .field("cached_glyphs", &self.glyphs.len())
+            .finish()
+    }
+}
+
+impl FontAtlas {
+    /// Load the embedded face.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded font fails to parse, which can only happen if the
+    /// asset in this repository is corrupt — there is no runtime input here.
+    #[must_use]
+    pub fn new() -> Self {
+        let font = Font::from_bytes(FONT_BYTES, FontSettings::default())
+            .expect("embedded Cascadia Mono asset is corrupt");
+        Self {
+            font,
+            glyphs: HashMap::new(),
+        }
+    }
+
+    fn key(c: char, px: f32) -> (char, u32) {
+        (c, (px.max(0.0) * 8.0).round() as u32)
+    }
+
+    fn ensure(&mut self, c: char, px: f32) -> (char, u32) {
+        let key = Self::key(c, px);
+        self.glyphs.entry(key).or_insert_with(|| {
+            let (metrics, bitmap) = self.font.rasterize(c, px);
+            Glyph { metrics, bitmap }
+        });
+        key
+    }
+
+    /// Total advance width of `text`, including `tracking` between characters.
+    pub fn measure(&mut self, text: &str, px: f32, tracking: f32) -> f32 {
+        let mut w = 0.0;
+        for c in text.chars() {
+            let key = self.ensure(c, px);
+            w += self.glyphs[&key].metrics.advance_width + tracking;
+        }
+        (w - tracking).max(0.0)
+    }
+
+    /// Distance from the baseline to the top and bottom of the run's inked
+    /// area, both measured upwards.
+    ///
+    /// Centring on the ink rather than on the font's line box is what keeps
+    /// `0:03` and `142 ms` optically centred in a 46 px pill; line-box centring
+    /// would leave them sitting high, because the descender space is empty.
+    pub fn ink_extents(&mut self, text: &str, px: f32) -> (f32, f32) {
+        let (mut top, mut bottom) = (f32::MIN, f32::MAX);
+        for c in text.chars() {
+            let key = self.ensure(c, px);
+            let m = &self.glyphs[&key].metrics;
+            if m.width == 0 || m.height == 0 {
+                continue;
+            }
+            top = top.max(m.ymin as f32 + m.height as f32);
+            bottom = bottom.min(m.ymin as f32);
+        }
+        if top == f32::MIN {
+            (0.0, 0.0)
+        } else {
+            (top, bottom)
+        }
+    }
+
+    /// Draw `text` with its ink box centred vertically on `center_y`.
+    ///
+    /// `alpha` scales the whole run, which is how every text fade in the pill is
+    /// expressed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &mut self,
+        pixmap: &mut Pixmap,
+        text: &str,
+        px: f32,
+        tracking: f32,
+        x: f32,
+        center_y: f32,
+        align: Align,
+        paint: TextPaint,
+        alpha: f32,
+    ) {
+        if text.is_empty() || alpha <= 0.001 || px <= 0.0 {
+            return;
+        }
+        let width = self.measure(text, px, tracking);
+        let left = match align {
+            Align::Center => x - width * 0.5,
+            Align::Right => x - width,
+        };
+        let (ink_top, ink_bottom) = self.ink_extents(text, px);
+        let baseline = center_y + (ink_top + ink_bottom) * 0.5;
+
+        let mut pen = left;
+        for c in text.chars() {
+            let key = self.ensure(c, px);
+            let glyph = &self.glyphs[&key];
+            let m = &glyph.metrics;
+            if m.width > 0 && m.height > 0 {
+                let gx = (pen + m.xmin as f32).round() as i32;
+                let gy = (baseline - m.ymin as f32 - m.height as f32).round() as i32;
+                blit(
+                    pixmap,
+                    &glyph.bitmap,
+                    m.width,
+                    m.height,
+                    gx,
+                    gy,
+                    paint,
+                    (left, left + width),
+                    alpha,
+                );
+            }
+            pen += m.advance_width + tracking;
+        }
+    }
+}
+
+impl Default for FontAtlas {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Alpha-blend a coverage bitmap into the pixmap.
+#[allow(clippy::too_many_arguments)]
+fn blit(
+    pixmap: &mut Pixmap,
+    bitmap: &[u8],
+    bw: usize,
+    bh: usize,
+    x0: i32,
+    y0: i32,
+    paint: TextPaint,
+    run: (f32, f32),
+    alpha: f32,
+) {
+    let (pw, ph) = (pixmap.width() as i32, pixmap.height() as i32);
+    let span = (run.1 - run.0).max(1.0);
+    let pixels = pixmap.pixels_mut();
+
+    for row in 0..bh as i32 {
+        let py = y0 + row;
+        if py < 0 || py >= ph {
+            continue;
+        }
+        for col in 0..bw as i32 {
+            let px = x0 + col;
+            if px < 0 || px >= pw {
+                continue;
+            }
+            let coverage = f32::from(bitmap[row as usize * bw + col as usize]) / 255.0;
+            if coverage <= 0.0 {
+                continue;
+            }
+            let colour = match paint {
+                TextPaint::Solid(c) => c,
+                TextPaint::Gradient(a, b) => a.lerp(b, (px as f32 - run.0) / span),
+            };
+            let a = coverage * colour.a * alpha;
+            if a <= 0.0 {
+                continue;
+            }
+            let slot = &mut pixels[(py * pw + px) as usize];
+            *slot = over(*slot, colour, a);
+        }
+    }
+}
+
+/// Source-over compositing of a straight-alpha colour onto a premultiplied
+/// destination pixel.
+fn over(dst: PremultipliedColorU8, src: Rgba, alpha: f32) -> PremultipliedColorU8 {
+    let a = alpha.clamp(0.0, 1.0);
+    let inv = 1.0 - a;
+    let chan = |s: u8, d: u8| {
+        let s = f32::from(s) / 255.0 * a;
+        let d = f32::from(d) / 255.0 * inv;
+        ((s + d) * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    let out_a = ((a + f32::from(dst.alpha()) / 255.0 * inv) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let r = chan(src.r, dst.red()).min(out_a);
+    let g = chan(src.g, dst.green()).min(out_a);
+    let b = chan(src.b, dst.blue()).min(out_a);
+    PremultipliedColorU8::from_rgba(r, g, b, out_a).unwrap_or(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn atlas() -> FontAtlas {
+        FontAtlas::new()
+    }
+
+    #[test]
+    fn the_embedded_font_loads() {
+        let mut a = atlas();
+        assert!(a.measure("0", 11.0, 0.0) > 0.0);
+    }
+
+    #[test]
+    fn the_face_is_monospaced() {
+        // The timer relies on this: `0:03` must not shift as digits change.
+        let mut a = atlas();
+        let zero = a.measure("0", 11.0, 0.0);
+        for c in ['1', '8', 'm', 'W', ':'] {
+            let w = a.measure(&c.to_string(), 11.0, 0.0);
+            assert!(
+                (w - zero).abs() < 0.01,
+                "{c} advances {w}, 0 advances {zero}"
+            );
+        }
+        assert!((a.measure("0:00", 11.0, 0.0) - zero * 4.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn tracking_goes_between_glyphs_not_after_the_last_one() {
+        let mut a = atlas();
+        let plain = a.measure("abc", 10.0, 0.0);
+        let tracked = a.measure("abc", 10.0, 2.0);
+        assert!((tracked - plain - 4.0).abs() < 0.01, "{tracked} vs {plain}");
+        // A single glyph gets no tracking at all.
+        let one = a.measure("a", 10.0, 0.0);
+        assert!((a.measure("a", 10.0, 5.0) - one).abs() < 0.01);
+    }
+
+    #[test]
+    fn measuring_empty_text_is_zero_not_negative() {
+        let mut a = atlas();
+        assert_eq!(a.measure("", 11.0, 4.0), 0.0);
+        assert_eq!(a.ink_extents("", 11.0), (0.0, 0.0));
+        // Whitespace has advance but no ink.
+        assert!(a.measure(" ", 11.0, 0.0) > 0.0);
+        assert_eq!(a.ink_extents(" ", 11.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn digits_sit_above_the_baseline() {
+        let mut a = atlas();
+        let (top, bottom) = a.ink_extents("0123456789", 11.0);
+        assert!(top > 0.0, "top {top}");
+        // -1 is antialiasing bleed under the baseline, not a descender.
+        assert!(bottom >= -1.5, "digits should not descend: {bottom}");
+    }
+
+    #[test]
+    fn glyphs_are_cached_not_re_rasterised() {
+        let mut a = atlas();
+        a.measure("0:00", 11.0, 0.0);
+        let after_first = a.glyphs.len();
+        a.measure("0:00", 11.0, 0.0);
+        assert_eq!(a.glyphs.len(), after_first, "cache missed on a repeat");
+        // A different size is a different entry.
+        a.measure("0", 10.0, 0.0);
+        assert!(a.glyphs.len() > after_first);
+    }
+
+    #[test]
+    fn drawing_puts_ink_on_the_pixmap() {
+        let mut a = atlas();
+        let mut pm = Pixmap::new(120, 40).unwrap();
+        a.draw(
+            &mut pm,
+            "142 ms",
+            11.0,
+            0.0,
+            60.0,
+            20.0,
+            Align::Center,
+            TextPaint::Solid(Rgba::hex(0xFF_FFFF)),
+            1.0,
+        );
+        let lit = pm.pixels().iter().filter(|p| p.alpha() > 0).count();
+        assert!(lit > 40, "only {lit} pixels inked");
+    }
+
+    #[test]
+    fn alignment_moves_the_run() {
+        let mut a = atlas();
+        let bounds = |align: Align| {
+            let mut pm = Pixmap::new(160, 40).unwrap();
+            let mut atlas = FontAtlas::new();
+            atlas.draw(
+                &mut pm,
+                "0:03",
+                11.0,
+                0.0,
+                80.0,
+                20.0,
+                align,
+                TextPaint::Solid(Rgba::hex(0xFF_FFFF)),
+                1.0,
+            );
+            let mut min = i32::MAX;
+            let mut max = i32::MIN;
+            for (i, p) in pm.pixels().iter().enumerate() {
+                if p.alpha() > 0 {
+                    let x = (i % 160) as i32;
+                    min = min.min(x);
+                    max = max.max(x);
+                }
+            }
+            (min, max)
+        };
+        let width = a.measure("0:03", 11.0, 0.0);
+        let (c_min, c_max) = bounds(Align::Center);
+        let (r_min, r_max) = bounds(Align::Right);
+        assert!(r_max <= 81, "right-aligned run ends at {r_max}");
+        assert!(
+            (r_min as f32 - (80.0 - width)).abs() <= 2.0,
+            "right-aligned run starts at {r_min}, expected {}",
+            80.0 - width
+        );
+        assert!(
+            ((c_min + c_max) / 2 - 80).abs() <= 2,
+            "centre off at {c_min}..{c_max}"
+        );
+    }
+
+    #[test]
+    fn alpha_zero_draws_nothing() {
+        let mut a = atlas();
+        let mut pm = Pixmap::new(80, 30).unwrap();
+        a.draw(
+            &mut pm,
+            "0:03",
+            11.0,
+            0.0,
+            40.0,
+            15.0,
+            Align::Center,
+            TextPaint::Solid(Rgba::hex(0xFF_FFFF)),
+            0.0,
+        );
+        assert!(pm.pixels().iter().all(|p| p.alpha() == 0));
+    }
+
+    #[test]
+    fn text_outside_the_pixmap_is_clipped_not_a_panic() {
+        let mut a = atlas();
+        let mut pm = Pixmap::new(20, 12).unwrap();
+        for (x, y) in [(-500.0, 6.0), (500.0, 6.0), (10.0, -500.0), (10.0, 500.0)] {
+            a.draw(
+                &mut pm,
+                "0123456789 ms",
+                11.0,
+                0.0,
+                x,
+                y,
+                Align::Center,
+                TextPaint::Solid(Rgba::hex(0xFF_FFFF)),
+                1.0,
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_paint_varies_across_the_run() {
+        let mut a = atlas();
+        let mut pm = Pixmap::new(160, 40).unwrap();
+        a.draw(
+            &mut pm,
+            "MMMMMMMM",
+            16.0,
+            0.0,
+            80.0,
+            20.0,
+            Align::Center,
+            TextPaint::Gradient(Rgba::hex(0xFF_0000), Rgba::hex(0x00_00FF)),
+            1.0,
+        );
+        let sample = |from: usize, to: usize| {
+            let mut r = 0u64;
+            let mut b = 0u64;
+            for (i, p) in pm.pixels().iter().enumerate() {
+                let x = i % 160;
+                if (from..to).contains(&x) && p.alpha() > 0 {
+                    r += u64::from(p.red());
+                    b += u64::from(p.blue());
+                }
+            }
+            (r, b)
+        };
+        let (left_r, left_b) = sample(0, 60);
+        let (right_r, right_b) = sample(90, 160);
+        assert!(
+            left_r > left_b,
+            "left end should be red: {left_r} vs {left_b}"
+        );
+        assert!(
+            right_b > right_r,
+            "right end should be blue: {right_b} vs {right_r}"
+        );
+    }
+
+    #[test]
+    fn compositing_stays_premultiplied() {
+        // Every output must satisfy r,g,b <= a or tiny-skia's invariant breaks
+        // and UpdateLayeredWindow renders garbage.
+        let opaque_white = PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+        let clear = PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap();
+        for dst in [opaque_white, clear] {
+            for a in [0.0, 0.01, 0.5, 0.99, 1.0] {
+                let out = over(dst, Rgba::hex(0xFF_FFFF), a);
+                assert!(out.red() <= out.alpha());
+                assert!(out.green() <= out.alpha());
+                assert!(out.blue() <= out.alpha());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_characters_do_not_panic() {
+        let mut a = atlas();
+        let mut pm = Pixmap::new(80, 30).unwrap();
+        // A private-use codepoint the face certainly lacks, plus the middle dot
+        // and em dash the mockup's chip actually uses.
+        for s in ["\u{E000}", "·", "—", "日本語", "\u{1F600}"] {
+            let _ = a.measure(s, 10.0, 0.5);
+            a.draw(
+                &mut pm,
+                s,
+                10.0,
+                0.5,
+                40.0,
+                15.0,
+                Align::Center,
+                TextPaint::Solid(Rgba::hex(0xFF_FFFF)),
+                1.0,
+            );
+        }
+    }
+
+    #[test]
+    fn the_engine_chip_string_renders() {
+        let mut a = atlas();
+        let mut pm = Pixmap::new(300, 20).unwrap();
+        a.draw(
+            &mut pm,
+            "groq · whisper-large-v3-turbo · en",
+            10.0,
+            0.8,
+            150.0,
+            10.0,
+            Align::Center,
+            TextPaint::Solid(Rgba::hex(0x5E_6778)),
+            0.85,
+        );
+        let lit = pm.pixels().iter().filter(|p| p.alpha() > 0).count();
+        assert!(lit > 200, "chip barely rendered: {lit} px");
+    }
+}

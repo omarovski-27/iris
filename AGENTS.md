@@ -87,3 +87,21 @@ When updating this file, preserve this bar for all agents and keep entries conci
   symbols MinGW headers lack). Default-feature windows-gnu check is fine.
   Prefer native Windows (MSVC/msys2) for shipping local engines.
 - whisper-rs bindgen needs libclang: e.g. `LIBCLANG_PATH=/usr/lib/llvm-18/lib`.
+
+## Pill overlay (`iris-overlay`)
+
+- Crate: `crates/iris-overlay/`. `OverlayHandle` is the contract the app drives
+  it through; rendering-stack rationale and the WSL loop are in
+  `crates/iris-overlay/README.md`.
+- The design is **captain-locked** (2026-07-31): Prism dark default, Porcelain
+  light, listening-only telemetry chip, prism-triangle icon. The constants in
+  `motion.rs` and `layout.rs` are acceptance criteria with tests that pin them —
+  changing one is a captain decision, not a commit. Source mockups live outside
+  the repo at `/home/omar/firstmate/data/iris-design/`.
+- Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
+  way or "same geometry, swapped tokens" stops holding.
+- The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is
+  the only `cfg(windows)` file. That is what lets `cargo run --example pill-demo
+  -- --filmstrip <dir>` produce reviewable PNGs of the real frames from Linux.
+- The pill is a display: it never activates, never hit-tests, holds no
+  transcript text, and never injects input.
