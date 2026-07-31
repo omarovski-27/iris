@@ -71,10 +71,10 @@ pub enum Command {
 
 /// How long a prewarmed session (see [`App::prewarm`]) is trusted before it
 /// is discarded in favour of opening fresh. A network engine can have its
-/// connection closed server-side after enough idle time; reusing a session
-/// that is already dead would fail the very dictation prewarming exists to
-/// speed up, so this stays well under any plausible idle timeout rather than
-/// trying to detect one.
+/// connection closed server-side after enough idle time, so this stays well
+/// under any plausible idle timeout. It is the cheap first filter, not the
+/// whole test: a session can also die *inside* the window, which is why
+/// `Dictation::start_with_session` checks liveness before adopting one.
 const PREWARM_STALE_AFTER: Duration = Duration::from_secs(8);
 
 /// What one dictation produced.
@@ -182,8 +182,12 @@ impl<A: AudioSource> App<A> {
         self
     }
 
-    /// Replace the engine, bypassing [`Config`]. For tests that need an engine
-    /// that fails on purpose.
+    /// Replace the engine, bypassing [`Config`]. The one place an engine swap
+    /// is written down — every command handler that builds a new engine goes
+    /// through here, so a step added to the swap cannot be missed by one of
+    /// them. Deliberately does not prewarm: callers that want the new engine
+    /// warmed follow with [`App::prewarm`], and a test swapping in a
+    /// deliberately failing engine does not.
     pub fn set_engine(&mut self, engine: Arc<dyn Engine>) {
         self.pill.set_engine(engine.name());
         self.engine = engine;
@@ -192,14 +196,17 @@ impl<A: AudioSource> App<A> {
     }
 
     /// Open a session ahead of the next hotkey press, so a network engine's
-    /// connect latency — TLS handshake, first round trip — overlaps idle time
-    /// between dictations instead of landing on the hold. A hold shorter than
-    /// that latency then has a transport that is already up rather than one
-    /// still handshaking; see `iris-core`'s `Dictation::start_with_session`.
+    /// connect latency — TLS handshake, first round trip — overlaps the
+    /// current hold and the idle time after it instead of landing on the next
+    /// one. Called once at startup and then at the *start* of every
+    /// [`App::capture`], not after it finishes. A hold shorter than that
+    /// latency then has a transport that is already up rather than one still
+    /// handshaking; see `iris-core`'s `Dictation::start_with_session`.
     ///
     /// Best-effort and a no-op if one is already pending: a failure here (a
     /// transient DNS hiccup, say) just means the next dictation opens fresh,
-    /// exactly as before this existed.
+    /// exactly as before this existed — and so does a session that opened but
+    /// then died, which `start_with_session` refuses.
     fn prewarm(&mut self) {
         if self.next_session.is_some() {
             return;
@@ -278,10 +285,7 @@ impl<A: AudioSource> App<A> {
                 self.config.engine = choice;
                 match engines::build(&self.config) {
                     Ok(engine) => {
-                        self.pill.set_engine(engine.name());
-                        self.engine = engine;
-                        // Whatever was prewarmed belongs to the old engine.
-                        self.next_session = None;
+                        self.set_engine(engine);
                         self.prewarm();
                         self.saved.engine = choice;
                         println!("  engine: {choice}");
@@ -370,10 +374,7 @@ impl<A: AudioSource> App<A> {
                     // toggle would write a cold-start failure into the file.
                     match engines::build(&config) {
                         Ok(engine) => {
-                            self.pill.set_engine(engine.name());
-                            self.engine = engine;
-                            // Whatever was prewarmed belongs to the old engine.
-                            self.next_session = None;
+                            self.set_engine(engine);
                             self.prewarm();
                         }
                         Err(e) => {
@@ -476,11 +477,19 @@ impl<A: AudioSource> App<A> {
         // everything below. Either way, immediately start opening the *next*
         // session so its own connect latency overlaps this dictation instead
         // of waiting for `capture` to return.
-        let mut dictation = match self.next_session.take() {
-            Some((opened_at, session)) if opened_at.elapsed() < PREWARM_STALE_AFTER => {
-                Dictation::start_with_session(self.engine.name(), session, pressed_at)
+        //
+        // Age is necessary but not sufficient: a session can connect and then
+        // die well inside the staleness window, so `start_with_session` gets
+        // the final say and hands back `None` for one that did.
+        let prewarmed = self.next_session.take().and_then(|(opened_at, session)| {
+            if opened_at.elapsed() >= PREWARM_STALE_AFTER {
+                return None;
             }
-            _ => Dictation::start_at(&*self.engine, pressed_at)?,
+            Dictation::start_with_session(self.engine.name(), session, pressed_at)
+        });
+        let mut dictation = match prewarmed {
+            Some(dictation) => dictation,
+            None => Dictation::start_at(&*self.engine, pressed_at)?,
         };
         self.prewarm();
 

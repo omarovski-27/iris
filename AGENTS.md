@@ -92,16 +92,23 @@ result is ~1-3 s; a hold shorter than that has nothing streamed back when the
 key comes up, so the entire transcript depends on one post-`Finalize` flush.
 `deepgram.rs`'s `pump` tracks `sent_secs` (audio actually forwarded) against
 `Transcript::covered_secs` (Deepgram's own reported `start + duration`) and
-withholds `CloseStream` until they converge, so a slow-to-respond Deepgram
-still gets to finish transcribing already-sent audio instead of having the
-socket pulled out from under it. See the module doc for the full mechanism and
+withholds `CloseStream` until they converge — but never past `CATCHUP_CEILING`,
+an absolute deadline taken when `Finalize` goes out. `FINALIZE_TIMEOUT` cannot
+serve as that backstop: it is re-armed on every inbound message, so it only
+fires after total silence. Note the resulting distinction between `closing`
+(Finalize sent) and `closed_stream` (CloseStream sent) — only the latter makes
+an inbound Metadata frame the sign-off, because a very short hold can drain its
+whole audio backlog before the socket is polled once and read the *open-time*
+Metadata after Finalize. See the module doc for the full mechanism and
 `a_hold_shorter_than_first_response_does_not_abandon_the_backlog` for the
 adversarial-fake-server regression test. `App` (`iris-app/src/app.rs`)
 attacks the same latency from the other side: `App::prewarm` opens the next
-session right after each dictation (and once at startup) so a network
-engine's connect cost overlaps idle time instead of the next hold; `capture`
-consumes it via `Dictation::start_with_session` when it is fresh enough
-(`PREWARM_STALE_AFTER`), falling back to opening fresh otherwise.
+session at the *start* of each `capture` (and once at startup), so its connect
+cost overlaps the current hold and the idle time after it rather than the next
+hold; `capture` consumes it via `Dictation::start_with_session` when it is
+fresh enough (`PREWARM_STALE_AFTER`) *and* still alive — that constructor
+returns `None` for a session that died while waiting — falling back to opening
+fresh otherwise.
 
 ## Sharp edges
 

@@ -82,27 +82,53 @@ impl Dictation {
     ///
     /// A network engine's connect latency (TLS handshake, first round trip)
     /// is otherwise paid again on every single dictation. A caller that keeps
-    /// one spare session open ahead of time — opened right after the previous
-    /// dictation finished, so the wait overlaps idle time instead of speech —
-    /// can hand it here instead, and a hold shorter than that connect latency
-    /// still has a transport that is already up. [`Mark::SessionOpen`] is
-    /// still stamped at `key_down`: the session existing earlier doesn't make
-    /// the engine open faster, it just moves *when* that cost was paid.
+    /// one spare session open ahead of time — opened at the *start* of the
+    /// previous dictation, so the wait overlaps that hold and the idle time
+    /// after it rather than speech — can hand it here instead, and a hold
+    /// shorter than that connect latency still has a transport that is
+    /// already up. [`Mark::SessionOpen`] is still stamped at `key_down`: the
+    /// session existing earlier doesn't make the engine open faster, it just
+    /// moves *when* that cost was paid.
+    ///
+    /// Returns `None` when the session did not survive the wait — a socket
+    /// closed server-side, an engine that already gave up. Age alone cannot
+    /// answer that, and adopting a dead session would fail the very dictation
+    /// prewarming exists to speed up; the caller must open fresh instead.
+    /// Anything the session queued while it waited is folded in here, so a
+    /// `Connected` that arrived long before the key press still lands as
+    /// [`Mark::StreamReady`] rather than being read as a missing mark.
     pub fn start_with_session(
         engine_name: &'static str,
         session: Box<dyn Session>,
         key_down: Instant,
-    ) -> Self {
+    ) -> Option<Self> {
         let mut timeline = Timeline::start_at(engine_name, key_down);
         timeline.mark(Mark::SessionOpen);
-        Self {
+        loop {
+            match session.events().try_recv() {
+                Ok(TranscriptEvent::Connected) => timeline.mark(Mark::StreamReady),
+                Ok(event) => {
+                    // A prewarmed session was never fed audio, so anything
+                    // else it has to say — an error, a terminal transcript —
+                    // means it is finished rather than waiting.
+                    vlog!("discarding a prewarmed session that already reported {event:?}");
+                    return None;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    vlog!("discarding a prewarmed session whose engine has hung up");
+                    return None;
+                }
+            }
+        }
+        Some(Self {
             session,
             timeline,
             samples: 0,
             latest_partial: String::new(),
             finishing: false,
             ended: None,
-        }
+        })
     }
 
     pub fn timeline(&self) -> &Timeline {
@@ -383,13 +409,71 @@ mod tests {
         let session = engine.open().unwrap();
         let key_down = Instant::now();
 
-        let dictation = Dictation::start_with_session("mock", session, key_down);
+        let dictation =
+            Dictation::start_with_session("mock", session, key_down).expect("a live session");
 
         assert_eq!(dictation.timeline().engine, "mock");
         assert!(dictation.timeline().at(Mark::KeyDown).is_some());
         assert!(
             dictation.timeline().at(Mark::SessionOpen).is_some(),
             "a pre-opened session must still stamp SessionOpen"
+        );
+        assert!(
+            dictation.timeline().at(Mark::StreamReady).is_some(),
+            "a Connected that arrived before the key press must still be stamped"
+        );
+    }
+
+    #[test]
+    fn a_prewarmed_session_that_died_while_waiting_is_refused() {
+        // A socket closed server-side between prewarm and the key press. The
+        // queued error would otherwise be absorbed mid-hold and fail the whole
+        // dictation, where opening fresh would simply have worked.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Error("socket closed".into()))
+            .unwrap();
+
+        struct Dead(crossbeam_channel::Receiver<TranscriptEvent>);
+        impl Session for Dead {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.0
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            Dictation::start_with_session("mock", Box::new(Dead(rx)), Instant::now()).is_none(),
+            "a session that already reported an error must not be adopted"
+        );
+    }
+
+    #[test]
+    fn a_prewarmed_session_whose_engine_hung_up_is_refused() {
+        let (tx, rx) = crossbeam_channel::unbounded::<TranscriptEvent>();
+        drop(tx);
+
+        struct Hungup(crossbeam_channel::Receiver<TranscriptEvent>);
+        impl Session for Hungup {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.0
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            Dictation::start_with_session("mock", Box::new(Hungup(rx)), Instant::now()).is_none(),
+            "a disconnected event channel means the pump is gone"
         );
     }
 
@@ -398,7 +482,8 @@ mod tests {
         let engine = MockEngine::new(MockConfig::default());
         let session = engine.open().unwrap();
 
-        let mut dictation = Dictation::start_with_session("mock", session, Instant::now());
+        let mut dictation =
+            Dictation::start_with_session("mock", session, Instant::now()).expect("a live session");
         for chunk in tone(1.0).chunks(audio::FRAME_SAMPLES) {
             dictation.feed(chunk).unwrap();
         }

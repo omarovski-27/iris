@@ -12,7 +12,7 @@
 //! injector rather than calling `iris_core::inject` directly.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -418,6 +418,38 @@ fn a_session_is_prewarmed_ahead_of_each_hotkey_press() {
 }
 
 #[test]
+fn a_prewarmed_session_that_died_while_idle_is_not_adopted() {
+    // Prewarming trades a fresh open for a session opened earlier — but an
+    // idle websocket can be closed server-side in between. Adopting one that
+    // already reported its death would fail a dictation that opening fresh
+    // would have completed, which is worse than never prewarming at all.
+    let opens = Arc::new(AtomicUsize::new(0));
+    let senders = Arc::new(Mutex::new(Vec::new()));
+    let mut rig = rig_with(|c| c.polish.enabled = false);
+    rig.app.set_engine(Arc::new(KillableEngine {
+        opens: opens.clone(),
+        senders: senders.clone(),
+    }));
+
+    rig.dictate().expect("first");
+    assert_eq!(opens.load(Ordering::SeqCst), 2, "one open plus one prewarm");
+
+    // The prewarmed session — the second one opened — dies while the app sits
+    // idle, exactly as an idle socket does.
+    senders.lock().expect("senders")[1]
+        .send(TranscriptEvent::Error("socket closed".into()))
+        .expect("killing the prewarmed session");
+
+    let dictated = rig.dictate().expect("the dead session must not fail this");
+    assert_eq!(dictated.record.text, "hello");
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        4,
+        "the dead session is discarded: this dictation opens fresh, plus the next prewarm"
+    );
+}
+
+#[test]
 fn switching_engines_prewarms_the_new_one_not_the_old() {
     // Polish is irrelevant to what this test checks and would otherwise
     // reshape the fixed transcript (capitalising and punctuating "new").
@@ -788,6 +820,31 @@ impl Engine for CountingEngine {
         tx.send(TranscriptEvent::Connected).unwrap();
         Ok(Box::new(FixedSession {
             text: self.text,
+            tx,
+            rx,
+        }))
+    }
+}
+
+/// A [`CountingEngine`] that also publishes each session's event sender, so a
+/// test can kill a session *after* it was handed over — the way a server
+/// closes a socket that has been sitting idle.
+struct KillableEngine {
+    opens: Arc<AtomicUsize>,
+    senders: Arc<Mutex<Vec<Sender<TranscriptEvent>>>>,
+}
+
+impl Engine for KillableEngine {
+    fn name(&self) -> &'static str {
+        "killable"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        self.senders.lock().expect("senders").push(tx.clone());
+        Ok(Box::new(FixedSession {
+            text: "hello",
             tx,
             rx,
         }))
