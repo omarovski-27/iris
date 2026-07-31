@@ -136,9 +136,9 @@ insert the overlay holds the confirmation then exits itself — the loop does
 
 | Sink | When |
 |---|---|
-| `OverlayPill` | Windows resident loop; `--demo-dictation` / `--speak-wav` when the overlay starts |
-| `LogPill` | `--verbose` fallback |
-| `NoopPill` | non-Windows CI paths when no overlay is up |
+| `OverlayPill` | Overlay started (Windows resident; also `--demo-dictation` / `--speak-wav`, headless off Windows) |
+| `LogPill` | `--verbose` when the overlay did not start |
+| `NoopPill` | Default when the overlay did not start |
 | `RecordingPill` | tests |
 
 `--demo-dictation` forces the mock engine, dry-run inject, synthetic levels, and

@@ -92,7 +92,7 @@ run anywhere.
 ## Docs
 
 - [`crates/iris-app/README.md`](crates/iris-app/README.md) — the app: the
-  dictation loop, configuration, the tray, the session log
+  dictation loop, configuration, tray, overlay adapter, session log
 - [`crates/iris-spike/README.md`](crates/iris-spike/README.md) — running the
   spike, and how to read the latency report
 - [`crates/iris-overlay/README.md`](crates/iris-overlay/README.md) — the pill
