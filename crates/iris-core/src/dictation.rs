@@ -30,6 +30,9 @@ pub struct Dictation {
     timeline: Timeline,
     samples: usize,
     latest_partial: String,
+    /// Set when [`Dictation::finish`] starts. Premature terminal events before
+    /// this are not allowed to end the utterance (see [`Dictation::absorb`]).
+    finishing: bool,
     ended: Option<Ending>,
 }
 
@@ -60,6 +63,7 @@ impl Dictation {
             timeline,
             samples: 0,
             latest_partial: String::new(),
+            finishing: false,
             ended: None,
         })
     }
@@ -126,19 +130,37 @@ impl Dictation {
         match event {
             TranscriptEvent::Connected => self.timeline.mark(Mark::StreamReady),
             TranscriptEvent::Partial(text) => {
-                self.timeline.mark(Mark::FirstPartial);
-                self.timeline.partials += 1;
-                self.latest_partial = text;
-                on_partial(&self.latest_partial);
+                self.note_partial(text, on_partial);
             }
             TranscriptEvent::Final(text) => {
+                // A streaming ASR may emit segment-level "finals" or even a
+                // premature session Final while the user is still holding the
+                // key. Accepting that as terminal makes `finish()` return
+                // immediately and drops every later word. Until we have asked
+                // the engine to finalise, treat Final as a (sticky) partial.
+                if !self.finishing {
+                    self.note_partial(text, on_partial);
+                    return;
+                }
                 self.timeline.mark(Mark::FinalTranscript);
+                let text = best_transcript(text, &self.latest_partial);
+                self.latest_partial = text.clone();
                 self.ended = Some(Ending::Final(text));
             }
             TranscriptEvent::Error(message) => {
+                // Errors are real even mid-hold (missing key, socket death).
+                // Keep the richest partial we saw so finish can salvage words
+                // when the engine died after producing useful text.
                 self.ended = Some(Ending::Error(message));
             }
         }
+    }
+
+    fn note_partial(&mut self, text: String, on_partial: &mut dyn FnMut(&str)) {
+        self.timeline.mark(Mark::FirstPartial);
+        self.timeline.partials += 1;
+        self.latest_partial = text;
+        on_partial(&self.latest_partial);
     }
 
     /// End of speech. Stamps [`Mark::KeyUp`], tells the engine to finalise, then
@@ -147,12 +169,23 @@ impl Dictation {
     /// The wait is where perceived latency lives, so `on_partial` keeps firing
     /// throughout: an overlay can keep updating right up to the moment the real
     /// text lands.
+    ///
+    /// A terminal event that arrived *before* this call (a premature Final from
+    /// a buggy or segment-oriented engine) does not short-circuit the wait:
+    /// [`Session::finish`] is always invoked, and a later, richer Final or the
+    /// best partial wins.
     pub fn finish(
         mut self,
         timeout: Duration,
         on_partial: &mut dyn FnMut(&str),
     ) -> Result<DictationOutcome> {
         self.timeline.mark(Mark::KeyUp);
+        // Drop any premature terminal Final so we wait for the post-finish one.
+        // Errors stay: the engine already failed and finish cannot un-fail it.
+        if matches!(self.ended, Some(Ending::Final(_))) {
+            self.ended = None;
+        }
+        self.finishing = true;
         self.session.finish()?;
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
@@ -173,8 +206,17 @@ impl Dictation {
 
         self.timeline.audio_secs = self.audio_secs();
 
+        // Prefer a real Final; otherwise salvage the best partial rather than
+        // discarding words the user already saw on the overlay.
+        let salvaged = (!self.latest_partial.trim().is_empty()).then(|| {
+            let text = self.latest_partial.clone();
+            self.timeline.mark(Mark::FinalTranscript);
+            text
+        });
+
         match self.ended {
             Some(Ending::Final(text)) => {
+                let text = best_transcript(text, salvaged.as_deref().unwrap_or(""));
                 self.timeline.transcript = text.clone();
                 Ok(DictationOutcome {
                     text,
@@ -182,18 +224,53 @@ impl Dictation {
                 })
             }
             Some(Ending::Error(message)) => {
-                Err(anyhow!("{} engine: {message}", self.timeline.engine))
+                if let Some(text) = salvaged {
+                    vlog!(
+                        "engine error after partial transcript; salvaging {} chars",
+                        text.chars().count()
+                    );
+                    self.timeline.transcript = text.clone();
+                    Ok(DictationOutcome {
+                        text,
+                        timeline: self.timeline,
+                    })
+                } else {
+                    Err(anyhow!("{} engine: {message}", self.timeline.engine))
+                }
             }
-            Some(Ending::Closed) => Err(anyhow!(
-                "{} engine closed without returning a transcript",
-                self.timeline.engine
-            )),
-            None => Err(anyhow!(
-                "{} engine did not return a transcript within {:.1}s",
-                self.timeline.engine,
-                timeout.as_secs_f64()
-            )),
+            Some(Ending::Closed) | None => {
+                if let Some(text) = salvaged {
+                    self.timeline.transcript = text.clone();
+                    Ok(DictationOutcome {
+                        text,
+                        timeline: self.timeline,
+                    })
+                } else if matches!(self.ended, Some(Ending::Closed)) {
+                    Err(anyhow!(
+                        "{} engine closed without returning a transcript",
+                        self.timeline.engine
+                    ))
+                } else {
+                    Err(anyhow!(
+                        "{} engine did not return a transcript within {:.1}s",
+                        self.timeline.engine,
+                        timeout.as_secs_f64()
+                    ))
+                }
+            }
         }
+    }
+}
+
+/// Prefer the longer hypothesis. Streaming engines sometimes emit a short
+/// session Final while a richer partial still holds the rest of the utterance.
+fn best_transcript(final_text: String, partial: &str) -> String {
+    let final_text = final_text.trim();
+    let partial = partial.trim();
+    if partial.chars().count() > final_text.chars().count() {
+        partial.to_string()
+    } else {
+        final_text.to_string()
     }
 }
 
@@ -381,5 +458,163 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("did not return a transcript"), "{err}");
+    }
+
+    /// Engine that emits a terminal Final after the first half-second of audio
+    /// while more audio is still being fed — the Deepgram-segment / pump-exit
+    /// failure mode that used to make `finish()` return "hello" and drop the rest.
+    struct EarlyFinalEngine;
+
+    struct EarlyFinalSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        samples: usize,
+        sent_early: bool,
+        finished: bool,
+    }
+
+    impl Engine for EarlyFinalEngine {
+        fn name(&self) -> &'static str {
+            "early-final"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            Ok(Box::new(EarlyFinalSession {
+                tx,
+                rx,
+                samples: 0,
+                sent_early: false,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for EarlyFinalSession {
+        fn push(&mut self, pcm: &[i16]) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.samples += pcm.len();
+            let secs = audio::secs(self.samples);
+            if secs >= 0.5 && !self.sent_early {
+                self.sent_early = true;
+                let _ = self.tx.send(TranscriptEvent::Partial("hello".into()));
+                let _ = self.tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            if secs >= 1.5 && self.sent_early {
+                let _ = self
+                    .tx
+                    .send(TranscriptEvent::Partial("hello world more speech".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.finished = true;
+            let _ = self
+                .tx
+                .send(TranscriptEvent::Final("hello world more speech after keyup".into()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn early_final_does_not_truncate_the_utterance() {
+        let mut partials = Vec::new();
+        let outcome = run_offline(&EarlyFinalEngine, &tone(2.0), Pace::Fast, &mut |p| {
+            partials.push(p.to_string())
+        })
+        .expect("dictation");
+
+        assert!(
+            outcome.text.contains("more speech"),
+            "premature Final must not win; got {:?} (partials={partials:?})",
+            outcome.text
+        );
+        assert!(
+            partials.iter().any(|p| p.contains("more speech")),
+            "later audio must still produce partials: {partials:?}"
+        );
+    }
+
+    /// Engine that dies after an early Final and never emits another — finish
+    /// must salvage the richest partial rather than return only the first word.
+    struct EarlyFinalThenDie;
+
+    struct EarlyFinalThenDieSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        samples: usize,
+        sent_early: bool,
+        finished: bool,
+    }
+
+    impl Engine for EarlyFinalThenDie {
+        fn name(&self) -> &'static str {
+            "early-final-die"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            Ok(Box::new(EarlyFinalThenDieSession {
+                tx,
+                rx,
+                samples: 0,
+                sent_early: false,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for EarlyFinalThenDieSession {
+        fn push(&mut self, pcm: &[i16]) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.samples += pcm.len();
+            if audio::secs(self.samples) >= 0.4 && !self.sent_early {
+                self.sent_early = true;
+                let _ = self.tx.send(TranscriptEvent::Partial("hello".into()));
+                let _ = self.tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            if audio::secs(self.samples) >= 1.0 {
+                let _ = self
+                    .tx
+                    .send(TranscriptEvent::Partial("hello there full sentence".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            // No terminal event after finish — forces salvage of latest_partial.
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_salvages_latest_partial_when_final_never_arrives() {
+        let outcome = run_offline(&EarlyFinalThenDie, &tone(1.5), Pace::Fast, &mut |_| {})
+            .expect("should salvage partial");
+        assert!(
+            outcome.text.contains("full sentence"),
+            "expected salvage of richest partial, got {:?}",
+            outcome.text
+        );
+    }
+
+    #[test]
+    fn best_transcript_prefers_the_longer_hypothesis() {
+        assert_eq!(best_transcript("hi".into(), "hello there"), "hello there");
+        assert_eq!(best_transcript("hello there".into(), "hi"), "hello there");
+        assert_eq!(best_transcript("  same  ".into(), "same"), "same");
     }
 }
