@@ -29,7 +29,10 @@ cargo run --release --bin iris-harness -- --engine mock
 
 | | |
 | --- | --- |
+| `crates/iris-app` | **the application**: `iris`, the resident tray app |
 | `crates/iris-core` | the pipeline: audio, the `Engine` trait, injection, latency |
+| `crates/iris-polish` | transcript cleanup: rule engine + LLM, deadline-bounded |
+| `crates/iris-engine-local` | on-device ASR: streaming Zipformer + Whisper finalizer |
 | `crates/iris-spike` | `iris-spike` (the app) and `iris-harness` (measurement) |
 | `crates/iris-overlay` | the pill HUD (always-on-top, click-through, never-activating) |
 
@@ -39,6 +42,8 @@ run anywhere.
 
 ## Docs
 
+- [`crates/iris-app/README.md`](crates/iris-app/README.md) — the app: the
+  dictation loop, configuration, the tray, the session log
 - [`crates/iris-spike/README.md`](crates/iris-spike/README.md) — running the
   spike, and how to read the latency report
 - [`crates/iris-overlay/README.md`](crates/iris-overlay/README.md) — the pill

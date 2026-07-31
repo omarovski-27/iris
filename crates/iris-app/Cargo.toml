@@ -1,0 +1,55 @@
+[package]
+name = "iris-app"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Iris: the resident push-to-talk dictation app — hotkey, streaming transcription, polish, injection, tray."
+readme = "README.md"
+
+# The product is `iris`, not `iris-app`; the crate is only named for the
+# directory it lives in.
+[[bin]]
+name = "iris"
+path = "src/main.rs"
+
+[features]
+default = []
+# Real offline ASR. Off by default because the native engines (sherpa-onnx,
+# whisper.cpp) do not cross-compile to x86_64-pc-windows-gnu from WSL; see
+# crates/iris-engine-local/README.md. Build them on native Windows.
+local-native = ["iris-engine-local/native"]
+
+[dependencies]
+iris-core = { path = "../iris-core" }
+iris-polish = { path = "../iris-polish" }
+iris-engine-local = { path = "../iris-engine-local" }
+
+anyhow.workspace = true
+clap.workspace = true
+crossbeam-channel.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+toml = "0.9"
+# Only used to stamp session-log entries with a wall-clock RFC 3339 timestamp;
+# `Instant` is monotonic and cannot be written to a file.
+time = { version = "0.3", default-features = false, features = [
+    "std",
+    "formatting",
+] }
+
+[target.'cfg(windows)'.dependencies]
+# Tray: `tray-icon` is the maintained extraction of Tauri's tray implementation
+# (same authors as `muda`, which it uses for the menu). It is pure Rust over
+# Win32 — no C toolchain — so it cross-compiles to x86_64-pc-windows-gnu, which
+# is how this project builds. See README.md for the alternatives considered.
+tray-icon = { version = "0.24", default-features = false }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -11,7 +11,7 @@ toolchain choice: `docs/dev-windows.md`.
 cargo test --workspace                                  # portable; the default loop
 cargo check --workspace --target x86_64-pc-windows-gnu  # type-check the Windows-only code
 cargo build --release --target x86_64-pc-windows-gnu    # produces runnable .exe
-./target/x86_64-pc-windows-gnu/release/iris-spike.exe   # WSL runs it as a real Windows process
+./target/x86_64-pc-windows-gnu/release/iris.exe         # WSL runs it as a real Windows process
 ```
 
 Everything except microphone capture, the hotkey hook, text injection, and the
@@ -19,10 +19,28 @@ overlay window is portable and `#[cfg(windows)]`-free, so tests and the latency
 harness run natively on Linux. Keep it that way — it is what makes the project
 CI-testable at all.
 
+## The application
+
+`crates/iris-app/` is the product — the resident tray app that wires the other
+crates into a working dictation loop. Its README is the map: the loop, the
+config file, the tray, the overlay seam, the session log.
+
+Two things there are load-bearing beyond that crate:
+
+- **`Injector` is a trait so no test can ever type into the user's desktop.**
+  `SystemInjector` is constructed in `main` and nowhere else; see the rule below.
+- **Keys reach engines through the environment only.** `Config::promote_keys`
+  copies file keys into the process environment in `main`, before any thread
+  exists, because that is the only point at which mutating it is safe.
+
+`cargo run -p iris-app -- --speak-wav assets/speech-16k.wav` runs one full
+dictation offline on any platform: the portable way to exercise the whole loop.
+
 ## iris-polish layout
 
-- `crates/iris-polish/` is a **standalone** crate (own `Cargo.toml` / `Cargo.lock`). It is not yet a workspace member — build and test with `cargo test` / `cargo build` **inside** that directory.
-- Cross-check Windows: `cargo build --target x86_64-pc-windows-gnu` from `crates/iris-polish/`.
+- `crates/iris-polish/` is a workspace member (it was standalone until
+  `iris-app` needed it as a path dependency). Its own `Cargo.lock` is now
+  unused; the workspace lock is the real one.
 - LLM path uses pure-Rust `ring` TLS (not aws-lc-rs) so `x86_64-pc-windows-gnu` cross-compiles cleanly. See crate `Cargo.toml` comments and `crates/iris-polish/README.md`.
 - Parallel workers may own other crates and the workspace root; do not restructure the monorepo from a polish-only task.
 
@@ -37,7 +55,10 @@ already disrupted real work once during development.
 
 `iris-spike --self-test` therefore never runs injection; the interactive
 checklist in `crates/iris-spike/README.md` is the sole verification path for
-it. Injection logic that *can* be tested
+it. In `iris-app` the same rule is structural: the loop takes an `Injector`,
+and `SystemInjector` — the only implementation that reaches the OS — is built in
+`main` and never in a test (`--dry-run` and `--speak-wav` are the safe paths).
+Injection logic that *can* be tested
 without the OS lives in `iris-core/src/text.rs` (UTF-16, surrogate pairs,
 control characters) and is unit-tested.
 
