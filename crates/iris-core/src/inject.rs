@@ -95,6 +95,27 @@ const MODIFIER_VKS: [u16; 8] = [
     0x5C, // VK_RWIN
 ];
 
+/// Whether a modifier's scan code is 0xE0-prefixed, i.e. whether a synthesised
+/// event for it must carry `KEYEVENTF_EXTENDEDKEY`.
+///
+/// `SendInput` fills in the scan code from `wVk` when none is supplied, and the
+/// mapping is not injective: right Ctrl and right Alt share their base scan
+/// code with the left-hand key and are told apart only by the extended flag,
+/// while the two Win keys exist only in extended form. Without the flag the
+/// corrective key-up below is delivered as (and decoded by the target as) the
+/// *left* counterpart, so it would fail to clear `VK_RCONTROL` — the default
+/// push-to-talk hotkey, and the one this whole correction exists for.
+#[cfg(any(windows, test))]
+fn is_extended_modifier(vk: u16) -> bool {
+    matches!(
+        vk,
+        0xA3 // VK_RCONTROL
+        | 0xA5 // VK_RMENU
+        | 0x5B // VK_LWIN
+        | 0x5C // VK_RWIN
+    )
+}
+
 /// Which of `MODIFIER_VKS` need a corrective key-up before a keystroke burst,
 /// given each one's current (virtual-key, is-down) state. Kept separate from
 /// the `GetAsyncKeyState` calls that produce `state` so the decision is
@@ -118,7 +139,7 @@ mod win {
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
     };
 
     use crate::text::{self, KeyUnit};
@@ -179,17 +200,29 @@ mod win {
             })
             .collect();
 
-        let mut corrections: Vec<INPUT> = super::stuck_modifiers(&state)
-            .into_iter()
-            .map(|vk| key_event(vk, 0, KEYEVENTF_KEYUP))
-            .collect();
-        if corrections.is_empty() {
+        let stuck = super::stuck_modifiers(&state);
+        if stuck.is_empty() {
             return Ok(());
         }
+        // The root cause is unreproducible off the user's desk, so the codes
+        // themselves are the field signal that confirms or refutes it.
+        let codes: Vec<String> = stuck.iter().map(|vk| format!("0x{vk:02X}")).collect();
         vlog!(
-            "releasing {} modifier(s) still reported down before injecting",
-            corrections.len()
+            "releasing {} modifier(s) still reported down before injecting: {}",
+            stuck.len(),
+            codes.join(", ")
         );
+
+        let mut corrections: Vec<INPUT> = stuck
+            .into_iter()
+            .map(|vk| {
+                let mut flags = KEYEVENTF_KEYUP;
+                if super::is_extended_modifier(vk) {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                key_event(vk, 0, flags)
+            })
+            .collect();
         flush(&mut corrections)
     }
 
@@ -326,6 +359,31 @@ mod tests {
             (0x5Cu16, true),  // VK_RWIN, down
         ];
         assert_eq!(stuck_modifiers(&state), vec![0xA3, 0x5C]);
+    }
+
+    #[test]
+    fn right_hand_and_win_modifiers_need_the_extended_flag() {
+        // Without it their corrective key-up carries the left-hand key's scan
+        // code — including VK_RCONTROL, the default push-to-talk hotkey.
+        for vk in [0xA3u16, 0xA5, 0x5B, 0x5C] {
+            assert!(is_extended_modifier(vk), "0x{vk:02X}");
+        }
+        for vk in [0xA2u16, 0xA0, 0xA1, 0xA4] {
+            assert!(!is_extended_modifier(vk), "0x{vk:02X}");
+        }
+    }
+
+    #[test]
+    fn every_tracked_modifier_has_an_extended_verdict() {
+        // Guards the pairing: a VK added to MODIFIER_VKS without a matching
+        // decision here would silently default to non-extended.
+        assert_eq!(
+            MODIFIER_VKS
+                .iter()
+                .filter(|&&vk| is_extended_modifier(vk))
+                .count(),
+            4
+        );
     }
 
     #[test]

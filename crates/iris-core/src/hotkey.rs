@@ -149,9 +149,12 @@ impl HotkeyEvent {
 
 /// `VK_PACKET`: the virtual-key code a low-level hook sees for a
 /// `KEYEVENTF_UNICODE` event (the character itself rides in `scanCode`
-/// instead). Exposed so both the hook and its tests can reason about the one
-/// vkCode text injection can ever produce.
-pub const VK_PACKET: u32 = 0xE7;
+/// instead) — the one vkCode text injection can ever produce.
+///
+/// `cfg(test)`: the hook filters on `LLKHF_INJECTED` rather than on this code,
+/// so it exists only for the tests that pin that reasoning down.
+#[cfg(test)]
+const VK_PACKET: u32 = 0xE7;
 
 /// Whether a low-level keyboard message is a genuine press/release of the
 /// configured hotkey — i.e. one the hook should act on, rather than a message
@@ -165,7 +168,8 @@ pub const VK_PACKET: u32 = 0xE7;
 /// *virtual-key* event — `VK_RETURN`, `VK_TAB`, or generic `VK_CONTROL` — so
 /// that a future hotkey choice sharing one of those codes can never be
 /// mistaken for a real press either.
-pub fn is_hotkey_event(vk_code: u32, target_vk: u32, injected: bool) -> bool {
+#[cfg(any(windows, test))]
+fn is_hotkey_event(vk_code: u32, target_vk: u32, injected: bool) -> bool {
     vk_code == target_vk && !injected
 }
 
