@@ -12,8 +12,11 @@
 //!   hook thread does nothing but pump messages, and the callback does nothing
 //!   but a non-blocking send.
 //! * **Our own `SendInput` comes back through the hook.** Injected events carry
-//!   `LLKHF_INJECTED`; without filtering them, injecting a transcript
-//!   containing the hotkey character would retrigger dictation.
+//!   `LLKHF_INJECTED` and are waved through untouched — including `inject.rs`'s
+//!   corrective key-up, which is the one injected event that carries the
+//!   hotkey's own virtual-key code and would otherwise be read back as a real
+//!   transition. See `is_hotkey_event` for why the flag is checked
+//!   unconditionally rather than only as a tie-breaker.
 
 use anyhow::{bail, Result};
 
@@ -90,6 +93,46 @@ impl Key {
         "f9",
         "f10",
     ];
+
+    /// Whether `inject.rs` may synthesise a corrective key-up for this hotkey
+    /// if it desyncs from `SendInput`'s point of view.
+    ///
+    /// `RightAlt` and `RightWin` are deliberately excluded even though they
+    /// are modifiers. Releasing either alone, with no other key involved, is
+    /// a standing Windows shell trigger — bare Alt activates the menu bar,
+    /// bare Win toggles the Start menu — and the correction's own key-up is
+    /// exactly that: injected, so the hook's `is_hotkey_event` correctly
+    /// does not suppress it, reaching the focused app with no press the app
+    /// ever saw before it (the *original* press was suppressed too). So even
+    /// a correction firing *correctly*, on a genuine desync, would reproduce
+    /// the live-desktop hazard this feature exists to prevent — this is not
+    /// the false-positive case, it is inherent to correcting these two keys
+    /// at all. `RightCtrl`/`LeftCtrl`/`RightShift` carry no equivalent
+    /// bare-tap meaning in the Windows shell.
+    ///
+    /// `cfg(any(windows, test))`: the only non-test consumer is
+    /// `inject.rs`'s Windows-only correction path — see that crate's rule
+    /// that decision logic is testable without the OS.
+    #[cfg(any(windows, test))]
+    pub(crate) fn is_correctable_modifier(self) -> bool {
+        matches!(self, Key::RightCtrl | Key::LeftCtrl | Key::RightShift)
+    }
+
+    /// Whether a synthesised key-up for this hotkey must carry
+    /// `KEYEVENTF_EXTENDEDKEY`. `SendInput` fills in the scan code from the
+    /// virtual-key when none is supplied, and the mapping is not injective:
+    /// right Ctrl and right Alt share their base scan code with the
+    /// left-hand key and are told apart only by this flag, and the two Win
+    /// keys exist only in extended form. Without it, a corrective key-up for
+    /// `RightCtrl` — the default push-to-talk hotkey — would be delivered
+    /// as, and decoded as, `LeftCtrl`, and fail to clear the key it exists
+    /// to correct. Listed independently of [`Key::is_correctable_modifier`]:
+    /// this is a fact about the key, not about whether Iris currently
+    /// chooses to correct it.
+    #[cfg(any(windows, test))]
+    pub(crate) fn needs_extended_flag(self) -> bool {
+        matches!(self, Key::RightCtrl | Key::RightAlt | Key::RightWin)
+    }
 }
 
 impl std::str::FromStr for Key {
@@ -147,8 +190,34 @@ impl HotkeyEvent {
     }
 }
 
+/// `VK_PACKET`: the virtual-key code a low-level hook sees for a
+/// `KEYEVENTF_UNICODE` event (the character itself rides in `scanCode`
+/// instead) — the one vkCode text injection can ever produce.
+///
+/// `cfg(test)`: the hook filters on `LLKHF_INJECTED` rather than on this code,
+/// so it exists only for the tests that pin that reasoning down.
+#[cfg(test)]
+const VK_PACKET: u32 = 0xE7;
+
+/// Whether a low-level keyboard message is a genuine press/release of the
+/// configured hotkey — i.e. one the hook should act on, rather than a message
+/// to wave through untouched via `CallNextHookEx`.
+///
+/// `injected` is checked unconditionally, not just as a tie-breaker: a
+/// `KEYEVENTF_UNICODE` character always carries `vkCode == VK_PACKET`
+/// (`0xE7`), never a configured hotkey's own code, so `vk_code == target_vk`
+/// alone already excludes every character Iris injects. The `injected` check
+/// is what also covers the case where Iris (or `paste`'s Ctrl+V) injects a
+/// *virtual-key* event — `VK_RETURN`, `VK_TAB`, or generic `VK_CONTROL` — so
+/// that a future hotkey choice sharing one of those codes can never be
+/// mistaken for a real press either.
+#[cfg(any(windows, test))]
+fn is_hotkey_event(vk_code: u32, target_vk: u32, injected: bool) -> bool {
+    vk_code == target_vk && !injected
+}
+
 #[cfg(windows)]
-pub use hook::{listen, Listener};
+pub use hook::{is_held, is_listening, listen, Listener};
 
 #[cfg(windows)]
 mod hook {
@@ -165,7 +234,7 @@ mod hook {
         WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
-    use super::{HotkeyEvent, Key};
+    use super::{is_hotkey_event, HotkeyEvent, Key};
 
     /// The hook callback is a bare `extern "system" fn`, so its state has to be
     /// global. One hook per process is all we want anyway.
@@ -173,6 +242,9 @@ mod hook {
     static TARGET_VK: AtomicU32 = AtomicU32::new(0);
     static SUPPRESS: AtomicBool = AtomicBool::new(true);
     static HELD: AtomicBool = AtomicBool::new(false);
+    /// Whether a hook is running *now*, as opposed to `SENDER`, which is a
+    /// `OnceLock` and stays set for process life once `listen` succeeds.
+    static ALIVE: AtomicBool = AtomicBool::new(false);
 
     /// A running hook. Dropping it stops the hook thread and unhooks.
     pub struct Listener {
@@ -186,6 +258,9 @@ mod hook {
         }
 
         fn shutdown(&mut self) {
+            // Before anything else, so a deliberate stop stops vouching for
+            // `HELD` immediately rather than after the thread has joined.
+            ALIVE.store(false, Ordering::Relaxed);
             if let Some(handle) = self.handle.take() {
                 // WM_QUIT breaks GetMessageW, and the thread unhooks on its way
                 // out.
@@ -256,6 +331,7 @@ mod hook {
                  running at a lower integrity level than the foreground window; try running from \
                  a normal (non-elevated) console, or elevate Iris to match.",
             )?;
+        ALIVE.store(true, Ordering::Relaxed);
 
         Ok((
             Listener {
@@ -264,6 +340,60 @@ mod hook {
             },
             rx,
         ))
+    }
+
+    /// Whether the hook currently believes the configured hotkey is held —
+    /// driven only by real, non-injected key transitions it has actually
+    /// seen (the same bookkeeping that decides whether to emit
+    /// [`HotkeyEvent::Down`]/[`HotkeyEvent::Up`]), never by polling live
+    /// keyboard state itself.
+    ///
+    /// This is the cross-check `inject.rs` needs before trusting
+    /// `GetAsyncKeyState`: a hotkey release is followed by transcription and
+    /// polish, easily hundreds of milliseconds, which is long enough for the
+    /// user to have genuinely pressed the hotkey again for their *next*
+    /// utterance. `GetAsyncKeyState` reading "down" at that point is not a
+    /// stuck leftover — it is correct, current state — and this function is
+    /// what lets the caller tell the difference without guessing at exactly
+    /// how Windows' asynchronous key state interacts with a suppressing
+    /// hook (a mechanism this project was not able to confirm; see
+    /// `inject.rs`'s `modifier_to_release`).
+    ///
+    /// Returns `false` before `listen` has ever been called — see
+    /// [`is_listening`] for why callers must check that separately rather
+    /// than reading this as "not held" in that case.
+    pub fn is_held() -> bool {
+        HELD.load(Ordering::Relaxed)
+    }
+
+    /// Whether a hook installed by [`listen`] is running right now.
+    ///
+    /// [`is_held`] defaults to `false` before `listen` runs, which is
+    /// indistinguishable from "a hook is running and genuinely reports the
+    /// hotkey is not held." Some injection paths construct an injector
+    /// without ever installing the hook (`--speak-wav --really-inject` has
+    /// no live hotkey to listen for). On those paths `is_held` alone would
+    /// silently claim "definitely not held," degrading `inject.rs`'s
+    /// two-signal correction back to trusting `GetAsyncKeyState` alone —
+    /// exactly the unsound single-signal check this design exists to avoid.
+    /// Callers must check this first and skip correction entirely when it is
+    /// `false`, rather than trust `is_held`'s default.
+    ///
+    /// `HELD` stops being driven by real key transitions the moment the hook
+    /// goes away, so "was a hook ever installed" is the wrong question: it
+    /// would keep vouching for a frozen value. Reading a dedicated flag that
+    /// [`Listener::shutdown`] clears covers the case Iris controls — a
+    /// deliberate stop, including the implicit one when a `Listener` is
+    /// dropped.
+    ///
+    /// **Accepted residual gap:** it does not cover Windows silently
+    /// uninstalling the hook for exceeding `LowLevelHooksTimeout` (see the
+    /// module docs). Windows offers no notification or query for that, so
+    /// there is nothing to observe; this flag would still read `true` while
+    /// `HELD` sat frozen. Recorded here rather than approximated with a
+    /// heartbeat that would only appear to detect it.
+    pub fn is_listening() -> bool {
+        ALIVE.load(Ordering::Relaxed)
     }
 
     /// Runs on the hook thread for every keystroke in the system. Must be fast:
@@ -275,12 +405,10 @@ mod hook {
         }
 
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let is_ours = info.vkCode == TARGET_VK.load(Ordering::Relaxed);
-        // Ignore what we synthesised ourselves, or injecting a transcript could
-        // retrigger dictation.
         let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
+        let is_ours = is_hotkey_event(info.vkCode, TARGET_VK.load(Ordering::Relaxed), injected);
 
-        if is_ours && !injected {
+        if is_ours {
             let now = std::time::Instant::now();
             let event = match wparam.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -340,5 +468,75 @@ mod tests {
     fn left_and_right_modifiers_are_distinct() {
         // The whole point of using a low-level hook rather than RegisterHotKey.
         assert_ne!(Key::RightCtrl.vk(), Key::LeftCtrl.vk());
+    }
+
+    #[test]
+    fn a_genuine_press_of_the_configured_hotkey_is_recognised() {
+        assert!(is_hotkey_event(
+            Key::RightCtrl.vk(),
+            Key::RightCtrl.vk(),
+            false
+        ));
+    }
+
+    #[test]
+    fn other_real_keys_are_never_mistaken_for_the_hotkey() {
+        assert!(!is_hotkey_event(
+            Key::LeftCtrl.vk(),
+            Key::RightCtrl.vk(),
+            false
+        ));
+    }
+
+    #[test]
+    fn injected_unicode_keystrokes_are_never_treated_as_the_hotkey() {
+        // This is the shape every character Iris injects actually takes: the
+        // hook sees vkCode == VK_PACKET, not the character, with LLKHF_INJECTED
+        // set. Proves the burst that types a transcript can never retrigger or
+        // otherwise be treated as a hotkey press, for every configured hotkey.
+        for key in [
+            Key::RightCtrl,
+            Key::LeftCtrl,
+            Key::RightShift,
+            Key::RightAlt,
+            Key::RightWin,
+            Key::CapsLock,
+            Key::ScrollLock,
+            Key::Pause,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+        ] {
+            assert!(!is_hotkey_event(VK_PACKET, key.vk(), true));
+        }
+    }
+
+    /// The hookless-injection path (`--speak-wav --really-inject` builds a
+    /// `SystemInjector` without ever calling [`listen`]) must be visible as
+    /// such. `is_held` cannot say so — it defaults to `false`, which reads
+    /// identically to "a live hook says the hotkey is up" — so `inject.rs`
+    /// gates on this instead and skips the correction entirely.
+    ///
+    /// Deliberately never calls `listen`: installing a real low-level hook
+    /// would suppress the user's own hotkey on the live desktop, and this
+    /// assertion needs no hook to be meaningful. Reading the flag is a plain
+    /// atomic load — no `SendInput`, nothing that touches input state.
+    #[cfg(windows)]
+    #[test]
+    fn no_hook_installed_reports_not_listening() {
+        assert!(
+            !is_listening(),
+            "with no hook installed the correction must not trust is_held's default"
+        );
+        assert!(!is_held(), "and is_held's default is the ambiguous 'false'");
+    }
+
+    #[test]
+    fn the_injected_flag_is_authoritative_even_on_a_vk_collision() {
+        // Even in the pathological case where a future hotkey's own vk code
+        // happened to equal VK_PACKET, `injected` alone must still veto it —
+        // the vk match is necessary but never sufficient.
+        assert!(!is_hotkey_event(VK_PACKET, VK_PACKET, true));
+        assert!(is_hotkey_event(VK_PACKET, VK_PACKET, false));
     }
 }

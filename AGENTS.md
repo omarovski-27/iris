@@ -95,6 +95,23 @@ Measured latency numbers, the budget breakdown, and open risks:
   and nasm to cross-compile.
 - The hotkey thread must only pump messages: Windows silently uninstalls a
   low-level hook whose callback exceeds ~300 ms.
+- `inject.rs` corrects the configured hotkey — and *only* the configured
+  hotkey, never a broader modifier sweep — before every `SendInput` burst,
+  per `SendInput`'s own warning that an already-pressed key can corrupt the
+  events it generates. Three narrowings were each cut from a real failure
+  mode found in review; do not simplify any of them back out:
+  - two signals must disagree, never one reading alone: `GetAsyncKeyState`
+    *and* `hotkey::is_held`, gated on `hotkey::is_listening`;
+  - `RightAlt` and `RightWin` are never corrected, even on a genuine desync;
+  - modifier and extended-flag knowledge lives on `Key`, beside `Key::vk`.
+
+  The reasoning for each — including which parts are heuristic and which
+  wiring is an accepted, permanently untestable gap — is in the doc comments
+  on `inject::modifier_to_release`, `release_hotkey_if_stuck`,
+  `Key::is_correctable_modifier` and `hotkey::is_listening`. Read those
+  before touching this; none of it is dead code. The configured hotkey
+  reaches the injector via `SystemInjector::new` (wired in `main.rs`), not
+  via `app.rs`.
 
 ## Maintaining this file
 
