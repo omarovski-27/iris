@@ -90,6 +90,46 @@ impl Key {
         "f9",
         "f10",
     ];
+
+    /// Whether `inject.rs` may synthesise a corrective key-up for this hotkey
+    /// if it desyncs from `SendInput`'s point of view.
+    ///
+    /// `RightAlt` and `RightWin` are deliberately excluded even though they
+    /// are modifiers. Releasing either alone, with no other key involved, is
+    /// a standing Windows shell trigger — bare Alt activates the menu bar,
+    /// bare Win toggles the Start menu — and the correction's own key-up is
+    /// exactly that: injected, so the hook's `is_hotkey_event` correctly
+    /// does not suppress it, reaching the focused app with no press the app
+    /// ever saw before it (the *original* press was suppressed too). So even
+    /// a correction firing *correctly*, on a genuine desync, would reproduce
+    /// the live-desktop hazard this feature exists to prevent — this is not
+    /// the false-positive case, it is inherent to correcting these two keys
+    /// at all. `RightCtrl`/`LeftCtrl`/`RightShift` carry no equivalent
+    /// bare-tap meaning in the Windows shell.
+    ///
+    /// `cfg(any(windows, test))`: the only non-test consumer is
+    /// `inject.rs`'s Windows-only correction path — see that crate's rule
+    /// that decision logic is testable without the OS.
+    #[cfg(any(windows, test))]
+    pub(crate) fn is_correctable_modifier(self) -> bool {
+        matches!(self, Key::RightCtrl | Key::LeftCtrl | Key::RightShift)
+    }
+
+    /// Whether a synthesised key-up for this hotkey must carry
+    /// `KEYEVENTF_EXTENDEDKEY`. `SendInput` fills in the scan code from the
+    /// virtual-key when none is supplied, and the mapping is not injective:
+    /// right Ctrl and right Alt share their base scan code with the
+    /// left-hand key and are told apart only by this flag, and the two Win
+    /// keys exist only in extended form. Without it, a corrective key-up for
+    /// `RightCtrl` — the default push-to-talk hotkey — would be delivered
+    /// as, and decoded as, `LeftCtrl`, and fail to clear the key it exists
+    /// to correct. Listed independently of [`Key::is_correctable_modifier`]:
+    /// this is a fact about the key, not about whether Iris currently
+    /// chooses to correct it.
+    #[cfg(any(windows, test))]
+    pub(crate) fn needs_extended_flag(self) -> bool {
+        matches!(self, Key::RightCtrl | Key::RightAlt | Key::RightWin)
+    }
 }
 
 impl std::str::FromStr for Key {
@@ -174,7 +214,7 @@ fn is_hotkey_event(vk_code: u32, target_vk: u32, injected: bool) -> bool {
 }
 
 #[cfg(windows)]
-pub use hook::{is_held, listen, Listener};
+pub use hook::{is_held, is_listening, listen, Listener};
 
 #[cfg(windows)]
 mod hook {
@@ -309,10 +349,28 @@ mod hook {
     /// hook (a mechanism this project was not able to confirm; see
     /// `inject.rs`'s `modifier_to_release`).
     ///
-    /// Returns `false` before `listen` has ever been called, which is the
-    /// correct answer: nothing is held if there is no hook to hold it.
+    /// Returns `false` before `listen` has ever been called — see
+    /// [`is_listening`] for why callers must check that separately rather
+    /// than reading this as "not held" in that case.
     pub fn is_held() -> bool {
         HELD.load(Ordering::Relaxed)
+    }
+
+    /// Whether a hook has ever been installed via [`listen`] in this
+    /// process.
+    ///
+    /// [`is_held`] defaults to `false` before `listen` runs, which is
+    /// indistinguishable from "a hook is running and genuinely reports the
+    /// hotkey is not held." Some injection paths construct an injector
+    /// without ever installing the hook (`--speak-wav --really-inject` has
+    /// no live hotkey to listen for). On those paths `is_held` alone would
+    /// silently claim "definitely not held," degrading `inject.rs`'s
+    /// two-signal correction back to trusting `GetAsyncKeyState` alone —
+    /// exactly the unsound single-signal check this design exists to avoid.
+    /// Callers must check this first and skip correction entirely when it is
+    /// `false`, rather than trust `is_held`'s default.
+    pub fn is_listening() -> bool {
+        SENDER.get().is_some()
     }
 
     /// Runs on the hook thread for every keystroke in the system. Must be fast:

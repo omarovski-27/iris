@@ -98,27 +98,42 @@ Measured latency numbers, the budget breakdown, and open risks:
 - `inject.rs` corrects the configured hotkey — and *only* the configured
   hotkey, never a broader modifier sweep — before every burst in both
   `send_keystrokes` and `paste`, per `SendInput`'s own warning that an
-  already-pressed key can corrupt the events it generates. The correction
-  fires only when two independent signals *disagree*: `GetAsyncKeyState`
-  says the hotkey is down, but `hotkey::is_held()` — Iris's own hook,
-  driven only by real key transitions it has actually seen — says no
-  genuine press is in progress. Do not simplify this to `GetAsyncKeyState`
-  alone: injection runs hundreds of ms after the hotkey's `Up` (polish +
-  transcription), long enough for a genuine repress for the *next*
-  utterance, and a single-signal check cannot tell that apart from a stuck
-  reading — firing on a real repress injects an orphan, unsuppressed key-up
-  into the focused app (Alt → menu-bar activation, Win → the Start menu) on
-  the user's own desktop mid-dictation. (Note for future readers: hook
-  suppression was originally suspected to be *why* the hotkey could read
-  stuck, but that theory did not hold up — Windows appears to update
-  `GetAsyncKeyState` independently of whether a low-level hook suppresses
-  the resulting message, per Microsoft's own docs on hook/state ordering.
-  The two-signal design does not depend on knowing the real mechanism.) See
-  `modifier_to_release` / `release_hotkey_if_stuck`; do not remove thinking
-  either is dead code. The configured hotkey reaches the injector via
-  `SystemInjector::new` (wired in `main.rs`), not via `app.rs`.
+  already-pressed key can corrupt the events it generates. Three things
+  narrow this beyond "check `GetAsyncKeyState`, fire if down," each cut from
+  a real failure mode found in review — do not simplify any of them back out:
+  - **Two signals must disagree, not one reading alone.** The correction
+    fires only when `GetAsyncKeyState` says the hotkey is down *and*
+    `hotkey::is_held()` — Iris's own hook, driven only by real key
+    transitions it has actually seen, gated on `hotkey::is_listening()` so a
+    hookless injection path (`--speak-wav --really-inject`) can't silently
+    degrade to trusting `GetAsyncKeyState` alone — says no genuine press is
+    in progress. Injection runs hundreds of ms after the hotkey's `Up`
+    (polish + transcription), long enough for a genuine repress for the
+    *next* utterance, which a single-signal check cannot tell apart from a
+    stuck reading. (The two never update perfectly atomically either — they
+    come from independent paths on different threads — so
+    `release_hotkey_if_stuck` gives the hook thread `SETTLE` to catch up
+    before trusting a `down` reading against `is_held`. This is a heuristic
+    margin, not a guarantee.) Note for future readers: hook suppression was
+    originally suspected to be *why* the hotkey could read stuck, but that
+    theory did not hold up — Windows appears to update `GetAsyncKeyState`
+    independently of whether a low-level hook suppresses the resulting
+    message. The two-signal design does not depend on knowing the real
+    mechanism.
+  - **RightAlt and RightWin are never corrected, even on a genuine desync.**
+    See `Key::is_correctable_modifier`: releasing either alone is a standing
+    Windows shell trigger (menu-bar activation, the Start menu), so the
+    correction's own key-up would reproduce that hazard regardless of
+    whether it fired for a "good" reason.
+  - Modifier/extended-flag knowledge lives on `Key`
+    (`is_correctable_modifier`, `needs_extended_flag`), not in separate
+    lookup tables that could drift from `Key::vk`.
+
+  See `modifier_to_release` / `release_hotkey_if_stuck`; do not remove any
+  of this thinking it's dead code. The configured hotkey reaches the
+  injector via `SystemInjector::new` (wired in `main.rs`), not via `app.rs`.
 - The wiring inside `inject.rs`'s `mod win` — that a caller actually reaches
-  `release_hotkey_if_stuck` with the right vk, with the right flags — is an
+  `release_hotkey_if_stuck` with the right hotkey and flags — is an
   accepted, permanent test gap: verifying it needs a real `SendInput` call,
   which the section above forbids. Don't try to close it with a test that
   only appears to; the decision logic is what's covered.
