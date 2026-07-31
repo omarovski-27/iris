@@ -52,9 +52,6 @@ pub const FRAME_INTERVAL_MS: u64 = 16;
 /// still sees `WM_DPICHANGED` / `WM_DISPLAYCHANGE` promptly.
 pub const IDLE_POLL_MS: u64 = 100;
 
-/// How many characters of partial transcript fill the partial ribbon.
-pub const RIBBON_FULL_CHARS: usize = 120;
-
 /// Attack time constant for the incoming microphone level, in ms.
 ///
 /// Level arrives from the audio thread as a noisy RMS. Rising fast and falling

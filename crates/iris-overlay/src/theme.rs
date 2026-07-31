@@ -419,6 +419,19 @@ mod tests {
         }
     }
 
+    /// Source-over compositing of a translucent colour onto an opaque one,
+    /// the same arithmetic the rasteriser does per pixel.
+    fn composite(src: Rgba, dst: Rgba) -> Rgba {
+        let a = src.a.clamp(0.0, 1.0);
+        let ch = |s: u8, d: u8| (f32::from(s) * a + f32::from(d) * (1.0 - a)).round() as u8;
+        Rgba {
+            r: ch(src.r, dst.r),
+            g: ch(src.g, dst.g),
+            b: ch(src.b, dst.b),
+            a: 1.0,
+        }
+    }
+
     /// The pill is drawn on top of an unknown desktop, and its own shell
     /// fill is a colour ramp (`theme.spectrum`) chosen for glassy variety,
     /// not for legibility — it does not itself promise contrast at every
@@ -426,25 +439,47 @@ mod tests {
     /// instead: a soft band painted behind live text only (see
     /// `render::draw_ribbon`). This test protects that guarantee, the one
     /// contrast the pill actually controls regardless of shell or desktop.
+    ///
+    /// It scores `ink` against what is *actually on screen* behind it, not
+    /// against `text_scrim`'s bare RGB: the scrim is translucent, so its own
+    /// `relative_luminance` (which ignores alpha) describes a colour that is
+    /// never painted, and a test written against it would keep passing if the
+    /// alpha were dropped to nothing. So the backing is rebuilt the way the
+    /// renderer builds it — every `spectrum` stop at `GLASS_FILL_ALPHA` over
+    /// the two extreme desktops, then `text_scrim` over that — and the worst
+    /// stop/desktop combination has to clear the floor. Only `ink` is checked
+    /// because only `ink` is ever painted on the scrim; `ink_dim` and
+    /// `ink_faint` belong to captions this design no longer draws.
     #[test]
     fn ink_contrasts_with_its_own_text_scrim() {
         for theme in THEMES {
-            let scrim = theme.text_scrim.relative_luminance();
-            for (label, ink) in [
-                ("ink", theme.ink),
-                ("ink_dim", theme.ink_dim),
-                ("ink_faint", theme.ink_faint),
-            ] {
-                let l = ink.relative_luminance();
-                let (hi, lo) = if l > scrim { (l, scrim) } else { (scrim, l) };
-                let ratio = (hi + 0.05) / (lo + 0.05);
-                assert!(
-                    ratio >= 2.5,
-                    "{} / {}: contrast ratio {ratio:.2} is too low to read against text_scrim",
-                    theme.name,
-                    label
-                );
+            let ink = theme.ink.relative_luminance();
+            let mut worst = f32::MAX;
+            let mut worst_where = String::new();
+            for desktop in [Rgba::hex(0x00_0000), Rgba::hex(0xFF_FFFF)] {
+                for (i, stop) in theme.spectrum.iter().enumerate() {
+                    let shell = composite(stop.fade(crate::render::GLASS_FILL_ALPHA), desktop);
+                    let backing = composite(theme.text_scrim, shell).relative_luminance();
+                    let (hi, lo) = if ink > backing {
+                        (ink, backing)
+                    } else {
+                        (backing, ink)
+                    };
+                    let ratio = (hi + 0.05) / (lo + 0.05);
+                    if ratio < worst {
+                        worst = ratio;
+                        worst_where = format!(
+                            "stop {i} over #{:02X}{:02X}{:02X}",
+                            desktop.r, desktop.g, desktop.b
+                        );
+                    }
+                }
             }
+            assert!(
+                worst >= 2.5,
+                "{}: ink contrasts only {worst:.2} against the composited text_scrim ({worst_where})",
+                theme.name
+            );
         }
     }
 

@@ -8,8 +8,16 @@
 //! it.
 //!
 //! Three box-blur passes approximate a Gaussian closely enough that no one can
-//! tell at the HUD chip's ~224×106 px window, and cost a couple of hundred
-//! microseconds.
+//! tell at the overlay's 528×102 logical px window (1056×204 at 200 % DPI).
+//!
+//! Cost is per *rebuild*, not per frame: `render::ensure_masks` caches the
+//! blurred masks and only rebuilds when the shape moves or its width crosses a
+//! 4 device-px bucket. Under the fixed-width pill this module predates that
+//! meant the enter and exit transforms only. The orb-to-ribbon shape widens
+//! while the transcript grows, so rebuilds now recur for as long as words keep
+//! arriving — two blurred masks over the full window each time. Coarsening the
+//! bucket would trade that against visible shadow lag during the morph; it is
+//! a deliberate follow-up, not an oversight.
 
 use tiny_skia::Mask;
 

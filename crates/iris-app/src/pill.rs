@@ -127,7 +127,10 @@ impl PillSink for LogPill {
     }
     fn update_level(&mut self, _level: f32) {}
     fn set_partial_text(&mut self, text: &str) {
-        iris_core::vlog!("pill: partial_text={text:?}");
+        // The loop already logged the text itself as `~ {text}` before calling
+        // this; what this line adds is that the *pill* was told about it, and
+        // the width the ribbon is being asked to hold.
+        iris_core::vlog!("pill: partial_text ({} chars)", text.chars().count());
     }
     fn set_engine(&mut self, label: &str) {
         iris_core::vlog!("pill: engine={label}");

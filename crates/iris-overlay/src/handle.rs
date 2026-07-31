@@ -35,8 +35,11 @@ impl Drop for AliveGuard {
 pub struct OverlayConfig {
     /// Palette to start in. Defaults to [`PRISM_DARK`], the locked v1 default.
     pub theme: Theme,
-    /// Initial engine label for the chip, e.g. `groq · whisper-large-v3-turbo · en`.
-    /// May be empty; the chip is simply not drawn.
+    /// Initial engine label, e.g. `groq · whisper-large-v3-turbo · en`.
+    ///
+    /// Carried on the model for continuity, but not rendered by this design —
+    /// see [`OverlayHandle::set_engine`] and [`crate::state::Command::Engine`].
+    /// May be empty.
     pub engine: String,
 }
 

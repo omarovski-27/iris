@@ -54,6 +54,7 @@ engine = "mock"           # mock | deepgram | groq | local
 hotkey = "right-ctrl"     # rctrl, lctrl, rshift, ralt, rwin, capslock, ...
 suppress_hotkey = true    # stop the hotkey reaching the focused app
 theme = "dark"            # dark | light
+show_live_text = true     # false keeps the overlay a quiet orb, no transcript
 
 [polish]
 enabled = true
@@ -129,7 +130,7 @@ The loop drives a `PillSink`. On Windows the resident app spawns
 
 ```rust
 set_engine / set_theme                     // startup + tray
-show_listening() → update_level* / set_partial_len*
+show_listening() → update_level* / set_partial_text*
   → processing() → inserted(latency_ms)    // success: pill auto-exits after ~550 ms
   → hide()                                 // cancel / empty / error only
 ```
@@ -137,6 +138,11 @@ show_listening() → update_level* / set_partial_len*
 `Theme::Dark` maps to Prism, `Theme::Light` to Porcelain. After a successful
 insert the overlay holds the confirmation then exits itself — the loop does
 **not** call `hide()` immediately, or the hold would be cancelled.
+
+`set_partial_text` is what opens the overlay's live-transcript ribbon.
+`show_live_text = false` in the config makes `OverlayPill` swallow it, so the
+overlay never sees a partial and stays the quiet orb — the opt-out for anyone
+who does not want dictated words on screen.
 
 | Sink | When |
 |---|---|

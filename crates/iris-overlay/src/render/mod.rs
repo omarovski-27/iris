@@ -44,6 +44,13 @@ use crate::motion::{
 use crate::state::{Model, OverlayState};
 use crate::theme::{sample_ramp, Rgba, Theme};
 
+/// Alpha the glass body's spectrum ramp is painted at, at every moment of the
+/// shape's life. Constant on purpose: legibility of the live text is carried
+/// by `theme.text_scrim` alone (see [`draw_ribbon`]), so the surface never has
+/// to trade its glassiness for contrast. `theme::tests` composites this over
+/// the spectrum to check that guarantee against the real on-screen colour.
+pub(crate) const GLASS_FILL_ALPHA: f32 = 0.20;
+
 /// Standard deviation of the shape's drop-shadow blur, in logical pixels.
 const SHADOW_SIGMA: f32 = 12.0;
 /// Vertical offset of the ambient shadow, in logical pixels.
@@ -93,6 +100,10 @@ const WAVE_Y_OFFSET: f32 = 10.0;
 const WAVE_IDLE_FLOOR: f32 = 0.05;
 const WAVE_PROCESSING_ENV: f32 = 0.16;
 const WAVE_RESTING_ENV: f32 = 0.05;
+
+/// Breathing room above and below the live text's ink box before the text
+/// scrim's rounded edge starts, in logical pixels.
+const SCRIM_PAD_Y: f32 = 3.0;
 
 /// scaleY for one wave bar. `p` is its position across the row, 0.0–1.0;
 /// `i` is its raw index, used only to decorrelate neighbours.
@@ -162,7 +173,7 @@ fn draw_wave(
         let by = cy - bh * 0.5;
         if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * 0.5) {
             let colour = sample_ramp(theme.spectrum, p);
-            fill_clipped(pixmap, ctx, &path, colour.fade(alpha), clip);
+            fill_clipped(pixmap, ctx, &path, ctx.c(colour.fade(alpha)), clip);
         }
     }
 }
@@ -420,18 +431,7 @@ impl Renderer {
             fill_through(pixmap, &m.glow, glow.fade(presence));
         }
 
-        draw_shell(
-            pixmap,
-            &ctx,
-            &shape,
-            x,
-            y,
-            w,
-            h,
-            r,
-            open,
-            cached.map(|m| &m.clip),
-        );
+        draw_shell(pixmap, &ctx, &shape, x, y, w, h, r, cached.map(|m| &m.clip));
         draw_wave(pixmap, &ctx, x, y, w, h, cached.map(|m| &m.clip));
         draw_glyph(pixmap, &ctx, glyph_alpha(open));
         if open > 0.02 && has_text {
@@ -607,12 +607,11 @@ fn fill_glass_shell(
     y: f32,
     w: f32,
     h: f32,
-    legibility: f32,
     now: f32,
     clip: Option<&Mask>,
 ) {
     let theme = ctx.theme;
-    let base_a = 0.20 + 0.44 * legibility;
+    let base_a = GLASS_FILL_ALPHA;
     let last = (theme.spectrum.len() - 1).max(1) as f32;
     let stops: Vec<GradientStop> = theme
         .spectrum
@@ -685,14 +684,15 @@ fn fill_glass_shell(
 /// the existing rim (`outer_ring`/`border`) plus the crisp `inner_highlight`
 /// line.
 ///
-/// **On legibility.** Live text sits directly on this surface once the
-/// ribbon opens, and it has to read over an arbitrary desktop, light or
-/// dark. Rather than pick one fixed opacity that compromises between "glassy
-/// at rest" and "legible with text", the fill's alpha is boosted smoothly as
-/// `open` increases — reusing [`text_alpha`], the exact curve that fades the
-/// live text in, so the backing gets more opaque in lockstep with there
-/// being something that needs a backing. At rest (the quiet orb, `open` at
-/// or near 0) the shell stays at its most transparent.
+/// **On legibility.** Live text sits directly on this surface once the ribbon
+/// opens, and it has to read over an arbitrary desktop, light or dark. The
+/// shell does *not* answer that: its fill stays at [`GLASS_FILL_ALPHA`], its
+/// most transparent, whether the ribbon is a closed orb or wide open with
+/// text. Pulling the whole surface back toward opaque whenever there is text
+/// would trade the glass away at exactly the moment it is most visible, so
+/// contrast is solved locally instead — `theme.text_scrim`, a soft band
+/// painted behind the run only in [`draw_ribbon`], is the sole mechanism, and
+/// `theme::tests` holds it to a measured ratio against the composited fill.
 #[allow(clippy::too_many_arguments)]
 fn draw_shell(
     pixmap: &mut Pixmap,
@@ -703,14 +703,12 @@ fn draw_shell(
     w: f32,
     h: f32,
     r: f32,
-    open: f32,
     clip: Option<&Mask>,
 ) {
     let s = ctx.layout.scale;
-    let legibility = text_alpha(open);
     let now = ctx.model.now_ms() as f32;
 
-    fill_glass_shell(pixmap, ctx, shape, x, y, w, h, legibility, now, clip);
+    fill_glass_shell(pixmap, ctx, shape, x, y, w, h, now, clip);
 
     // `0 0 0 1px` — a hairline ring just outside the body.
     stroke(
@@ -882,16 +880,29 @@ fn draw_ribbon(
     // contrast with `ink` at every point along it; `text_scrim` is the token
     // that does, so this closes the legibility gap exactly where it matters
     // instead of pulling the whole surface back toward opaque.
+    //
+    // Vertically the band hugs the run's own ink box rather than the shape,
+    // and its top edge is held at or below the bottom of the waveform row: a
+    // shape-height band reached up into the bars and visibly darkened them
+    // along the whole length of the text.
     let text_w = atlas.measure(shown, l.text_font, 0.0);
     if text_w > 0.0 {
         let scrim_pad = l.text_pad_x * 0.4;
         let band_right = (x + w - l.text_pad_x + scrim_pad).min(x + w);
         let band_w = (text_w + 2.0 * scrim_pad).min(w);
         let band_x = (band_right - band_w).max(x);
-        let band_h = h * 0.68;
-        let band_y = y + (h - band_h) * 0.5;
-        if let Some(path) = shapes::round_rect(band_x, band_y, band_w, band_h, band_h * 0.5) {
-            fill(pixmap, ctx, &path, ctx.c(theme.text_scrim.fade(alpha)));
+
+        let (ink_top, ink_bottom) = atlas.ink_extents(shown, l.text_font);
+        let baseline = y + h * 0.5 + (ink_top + ink_bottom) * 0.5;
+        let pad_y = SCRIM_PAD_Y * l.scale;
+        let wave_bottom = y + h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
+        let band_top = (baseline - ink_top - pad_y).max(wave_bottom);
+        let band_bottom = (baseline - ink_bottom + pad_y).min(y + h);
+        let band_h = band_bottom - band_top;
+        if band_h > 0.0 {
+            if let Some(path) = shapes::round_rect(band_x, band_top, band_w, band_h, band_h * 0.5) {
+                fill(pixmap, ctx, &path, ctx.c(theme.text_scrim.fade(alpha)));
+            }
         }
     }
 

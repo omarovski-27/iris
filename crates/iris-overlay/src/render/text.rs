@@ -99,6 +99,13 @@ impl FontAtlas {
         key
     }
 
+    /// Advance width of one character, rasterising it into the cache first if
+    /// it is not there yet.
+    fn advance(&mut self, c: char, px: f32) -> f32 {
+        let key = self.ensure(c, px);
+        self.glyphs[&key].metrics.advance_width
+    }
+
     /// Total advance width of `text`, including `tracking` between characters.
     pub fn measure(&mut self, text: &str, px: f32, tracking: f32) -> f32 {
         let mut w = 0.0;
@@ -196,9 +203,14 @@ impl Default for FontAtlas {
 /// than `max_w`. The overflow strategy for the live-transcript ribbon: rather
 /// than clip pixels (this atlas has no clip-mask parameter to draw through),
 /// the shown *string* is trimmed so the newest words stay against the right
-/// padding and the oldest ones drop off cleanly. `O(n^2)` in the worst case —
-/// fine for the short strings a dictation ribbon ever holds, not fine as a
-/// general-purpose primitive.
+/// padding and the oldest ones drop off cleanly.
+///
+/// It walks *backwards* from the end, accumulating one advance per step, so
+/// the cost is `O(shown)` rather than `O(len)` per dropped character. That
+/// matters: the ribbon holds the whole utterance, which grows for as long as
+/// the user keeps speaking, and this runs once per frame inside a 16 ms
+/// budget. Re-measuring each candidate suffix from the front made the cost
+/// quadratic in the length of a transcript that only ever gets longer.
 pub(crate) fn trailing_fit<'a>(
     atlas: &mut FontAtlas,
     text: &'a str,
@@ -208,13 +220,16 @@ pub(crate) fn trailing_fit<'a>(
     if atlas.measure(text, px, 0.0) <= max_w {
         return text;
     }
-    for (byte_idx, _) in text.char_indices() {
-        let candidate = &text[byte_idx..];
-        if atlas.measure(candidate, px, 0.0) <= max_w {
-            return candidate;
+    let mut w = 0.0;
+    let mut start = text.len();
+    for (byte_idx, c) in text.char_indices().rev() {
+        w += atlas.advance(c, px);
+        if w > max_w {
+            break;
         }
+        start = byte_idx;
     }
-    ""
+    &text[start..]
 }
 
 /// Alpha-blend a coverage bitmap into the pixmap.
@@ -555,6 +570,33 @@ mod tests {
         assert!(shown.len() < long.len());
         assert!(long.ends_with(shown));
         assert!(a.measure(shown, 15.0, 0.0) <= 60.0);
+    }
+
+    /// The backwards walk must pick exactly the suffix the straightforward
+    /// (quadratic) forward scan would, including on a multi-byte string and
+    /// at a budget too small for even one character.
+    #[test]
+    fn trailing_fit_matches_a_front_to_back_reference() {
+        let mut a = atlas();
+        let reference = |a: &mut FontAtlas, text: &str, max_w: f32| -> String {
+            text.char_indices()
+                .map(|(i, _)| &text[i..])
+                .find(|c| a.measure(c, 15.0, 0.0) <= max_w)
+                .unwrap_or("")
+                .to_string()
+        };
+        for text in [
+            "the quick brown fox jumps over the lazy dog and keeps talking",
+            "naïve café — 日本語 mixed in",
+        ] {
+            for max_w in [0.0, 3.0, 17.0, 60.0, 240.0] {
+                assert_eq!(
+                    trailing_fit(&mut a, text, 15.0, max_w),
+                    reference(&mut a, text, max_w),
+                    "text {text:?} at {max_w}"
+                );
+            }
+        }
     }
 
     #[test]
