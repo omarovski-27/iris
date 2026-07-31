@@ -4,6 +4,15 @@
 //! Windows pipeline wraps it with those; the harness wraps it with a WAV file.
 //! Both produce a [`Timeline`] from the same code, so a number measured in CI is
 //! the same number measured on a desk.
+//!
+//! # Hold integrity
+//!
+//! A continuous key-hold is one utterance. [`TranscriptEvent::Final`] before
+//! [`Dictation::finish`] is demoted to a partial so segment-oriented or buggy
+//! engines cannot truncate mid-hold; `finish` always calls [`Session::finish`]
+//! and waits. On timeout, close, or error, a non-empty `latest_partial` is
+//! salvaged so words already shown on the overlay are not discarded. Prefer the
+//! longer of Final vs latest partial when both exist.
 
 use std::time::{Duration, Instant};
 
@@ -522,9 +531,9 @@ mod tests {
                 return Ok(());
             }
             self.finished = true;
-            let _ = self
-                .tx
-                .send(TranscriptEvent::Final("hello world more speech after keyup".into()));
+            let _ = self.tx.send(TranscriptEvent::Final(
+                "hello world more speech after keyup".into(),
+            ));
             Ok(())
         }
     }
@@ -683,9 +692,12 @@ mod tests {
     #[test]
     fn demoted_short_final_does_not_clobber_longer_partial() {
         let mut partials = Vec::new();
-        let outcome = run_offline(&ShortFinalAfterLongPartial, &tone(1.2), Pace::Fast, &mut |p| {
-            partials.push(p.to_string())
-        })
+        let outcome = run_offline(
+            &ShortFinalAfterLongPartial,
+            &tone(1.2),
+            Pace::Fast,
+            &mut |p| partials.push(p.to_string()),
+        )
         .expect("should salvage longer partial");
 
         assert!(
@@ -743,9 +755,9 @@ mod tests {
             // Yield so a buggy finish() that arms finishing before draining
             // would already have consumed the queued Final and returned.
             std::thread::sleep(Duration::from_millis(20));
-            let _ = self
-                .tx
-                .send(TranscriptEvent::Final("hello world more speech after keyup".into()));
+            let _ = self.tx.send(TranscriptEvent::Final(
+                "hello world more speech after keyup".into(),
+            ));
             Ok(())
         }
     }
@@ -759,7 +771,9 @@ mod tests {
 
         let mut partials = Vec::new();
         let outcome = dictation
-            .finish(Duration::from_secs(2), &mut |p| partials.push(p.to_string()))
+            .finish(Duration::from_secs(2), &mut |p| {
+                partials.push(p.to_string())
+            })
             .expect("dictation");
 
         assert!(

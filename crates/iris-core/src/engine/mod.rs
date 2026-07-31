@@ -46,20 +46,32 @@ pub use mock::{MockConfig, MockEngine};
 
 /// Everything an engine can tell us about a session, in arrival order.
 ///
-/// A session ends with exactly one [`TranscriptEvent::Final`] or
-/// [`TranscriptEvent::Error`]; the channel closing without either is also
-/// terminal and is treated as a failure by [`crate::dictation::Dictation`].
+/// Well-behaved engines emit at most one post-[`Session::finish`] terminal
+/// event: [`TranscriptEvent::Final`] or [`TranscriptEvent::Error`]. Segment
+/// hypotheses during the hold must be [`TranscriptEvent::Partial`] only —
+/// mid-hold "finals" from endpointing are not session-terminal.
+///
+/// [`crate::dictation::Dictation`] defends the hold either way: a `Final`
+/// before `finish()` is demoted to a sticky partial; after `finish()`, a
+/// longer partial can still beat a short `Final`; and if the channel closes
+/// (or errors / times out) with no usable `Final`, any non-empty partial is
+/// salvaged rather than discarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEvent {
     /// The transport is up and audio is flowing. Engines with no transport emit
     /// this immediately.
     Connected,
     /// Interim text covering the audio so far. Successive partials replace one
-    /// another; they are not appended.
+    /// another; they are not appended. Streaming engines that segment on
+    /// silence should still surface each committed segment through this
+    /// variant (as running text), not as [`TranscriptEvent::Final`].
     Partial(String),
-    /// The complete transcript. Terminal.
+    /// The complete transcript for the session. Intended only after
+    /// [`Session::finish`]; see the enum docs for how earlier arrivals are
+    /// handled.
     Final(String),
-    /// The session failed. Terminal.
+    /// The session failed. After `finish()`, [`crate::dictation::Dictation`]
+    /// may still salvage a non-empty partial instead of surfacing the error.
     Error(String),
 }
 

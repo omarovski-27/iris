@@ -3,8 +3,10 @@
 //! Audio goes up as raw 16 kHz linear PCM the moment it is captured, and
 //! Deepgram returns interim hypotheses continuously. By the time the user lets
 //! go of the hotkey, everything but the last fragment of speech has already been
-//! transcribed, so `finish()` costs one flush round-trip rather than a whole
-//! inference over the utterance.
+//! transcribed, so `finish()` costs a Finalize + CloseStream flush rather than
+//! a whole inference over the utterance. Segment `is_final` frames and the
+//! open-time Metadata message never end the session — only Metadata after
+//! CloseStream (or socket death) does, via the pump's `conclude` helper.
 //!
 //! The connection is established *concurrently with the first frames*: `open()`
 //! returns immediately and audio queues in an unbounded channel until the socket
@@ -297,7 +299,9 @@ impl Transcript {
 
         match value.get("type").and_then(|t| t.as_str()) {
             Some("Metadata") => {
-                // Deepgram's sign-off after CloseStream.
+                // Deepgram sends Metadata at open and again after CloseStream.
+                // `done` is sticky here; the pump clears it when `closing` is
+                // still false so only the post-CloseStream frame ends the loop.
                 self.done = true;
                 return None;
             }
@@ -409,7 +413,10 @@ mod tests {
         t.absorb(&results("Hello.", true));
         assert!(!t.done);
         t.absorb(&results("Why are you not", false));
-        t.absorb(&results("Why are you not taking the first words only.", true));
+        t.absorb(&results(
+            "Why are you not taking the first words only.",
+            true,
+        ));
         assert!(!t.done);
         assert_eq!(
             t.finished_text(),
