@@ -7,7 +7,10 @@
 //!   │   idle   │───────────────►│   capturing   │─────────────►│ finalising │
 //!   └──────────┘                └───────────────┘              └────────────┘
 //!         ▲                        frames → engine              polish, inject,
-//!         └───────────────────────────────────────────────────  log, hide pill
+//!         │                                                     log session
+//!         │                          ┌── inserted ── self-dismiss (~550 ms)
+//!         └──────────────────────────┤
+//!                                    └── cancel/empty/error ── hide pill
 //! ```
 //!
 //! Two properties are worth defending when changing this file.

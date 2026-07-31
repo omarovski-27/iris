@@ -238,8 +238,8 @@ fn run(
 ) -> Result<()> {
     anyhow::bail!(
         "the resident loop needs Windows: the global hotkey hook, microphone capture and text \
-         injection are all Win32.\nOn this host you can still use --speak-wav to run a dictation \
-         from a file, --history, --list-devices and --print-config."
+         injection are all Win32.\nOn this host you can still use --demo-dictation, --speak-wav \
+         to run a dictation from a file, --history, --list-devices and --print-config."
     )
 }
 
