@@ -493,10 +493,11 @@ fn a_tray_save_never_persists_a_cli_override() {
 
 #[test]
 fn reload_keeps_in_force_settings_that_need_a_restart() {
-    // Reload must not pretend hotkey/audio/keys took effect: the hook and the
-    // mic were configured at startup, and promote_keys cannot run again. The
-    // in-memory config keeps what is actually in force so a second reload of
-    // the same file still has something to compare against.
+    // Reload must not pretend hotkey/audio/keys/inject.method took effect:
+    // the hook, mic and injector were configured at startup, and promote_keys
+    // cannot run again. The in-memory config keeps what is actually in force
+    // so a second reload of the same file still has something to compare
+    // against. trailing_space is read live, so the file value does apply.
     let dir = tempfile::tempdir().expect("temp dir");
     let config_path = dir.path().join("config.toml");
 
@@ -506,6 +507,8 @@ fn reload_keeps_in_force_settings_that_need_a_restart() {
     file_config.audio.device = Some("Yeti".into());
     file_config.audio.warm = false;
     file_config.keys.deepgram = Some("file-key".into());
+    file_config.inject.method = iris_core::inject::Method::Clipboard;
+    file_config.inject.trailing_space = false;
     file_config
         .save(&config_path)
         .expect("seeding the config file");
@@ -517,6 +520,8 @@ fn reload_keeps_in_force_settings_that_need_a_restart() {
     run_config.audio.device = Some("USB".into());
     run_config.audio.warm = true;
     run_config.keys.deepgram = Some("run-key".into());
+    run_config.inject.method = iris_core::inject::Method::SendInput;
+    run_config.inject.trailing_space = true;
 
     let app = App::new(
         run_config,
@@ -545,8 +550,16 @@ fn reload_keeps_in_force_settings_that_need_a_restart() {
     assert_eq!(app.config().audio.device.as_deref(), Some("USB"));
     assert!(app.config().audio.warm);
     assert_eq!(app.config().keys.deepgram.as_deref(), Some("run-key"));
+    assert_eq!(
+        app.config().inject.method,
+        iris_core::inject::Method::SendInput
+    );
+    assert!(!app.config().inject.trailing_space);
 }
 
+// Local without `local-native` always fails to build, independent of ambient
+// API keys — Deepgram would succeed whenever IRIS_DEEPGRAM_KEY is set.
+#[cfg(not(feature = "local-native"))]
 #[test]
 fn reload_does_not_persist_a_failed_engine_choice() {
     // A file that asks for an engine we cannot build must not poison `saved`:
@@ -556,7 +569,7 @@ fn reload_does_not_persist_a_failed_engine_choice() {
 
     let mut file_config = Config::default();
     file_config.polish.llm = false;
-    file_config.engine = EngineChoice::Deepgram;
+    file_config.engine = EngineChoice::Local;
     file_config
         .save(&config_path)
         .expect("seeding the config file");
@@ -583,7 +596,7 @@ fn reload_does_not_persist_a_failed_engine_choice() {
     let (commands, commands_rx) = crossbeam_channel::unbounded();
     let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
     commands.send(Command::Reload).unwrap();
-    // A tray change that persists: must not write deepgram into the file.
+    // A tray change that persists: must not write local into the file.
     commands.send(Command::SetTheme(Theme::Light)).unwrap();
     commands.send(Command::Quit).unwrap();
 

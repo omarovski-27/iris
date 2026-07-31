@@ -278,12 +278,13 @@ impl<A: AudioSource> App<A> {
             Command::Reload => match Config::load(&self.config_path) {
                 Ok(loaded) => {
                     // The hotkey hook was installed in `main` and the audio
-                    // source was configured there too; neither is rebuilt
-                    // here, so a reload that changed them must say so instead
-                    // of claiming they took effect. Keys are the same story:
-                    // `promote_keys` ran once before any thread existed and
-                    // cannot safely run again, so a file edit there is a
-                    // restart too.
+                    // source / injector were configured there too; none of
+                    // those are rebuilt here, so a reload that changed them
+                    // must say so instead of claiming they took effect.
+                    // Keys are the same story: `promote_keys` ran once before
+                    // any thread existed and cannot safely run again.
+                    // `inject.trailing_space` is read live at inject time, so
+                    // it does take effect without a restart.
                     let mut needs_restart = Vec::new();
                     if loaded.hotkey != self.config.hotkey {
                         needs_restart.push("hotkey");
@@ -300,6 +301,9 @@ impl<A: AudioSource> App<A> {
                     if loaded.keys != self.config.keys {
                         needs_restart.push("keys");
                     }
+                    if loaded.inject.method != self.config.inject.method {
+                        needs_restart.push("inject.method");
+                    }
 
                     // `saved` tracks the file. `config` is what this process
                     // is actually running: keep the in-force values for
@@ -312,6 +316,7 @@ impl<A: AudioSource> App<A> {
                     config.suppress_hotkey = self.config.suppress_hotkey;
                     config.audio = self.config.audio.clone();
                     config.keys = self.config.keys.clone();
+                    config.inject.method = self.config.inject.method;
 
                     // Same rollback as SetEngine: a choice that cannot be
                     // built must not land in `saved`, or the next theme
