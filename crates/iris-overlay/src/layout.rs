@@ -3,7 +3,7 @@
 //!
 //! Every constant here is in *logical* pixels at 100 % scale. The locked Prism
 //! placement is still bottom-centre, 58 px above the work area; the body itself
-//! is a compact HUD chip (`188 × 34`, radius 17) rather than the original mockup
+//! is a compact HUD chip (`168 × 34`, radius 17) rather than the original mockup
 //! recorder bar (`248 × 46`). [`Layout::new`] multiplies them by the monitor's
 //! scale factor, which is the whole of this crate's per-monitor-V2 DPI story:
 //! nothing is rasterised at 96 dpi and stretched, the pill is re-laid-out and
@@ -18,7 +18,7 @@ use crate::spectrum::BAR_COUNT;
 // ---------------------------------------------------------------------------
 
 /// Pill width.
-pub const PILL_W: f32 = 188.0;
+pub const PILL_W: f32 = 168.0;
 /// Pill height.
 pub const PILL_H: f32 = 34.0;
 /// Pill corner radius. Exactly half the height, so the ends are true semicircles.
@@ -35,45 +35,45 @@ pub const WORK_AREA_GAP: f32 = 58.0;
 /// still faintly non-zero two standard deviations out. Anything less than
 /// ~2.5 sigma of margin and the halo is cut off square at the window edge,
 /// which on a dark wallpaper reads as a visible rectangle around the pill.
-pub const MARGIN_X: f32 = 32.0;
+pub const MARGIN_X: f32 = 28.0;
 /// Transparent margin above the pill.
-pub const MARGIN_TOP: f32 = 26.0;
+pub const MARGIN_TOP: f32 = 28.0;
 /// Transparent margin below the engine chip.
-pub const MARGIN_BOTTOM: f32 = 26.0;
+pub const MARGIN_BOTTOM: f32 = 28.0;
 
 /// Gap between the bottom of the pill and the top of the engine chip.
-pub const CHIP_GAP: f32 = 8.0;
+pub const CHIP_GAP: f32 = 7.0;
 /// Height of the engine chip's text box.
 pub const CHIP_H: f32 = 9.0;
 
 /// Left padding inside the pill, before the capsule.
-const PAD_L: f32 = 6.0;
+const PAD_L: f32 = 5.0;
 /// The capsule's square box.
-const CAP_BOX: f32 = 20.0;
+const CAP_BOX: f32 = 18.0;
 /// Gap between the capsule box and the waveform.
 const CAP_GAP: f32 = 2.0;
 /// Diameter of the capsule ring.
-const CAP_RING_D: f32 = 15.0;
+const CAP_RING_D: f32 = 14.0;
 /// Stroke width of the capsule ring.
-const CAP_RING_W: f32 = 1.25;
-/// Diameter of the capsule core (the recording dot).
-const CAP_CORE_D: f32 = 5.5;
+const CAP_RING_W: f32 = 1.2;
+/// Diameter of the capsule core (live indicator — not a rec-button red).
+const CAP_CORE_D: f32 = 5.0;
 
 /// Width reserved on the right for the telemetry readout, including the pill's
 /// own right padding. Fixed, so the waveform never reflows when the readout
 /// changes from `0:03` to `142 ms` — the report forbids layout thrash.
-const META_SLOT: f32 = 46.0;
+const META_SLOT: f32 = 42.0;
 /// Distance from the pill's right edge to the right edge of the readout text.
-const META_PAD_R: f32 = 11.0;
+const META_PAD_R: f32 = 10.0;
 
 /// Height of the waveform box.
 const WAVE_H: f32 = 18.0;
 /// Inner padding at each end of the waveform box.
-const WAVE_PAD: f32 = 5.0;
+const WAVE_PAD: f32 = 4.0;
 /// Width of one bar.
 const BAR_W: f32 = 1.5;
 /// Gap between bars.
-const BAR_GAP: f32 = 1.75;
+const BAR_GAP: f32 = 1.6;
 /// Height of a bar at `scaleY(1)`.
 const BAR_H: f32 = 16.0;
 
@@ -83,9 +83,9 @@ const HAIRLINE_INSET: f32 = 10.0;
 const HAIRLINE_H: f32 = 1.0;
 
 /// Left edge of the processing scan track.
-const SCAN_L: f32 = 28.0;
+const SCAN_L: f32 = 26.0;
 /// Distance from the pill's right edge to the right edge of the scan track.
-const SCAN_R: f32 = 50.0;
+const SCAN_R: f32 = 46.0;
 /// Thickness of the scan band.
 const SCAN_H: f32 = 1.5;
 
@@ -401,20 +401,20 @@ mod tests {
     fn logical_geometry_is_the_hud_chip_spec() {
         // Compact HUD chip: smaller than the original Prism mockup bar so the
         // pill reads as status chrome, not a digital recorder strip.
-        assert_eq!(PILL_W, 188.0);
+        assert_eq!(PILL_W, 168.0);
         assert_eq!(PILL_H, 34.0);
         assert_eq!(PILL_RADIUS, 17.0);
         assert_eq!(WORK_AREA_GAP, 58.0);
         // Radius is exactly half the height: the ends are true semicircles.
         assert_eq!(PILL_RADIUS * 2.0, PILL_H);
         // Stay clearly smaller than the mockup recorder proportions.
-        assert!(PILL_W < 220.0 && PILL_H < 40.0);
+        assert!(PILL_W < 180.0 && PILL_H < 40.0);
     }
 
     #[test]
     fn window_is_bigger_than_the_pill_it_contains() {
         let l = Layout::new(1.0);
-        assert_eq!((l.window_w, l.window_h), (252, 103));
+        assert_eq!((l.window_w, l.window_h), (224, 106));
         assert!(l.pill.x > 0.0 && l.pill.y > 0.0);
         assert!(l.pill.right() < l.window_w as f32);
         // The chip lives below the pill and inside the window.

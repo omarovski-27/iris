@@ -125,10 +125,10 @@ When updating this file, preserve this bar for all agents and keep entries conci
   light, listening-only telemetry chip, prism-triangle icon (tray uses the same
   mark via `tray::icon_rgba`). Source mockups:
   `/home/omar/firstmate/data/iris-design/`.
-- Geometry is a compact HUD chip (`188×34`, radius 17 in `layout.rs`) — desk
+- Geometry is a compact HUD chip (`168×34`, radius 17 in `layout.rs`) — desk
   feedback tightened it from the mockup recorder bar so it does not read as a
-  digital recording strip. Motion timings in `motion.rs` and the token locks
-  stay captain criteria; size changes still need a product decision.
+  digital recording strip. No solid rec-red (mint/sky live core); spectrum stays
+  on the waveform only. Motion timings in `motion.rs` stay captain criteria.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
 - The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is

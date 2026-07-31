@@ -816,13 +816,13 @@ mod tests {
     #[test]
     fn re_scaling_resizes_the_frame() {
         let mut r = Renderer::new(1.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (252, 103));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (224, 106));
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (504, 206));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (448, 212));
         assert!((r.layout().scale - 2.0).abs() < f32::EPSILON);
         // Idempotent.
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (504, 206));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (448, 212));
     }
 
     #[test]

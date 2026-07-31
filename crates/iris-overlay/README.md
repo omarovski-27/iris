@@ -67,16 +67,16 @@ The numbers in `motion.rs` and `layout.rs` are acceptance criteria, not
 preferences, and each has a test that pins it:
 
 ```
-188 × 34 px, radius 17, bottom-centre, 58 px above the work area
+168 × 34 px, radius 17, bottom-centre, 58 px above the work area
 enter 130 ms · exit 150 ms · state cross 90 ms · check draw 240 ms
 inserted hold 550 ms
 28 bars × scaleY only · no blur filter · no animated gradient stops
 ```
 
 Desk feedback tightened the body from the original Prism mockup bar
-(`248 × 46`) so it reads as a small HUD chip rather than a digital recorder
-strip. Placement, spectrum-on-waveform-only, listening-only chip, and Prism /
-Porcelain token locks are unchanged.
+(`248 × 46`) into a small modern HUD chip: no solid rec-red, quiet instrument
+shell, spectrum only on the live waveform. Placement, listening-only chip, and
+Prism / Porcelain product locks (dark default / light skin) are unchanged.
 
 Two places where the implementation deliberately departs from the mockup, both
 because the mockup is a web page and this is not:
@@ -101,11 +101,11 @@ crash dump.
 
 ## Why a CPU raster path
 
-The pill is ~250 × 100 device pixels at 100 %, ~500 × 200 at 200 %. It is
+The pill is ~224 × 106 device pixels at 100 %, ~448 × 212 at 200 %. It is
 rasterised on the CPU with [tiny-skia] and blitted with `UpdateLayeredWindow`.
 
 A GPU surface was considered and rejected: at this size the entire frame is
-under 60 K pixels, which a single core rasterises in well under a millisecond,
+under 50 K pixels, which a single core rasterises in well under a millisecond,
 while a D3D/D2D path would add adapter enumeration, device-lost handling, a
 swapchain that has to cooperate with `WS_EX_LAYERED`, and a second code path
 that cannot be tested anywhere but a real Windows desktop. A WebView2 pill was
