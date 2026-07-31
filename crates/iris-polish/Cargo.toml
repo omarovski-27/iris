@@ -1,3 +1,9 @@
+# Standalone crate, deliberately not a member of the root workspace (see
+# CLAUDE.md / AGENTS.md "iris-polish layout"). The empty table below is the
+# Cargo escape hatch that stops it being implicitly pulled into the root
+# workspace now that one exists.
+[workspace]
+
 [package]
 name = "iris-polish"
 version = "0.1.0"
