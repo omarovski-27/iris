@@ -96,8 +96,10 @@ withholds `CloseStream` until they converge. That wait ends on *progress*, not
 a fixed timer: coverage often never converges (trailing silence is audio
 Deepgram will never report words for), so waiting out a ceiling would spend it
 on every ordinary dictation against a ~300 ms perceived-latency bar. The socket
-is polled on `CATCHUP_STALL`, renewed by any inbound frame; silence for that
-long is the stop signal. `FINALIZE_TIMEOUT` is only the absolute cap on the
+is polled on `CATCHUP_STALL`, renewed only by a frame that reports *new*
+coverage — a Metadata greeting or a repeated span proves nothing about whether
+Deepgram is still working, so it must not extend the wait. `FINALIZE_TIMEOUT`
+is only the absolute cap on the
 whole wait, for a socket that chatters without converging — reaching it in
 ordinary use means the stall detection is wrong, not that the cap is too tight.
 Note the resulting distinction between `closing` (Finalize sent) and

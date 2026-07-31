@@ -33,9 +33,12 @@
 //! fixed ceiling would put that whole ceiling on the perceived latency of an
 //! ordinary dictation, and this product's bar for key-release → text is
 //! ~300 ms (`docs/spike-findings.md`). Instead the socket is polled on
-//! `CATCHUP_STALL`, renewed every time anything arrives: Deepgram falling
-//! silent for that long *is* the signal that it has nothing further to send,
-//! and `CloseStream` goes out immediately. `FINALIZE_TIMEOUT` doubles as an
+//! `CATCHUP_STALL`, renewed only by a frame that reports *new* coverage:
+//! Deepgram going that long without telling us it got any further *is* the
+//! signal that it has nothing more to send, and `CloseStream` goes out
+//! immediately. A frame that carries no coverage news — the open-time
+//! Metadata, a repeated span — must not renew it, or the wait creeps toward
+//! the backstop on traffic that proves nothing. `FINALIZE_TIMEOUT` doubles as an
 //! absolute cap on the whole wait, measured from `Finalize`, purely against a
 //! socket that chatters without ever converging; reaching it in ordinary use
 //! would mean the stall detection is wrong, not that the cap is too tight.
@@ -220,8 +223,12 @@ impl CatchupWait {
         self.deadline() <= tokio::time::Instant::now()
     }
 
-    /// Something arrived, so Deepgram is still working: grant another stall
-    /// interval. The backstop is deliberately untouched.
+    /// Deepgram reported covering more audio than before, so it is still
+    /// working through the backlog: grant another stall interval. Only a real
+    /// advance in coverage counts — a frame that says nothing new about how
+    /// far Deepgram has got carries no evidence that it is still going, and
+    /// letting it renew the wait is what would push an ordinary dictation onto
+    /// the backstop. The backstop itself is deliberately untouched.
     fn progressed(self) -> Self {
         Self {
             stall_at: tokio::time::Instant::now() + CATCHUP_STALL,
@@ -366,13 +373,16 @@ async fn pump(
                 };
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        let covered_before = acc.covered_secs;
                         if let Some(update) = acc.absorb(&text) {
                             let _ = events.send(TranscriptEvent::Partial(update));
                         }
                         // Deepgram has reported processing everything that was
                         // sent — or has run out of time to. Either way, ask it
-                        // to close; anything short of that is progress, and
-                        // buys another stall interval.
+                        // to close. Short of that, only a frame that moved
+                        // coverage forward buys another stall interval; one
+                        // that did not (a Metadata greeting, a repeated span)
+                        // leaves the running stall to expire on schedule.
                         if let Some(wait) = catchup {
                             if acc.caught_up(sent_secs) || wait.expired() {
                                 catchup = None;
@@ -385,7 +395,7 @@ async fn pump(
                                     failure = Some(e);
                                     break;
                                 }
-                            } else {
+                            } else if acc.covered_secs > covered_before {
                                 catchup = Some(wait.progressed());
                             }
                         }
@@ -1117,11 +1127,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_chattering_socket_that_never_converges_hits_the_absolute_backstop() {
-        // Renewing the stall on every message means a server that talks
-        // without ever advancing its coverage would hold the wait open
-        // forever; `FINALIZE_TIMEOUT`, measured from `Finalize`, caps the
-        // whole thing, and the flush that follows CloseStream still lands.
+    async fn a_socket_that_creeps_forward_without_converging_hits_the_backstop() {
+        // Coverage that keeps genuinely advancing keeps renewing the stall, so
+        // a server inching forward without ever reaching `sent_secs` would
+        // hold the wait open indefinitely; `FINALIZE_TIMEOUT`, measured from
+        // `Finalize`, caps the whole thing, and the flush that follows
+        // CloseStream still lands.
         let started = std::time::Instant::now();
         let outcome = run_pump(
             |mut ws| async move {
@@ -1133,13 +1144,17 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-                // Empty results, spaced well inside CATCHUP_STALL so the
-                // stall can never fire, and never advancing coverage past the
-                // first of the three seconds sent.
+                // Real but minute progress, spaced well inside CATCHUP_STALL
+                // so the stall keeps being renewed, and creeping far too
+                // slowly to ever reach the three seconds that were sent.
                 let deadline = tokio::time::Instant::now() + FINALIZE_TIMEOUT;
+                let mut covered = 1.0;
                 while tokio::time::Instant::now() < deadline {
+                    covered += 0.01;
                     if ws
-                        .send(Message::Text(results_with_span("", false, 0.0, 1.0).into()))
+                        .send(Message::Text(
+                            results_with_span("", false, 0.0, covered).into(),
+                        ))
                         .await
                         .is_err()
                     {
@@ -1176,6 +1191,69 @@ mod tests {
         assert!(
             elapsed >= FINALIZE_TIMEOUT,
             "the backstop, not the stall, is what should have ended this wait; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_carrying_no_new_coverage_does_not_extend_the_wait() {
+        // The stall runs from the last frame that actually reported progress.
+        // A Metadata greeting says nothing about how far Deepgram has got, so
+        // it must not buy another interval — otherwise every non-advancing
+        // frame walks an ordinary dictation toward the 5 s backstop.
+        let closed_after = std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let recorded = std::sync::Arc::clone(&closed_after);
+        let outcome = run_pump(
+            move |mut ws| async move {
+                if !wait_for_text(&mut ws, "Finalize").await {
+                    return;
+                }
+                ws.send(Message::Text(
+                    results_with_span("Extraordinary.", true, 0.0, 1.0).into(),
+                ))
+                .await
+                .unwrap();
+                let advanced_at = tokio::time::Instant::now();
+
+                // Two thirds of the way through the stall window, so renewing
+                // on this frame would push the close out to 1⅔ intervals.
+                tokio::time::sleep(CATCHUP_STALL * 2 / 3).await;
+                ws.send(Message::Text(
+                    r#"{"type":"Metadata","duration":0.0}"#.into(),
+                ))
+                .await
+                .unwrap();
+
+                if !wait_for_text(&mut ws, "CloseStream").await {
+                    return;
+                }
+                *recorded.lock().expect("timing") = advanced_at.elapsed();
+                ws.send(Message::Text(
+                    results_with_span("Weather today.", true, 1.0, 2.0).into(),
+                ))
+                .await
+                .unwrap();
+                let _ = ws
+                    .send(Message::Text(
+                        r#"{"type":"Metadata","duration":3.0}"#.into(),
+                    ))
+                    .await;
+            },
+            3,
+        )
+        .await;
+
+        let waited = *closed_after.lock().expect("timing");
+        assert_eq!(
+            outcome,
+            Some(TranscriptEvent::Final(
+                "Extraordinary. Weather today.".into()
+            )),
+            "closing on the stall must still collect the flush"
+        );
+        assert!(
+            waited < CATCHUP_STALL + CATCHUP_STALL / 3,
+            "the stall must run from the last frame that advanced coverage, not from the \
+             Metadata that carried none; CloseStream came {waited:?} after it"
         );
     }
 }
