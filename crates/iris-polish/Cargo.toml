@@ -1,0 +1,56 @@
+[package]
+name = "iris-polish"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Text-cleanup engine for Iris: turns a raw speech-to-text transcript into clean, insertable prose."
+license = "MIT"
+repository = "https://github.com/omarovski-27/iris"
+readme = "README.md"
+keywords = ["dictation", "transcript", "speech-to-text", "punctuation"]
+categories = ["text-processing"]
+
+[features]
+default = ["llm"]
+# The LLM quality path. Disabling it leaves a fully dependency-free crate
+# with `RulePolisher` + `MockPolisher` only (no HTTP, no TLS).
+llm = ["dep:reqwest", "dep:rustls", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["time", "rt"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+# `rustls-no-provider` keeps us off aws-lc-rs (which needs cmake/NASM and does
+# not cross-compile cleanly to x86_64-pc-windows-gnu). We install the pure-Rust
+# `ring` provider ourselves; see `llm::install_crypto_provider`.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "http2",
+    "json",
+    "charset",
+], optional = true }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "time",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+] }
+
+[[example]]
+name = "polish"
+required-features = []

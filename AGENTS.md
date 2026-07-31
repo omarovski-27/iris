@@ -19,6 +19,13 @@ portable and `#[cfg(windows)]`-free, so tests and the latency harness run
 natively on Linux. Keep it that way — it is what makes the project CI-testable
 at all.
 
+## iris-polish layout
+
+- `crates/iris-polish/` is a **standalone** crate (own `Cargo.toml` / `Cargo.lock`). It is not yet a workspace member — build and test with `cargo test` / `cargo build` **inside** that directory.
+- Cross-check Windows: `cargo build --target x86_64-pc-windows-gnu` from `crates/iris-polish/`.
+- LLM path uses pure-Rust `ring` TLS (not aws-lc-rs) so `x86_64-pc-windows-gnu` cross-compiles cleanly. See crate `Cargo.toml` comments and `crates/iris-polish/README.md`.
+- Parallel workers may own other crates and the workspace root; do not restructure the monorepo from a polish-only task.
+
 ## Never run text injection unattended
 
 **Do not execute the text-injection path as a test, in CI, or in a loop.**
