@@ -239,6 +239,9 @@ mod hook {
     static TARGET_VK: AtomicU32 = AtomicU32::new(0);
     static SUPPRESS: AtomicBool = AtomicBool::new(true);
     static HELD: AtomicBool = AtomicBool::new(false);
+    /// Whether a hook is running *now*, as opposed to `SENDER`, which is a
+    /// `OnceLock` and stays set for process life once `listen` succeeds.
+    static ALIVE: AtomicBool = AtomicBool::new(false);
 
     /// A running hook. Dropping it stops the hook thread and unhooks.
     pub struct Listener {
@@ -252,6 +255,9 @@ mod hook {
         }
 
         fn shutdown(&mut self) {
+            // Before anything else, so a deliberate stop stops vouching for
+            // `HELD` immediately rather than after the thread has joined.
+            ALIVE.store(false, Ordering::Relaxed);
             if let Some(handle) = self.handle.take() {
                 // WM_QUIT breaks GetMessageW, and the thread unhooks on its way
                 // out.
@@ -322,6 +328,7 @@ mod hook {
                  running at a lower integrity level than the foreground window; try running from \
                  a normal (non-elevated) console, or elevate Iris to match.",
             )?;
+        ALIVE.store(true, Ordering::Relaxed);
 
         Ok((
             Listener {
@@ -356,8 +363,7 @@ mod hook {
         HELD.load(Ordering::Relaxed)
     }
 
-    /// Whether a hook has ever been installed via [`listen`] in this
-    /// process.
+    /// Whether a hook installed by [`listen`] is running right now.
     ///
     /// [`is_held`] defaults to `false` before `listen` runs, which is
     /// indistinguishable from "a hook is running and genuinely reports the
@@ -369,8 +375,22 @@ mod hook {
     /// exactly the unsound single-signal check this design exists to avoid.
     /// Callers must check this first and skip correction entirely when it is
     /// `false`, rather than trust `is_held`'s default.
+    ///
+    /// `HELD` stops being driven by real key transitions the moment the hook
+    /// goes away, so "was a hook ever installed" is the wrong question: it
+    /// would keep vouching for a frozen value. Reading a dedicated flag that
+    /// [`Listener::shutdown`] clears covers the case Iris controls — a
+    /// deliberate stop, including the implicit one when a `Listener` is
+    /// dropped.
+    ///
+    /// **Accepted residual gap:** it does not cover Windows silently
+    /// uninstalling the hook for exceeding `LowLevelHooksTimeout` (see the
+    /// module docs). Windows offers no notification or query for that, so
+    /// there is nothing to observe; this flag would still read `true` while
+    /// `HELD` sat frozen. Recorded here rather than approximated with a
+    /// heartbeat that would only appear to detect it.
     pub fn is_listening() -> bool {
-        SENDER.get().is_some()
+        ALIVE.load(Ordering::Relaxed)
     }
 
     /// Runs on the hook thread for every keystroke in the system. Must be fast:

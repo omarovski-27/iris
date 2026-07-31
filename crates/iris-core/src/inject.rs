@@ -233,10 +233,14 @@ mod win {
         }
         // The hotkey reads down: give the hook thread SETTLE to catch up
         // before trusting that against `is_held` (see SETTLE's docs), then
-        // take fresh readings of both.
+        // take fresh readings of both — the async key state first, so a
+        // repress that begins after it reads `false` cannot fire a
+        // correction, and one that began before it has the whole
+        // `is_held` call's worth of extra time to reach `HELD`.
         std::thread::sleep(SETTLE);
+        let down = is_down();
         let held = crate::hotkey::is_held();
-        let Some(hotkey) = super::modifier_to_release(hotkey, is_down(), held) else {
+        let Some(hotkey) = super::modifier_to_release(hotkey, down, held) else {
             return Ok(());
         };
         // The root cause is unreproducible off the user's desk, so the code
@@ -291,8 +295,13 @@ mod win {
     /// the previous clipboard contents are lost. Restoring them requires waiting
     /// for the target app to finish pasting, which is unbounded.
     fn paste(text: &str, hotkey: Key) -> Result<()> {
-        release_hotkey_if_stuck(hotkey)?;
         set_clipboard(text)?;
+        // After the clipboard work, not before it: `set_clipboard` can block
+        // on another application holding the clipboard, and any gap between
+        // checking the hotkey and sending the burst is a window for the
+        // hotkey to change state again. This mirrors `send_keystrokes`,
+        // where the correction already immediately precedes its burst.
+        release_hotkey_if_stuck(hotkey)?;
 
         let inputs = [
             key_event(VK_CONTROL, 0, KEYBD_EVENT_FLAGS(0)),
