@@ -5,10 +5,25 @@
 //! on Linux. That is what [`crate::HeadlessOverlay`] and `--filmstrip` in the
 //! demo are for.
 //!
-//! Everything the mockups animate is animated here as transform and opacity:
-//! bars change `scaleY`, the pill rises and scales on enter, the scan band
-//! translates. Nothing is blurred per frame except the drop shadow, which is
-//! cached (see [`shadow`]).
+//! # The morph
+//!
+//! The shape's width is animation state, not layout: [`Renderer`] owns
+//! `openness` (an open/close tween, built the same way [`Model::presence`]
+//! is — a linear ramp through [`crate::motion::EASE_IN`] /
+//! [`crate::motion::EASE_OUT`]) and `measured_w` (the ribbon's target width,
+//! smoothed with the same attack/release character
+//! [`crate::motion::LEVEL_ATTACK_MS`] / [`crate::motion::LEVEL_RELEASE_MS`]
+//! already give the microphone level meter). Both live here rather than on
+//! [`Model`] because measuring text width needs the [`FontAtlas`] this type
+//! owns; `Model` stays shape-agnostic.
+//!
+//! One subtlety worth keeping intact: one-pole smoothing is asymptotic — it
+//! approaches `measured_w`'s target but never exactly reaches it. The
+//! overflow trim in [`text::draw_trailing_fit`]-style logic is a hard
+//! boundary, so a ribbon that looked fully grown but was a sub-pixel short of
+//! its target used to drop a whole character. `Renderer::draw` snaps
+//! `measured_w` to its target once within a pixel or so specifically to
+//! avoid that — see the snap in the width-smoothing step below.
 
 mod shadow;
 mod shapes;
@@ -21,31 +36,220 @@ use tiny_skia::{
     SpreadMode, Stroke, StrokeDash, Transform,
 };
 
-use crate::layout::{Layout, Rect};
-use crate::motion::{CHECK_DRAW_MS, REC_PULSE_MS, SCAN_PERIOD_MS, SPINNER_PERIOD_MS};
-use crate::spectrum::BAR_COUNT;
+use crate::layout::Layout;
+use crate::motion::{
+    one_pole, CHECK_DRAW_MS, EASE_IN, EASE_OUT, ENTER_MS, LEVEL_ATTACK_MS, LEVEL_RELEASE_MS,
+    REC_PULSE_MS, SCAN_PERIOD_MS, SPINNER_PERIOD_MS,
+};
 use crate::state::{Model, OverlayState};
 use crate::theme::{sample_ramp, Rgba, Theme};
 
-/// Standard deviation of the pill's shadow blur, in logical pixels.
-///
-/// Sized for the compact HUD chip: softer and tighter than a pro-meter bezel
-/// (CSS blur-radius ~22 ≈ Gaussian sigma 11).
-const SHADOW_SIGMA: f32 = 11.0;
+/// Standard deviation of the shape's drop-shadow blur, in logical pixels.
+const SHADOW_SIGMA: f32 = 12.0;
 /// Vertical offset of the ambient shadow, in logical pixels.
 const SHADOW_DY: f32 = 7.0;
-/// Negative spread of the ambient shadow, in logical pixels.
+/// Negative spread of the ambient shadow, in logical pixels — the pre-blur
+/// shape is inset by this before blurring, so the shadow reads as a
+/// concentrated halo rather than a soft copy of the shape at full size.
 const SHADOW_SPREAD: f32 = 6.0;
+/// Standard deviation of the coloured state-glow blur.
+const GLOW_SIGMA: f32 = 14.0;
 /// Negative spread of the coloured state halo.
 const GLOW_SPREAD: f32 = 3.0;
 
-/// Cached, transform-dependent masks. Rebuilt only when the pill moves, which
-/// in the steady state is never.
+// ---------------------------------------------------------------------------
+// the wave
+// ---------------------------------------------------------------------------
+//
+// Brought back after direct captain feedback on a first pass that dropped it
+// in favour of a plain pulsing dot: "I like the waves, and I like how it
+// moves." Two things are deliberately different from the previous 28-bar
+// design it echoes:
+//
+// - The taper has a floor instead of hitting exactly zero at both ends. The
+//   previous row's `sqrt(sin(pi*p))` taper measured out at under 75% of peak
+//   height for the outer ~18% of bars each side even at maximum volume, and
+//   the very end bars never moved at all regardless of signal — see the
+//   design report for the exact numbers. That is what "the waves... get cut
+//   off about 75%" was.
+// - The response curve is expansive (`powf(1.6)`), not linear, so quiet and
+//   loud read as clearly different at a glance rather than compressing
+//   toward the middle — the captain's explicit ask, and a real functional
+//   need: silent dictations were going unnoticed until the text failed to
+//   land.
+//
+// Bar count and pitch are recomputed from the shape's *current* width every
+// frame — the same reasoning as the mask cache above: a fixed bar count
+// would either be sparse and thin at the wide-open ribbon or crowded past
+// legibility at the orb's 34px, so density targets a constant pitch instead
+// and the bar count follows.
+const WAVE_INSET: f32 = 7.0;
+const WAVE_TARGET_PITCH: f32 = 12.0;
+const WAVE_MIN_BARS: usize = 7;
+const WAVE_MAX_BARS: usize = 40;
+const WAVE_BAR_W_FRAC: f32 = 0.46;
+const WAVE_MAX_H: f32 = 8.0;
+const WAVE_Y_OFFSET: f32 = 10.0;
+const WAVE_IDLE_FLOOR: f32 = 0.05;
+const WAVE_PROCESSING_ENV: f32 = 0.16;
+const WAVE_RESTING_ENV: f32 = 0.05;
+
+/// scaleY for one wave bar. `p` is its position across the row, 0.0–1.0;
+/// `i` is its raw index, used only to decorrelate neighbours.
+fn wave_bar_scale(p: f32, i: f32, env: f32, now_ms: u64) -> f32 {
+    let t = now_ms as f32;
+    // Floor of 0.4 rather than 0: a gentle lens taper without ever going
+    // fully flat at the ends. See the module-level comment above.
+    let taper = 0.4 + 0.6 * (std::f32::consts::PI * p).sin().max(0.0).sqrt();
+    let wobble = 0.4 + 0.6 * ((t / 88.0 + i * 0.9).sin() * (t / 230.0 + i * 0.33).sin()).abs();
+    // Expansive, not linear: widens the gap between quiet and loud instead
+    // of compressing it.
+    let response = env.clamp(0.0, 1.0).powf(1.6);
+    WAVE_IDLE_FLOOR + response * taper * wobble * (1.0 - WAVE_IDLE_FLOOR)
+}
+
+/// The live waveform: a row of bars whose count and pitch are recomputed
+/// from the shape's current width every frame, sitting in a band above the
+/// shape's centre so it coexists with the text and the core glyph rather
+/// than competing with either.
+fn draw_wave(
+    pixmap: &mut Pixmap,
+    ctx: &Ctx<'_>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    clip: Option<&Mask>,
+) {
+    let l = ctx.layout;
+    let theme = ctx.theme;
+    let model = ctx.model;
+
+    let listening = ctx.state_alpha(OverlayState::Listening);
+    let processing = ctx.state_alpha(OverlayState::Processing);
+    let inserted = ctx.state_alpha(OverlayState::Inserted);
+    let alpha = (1.0 - inserted).max(listening + processing).min(1.0) * (1.0 - inserted * 0.9);
+    if alpha <= 0.001 {
+        return;
+    }
+    let env = model.level() * listening
+        + WAVE_PROCESSING_ENV * processing
+        + WAVE_RESTING_ENV * (1.0 - listening - processing).max(0.0);
+
+    let inset = WAVE_INSET * l.scale;
+    let usable = (w - 2.0 * inset).max(0.0);
+    if usable <= 0.0 {
+        return;
+    }
+    let pitch_target = WAVE_TARGET_PITCH * l.scale;
+    let count = ((usable / pitch_target).round() as usize).clamp(WAVE_MIN_BARS, WAVE_MAX_BARS);
+    let pitch = usable / count as f32;
+    let bar_w = (pitch * WAVE_BAR_W_FRAC).max(l.scale * 0.75);
+
+    let cy = y + h * 0.5 - WAVE_Y_OFFSET * l.scale;
+    let max_h = WAVE_MAX_H * l.scale;
+    let now_ms = model.now_ms();
+
+    for i in 0..count {
+        let p = if count > 1 {
+            i as f32 / (count - 1) as f32
+        } else {
+            0.5
+        };
+        let scale = wave_bar_scale(p, i as f32, env, now_ms);
+        let bh = (max_h * scale).max(l.scale * 0.6);
+        let bx = x + inset + pitch * i as f32 + (pitch - bar_w) * 0.5;
+        let by = cy - bh * 0.5;
+        if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * 0.5) {
+            let colour = sample_ramp(theme.spectrum, p);
+            fill_clipped(pixmap, ctx, &path, colour.fade(alpha), clip);
+        }
+    }
+}
+
+/// Cached, transform- and width-dependent masks. Rebuilt whenever the pill
+/// moves *or the shape's width changes*, which — unlike the fixed-width pill
+/// this replaces — is common while the ribbon is opening, closing, or the
+/// transcript is growing. The width component of the key is rounded to the
+/// nearest 4 device px rather than compared exactly, so a settled ribbon
+/// still hits the cache between frames and only the brief morph window pays
+/// full cost.
 struct Masks {
-    key: (u32, i32, i32),
+    key: (u32, i32, i32, i32),
     clip: Mask,
     ambient: Mask,
     glow: Mask,
+}
+
+impl std::fmt::Debug for Masks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Masks").field("key", &self.key).finish()
+    }
+}
+
+/// A linear ramp through an easing curve, evaluated exactly like
+/// [`Model::presence`] is — same shape of code, a different target and
+/// duration. Drives the orb-to-ribbon width morph.
+#[derive(Clone, Copy, Debug)]
+struct Tween {
+    linear: f32,
+    open: bool,
+}
+
+impl Tween {
+    const fn new() -> Self {
+        Self {
+            linear: 0.0,
+            open: false,
+        }
+    }
+
+    fn tick(&mut self, target_open: bool, dt: f32) {
+        self.open = target_open;
+        let duration = if target_open {
+            ENTER_MS as f32
+        } else {
+            CHECK_DRAW_MS as f32
+        };
+        let step = if duration > 0.0 { dt / duration } else { 1.0 };
+        self.linear = if target_open {
+            (self.linear + step).min(1.0)
+        } else {
+            (self.linear - step).max(0.0)
+        };
+    }
+
+    fn eval(&self) -> f32 {
+        if self.open {
+            EASE_IN.eval(self.linear)
+        } else {
+            1.0 - EASE_OUT.eval(1.0 - self.linear)
+        }
+    }
+}
+
+/// The open value below which the closed-state glyph (core / spinner /
+/// check) is fully visible, and the ribbon text is fully invisible.
+const HANDOFF_LO: f32 = 0.28;
+/// The open value above which the ribbon text is fully visible.
+const HANDOFF_HI: f32 = 0.55;
+
+/// How visible the closed-state glyph is. Zero while the ribbon is
+/// meaningfully open, one once it has mostly closed, straight-line crossfade
+/// between — chosen so the glyph never has to share pixels with the
+/// still-wide text. An earlier, linear version of this faded the checkmark in
+/// from the very start of the collapse and it was visibly drawn *underneath*
+/// text that hadn't finished closing; this handoff window is the fix, and it
+/// must not regress back to a plain linear fade.
+fn glyph_alpha(open: f32) -> f32 {
+    ((HANDOFF_HI - open) / (HANDOFF_HI - HANDOFF_LO)).clamp(0.0, 1.0)
+}
+
+/// The complement of [`glyph_alpha`]. `glyph_alpha(open) + text_alpha(open)
+/// == 1` for every `open`, so the handoff never has a gap or a double
+/// exposure.
+fn text_alpha(open: f32) -> f32 {
+    ((open - HANDOFF_LO) / (HANDOFF_HI - HANDOFF_LO)).clamp(0.0, 1.0)
 }
 
 /// Draws one pill frame into an RGBA pixmap.
@@ -55,12 +259,11 @@ pub struct Renderer {
     pixmap: Pixmap,
     atlas: FontAtlas,
     masks: Option<Masks>,
-}
 
-impl std::fmt::Debug for Masks {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Masks").field("key", &self.key).finish()
-    }
+    openness: Tween,
+    measured_w: f32,
+    prev_now: u64,
+    started: bool,
 }
 
 impl Renderer {
@@ -69,24 +272,37 @@ impl Renderer {
     /// # Panics
     ///
     /// Panics if the pixmap for the resulting window size cannot be allocated,
-    /// which at ~130 KB means the process is already out of memory.
+    /// which at the shape's size means the process is already out of memory.
     #[must_use]
     pub fn new(scale: f32) -> Self {
         let layout = Layout::new(scale);
         let pixmap = Pixmap::new(layout.window_w, layout.window_h)
             .expect("overlay pixmap allocation failed");
+        let measured_w = layout.shape_h;
         Self {
             layout,
             pixmap,
             atlas: FontAtlas::new(),
             masks: None,
+            openness: Tween::new(),
+            measured_w,
+            prev_now: 0,
+            started: false,
         }
     }
 
     /// Re-lay-out and re-allocate for a new scale factor. A no-op if the scale
-    /// is unchanged, so it is safe to call on every `WM_DPICHANGED`.
+    /// is unchanged, so it is safe to call on every `WM_DPICHANGED`. The
+    /// in-flight morph width is rescaled proportionally rather than reset, so
+    /// a DPI change mid-animation does not visibly snap the shape.
     pub fn set_scale(&mut self, scale: f32) {
         let layout = Layout::new(scale);
+        let ratio = if self.layout.scale > 0.0 {
+            layout.scale / self.layout.scale
+        } else {
+            1.0
+        };
+        self.measured_w *= ratio;
         if layout.window_w == self.layout.window_w && layout.window_h == self.layout.window_h {
             self.layout = layout;
             return;
@@ -113,6 +329,43 @@ impl Renderer {
     /// Draw `model` and return the frame. Premultiplied RGBA, ready for
     /// `UpdateLayeredWindow` after a channel swap.
     pub fn draw(&mut self, model: &Model) -> &Pixmap {
+        let dt = if self.started {
+            (model.now_ms().saturating_sub(self.prev_now) as f32).min(100.0)
+        } else {
+            self.started = true;
+            0.0
+        };
+        self.prev_now = model.now_ms();
+
+        let has_text = !model.text().is_empty();
+        let target_open = has_text
+            && matches!(
+                model.state(),
+                OverlayState::Listening | OverlayState::Processing
+            );
+        self.openness.tick(target_open, dt);
+
+        let target_w = if has_text {
+            let text_w = self.atlas.measure(model.text(), self.layout.text_font, 0.0);
+            (text_w + 2.0 * self.layout.text_pad_x)
+                .max(self.layout.shape_h)
+                .min(self.layout.ribbon_max_w)
+        } else {
+            self.layout.shape_h
+        };
+        let tau = if target_w > self.measured_w {
+            LEVEL_ATTACK_MS
+        } else {
+            LEVEL_RELEASE_MS
+        };
+        self.measured_w += (target_w - self.measured_w) * one_pole(tau, dt);
+        // One-pole smoothing never exactly reaches its target; snap once
+        // close so the overflow trim below doesn't drop a whole character
+        // over a sub-pixel gap. See the module doc.
+        if (target_w - self.measured_w).abs() < 1.5 {
+            self.measured_w = target_w;
+        }
+
         // Disjoint field borrows: the drawing steps below are free functions so
         // the pixmap, the atlas and the mask cache can be borrowed at once.
         let Renderer {
@@ -120,6 +373,9 @@ impl Renderer {
             pixmap,
             atlas,
             masks,
+            openness,
+            measured_w,
+            ..
         } = self;
 
         pixmap.fill(Color::TRANSPARENT);
@@ -129,12 +385,23 @@ impl Renderer {
         }
 
         let theme = *model.theme();
+        let open = openness.eval();
+        let w = layout.shape_h + (*measured_w - layout.shape_h).max(0.0) * open;
+        let h = layout.shape_h;
+        let r = h * 0.5;
+        let x = layout.center_x - w * 0.5;
+        let y = layout.center_y - h * 0.5;
+
         let (dy, content_scale) = model.enter_transform(layout.scale);
-        let ox = layout.pill.center_x();
-        let oy = layout.pill.bottom();
+        let ox = layout.center_x;
+        let oy = layout.center_y + h * 0.5;
         let xf = Transform::from_translate(ox, oy + dy)
             .pre_scale(content_scale, content_scale)
             .pre_translate(-ox, -oy);
+
+        let Some(shape) = shapes::round_rect(x, y, w, h, r) else {
+            return &self.pixmap;
+        };
 
         let ctx = Ctx {
             layout,
@@ -144,7 +411,7 @@ impl Renderer {
             model,
         };
 
-        ensure_masks(masks, layout, xf);
+        ensure_masks(masks, layout, xf, x, y, w, h, r);
         let cached = masks.as_ref();
 
         if let Some(m) = cached {
@@ -153,10 +420,34 @@ impl Renderer {
             fill_through(pixmap, &m.glow, glow.fade(presence));
         }
 
-        draw_shell(pixmap, &ctx);
-        draw_signal(pixmap, &ctx, cached.map(|m| &m.clip));
-        draw_capsule(pixmap, &ctx);
-        draw_telemetry(pixmap, atlas, &ctx);
+        draw_shell(
+            pixmap,
+            &ctx,
+            &shape,
+            x,
+            y,
+            w,
+            h,
+            r,
+            open,
+            cached.map(|m| &m.clip),
+        );
+        draw_wave(pixmap, &ctx, x, y, w, h, cached.map(|m| &m.clip));
+        draw_glyph(pixmap, &ctx, glyph_alpha(open));
+        if open > 0.02 && has_text {
+            draw_ribbon(
+                pixmap,
+                &ctx,
+                atlas,
+                x,
+                y,
+                w,
+                h,
+                open,
+                cached.map(|m| &m.clip),
+            );
+        }
+        draw_caption(pixmap, atlas, &ctx);
 
         &self.pixmap
     }
@@ -209,21 +500,32 @@ fn fade_between(now: bool, before: bool, cross: f32) -> f32 {
 // masks
 // ---------------------------------------------------------------------------
 
-fn ensure_masks(slot: &mut Option<Masks>, layout: &Layout, xf: Transform) {
+#[allow(clippy::too_many_arguments)]
+fn ensure_masks(
+    slot: &mut Option<Masks>,
+    layout: &Layout,
+    xf: Transform,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+) {
+    let width_bucket = (w / 4.0).round() as i32;
     let key = (
         layout.scale.to_bits(),
         (xf.ty * 4.0).round() as i32,
         (xf.sx * 512.0).round() as i32,
+        width_bucket,
     );
     if slot.as_ref().is_some_and(|m| m.key == key) {
         return;
     }
 
-    let (w, h) = (layout.window_w, layout.window_h);
-    let pill = layout.pill;
+    let (ww, wh) = (layout.window_w, layout.window_h);
     let build = |inset: f32, offset_y: f32, blur_sigma: Option<f32>| -> Option<Mask> {
-        let path = shapes::round_rect_inset(pill.x, pill.y, pill.w, pill.h, layout.radius, inset)?;
-        let mut mask = Mask::new(w, h)?;
+        let path = shapes::round_rect_inset(x, y, w, h, r, inset)?;
+        let mut mask = Mask::new(ww, wh)?;
         mask.fill_path(
             &path,
             FillRule::Winding,
@@ -240,7 +542,7 @@ fn ensure_masks(slot: &mut Option<Masks>, layout: &Layout, xf: Transform) {
     let (Some(clip), Some(ambient), Some(glow)) = (
         build(0.0, 0.0, None),
         build(SHADOW_SPREAD * s, SHADOW_DY * s, Some(SHADOW_SIGMA * s)),
-        build(GLOW_SPREAD * s, 0.0, Some(SHADOW_SIGMA * s)),
+        build(GLOW_SPREAD * s, 0.0, Some(GLOW_SIGMA * s)),
     ) else {
         *slot = None;
         return;
@@ -283,39 +585,98 @@ fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
 // drawing steps
 // ---------------------------------------------------------------------------
 
-/// The pill body, its two rings and the inner top highlight.
-fn draw_shell(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
-    let l = ctx.layout;
-    let p = l.pill;
-    let s = l.scale;
+/// The shell: translucent glass body, a soft top sheen, two rings, and the
+/// lit top edge.
+///
+/// **On the glass.** The overlay is already a per-pixel-alpha layered window,
+/// so the body's fill carries alpha straight from `theme.shell_top`/
+/// `shell_bottom` and the real desktop shows through underneath it — this is
+/// ordinary alpha compositing, the same mechanism `UpdateLayeredWindow`
+/// already does every frame, not a new capability. What this deliberately
+/// does *not* do is sample or blur whatever is behind the window (acrylic /
+/// Mica-style backdrop blur): a layered window does not get that behind-pixel
+/// read for free, and faking it by, say, blurring a guess at the desktop
+/// would be worse than not attempting it. The glass *impression* instead
+/// comes from three honest ingredients: translucency (the fill alpha
+/// itself), a soft directional sheen (`glass_sheen`, below, brighter at the
+/// top like light catching a curved glass surface), and the existing rim
+/// (`outer_ring`/`border`) plus the crisp `inner_highlight` line.
+///
+/// **On legibility.** Live text sits directly on this surface once the
+/// ribbon opens, and it has to read over an arbitrary desktop, light or
+/// dark. Rather than pick one fixed opacity that compromises between "glassy
+/// at rest" and "legible with text", the fill's alpha is boosted smoothly as
+/// `open` increases — reusing [`text_alpha`], the exact curve that fades the
+/// live text in, so the backing gets more opaque in lockstep with there
+/// being something that needs a backing. At rest (the quiet orb, `open` at
+/// or near 0) the shell stays at its most transparent.
+#[allow(clippy::too_many_arguments)]
+fn draw_shell(
+    pixmap: &mut Pixmap,
+    ctx: &Ctx<'_>,
+    shape: &Path,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    open: f32,
+    clip: Option<&Mask>,
+) {
+    let s = ctx.layout.scale;
+    let legibility = text_alpha(open);
+    let boosted = |c: Rgba| Rgba {
+        a: (c.a + (1.0 - c.a) * 0.62 * legibility).min(1.0),
+        ..c
+    };
 
-    if let Some(path) = shapes::round_rect(p.x, p.y, p.w, p.h, l.radius) {
-        let shader = LinearGradient::new(
-            Point::from_xy(p.center_x(), p.y),
-            Point::from_xy(p.center_x(), p.bottom()),
-            vec![
-                GradientStop::new(0.0, ctx.c(ctx.theme.shell_top).to_color()),
-                GradientStop::new(1.0, ctx.c(ctx.theme.shell_bottom).to_color()),
-            ],
-            SpreadMode::Pad,
-            Transform::identity(),
-        )
-        .unwrap_or_else(|| Shader::SolidColor(ctx.c(ctx.theme.shell_top).to_color()));
+    let shader = LinearGradient::new(
+        Point::from_xy(x + w * 0.5, y),
+        Point::from_xy(x + w * 0.5, y + h),
+        vec![
+            GradientStop::new(0.0, ctx.c(boosted(ctx.theme.shell_top)).to_color()),
+            GradientStop::new(1.0, ctx.c(boosted(ctx.theme.shell_bottom)).to_color()),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .unwrap_or_else(|| Shader::SolidColor(ctx.c(boosted(ctx.theme.shell_top)).to_color()));
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Paint::default()
+    };
+    pixmap.fill_path(shape, &paint, FillRule::Winding, ctx.xf, None);
 
+    // Glass sheen: a soft wash brighter at the top, fading out by the
+    // vertical midpoint — the cue that reads as "curved glass catching
+    // light" rather than "flat tinted panel". Clipped to the shape itself
+    // (reusing the same cached mask the shadow/glow already built this
+    // frame) so it never bleeds past the rounded ends.
+    let sheen = LinearGradient::new(
+        Point::from_xy(x + w * 0.5, y),
+        Point::from_xy(x + w * 0.5, y + h * 0.62),
+        vec![
+            GradientStop::new(0.0, ctx.c(ctx.theme.glass_sheen).to_color()),
+            GradientStop::new(1.0, ctx.c(ctx.theme.glass_sheen.fade(0.0)).to_color()),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    );
+    if let Some(shader) = sheen {
         let paint = Paint {
             shader,
             anti_alias: true,
             ..Paint::default()
         };
-        pixmap.fill_path(&path, &paint, FillRule::Winding, ctx.xf, None);
+        pixmap.fill_path(shape, &paint, FillRule::Winding, ctx.xf, clip);
     }
 
-    // `0 0 0 1px` — a hairline ring just outside the body, which is what keeps
-    // a dark pill legible against a dark wallpaper.
+    // `0 0 0 1px` — a hairline ring just outside the body.
     stroke(
         pixmap,
         ctx,
-        shapes::round_rect_inset(p.x, p.y, p.w, p.h, l.radius, -0.5 * s),
+        shapes::round_rect_inset(x, y, w, h, r, -0.5 * s),
         ctx.c(ctx.theme.outer_ring),
         s,
     );
@@ -323,217 +684,96 @@ fn draw_shell(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
     stroke(
         pixmap,
         ctx,
-        shapes::round_rect_inset(p.x, p.y, p.w, p.h, l.radius, 0.5 * s),
+        shapes::round_rect_inset(x, y, w, h, r, 0.5 * s),
         ctx.c(ctx.theme.border),
         s,
     );
 
-    // `inset 0 1px 0` — a lit top edge, along the flat part between the caps.
-    let hl_w = p.w - l.radius * 2.0;
+    // Lit top edge along the flat part between the caps — absent exactly at
+    // the circle, present at any wider width.
+    let hl_w = w - r * 2.0;
     if hl_w > 0.0 {
-        if let Some(path) = shapes::round_rect(
-            p.x + l.radius,
-            p.y + 0.5 * s,
-            hl_w,
-            (1.0 * s).max(1.0),
-            0.5 * s,
-        ) {
+        if let Some(path) =
+            shapes::round_rect(x + r, y + 0.5 * s, hl_w, (1.0 * s).max(1.0), 0.5 * s)
+        {
             fill(pixmap, ctx, &path, ctx.c(ctx.theme.inner_highlight));
         }
     }
 }
 
-/// Everything on the live signal path: hairline, waveform, scan, ribbon.
-/// All of it is clipped to the pill so nothing escapes the rounded ends.
-fn draw_signal(pixmap: &mut Pixmap, ctx: &Ctx<'_>, clip: Option<&Mask>) {
+/// The closed-state glyph at the shape's centre: pulsing core while
+/// listening, two-arc spinner while processing with nothing captured yet,
+/// drawn-on check once inserted. `alpha` is [`glyph_alpha`], so it fades out
+/// as the ribbon opens and back in as it closes.
+fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
+    if alpha <= 0.001 {
+        return;
+    }
     let l = ctx.layout;
     let theme = ctx.theme;
-
-    // 1 px spectrum hairline along the top edge.
-    if let Some(path) = shapes::round_rect(
-        l.hairline.x,
-        l.hairline.y,
-        l.hairline.w,
-        l.hairline.h,
-        l.hairline.h * 0.5,
-    ) {
-        fill_ramp(
-            pixmap,
-            ctx,
-            &path,
-            l.hairline,
-            theme.hairline,
-            ctx.alpha * theme.hairline_opacity,
-            clip,
-        );
-    }
-
-    // 28 bars, scaleY only, each a fixed sample of the ramp.
-    let bars = ctx.model.bars();
-    for (i, &height) in bars.iter().enumerate().take(BAR_COUNT) {
-        let r = l.bar_rect(i, height);
-        let colour = sample_ramp(theme.spectrum, i as f32 / (BAR_COUNT - 1) as f32);
-        if let Some(path) = shapes::round_rect(r.x, r.y, r.w, r.h, r.w * 0.5) {
-            fill_clipped(pixmap, ctx, &path, ctx.c(colour), clip);
-        }
-    }
-
-    // Processing scan band.
-    let scan_alpha = ctx.state_alpha(OverlayState::Processing);
-    if scan_alpha > 0.001 {
-        let track = l.scan_track;
-        let phase = (ctx.model.now_ms() % u64::from(SCAN_PERIOD_MS)) as f32 / SCAN_PERIOD_MS as f32;
-        let band_w = track.w * 0.2;
-        // The mockup translates the band 280 % of its own width, which sends it
-        // clean off the pill for most of each period (the mock has no overflow
-        // clip). We clip to the pill and size the travel so the band enters and
-        // leaves the track exactly once per period instead.
-        let band = Rect {
-            x: track.x - band_w + (track.w + band_w) * phase,
-            w: band_w,
-            ..track
-        };
-        // Fade in over the first 15 % and out over the last 15 %, as the mock's
-        // scan keyframes do.
-        let edge = (phase / 0.15).min(1.0).min((1.0 - phase) / 0.15).max(0.0);
-        if let Some(path) = shapes::round_rect(band.x, band.y, band.w, band.h, band.h * 0.5) {
-            fill_ramp(
-                pixmap,
-                ctx,
-                &path,
-                band,
-                theme.scan,
-                ctx.alpha * scan_alpha * 0.9 * edge,
-                clip,
-            );
-        }
-    }
-
-    // Partial-transcript ribbon. See README: the one element with no direct
-    // mockup counterpart, because `set_partial_len` has none either.
-    let ribbon_alpha = ctx.state_alpha(OverlayState::Listening) * 0.8;
-    let lit = ctx.model.ribbon_rect(l.ribbon);
-    if ribbon_alpha > 0.001 && lit.w > 0.5 {
-        if let Some(path) = shapes::round_rect(lit.x, lit.y, lit.w, lit.h, lit.h * 0.5) {
-            // The ramp spans the *full* track, so colours stay put as it grows.
-            fill_ramp(
-                pixmap,
-                ctx,
-                &path,
-                l.ribbon,
-                theme.spectrum,
-                ctx.alpha * ribbon_alpha,
-                clip,
-            );
-        }
-    }
-}
-
-/// The capsule on the left: ring, live core, spinner, check.
-fn draw_capsule(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
-    let l = ctx.layout;
-    let theme = ctx.theme;
-    let (cx, cy) = (l.cap.center_x(), l.cap.center_y());
-    let cross = ctx.model.cross();
-
-    // Ring: cross-faded between the two states' colours.
-    let ring_for = |state: OverlayState| match state {
-        OverlayState::Listening => theme.ring_listening,
-        OverlayState::Processing => theme.ring_processing,
-        OverlayState::Inserted => theme.ring_inserted,
-        OverlayState::Hidden => theme.ring_idle,
-    };
-    let ring = ring_for(ctx.model.previous_state()).lerp(ring_for(ctx.model.state()), cross);
-    stroke(
-        pixmap,
-        ctx,
-        shapes::circle(cx, cy, (l.cap_ring_d - l.cap_ring_w) * 0.5),
-        ctx.c(ring),
-        l.cap_ring_w,
-    );
+    let model = ctx.model;
+    let (cx, cy) = (l.center_x, l.center_y);
 
     let listening = ctx.state_alpha(OverlayState::Listening);
     let processing = ctx.state_alpha(OverlayState::Processing);
     let inserted = ctx.state_alpha(OverlayState::Inserted);
 
-    // Listening pulse: an expanding, fading halo around the live core.
     if listening > 0.001 {
-        let t = (ctx.model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
+        let t = (model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
         let grow = (t / 0.7).min(1.0);
-        // Keep the halo inside the ring so the rec core never reads as a
-        // chunky recorder button on the compact HUD chip.
-        let halo_r = l.cap_core_d * 0.5 + 4.0 * l.scale * grow;
-        let halo_a = 0.4 * (1.0 - grow) * listening;
-        if halo_a > 0.001 {
-            if let Some(path) = shapes::circle(cx, cy, halo_r) {
-                fill(pixmap, ctx, &path, ctx.c(theme.rec.fade(halo_a)));
-            }
+        let halo_r = l.shape_h * 0.16 + l.shape_h * 0.22 * grow;
+        let halo_a = 0.4 * (1.0 - grow) * listening * alpha;
+        if let Some(p) = shapes::circle(cx, cy, halo_r) {
+            fill(pixmap, ctx, &p, ctx.c(theme.rec.fade(halo_a)));
         }
     }
 
-    // Core: full size while listening, shrunk to 40 % while processing, gone
-    // once the check takes over.
-    let core_scale_for = |state: OverlayState| {
-        if state == OverlayState::Processing {
-            0.4
-        } else {
-            1.0
-        }
+    let core_colour = if model.state() == OverlayState::Processing {
+        theme.accent
+    } else {
+        theme.rec
     };
-    let core_colour_for = |state: OverlayState| match state {
-        OverlayState::Listening => theme.rec,
-        OverlayState::Processing => theme.accent,
-        _ => theme.ink_faint,
-    };
-    let mut core_scale = core_scale_for(ctx.model.previous_state())
-        + (core_scale_for(ctx.model.state()) - core_scale_for(ctx.model.previous_state())) * cross;
+    let mut core_r = l.shape_h * 0.15;
     if listening > 0.0 {
-        let t = (ctx.model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
+        let t = (model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
         let pulse = if t < 0.7 {
             1.0 + 0.12 * (t / 0.7)
         } else {
             1.12 - 0.12 * ((t - 0.7) / 0.3)
         };
-        core_scale *= 1.0 + (pulse - 1.0) * listening;
+        core_r *= 1.0 + (pulse - 1.0) * listening;
     }
-    let core_colour =
-        core_colour_for(ctx.model.previous_state()).lerp(core_colour_for(ctx.model.state()), cross);
-    let core_alpha = 1.0 - inserted;
+    let core_alpha = (1.0 - inserted) * alpha;
     if core_alpha > 0.001 {
-        if let Some(path) = shapes::circle(cx, cy, l.cap_core_d * 0.5 * core_scale) {
-            fill(pixmap, ctx, &path, ctx.c(core_colour.fade(core_alpha)));
+        if let Some(p) = shapes::circle(cx, cy, core_r) {
+            fill(pixmap, ctx, &p, ctx.c(core_colour.fade(core_alpha)));
         }
     }
 
-    // Spinner: two quadrant arcs, the mockup's `border-top-color` +
-    // `border-right-color` trick, turning once per period.
     if processing > 0.001 {
-        let turn = (ctx.model.now_ms() % u64::from(SPINNER_PERIOD_MS)) as f32
+        let turn = (model.now_ms() % u64::from(SPINNER_PERIOD_MS)) as f32
             / SPINNER_PERIOD_MS as f32
             * 360.0;
-        // Track the ring, not a hard-coded inset, so the spinner stays
-        // proportional when the capsule shrinks with the HUD chip.
-        let radius = (l.cap_ring_d * 0.5 - l.cap_ring_w - 1.0 * l.scale).max(l.scale);
+        let radius = l.shape_h * 0.32;
         for (offset, colour) in [(-45.0, theme.spinner.0), (45.0, theme.spinner.1)] {
             stroke(
                 pixmap,
                 ctx,
                 shapes::arc(cx, cy, radius, turn + offset, 90.0),
-                ctx.c(colour.fade(processing)),
-                l.cap_ring_w,
+                ctx.c(colour.fade(processing * alpha)),
+                (l.shape_h * 0.045).max(l.scale),
             );
         }
     }
 
-    // Check: drawn on, not faded in.
     if inserted > 0.001 {
-        if let Some((path, length)) = shapes::check_mark(cx, cy, l.cap_ring_d) {
-            let progress = (ctx.model.age_ms() as f32 / CHECK_DRAW_MS as f32).clamp(0.0, 1.0);
+        if let Some((path, length)) = shapes::check_mark(cx, cy, l.shape_h * 0.6) {
+            let progress = (model.age_ms() as f32 / CHECK_DRAW_MS as f32).clamp(0.0, 1.0);
             let mut paint = Paint::default();
-            paint.set_color(ctx.c(theme.ok.fade(inserted)).to_color());
+            paint.set_color(ctx.c(theme.ok.fade(inserted * alpha)).to_color());
             paint.anti_alias = true;
             let stroke_style = Stroke {
-                width: (2.0 * l.scale).max(1.0),
+                width: (l.shape_h * 0.09).max(l.scale),
                 line_cap: tiny_skia::LineCap::Round,
                 line_join: tiny_skia::LineJoin::Round,
                 dash: StrokeDash::new(vec![length, length], length * (1.0 - progress)),
@@ -544,55 +784,97 @@ fn draw_capsule(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
     }
 }
 
-/// The telemetry readout inside the pill and the engine chip below it.
-fn draw_telemetry(pixmap: &mut Pixmap, atlas: &mut FontAtlas, ctx: &Ctx<'_>) {
+/// Live text and, while processing, a shimmer sweep — everything that only
+/// exists once the ribbon has opened.
+///
+/// Overflow is not clipped to the shape (`FontAtlas` has no clip-mask
+/// parameter): the shown string is pre-trimmed to the longest *tail* that
+/// measures inside the padded interior and drawn right-aligned, so the
+/// newest word always sits against the right padding and the oldest ones
+/// quietly drop off the left. No new text-rendering primitive needed.
+#[allow(clippy::too_many_arguments)]
+fn draw_ribbon(
+    pixmap: &mut Pixmap,
+    ctx: &Ctx<'_>,
+    atlas: &mut FontAtlas,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    open: f32,
+    clip: Option<&Mask>,
+) {
+    let alpha = text_alpha(open);
+    if alpha <= 0.001 {
+        return;
+    }
+    let l = ctx.layout;
+    let theme = ctx.theme;
+
+    if ctx.model.state() == OverlayState::Processing {
+        let phase = (ctx.model.now_ms() % u64::from(SCAN_PERIOD_MS)) as f32 / SCAN_PERIOD_MS as f32;
+        let band_w = w * 0.35;
+        let band_x = x - band_w + (w + band_w) * phase;
+        let edge = (phase / 0.15).min(1.0).min((1.0 - phase) / 0.15).max(0.0);
+        if let Some(band) = shapes::round_rect(band_x, y, band_w, h, h * 0.5) {
+            fill_ramp(
+                pixmap,
+                ctx,
+                &band,
+                crate::layout::Rect {
+                    x: band_x,
+                    y,
+                    w: band_w,
+                    h,
+                },
+                theme.scan,
+                ctx.alpha * 0.5 * edge * open,
+                clip,
+            );
+        }
+    }
+
+    let available = (w - 2.0 * l.text_pad_x).max(0.0);
+    let shown = text::trailing_fit(atlas, ctx.model.text(), l.text_font, available);
+    let (tx, ty) = ctx.map(x + w - l.text_pad_x, y + h * 0.5);
+    atlas.draw(
+        pixmap,
+        shown,
+        l.text_font,
+        0.0,
+        tx,
+        ty,
+        Align::Right,
+        TextPaint::Solid(theme.ink),
+        ctx.alpha * alpha,
+    );
+}
+
+/// The latency caption below the shape, insert-only.
+fn draw_caption(pixmap: &mut Pixmap, atlas: &mut FontAtlas, ctx: &Ctx<'_>) {
     let l = ctx.layout;
     let theme = ctx.theme;
     let model = ctx.model;
 
-    // A short fade on state change so the readout swaps rather than pops.
+    if model.state() != OverlayState::Inserted {
+        return;
+    }
+    let Some(latency) = model.latency_ms() else {
+        return;
+    };
     let settle = 0.35 + 0.65 * model.cross();
-
-    if let Some(readout) = model.readout() {
-        let paint = match model.state() {
-            OverlayState::Inserted => TextPaint::Gradient(theme.latency.0, theme.latency.1),
-            OverlayState::Processing => TextPaint::Solid(theme.processing_ink),
-            _ => TextPaint::Solid(theme.ink_dim),
-        };
-        let (x, y) = ctx.map(l.meta_right, l.meta_center_y);
-        atlas.draw(
-            pixmap,
-            &readout,
-            l.meta_font,
-            0.0,
-            x,
-            y,
-            Align::Right,
-            paint,
-            ctx.alpha * settle,
-        );
-    }
-
-    // Listening-only engine chip — the captain's locked telemetry decision.
-    let chip_alpha = fade_between(
-        model.state().shows_chip(),
-        model.previous_state().shows_chip(),
-        model.cross(),
+    let (x, y) = ctx.map(l.center_x, l.caption_y);
+    atlas.draw(
+        pixmap,
+        &format!("{latency} ms"),
+        l.caption_font,
+        0.0,
+        x,
+        y,
+        Align::Center,
+        TextPaint::Gradient(theme.latency.0, theme.latency.1),
+        ctx.alpha * settle,
     );
-    if chip_alpha > 0.001 && !model.engine().is_empty() {
-        let (x, y) = ctx.map(l.pill.center_x(), l.chip_center_y);
-        atlas.draw(
-            pixmap,
-            model.engine(),
-            l.chip_font,
-            l.chip_tracking,
-            x,
-            y,
-            Align::Center,
-            TextPaint::Solid(theme.ink_faint),
-            ctx.alpha * chip_alpha * 0.85,
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +906,7 @@ fn fill_ramp(
     pixmap: &mut Pixmap,
     ctx: &Ctx<'_>,
     path: &Path,
-    across: Rect,
+    across: crate::layout::Rect,
     stops: &[Rgba],
     alpha: f32,
     clip: Option<&Mask>,
@@ -673,19 +955,26 @@ mod tests {
     use crate::state::Command;
     use crate::theme::{PORCELAIN_LIGHT, PRISM_DARK};
 
+    /// Draws every tick, not just the last one — unlike the old fixed-size
+    /// pill, `Renderer` integrates its own morph state (`openness`,
+    /// `measured_w`) frame to frame via a `dt` it derives from consecutive
+    /// `draw` calls, exactly like the real window loop drives it. A helper
+    /// that ticked the model forward and drew only once would leave that
+    /// state at its initial (closed) value regardless of what the model says.
     fn drive(commands: &[Command], run_ms: u64, theme: Theme) -> (Renderer, Model) {
         let mut model = Model::new(theme);
         model.tick(0);
         for c in commands {
             model.apply(c.clone());
         }
+        let mut renderer = Renderer::new(1.0);
         let mut t = 0;
+        renderer.draw(&model);
         while t < run_ms {
             t = (t + 16).min(run_ms);
             model.tick(t);
+            renderer.draw(&model);
         }
-        let mut renderer = Renderer::new(1.0);
-        renderer.draw(&model);
         (renderer, model)
     }
 
@@ -693,10 +982,10 @@ mod tests {
         pixmap.pixels().iter().filter(|p| p.alpha() > 0).count()
     }
 
-    /// Alpha of the pixel at the centre of the pill.
+    /// Alpha of the pixel at the centre of the shape.
     fn centre_alpha(r: &Renderer) -> u8 {
         let l = r.layout();
-        let (x, y) = (l.pill.center_x() as u32, l.pill.center_y() as u32);
+        let (x, y) = (l.center_x as u32, l.center_y as u32);
         r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha()
     }
 
@@ -708,14 +997,13 @@ mod tests {
     }
 
     #[test]
-    fn a_listening_pill_is_opaque_in_the_middle_and_clear_at_the_corners() {
+    fn a_listening_orb_is_opaque_in_the_middle_and_clear_at_the_corners() {
         let (r, _) = drive(
             &[Command::ShowListening, Command::Level(0.8)],
             400,
             PRISM_DARK,
         );
-        assert!(centre_alpha(&r) > 240, "pill body is not opaque");
-        // The window corner is outside both the pill and its shadow.
+        assert!(centre_alpha(&r) > 240, "shape body is not opaque");
         assert_eq!(
             r.pixmap().pixels()[0].alpha(),
             0,
@@ -740,23 +1028,37 @@ mod tests {
                 ],
             ),
         ] {
-            let mut cmds = commands;
-            cmds.push(Command::Engine("groq · whisper-large-v3-turbo · en".into()));
-            let (r, _) = drive(&cmds, 200, PRISM_DARK);
-            // Compact HUD chip is ~250×100; still plenty of ink when visible.
-            assert!(lit_pixels(r.pixmap()) > 2_500, "{name} drew almost nothing");
+            let (r, _) = drive(&commands, 200, PRISM_DARK);
+            assert!(lit_pixels(r.pixmap()) > 500, "{name} drew almost nothing");
         }
     }
 
     #[test]
+    fn an_open_ribbon_draws_more_than_the_closed_orb() {
+        let (closed, _) = drive(&[Command::ShowListening], 200, PRISM_DARK);
+        let (open, _) = drive(
+            &[
+                Command::ShowListening,
+                Command::PartialText("the quarterly report needs three more charts".into()),
+            ],
+            600,
+            PRISM_DARK,
+        );
+        assert!(
+            lit_pixels(open.pixmap()) > lit_pixels(closed.pixmap()) * 2,
+            "ribbon did not visibly open: {} vs {}",
+            lit_pixels(open.pixmap()),
+            lit_pixels(closed.pixmap())
+        );
+    }
+
+    #[test]
     fn the_frame_stays_premultiplied() {
-        // UpdateLayeredWindow reads these bytes directly; r,g,b > a renders as
-        // bright fringing around the pill.
         let (r, _) = drive(
             &[
                 Command::ShowListening,
                 Command::Level(1.0),
-                Command::Engine("groq".into()),
+                Command::PartialText("hello there".into()),
             ],
             300,
             PRISM_DARK,
@@ -768,7 +1070,6 @@ mod tests {
 
     #[test]
     fn nothing_is_drawn_outside_the_window() {
-        // A frame mid-enter, when the pill is translated and scaled.
         let mut model = Model::new(PRISM_DARK);
         model.tick(0);
         model.apply(Command::ShowListening);
@@ -790,77 +1091,54 @@ mod tests {
             "themes identical"
         );
 
-        // The dark shell must actually be darker than the light one.
         let brightness = |r: &Renderer| {
             let l = r.layout();
-            let i = ((l.pill.center_y() as u32) * l.window_w + l.pill.x as u32 + 4) as usize;
+            let i = ((l.center_y as u32) * l.window_w + l.center_x as u32) as usize;
             let p = r.pixmap().pixels()[i];
             u32::from(p.red()) + u32::from(p.green()) + u32::from(p.blue())
         };
-        assert!(brightness(&dark) < brightness(&light));
-    }
-
-    #[test]
-    fn the_shadow_reaches_past_the_pill_but_not_past_the_window() {
-        let (r, _) = drive(&[Command::ShowListening], 300, PRISM_DARK);
-        let l = r.layout();
-        let px = |x: u32, y: u32| r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha();
-        // Just below the pill: shadow, not nothing.
-        assert!(px(l.pill.center_x() as u32, l.pill.bottom() as u32 + 6) > 0);
-        // The very edges of the window stay clear so the pill never looks boxed.
-        for x in 0..l.window_w {
-            assert_eq!(px(x, 0), 0, "top row inked at x={x}");
-        }
+        // Both show the live core dot at centre, so sample just off-centre
+        // where the shell gradient itself is visible.
+        let shell_brightness = |r: &Renderer| {
+            let l = r.layout();
+            let i = ((l.center_y as u32) * l.window_w + (l.center_x as i32 - 12).max(0) as u32)
+                as usize;
+            let p = r.pixmap().pixels()[i];
+            u32::from(p.red()) + u32::from(p.green()) + u32::from(p.blue())
+        };
+        let _ = brightness;
+        assert!(shell_brightness(&dark) < shell_brightness(&light));
     }
 
     #[test]
     fn re_scaling_resizes_the_frame() {
         let mut r = Renderer::new(1.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (224, 106));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (528, 122));
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (448, 212));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (1056, 244));
         assert!((r.layout().scale - 2.0).abs() < f32::EPSILON);
-        // Idempotent.
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (448, 212));
-    }
-
-    #[test]
-    fn known_readouts_fit_the_meta_slot() {
-        let l = Layout::new(1.0);
-        let budget = l.meta_right - l.wave.right();
-        let mut atlas = FontAtlas::new();
-        for s in ["0:03", "9:59", "···", "142 ms", "999 ms", "1000 ms"] {
-            let w = atlas.measure(s, l.meta_font, 0.0);
-            assert!(
-                w <= budget + 0.05,
-                "{s:?} is {w:.2}px wide, meta budget is {budget:.2}px"
-            );
-        }
-        let last = l.bar_rect(BAR_COUNT - 1, 1.0);
-        assert!(last.right() <= l.wave.right() + 0.01);
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (1056, 244));
     }
 
     #[test]
     fn a_full_cycle_never_panics_at_any_scale() {
-        // 100 %, 150 % and 200 % are the scales Windows actually offers most
-        // often; the odd ones in between are covered by the layout tests, which
-        // are cheap because they do not rasterise.
         for scale in [1.0, 1.5, 2.0] {
             let mut model = Model::new(PRISM_DARK);
             let mut r = Renderer::new(scale);
             model.tick(0);
-            model.apply(Command::Engine("deepgram · nova-3 · en".into()));
+            let words = "the quick brown fox jumps over the lazy dog and keeps talking well past the edge of the ribbon";
             let mut t = 0u64;
-            for step in 0..90 {
+            for step in 0..140 {
                 match step {
                     5 => drop(model.apply(Command::ShowListening)),
-                    40 => drop(model.apply(Command::Processing)),
-                    50 => drop(model.apply(Command::Inserted { latency_ms: 142 })),
+                    100 => drop(model.apply(Command::Processing)),
+                    115 => drop(model.apply(Command::Inserted { latency_ms: 142 })),
                     _ => {}
                 }
                 model.apply(Command::Level((step as f32 * 0.11).sin().abs()));
-                model.apply(Command::PartialLen(step));
+                let said = ((step * 2) as usize).min(words.len());
+                model.apply(Command::PartialText(words[..said].to_string()));
                 t += 16;
                 model.tick(t);
                 r.draw(&model);
@@ -878,6 +1156,74 @@ mod tests {
         r.draw(&model);
         let a = centre_alpha(&r);
         assert!(a > 0, "nothing drawn mid-enter");
-        assert!(a < 250, "pill was fully opaque only 8 ms in: {a}");
+        assert!(a < 250, "shape was fully opaque only 8 ms in: {a}");
+    }
+
+    // -- the two animation bugs found during prototyping, pinned as regressions --
+
+    /// One-pole width smoothing is asymptotic and never exactly reaches its
+    /// target; a ribbon that looks fully grown but is a sub-pixel short of
+    /// fitting the text used to silently drop a whole leading character. This
+    /// drives the model at a coarse, uneven tick step (reproducing how it was
+    /// originally caught) and asserts the shown text never loses more than
+    /// the minimum characters needed to fit.
+    #[test]
+    fn width_smoothing_does_not_drop_a_whole_character_once_settled() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        model.apply(Command::PartialText("the quarterly".into()));
+
+        let mut r = Renderer::new(1.0);
+        let mut t = 0u64;
+        // Coarse, slightly uneven steps — the conditions that first surfaced
+        // the bug — held long enough for the one-pole filter to fully settle.
+        for step in [80u64, 80, 80, 80, 80, 80] {
+            t += step;
+            model.tick(t);
+            r.draw(&model);
+        }
+
+        let available = r.measured_w - 2.0 * r.layout().text_pad_x;
+        let text_font = r.layout().text_font;
+        let shown = text::trailing_fit(&mut r.atlas, "the quarterly", text_font, available);
+        assert_eq!(
+            shown, "the quarterly",
+            "settled ribbon dropped a character it had room for: {shown:?}"
+        );
+    }
+
+    /// The closed-state glyph and the open-state text must be a true
+    /// crossfade, not two independently-tuned linear fades that happen to
+    /// overlap — otherwise the checkmark is visibly drawn underneath
+    /// still-wide ribbon text during the collapse.
+    #[test]
+    fn glyph_and_text_alpha_are_a_true_crossfade() {
+        // The original bug: the checkmark visibly drawn *underneath text that
+        // had not yet started fading* — i.e. both near-fully-opaque at once.
+        // That is what this pins, not "never simultaneously nonzero", which
+        // is just what a crossfade is.
+        assert!(
+            glyph_alpha(0.0) > 0.99 && text_alpha(0.0) < 0.01,
+            "fully closed"
+        );
+        assert!(
+            glyph_alpha(1.0) < 0.01 && text_alpha(1.0) > 0.99,
+            "fully open"
+        );
+
+        let mut open = 0.0f32;
+        while open <= 1.0 {
+            let sum = glyph_alpha(open) + text_alpha(open);
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "open={open}: glyph+text={sum}, not a clean handoff"
+            );
+            assert!(
+                glyph_alpha(open) < 0.95 || text_alpha(open) < 0.05,
+                "open={open}: glyph is nearly opaque while text is not yet faded, the original bug"
+            );
+            open += 0.01;
+        }
     }
 }

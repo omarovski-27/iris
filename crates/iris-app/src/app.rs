@@ -479,7 +479,7 @@ impl<A: AudioSource> App<A> {
                         let pill = &mut self.pill;
                         dictation.absorb_event(event, &mut |text: &str| {
                             iris_core::vlog!("~ {text}");
-                            pill.set_partial_len(text.chars().count());
+                            pill.set_partial_text(text);
                         });
                     }
                     Err(_) => {
@@ -517,7 +517,7 @@ impl<A: AudioSource> App<A> {
             let pill = &mut self.pill;
             dictation.finish(self.final_timeout, &mut |text: &str| {
                 iris_core::vlog!("~ {text}");
-                pill.set_partial_len(text.chars().count());
+                pill.set_partial_text(text);
             })?
         };
         let mut timeline = outcome.timeline;

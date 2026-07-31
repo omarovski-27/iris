@@ -187,6 +187,31 @@ impl Default for FontAtlas {
     }
 }
 
+/// The longest suffix of `text`, on a char boundary, that measures no wider
+/// than `max_w`. The overflow strategy for the live-transcript ribbon: rather
+/// than clip pixels (this atlas has no clip-mask parameter to draw through),
+/// the shown *string* is trimmed so the newest words stay against the right
+/// padding and the oldest ones drop off cleanly. `O(n^2)` in the worst case —
+/// fine for the short strings a dictation ribbon ever holds, not fine as a
+/// general-purpose primitive.
+pub(crate) fn trailing_fit<'a>(
+    atlas: &mut FontAtlas,
+    text: &'a str,
+    px: f32,
+    max_w: f32,
+) -> &'a str {
+    if atlas.measure(text, px, 0.0) <= max_w {
+        return text;
+    }
+    for (byte_idx, _) in text.char_indices() {
+        let candidate = &text[byte_idx..];
+        if atlas.measure(candidate, px, 0.0) <= max_w {
+            return candidate;
+        }
+    }
+    ""
+}
+
 /// Alpha-blend a coverage bitmap into the pixmap.
 #[allow(clippy::too_many_arguments)]
 fn blit(
@@ -515,5 +540,23 @@ mod tests {
         );
         let lit = pm.pixels().iter().filter(|p| p.alpha() > 0).count();
         assert!(lit > 200, "chip barely rendered: {lit} px");
+    }
+
+    #[test]
+    fn trailing_fit_keeps_the_newest_words_and_fits_the_budget() {
+        let mut a = atlas();
+        let long = "the quick brown fox jumps over the lazy dog";
+        let shown = trailing_fit(&mut a, long, 15.0, 60.0);
+        assert!(shown.len() < long.len());
+        assert!(long.ends_with(shown));
+        assert!(a.measure(shown, 15.0, 0.0) <= 60.0);
+    }
+
+    #[test]
+    fn trailing_fit_returns_the_whole_string_when_it_already_fits() {
+        let mut a = atlas();
+        let short = "hello";
+        let width = a.measure(short, 15.0, 0.0);
+        assert_eq!(trailing_fit(&mut a, short, 15.0, width + 5.0), short);
     }
 }

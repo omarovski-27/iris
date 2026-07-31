@@ -149,7 +149,9 @@ mod tests {
                 pill.apply(Command::Processing);
             } else {
                 pill.apply(Command::Level(((t as f32) / 90.0).sin().abs()));
-                pill.apply(Command::PartialLen((t / 20) as usize));
+                let words = "the quarterly report needs three more charts";
+                let said = ((t / 60) as usize).min(words.len());
+                pill.apply(Command::PartialText(words[..said].to_string()));
             }
             t += 16;
             pill.tick(t);

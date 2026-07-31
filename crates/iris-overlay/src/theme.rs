@@ -151,6 +151,10 @@ pub struct Theme {
     pub outer_ring: Rgba,
     /// 1 px inner highlight along the top edge (`inset 0 1px 0` in CSS).
     pub inner_highlight: Rgba,
+    /// Soft, broad highlight wash across the upper portion of the shell —
+    /// the glass "sheen" a curved translucent surface catches light with,
+    /// distinct from `inner_highlight`'s crisp 1 px line.
+    pub glass_sheen: Rgba,
     /// Colour of the ambient drop shadow.
     pub ambient_shadow: Rgba,
 
@@ -163,11 +167,7 @@ pub struct Theme {
     pub glow_inserted: Rgba,
 
     // ---- the live signal path: the only place the spectrum is allowed ----
-    /// Stops of the 1 px hairline along the pill's top edge.
-    pub hairline: &'static [Rgba],
-    /// Opacity applied to the whole hairline.
-    pub hairline_opacity: f32,
-    /// Stops of the ramp painted across the 28 waveform bars.
+    /// Stops of the ramp painted across the waveform bars.
     pub spectrum: &'static [Rgba],
     /// Stops of the processing scan band.
     pub scan: &'static [Rgba],
@@ -207,34 +207,32 @@ pub struct Theme {
 
 /// Prism — the locked v1 dark default.
 ///
-/// Quiet instrument shell: spectrum lives only on the live signal path. Solid
-/// UI accents are cool mint/sky — never a red "recording" cue.
+/// Glass, not flat black — the captain's own words on the first pass of this
+/// shell: "it's now just black". Shell stops carry alpha rather than being
+/// fully opaque, so the desktop shows through exactly the way a real layered
+/// window composites (no backdrop sampling, no faked blur — see
+/// `render/mod.rs`'s `draw_shell` for what that does and does not mean).
+/// Solid UI accents stay cool mint/sky — never a red "recording" cue.
 pub const PRISM_DARK: Theme = Theme {
     name: "prism-dark",
     dark: true,
 
-    // Nearly flat dark shell — refined HUD, not glossy glass.
-    shell_top: Rgba::hex(0x12_151C),
-    shell_bottom: Rgba::hex(0x0E_1117),
-    border: Rgba::hex_a(0xFF_FFFF, 0.06),
-    outer_ring: Rgba::hex_a(0x00_0000, 0.28),
-    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.03),
-    ambient_shadow: Rgba::hex_a(0x00_0000, 0.55),
+    // Translucent glass body: lighter/more open at the top, a touch denser
+    // at the bottom for grounding and text legibility. `draw_shell` boosts
+    // this further, dynamically, while the ribbon holds text.
+    shell_top: Rgba::hex_a(0x12_151C, 0.46),
+    shell_bottom: Rgba::hex_a(0x0E_1117, 0.66),
+    border: Rgba::hex_a(0xFF_FFFF, 0.10),
+    outer_ring: Rgba::hex_a(0x00_0000, 0.22),
+    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.16),
+    glass_sheen: Rgba::hex_a(0xE4_F0_FF, 0.12),
+    ambient_shadow: Rgba::hex_a(0x00_0000, 0.50),
 
     // Soft cool halos only — no purple blob, no crimson listening glow.
     glow_idle: Rgba::hex_a(0x6B_CBFF, 0.08),
     glow_listening: Rgba::hex_a(0x5C_E6A8, 0.10),
     glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.12),
 
-    // Refined hairline: cool mint→sky→soft periwinkle, low opacity.
-    hairline: &[
-        Rgba::TRANSPARENT,
-        Rgba::hex(0x6B_E0C0),
-        Rgba::hex(0x6B_CBFF),
-        Rgba::hex(0x8A_9B_E0),
-        Rgba::TRANSPARENT,
-    ],
-    hairline_opacity: 0.32,
     // Live waveform only: muted cool instrument spectrum (no rose/red candy).
     spectrum: &[
         Rgba::hex(0xB8_C4_A0),
@@ -274,31 +272,24 @@ pub const PRISM_DARK: Theme = Theme {
 
 /// Porcelain — the light theme, shipping day one.
 ///
-/// Same geometry and motion as Prism; soft white shell with a cool mint→sky
-/// live path. No rose/rec-red accents.
+/// Same geometry and motion as Prism; translucent white glass shell with a
+/// cool mint→sky live path. No rose/rec-red accents.
 pub const PORCELAIN_LIGHT: Theme = Theme {
     name: "porcelain-light",
     dark: false,
 
-    shell_top: Rgba::hex(0xFF_FFFF),
-    shell_bottom: Rgba::hex(0xF8_F9_FC),
-    border: Rgba::hex_a(0x1C_2430, 0.05),
-    outer_ring: Rgba::hex_a(0x1C_2430, 0.04),
+    shell_top: Rgba::hex_a(0xFF_FFFF, 0.62),
+    shell_bottom: Rgba::hex_a(0xF8_F9_FC, 0.80),
+    border: Rgba::hex_a(0x1C_2430, 0.08),
+    outer_ring: Rgba::hex_a(0x1C_2430, 0.05),
     inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.90),
-    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.10),
+    glass_sheen: Rgba::hex_a(0xFF_FFFF, 0.38),
+    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.14),
 
     glow_idle: Rgba::hex_a(0x7A_A8_C8, 0.07),
     glow_listening: Rgba::hex_a(0x3D_BF8A, 0.09),
     glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.10),
 
-    hairline: &[
-        Rgba::TRANSPARENT,
-        Rgba::hex(0x8E_C5_C0),
-        Rgba::hex(0x8E_C5_E8),
-        Rgba::hex(0xA0_B0_D8),
-        Rgba::TRANSPARENT,
-    ],
-    hairline_opacity: 0.36,
     spectrum: &[
         Rgba::hex(0x9A_C8_B0),
         Rgba::hex(0x8E_C5_C8),
@@ -398,6 +389,7 @@ mod tests {
                 theme.border,
                 theme.outer_ring,
                 theme.inner_highlight,
+                theme.glass_sheen,
                 theme.ambient_shadow,
                 theme.glow_idle,
                 theme.glow_listening,
@@ -418,7 +410,6 @@ mod tests {
                 theme.latency.0,
                 theme.latency.1,
             ];
-            all.extend_from_slice(theme.hairline);
             all.extend_from_slice(theme.spectrum);
             all.extend_from_slice(theme.scan);
             for c in all {
@@ -429,11 +420,6 @@ mod tests {
                     c.a
                 );
             }
-            assert!(
-                (0.0..=1.0).contains(&theme.hairline_opacity),
-                "{}",
-                theme.name
-            );
         }
     }
 
@@ -471,17 +457,9 @@ mod tests {
     fn every_theme_has_a_real_ramp() {
         for theme in THEMES {
             assert!(theme.spectrum.len() >= 2, "{}", theme.name);
-            assert!(theme.hairline.len() >= 3, "{}", theme.name);
             assert!(theme.scan.len() >= 3, "{}", theme.name);
-            // Both ends of the hairline and the scan fade out, so they never
-            // collide with the pill's rounded ends.
-            assert_eq!(theme.hairline[0].a, 0.0, "{}", theme.name);
-            assert_eq!(
-                theme.hairline[theme.hairline.len() - 1].a,
-                0.0,
-                "{}",
-                theme.name
-            );
+            // Both ends of the scan band fade out, so it never collides with
+            // the pill's rounded ends.
             assert_eq!(theme.scan[0].a, 0.0, "{}", theme.name);
             assert_eq!(theme.scan[theme.scan.len() - 1].a, 0.0, "{}", theme.name);
         }

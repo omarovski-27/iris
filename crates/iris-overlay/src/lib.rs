@@ -1,10 +1,11 @@
 //! The Iris pill overlay — the hero UI surface.
 //!
-//! A small always-on-top capsule that appears bottom-centre while you hold the
-//! dictation hotkey, shows the microphone as a 28-bar spectrum waveform, then
-//! confirms the insert and takes itself off screen. It never takes focus, never
-//! accepts a click, and never types: text injection lives elsewhere in Iris and
-//! deliberately not here.
+//! A small always-on-top shape that appears bottom-centre while you hold the
+//! dictation hotkey: a quiet orb while it waits for speech, opening into a
+//! capsule that shows the live transcript as words arrive, then collapsing
+//! back to a checkmark on insert before it takes itself off screen. It never
+//! takes focus, never accepts a click, and never types: text injection lives
+//! elsewhere in Iris and deliberately not here.
 //!
 //! # Using it
 //!
@@ -20,6 +21,7 @@
 //!
 //! pill.show_listening();
 //! pill.update_level(0.7);
+//! pill.set_partial_text("the quarterly report needs");
 //! pill.processing();
 //! pill.inserted(142);               // hides itself ~550 ms later
 //!
@@ -30,16 +32,18 @@
 //!
 //! [`OverlayHandle`] is the whole contract. Everything else in this crate is
 //! either the data behind the design tokens ([`theme`]), the acceptance
-//! criteria the motion is held to ([`motion`], [`layout`], [`spectrum`]), or
-//! testing scaffolding ([`HeadlessOverlay`]).
+//! criteria the motion is held to ([`motion`], [`layout`]), or testing
+//! scaffolding ([`HeadlessOverlay`]).
 //!
 //! # Design provenance
 //!
-//! The pill implements the captain-approved Prism direction as the dark default
-//! and Porcelain as the day-one light theme. Geometry and motion are single
-//! sourced from Prism's spec and a theme swaps colours only, so switching skins
-//! cannot move a pixel. The numbers in [`motion`] and [`layout`] are acceptance
-//! criteria, not preferences — see `README.md`.
+//! This direction — orb → live-text ribbon — replaced an earlier fixed-size
+//! capsule design; see `README.md` "Design provenance" for the full record and
+//! why the overlay now holds transcript text when it previously never did.
+//! Geometry and motion stay single-sourced and a theme swaps colours only, so
+//! switching skins cannot move a pixel — that discipline carried over from the
+//! previous design intact. The numbers in [`motion`] and [`layout`] are
+//! acceptance criteria, not preferences — see `README.md`.
 //!
 //! # Platforms
 //!
@@ -55,7 +59,6 @@ mod headless;
 pub mod layout;
 pub mod motion;
 mod render;
-pub mod spectrum;
 pub mod state;
 pub mod theme;
 mod window;
@@ -63,7 +66,6 @@ mod window;
 pub use handle::{spawn, Overlay, OverlayConfig, OverlayHandle};
 pub use headless::{Frame, HeadlessOverlay};
 pub use layout::{Layout, Placement, WorkArea};
-pub use spectrum::BAR_COUNT;
 pub use state::{Command, OverlayState};
 pub use theme::{Rgba, Theme, PORCELAIN_LIGHT, PRISM_DARK, THEMES};
 
