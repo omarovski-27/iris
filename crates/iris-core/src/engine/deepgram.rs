@@ -445,8 +445,10 @@ impl Transcript {
         match value.get("type").and_then(|t| t.as_str()) {
             Some("Metadata") => {
                 // Deepgram sends Metadata at open and again after CloseStream.
-                // `done` is sticky here; the pump clears it when `closing` is
-                // still false so only the post-CloseStream frame ends the loop.
+                // `done` is sticky here; the pump only honours it when
+                // `CloseStream` had already been sent before this message was
+                // processed (`was_closed_stream`), and clears it otherwise, so
+                // only the post-CloseStream frame ends the loop.
                 self.done = true;
                 return None;
             }
