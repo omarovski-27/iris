@@ -16,6 +16,7 @@
 use std::sync::Mutex;
 
 use anyhow::Result;
+use iris_core::hotkey::Key;
 use iris_core::inject::Method;
 
 /// Something that can put text into the focused window.
@@ -35,12 +36,15 @@ pub trait Injector: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct SystemInjector {
     method: Method,
+    hotkey: Key,
 }
 
 impl SystemInjector {
-    /// Deliver text using `method`.
-    pub fn new(method: Method) -> Self {
-        Self { method }
+    /// Deliver text using `method`. `hotkey` is the configured push-to-talk
+    /// key, passed through so `iris_core::inject` can correct it if it still
+    /// reads as down when injection starts — see that function's docs.
+    pub fn new(method: Method, hotkey: Key) -> Self {
+        Self { method, hotkey }
     }
 }
 
@@ -53,7 +57,7 @@ impl Injector for SystemInjector {
     }
 
     fn inject(&self, text: &str) -> Result<()> {
-        iris_core::inject::inject(text, self.method)
+        iris_core::inject::inject(text, self.method, self.hotkey)
     }
 }
 

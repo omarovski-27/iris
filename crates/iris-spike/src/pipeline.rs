@@ -179,7 +179,7 @@ fn dictate(ctx: Dictating<'_>, pressed_at: std::time::Instant) -> Result<()> {
     if args.dry_run {
         println!("\r  (dry run) would inject: {payload:?}{:<40}", "");
     } else {
-        inject::inject(&payload, args.inject).context("injecting the transcript")?;
+        inject::inject(&payload, args.inject, args.hotkey).context("injecting the transcript")?;
         timeline.mark(Mark::Injected);
         print!("\r{:<80}\r", "");
     }

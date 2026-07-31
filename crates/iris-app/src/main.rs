@@ -197,7 +197,7 @@ fn run(
     let injector: Arc<dyn Injector> = if args.dry_run {
         Arc::new(DryRunInjector)
     } else {
-        Arc::new(SystemInjector::new(config.inject.method))
+        Arc::new(SystemInjector::new(config.inject.method, config.hotkey))
     };
 
     let devices = iris_core::capture::list_devices()
@@ -265,7 +265,10 @@ fn speak_wav(
     }
     let injector: Arc<dyn Injector> = match args.really_inject && !args.dry_run {
         #[cfg(windows)]
-        true => Arc::new(iris_app::inject::SystemInjector::new(config.inject.method)),
+        true => Arc::new(iris_app::inject::SystemInjector::new(
+            config.inject.method,
+            config.hotkey,
+        )),
         #[cfg(not(windows))]
         true => unreachable!("guarded above"),
         false => Arc::new(DryRunInjector),

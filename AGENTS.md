@@ -95,12 +95,25 @@ Measured latency numbers, the budget breakdown, and open risks:
   and nasm to cross-compile.
 - The hotkey thread must only pump messages: Windows silently uninstalls a
   low-level hook whose callback exceeds ~300 ms.
-- `send_keystrokes` clears stuck modifiers (`GetAsyncKeyState` on the 8
-  standard L/R Ctrl/Shift/Alt/Win codes) before every `SendInput` burst.
-  `SendInput`'s own docs warn that an already-pressed key can corrupt the
-  events it generates, and the push-to-talk hotkey — suppressed end-to-end by
-  the low-level hook — is exactly that key. Do not remove this thinking it's
-  dead code; see `inject.rs`'s `stuck_modifiers`/`release_stuck_modifiers`.
+- `inject.rs` corrects the configured hotkey — and *only* the configured
+  hotkey, never a broader modifier sweep — before every burst in both
+  `send_keystrokes` and `paste`. `SendInput`'s own docs warn an
+  already-pressed key can corrupt the events it generates, and the
+  push-to-talk hotkey is exactly that key: the low-level hook suppresses its
+  events end to end (`hotkey.rs`), so it can still read as down after
+  release. The check is scoped to that one key deliberately: sweeping every
+  standard modifier would also release ones the user is genuinely holding for
+  unrelated reasons, and an orphan Alt/Win release is a live Windows UI
+  trigger (menu-bar activation, the Start menu) on the user's own desktop —
+  do not widen this back into a sweep. See `modifier_to_release` /
+  `release_hotkey_if_stuck`; do not remove thinking it's dead code. The
+  configured hotkey reaches the injector via `SystemInjector::new` (wired in
+  `main.rs`), not via `app.rs`.
+- The wiring inside `inject.rs`'s `mod win` — that a caller actually reaches
+  `release_hotkey_if_stuck` with the right vk, with the right flags — is an
+  accepted, permanent test gap: verifying it needs a real `SendInput` call,
+  which the section above forbids. Don't try to close it with a test that
+  only appears to; the decision logic is what's covered.
 
 ## Maintaining this file
 

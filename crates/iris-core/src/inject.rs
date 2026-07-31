@@ -15,6 +15,8 @@
 
 use anyhow::{bail, Result};
 
+use crate::hotkey::Key;
+
 /// How to deliver text to the focused window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
@@ -50,11 +52,15 @@ impl std::fmt::Display for Method {
 }
 
 /// Deliver `text` to the focused window.
-pub fn inject(text: &str, method: Method) -> Result<()> {
+///
+/// `hotkey` is the configured push-to-talk key. It is passed through so the
+/// injector can correct *that* key if it still reads as down — see
+/// [`modifier_to_release`] for why only this one key is ever touched.
+pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    imp(text, method)
+    imp(text, method, hotkey.vk() as u16)
 }
 
 #[cfg(windows)]
@@ -62,22 +68,16 @@ use win::inject as imp;
 
 /// Stub so the harness and the portable tests build on non-Windows hosts.
 #[cfg(not(windows))]
-fn imp(_text: &str, _method: Method) -> Result<()> {
+fn imp(_text: &str, _method: Method, _hotkey_vk: u16) -> Result<()> {
     bail!("text injection is only implemented on Windows")
 }
 
 /// Virtual-key codes for the eight standard modifiers (left/right Ctrl,
 /// Shift, Alt, Win) — plain `u16`s rather than the `windows` crate's typed
-/// constants so this list, and the decision below, stay portable.
+/// constants so this list, and the decisions below, stay portable.
 ///
-/// `SendInput`'s own documentation warns: "This function does not reset the
-/// keyboard's current state. Any keys that are already pressed when the
-/// function is called might interfere with the events that this function
-/// generates. To avoid this problem, check the keyboard's state with
-/// `GetAsyncKeyState`... and correct as necessary." Iris's push-to-talk
-/// hotkey is one of these on every modifier-based configuration, and the
-/// low-level hook suppresses its key events end to end (see `hotkey.rs`), so
-/// it is the one most likely to still read as down when injection starts.
+/// Reference set only: "is the *configured hotkey* one of these." Never swept
+/// wholesale — see [`modifier_to_release`] for why.
 ///
 /// `cfg(any(windows, test))`: the only non-test consumer is `mod win`, so a
 /// plain non-Windows build has nothing that reaches this — but `cargo test`
@@ -116,17 +116,37 @@ fn is_extended_modifier(vk: u16) -> bool {
     )
 }
 
-/// Which of `MODIFIER_VKS` need a corrective key-up before a keystroke burst,
-/// given each one's current (virtual-key, is-down) state. Kept separate from
-/// the `GetAsyncKeyState` calls that produce `state` so the decision is
+/// Whether the configured hotkey needs a corrective key-up before a keystroke
+/// burst, given its current down/up state. Kept separate from the
+/// `GetAsyncKeyState` call that produces `hotkey_down` so the decision is
 /// testable without the OS.
+///
+/// `SendInput`'s own documentation warns: "This function does not reset the
+/// keyboard's current state. Any keys that are already pressed when the
+/// function is called might interfere with the events that this function
+/// generates. To avoid this problem, check the keyboard's state with
+/// `GetAsyncKeyState`... and correct as necessary." Iris's push-to-talk
+/// hotkey is exactly this: the low-level hook (`hotkey.rs`) suppresses its
+/// key events end to end, so it is the one key that can plausibly still read
+/// as down when injection starts.
+///
+/// This checks *only* `hotkey_vk`, deliberately, never a broader sweep of
+/// `MODIFIER_VKS`: injection runs after the hotkey's own `Up` event (see
+/// `iris-app/src/app.rs`), so any *other* modifier still reading as down is
+/// one the user is holding for their own reasons, unrelated to Iris.
+/// Synthesising a release for it would be Iris reaching into input it did
+/// not cause — and on Windows an orphan Alt release activates the menu bar,
+/// an orphan Win release opens the Start menu, either of which would fire on
+/// the user's own live desktop in the middle of a dictation. That is a worse
+/// regression than the corruption this correction exists to fix.
+///
+/// Returns `None` when the configured hotkey is not one of `MODIFIER_VKS`
+/// (F8, CapsLock, ScrollLock, Pause, F9, F10): those cannot desync
+/// `SendInput`'s modifier-state assumptions, because they are not modifiers.
+/// Nothing to correct there is the correct outcome, not a coverage gap.
 #[cfg(any(windows, test))]
-fn stuck_modifiers(state: &[(u16, bool)]) -> Vec<u16> {
-    state
-        .iter()
-        .filter(|(_, down)| *down)
-        .map(|(vk, _)| *vk)
-        .collect()
+fn modifier_to_release(hotkey_vk: u16, hotkey_down: bool) -> Option<u16> {
+    (hotkey_down && MODIFIER_VKS.contains(&hotkey_vk)).then_some(hotkey_vk)
 }
 
 #[cfg(windows)]
@@ -157,18 +177,18 @@ mod win {
     /// keeps the temporary array comfortably small.
     const BATCH: usize = 512;
 
-    pub fn inject(text: &str, method: Method) -> Result<()> {
+    pub fn inject(text: &str, method: Method, hotkey_vk: u16) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
         match method {
-            Method::SendInput => send_keystrokes(text),
-            Method::Clipboard => paste(text),
+            Method::SendInput => send_keystrokes(text, hotkey_vk),
+            Method::Clipboard => paste(text, hotkey_vk),
         }
     }
 
-    fn send_keystrokes(text: &str) -> Result<()> {
-        release_stuck_modifiers()?;
+    fn send_keystrokes(text: &str, hotkey_vk: u16) -> Result<()> {
+        release_hotkey_if_stuck(hotkey_vk)?;
 
         let mut inputs = Vec::with_capacity(BATCH);
         for unit in text::plan(text) {
@@ -186,44 +206,44 @@ mod win {
         flush(&mut inputs)
     }
 
-    /// Correct any modifier Windows still thinks is down before typing.
+    /// Correct the configured hotkey if Windows still thinks it is down.
     ///
-    /// One dedicated `SendInput` call, issued and flushed before the text
-    /// burst, so the correction is fully processed first rather than merely
-    /// ordered first within a single array (see `super::MODIFIER_VKS`).
-    fn release_stuck_modifiers() -> Result<()> {
-        let state: Vec<(u16, bool)> = super::MODIFIER_VKS
-            .iter()
-            .map(|&vk| {
-                let down = unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
-                (vk, down)
-            })
-            .collect();
-
-        let stuck = super::stuck_modifiers(&state);
-        if stuck.is_empty() {
+    /// One dedicated `SendInput` call, issued and flushed before the burst
+    /// that follows (text keystrokes, or the paste accelerator), so the
+    /// correction is fully processed first rather than merely ordered first
+    /// within a single array. Shared by both injection methods: a stuck
+    /// hotkey can corrupt a `KEYEVENTF_UNICODE` burst here, and can just as
+    /// well turn `paste`'s Ctrl+V into a different accelerator (Ctrl+Shift+V,
+    /// Ctrl+Alt+V, ...) if the configured hotkey is Shift or Alt.
+    ///
+    /// Scoped to `hotkey_vk` alone, never a sweep of every standard modifier
+    /// — see `super::modifier_to_release` for why that matters.
+    ///
+    /// **Known, accepted gap:** nothing verifies that callers actually reach
+    /// this function with the right `hotkey_vk`, or that the `INPUT` it
+    /// builds carries the flags `super::modifier_to_release` and
+    /// `super::is_extended_modifier` imply. Verifying that would mean
+    /// executing a real `SendInput` call, which this repo's `CLAUDE.md`
+    /// forbids — it types into whichever desktop the user is looking at, with
+    /// no sandbox. The decision logic itself is fully covered by tests; this
+    /// wiring is not, and cannot be without relaxing that constraint. This is
+    /// deliberate, not an oversight: recorded here rather than papered over
+    /// with a test that would only appear to cover it.
+    fn release_hotkey_if_stuck(hotkey_vk: u16) -> Result<()> {
+        let down = unsafe { GetAsyncKeyState(hotkey_vk as i32) } as u16 & 0x8000 != 0;
+        let Some(vk) = super::modifier_to_release(hotkey_vk, down) else {
             return Ok(());
-        }
-        // The root cause is unreproducible off the user's desk, so the codes
-        // themselves are the field signal that confirms or refutes it.
-        let codes: Vec<String> = stuck.iter().map(|vk| format!("0x{vk:02X}")).collect();
-        vlog!(
-            "releasing {} modifier(s) still reported down before injecting: {}",
-            stuck.len(),
-            codes.join(", ")
-        );
+        };
+        // The root cause is unreproducible off the user's desk, so the code
+        // itself is the field signal that confirms or refutes it.
+        vlog!("releasing the hotkey (0x{vk:02X}) still reported down before injecting");
 
-        let mut corrections: Vec<INPUT> = stuck
-            .into_iter()
-            .map(|vk| {
-                let mut flags = KEYEVENTF_KEYUP;
-                if super::is_extended_modifier(vk) {
-                    flags |= KEYEVENTF_EXTENDEDKEY;
-                }
-                key_event(vk, 0, flags)
-            })
-            .collect();
-        flush(&mut corrections)
+        let mut flags = KEYEVENTF_KEYUP;
+        if super::is_extended_modifier(vk) {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        let mut correction = vec![key_event(vk, 0, flags)];
+        flush(&mut correction)
     }
 
     fn key_event(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -265,7 +285,8 @@ mod win {
     /// Known limitation, kept out of the default path for exactly this reason:
     /// the previous clipboard contents are lost. Restoring them requires waiting
     /// for the target app to finish pasting, which is unbounded.
-    fn paste(text: &str) -> Result<()> {
+    fn paste(text: &str, hotkey_vk: u16) -> Result<()> {
+        release_hotkey_if_stuck(hotkey_vk)?;
         set_clipboard(text)?;
 
         let inputs = [
@@ -341,24 +362,47 @@ mod tests {
     #[test]
     fn injecting_nothing_is_a_no_op_everywhere() {
         // Guards the early return: without it this would fail on Linux.
-        assert!(inject("", Method::SendInput).is_ok());
+        assert!(inject("", Method::SendInput, Key::default()).is_ok());
     }
 
     #[test]
-    fn stuck_modifiers_is_empty_when_nothing_is_held() {
-        let state: Vec<(u16, bool)> = MODIFIER_VKS.iter().map(|&vk| (vk, false)).collect();
-        assert!(stuck_modifiers(&state).is_empty());
+    fn a_stuck_hotkey_modifier_needs_releasing() {
+        // VK_RCONTROL, held — e.g. the default push-to-talk hotkey.
+        assert_eq!(modifier_to_release(0xA3, true), Some(0xA3));
     }
 
     #[test]
-    fn stuck_modifiers_returns_only_the_ones_reported_down() {
-        let state = [
-            (0xA2u16, false), // VK_LCONTROL, up
-            (0xA3u16, true),  // VK_RCONTROL, down — e.g. the push-to-talk hotkey
-            (0xA0u16, false), // VK_LSHIFT, up
-            (0x5Cu16, true),  // VK_RWIN, down
-        ];
-        assert_eq!(stuck_modifiers(&state), vec![0xA3, 0x5C]);
+    fn a_hotkey_modifier_reading_up_needs_nothing() {
+        assert_eq!(modifier_to_release(0xA3, false), None);
+    }
+
+    #[test]
+    fn every_tracked_modifier_can_be_the_configured_hotkey() {
+        // Whichever of the 8 the user configures, holding it is caught.
+        for vk in MODIFIER_VKS {
+            assert_eq!(modifier_to_release(vk, true), Some(vk), "0x{vk:02X}");
+        }
+    }
+
+    #[test]
+    fn a_non_modifier_hotkey_needs_no_correction_even_when_held() {
+        // F8 cannot interfere as a modifier because it is not one — clearing
+        // nothing here is correct behaviour, not a coverage gap. Covers every
+        // non-modifier hotkey choice, not just F8.
+        for key in [
+            Key::CapsLock,
+            Key::ScrollLock,
+            Key::Pause,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+        ] {
+            assert_eq!(
+                modifier_to_release(key.vk() as u16, true),
+                None,
+                "{key} is not a modifier"
+            );
+        }
     }
 
     #[test]
@@ -386,9 +430,190 @@ mod tests {
         );
     }
 
+    /// One synthetic keyboard event, holding the fields of the `INPUT` that
+    /// `win::key_event` fills in. `mod win` is `cfg(windows)` and its events
+    /// can only ever be observed by calling `SendInput` for real — which this
+    /// project forbids (see the crate docs and `CLAUDE.md`) — so the two
+    /// `SendInput` calls below are reconstructed from the same portable
+    /// decision functions the real code calls, exactly as `text.rs` already
+    /// mirrors `send_keystrokes`'s batching loop. This proves the *decisions*
+    /// are right; it cannot prove `mod win` actually wires them up this way
+    /// — see `release_hotkey_if_stuck`'s doc comment for that accepted gap.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Event {
+        vk: u16,
+        scan: u16,
+        unicode: bool,
+        key_up: bool,
+        extended: bool,
+    }
+
+    /// The two flushes `send_keystrokes` performs, in order: the corrective
+    /// key-up for the configured hotkey if it reads down, then the text burst.
+    fn burst(text: &str, hotkey_vk: u16, hotkey_down: bool) -> (Vec<Event>, Vec<Event>) {
+        let corrections = modifier_to_release(hotkey_vk, hotkey_down)
+            .into_iter()
+            .map(|vk| Event {
+                vk,
+                scan: 0,
+                unicode: false,
+                key_up: true,
+                extended: is_extended_modifier(vk),
+            })
+            .collect();
+
+        let mut keystrokes = Vec::new();
+        for unit in crate::text::plan(text) {
+            let (scan, vk, unicode) = match unit {
+                crate::text::KeyUnit::Unicode(u) => (u, 0u16, true),
+                crate::text::KeyUnit::Virtual(vk) => (0u16, vk, false),
+            };
+            for key_up in [false, true] {
+                keystrokes.push(Event {
+                    vk,
+                    scan,
+                    unicode,
+                    key_up,
+                    extended: false,
+                });
+            }
+        }
+        (corrections, keystrokes)
+    }
+
+    /// What a target window would end up with, reading only the key-down
+    /// Unicode events back out of the burst.
+    fn typed(keystrokes: &[Event]) -> String {
+        let units: Vec<u16> = keystrokes
+            .iter()
+            .filter(|e| e.unicode && !e.key_up)
+            .map(|e| e.scan)
+            .collect();
+        String::from_utf16(&units).expect("the burst is valid UTF-16")
+    }
+
     #[test]
-    fn stuck_modifiers_covers_every_tracked_modifier() {
-        let state: Vec<(u16, bool)> = MODIFIER_VKS.iter().map(|&vk| (vk, true)).collect();
-        assert_eq!(stuck_modifiers(&state), MODIFIER_VKS.to_vec());
+    fn the_reported_failure_case_types_byte_for_byte_with_the_hotkey_still_down() {
+        // The bug report: 25 characters spoken, 25 characters delivered, but
+        // everything after the first word arrived as literal 0x20. The state
+        // that produced it is push-to-talk (VK_RCONTROL) still reading as
+        // down when the burst starts, because the low-level hook suppresses
+        // its key-up end to end.
+        let text = crate::text::prepare("This is a full sentence.", true);
+        let (corrections, keystrokes) = burst(&text, 0xA3, true);
+
+        // The correction is one dedicated key-up, flushed before any text.
+        assert_eq!(
+            corrections,
+            vec![Event {
+                vk: 0xA3,
+                scan: 0,
+                unicode: false,
+                key_up: true,
+                extended: true,
+            }],
+            "RightCtrl needs KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY, or the \
+             target decodes it as LeftCtrl and the hotkey stays down"
+        );
+
+        // The correction can never itself type: key-ups only, no Unicode.
+        assert!(corrections.iter().all(|e| e.key_up && !e.unicode));
+
+        // And the text that follows is the transcript, unaltered.
+        assert_eq!(typed(&keystrokes), "This is a full sentence. ");
+        assert_eq!(keystrokes.len(), 50, "25 characters, down + up each");
+
+        // The specific corruption reported: everything past "This" became
+        // 0x20. Only the five real spaces may be 0x20.
+        let spaces = keystrokes
+            .iter()
+            .filter(|e| e.unicode && !e.key_up && e.scan == 0x20)
+            .count();
+        assert_eq!(spaces, 5, "no character was substituted with a space");
+    }
+
+    #[test]
+    fn nothing_is_prepended_when_the_hotkey_is_not_down() {
+        // The shorter dictation that came out byte-perfect on the same build:
+        // with the hotkey not held there is no extra SendInput call at all,
+        // so the correction cannot change the common path.
+        let (corrections, keystrokes) = burst("hello ", 0xA3, false);
+        assert!(corrections.is_empty());
+        assert_eq!(typed(&keystrokes), "hello ");
+    }
+
+    #[test]
+    fn every_tracked_modifier_is_corrected_when_configured_as_the_hotkey() {
+        for vk in MODIFIER_VKS {
+            let (corrections, keystrokes) = burst("ok ", vk, true);
+            assert_eq!(corrections.len(), 1, "0x{vk:02X}");
+            assert_eq!(corrections[0].vk, vk);
+            assert_eq!(typed(&keystrokes), "ok ");
+        }
+    }
+
+    /// Renders the event stream above as a reviewable transcript. Run with
+    /// `cargo test -p iris-core -- --nocapture injection_transcript`.
+    #[test]
+    fn injection_transcript_for_the_reported_failure_case() {
+        fn hex(s: &str) -> String {
+            s.encode_utf16()
+                .map(|u| format!("{u:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let spoken = "This is a full sentence.";
+        let text = crate::text::prepare(spoken, true);
+        let (corrections, keystrokes) = burst(&text, 0xA3, true);
+        let out = typed(&keystrokes);
+
+        println!("\n=== Iris injection burst — reported failure case ===");
+        println!("transcript to inject : {spoken:?}  (+1 trailing space)");
+        println!("state at burst time  : VK_RCONTROL (0xA3) reads as down");
+        println!("                       (push-to-talk, key-up suppressed by Iris's own hook)\n");
+
+        println!(
+            "SendInput call 1 — correction, {} event(s):",
+            corrections.len()
+        );
+        for e in &corrections {
+            let flags = if e.extended {
+                "KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY"
+            } else {
+                "KEYEVENTF_KEYUP"
+            };
+            println!("  wVk=0x{:02X} wScan=0x{:04X} {flags}", e.vk, e.scan);
+        }
+        println!(
+            "\nSendInput call 2 — text, {} event(s), first 6 shown:",
+            keystrokes.len()
+        );
+        for e in keystrokes.iter().take(6) {
+            println!(
+                "  wVk=0x{:02X} wScan=0x{:04X} KEYEVENTF_UNICODE{}   ({:?})",
+                e.vk,
+                e.scan,
+                if e.key_up { " | KEYEVENTF_KEYUP" } else { "" },
+                char::from_u32(e.scan as u32).unwrap()
+            );
+        }
+        println!("  ... {} more", keystrokes.len() - 6);
+
+        println!(
+            "\nspoken   ({:2} chars): {}",
+            text.chars().count(),
+            hex(&text)
+        );
+        println!("delivered({:2} chars): {}", out.chars().count(), hex(&out));
+        println!(
+            "reported (25 chars): {}   <- the bug: 'This' then 21x 0x20",
+            hex("This                     ")
+        );
+        println!(
+            "\nresult: delivered == spoken -> {}\n",
+            if out == text { "MATCH" } else { "MISMATCH" }
+        );
+        assert_eq!(out, text);
     }
 }
