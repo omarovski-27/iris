@@ -74,3 +74,16 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
+
+## Local ASR (`iris-engine-local`)
+
+- Crate: `crates/iris-engine-local/`. Architecture and Windows link story:
+  `crates/iris-engine-local/README.md`.
+- Default features are offline (mock + model manager only). Real engines need
+  `--features native` (or `streaming` / `whisper`). Integration tests need
+  `IRIS_LOCAL_MODELS=1` and network on first model download.
+- Cross-compile of **native** features to `x86_64-pc-windows-gnu` from WSL is
+  blocked (sherpa prebuilt is MSVC/MT; whisper.cpp/ggml needs Windows SDK
+  symbols MinGW headers lack). Default-feature windows-gnu check is fine.
+  Prefer native Windows (MSVC/msys2) for shipping local engines.
+- whisper-rs bindgen needs libclang: e.g. `LIBCLANG_PATH=/usr/lib/llvm-18/lib`.
