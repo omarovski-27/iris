@@ -826,6 +826,22 @@ mod tests {
     }
 
     #[test]
+    fn known_readouts_fit_the_meta_slot() {
+        let l = Layout::new(1.0);
+        let budget = l.meta_right - l.wave.right();
+        let mut atlas = FontAtlas::new();
+        for s in ["0:03", "9:59", "···", "142 ms", "999 ms", "1000 ms"] {
+            let w = atlas.measure(s, l.meta_font, 0.0);
+            assert!(
+                w <= budget + 0.05,
+                "{s:?} is {w:.2}px wide, meta budget is {budget:.2}px"
+            );
+        }
+        let last = l.bar_rect(BAR_COUNT - 1, 1.0);
+        assert!(last.right() <= l.wave.right() + 0.01);
+    }
+
+    #[test]
     fn a_full_cycle_never_panics_at_any_scale() {
         // 100 %, 150 % and 200 % are the scales Windows actually offers most
         // often; the odd ones in between are covered by the layout tests, which

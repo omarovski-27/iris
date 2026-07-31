@@ -62,7 +62,10 @@ const CAP_CORE_D: f32 = 5.0;
 /// Width reserved on the right for the telemetry readout, including the pill's
 /// own right padding. Fixed, so the waveform never reflows when the readout
 /// changes from `0:03` to `142 ms` — the report forbids layout thrash.
-const META_SLOT: f32 = 42.0;
+///
+/// Holds Cascadia Mono at [`META_FONT`] through `1000 ms` (~41 px advance plus
+/// [`META_PAD_R`]) without the right-aligned run entering the waveform.
+const META_SLOT: f32 = 52.0;
 /// Distance from the pill's right edge to the right edge of the readout text.
 const META_PAD_R: f32 = 10.0;
 
@@ -449,6 +452,11 @@ mod tests {
             assert!(
                 l.meta_right > l.wave.right(),
                 "readout overlaps wave at {scale}x"
+            );
+            let budget = l.meta_right - l.wave.right();
+            assert!(
+                budget + 0.05 >= 41.0 * scale,
+                "meta budget {budget} too tight for 1000 ms at {scale}x"
             );
         }
     }
