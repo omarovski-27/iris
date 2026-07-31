@@ -601,6 +601,111 @@ mod tests {
         }
     }
 
+    /// Renders every hotkey × signal combination the correction can face as
+    /// one reviewable table, so the three guarantees that matter can be read
+    /// off directly rather than inferred from a list of green test names:
+    /// the reported desync is corrected, a genuine repress is not, and
+    /// RightAlt/RightWin are never corrected even on a real desync. Run with
+    /// `cargo test -p iris-core -- --nocapture correction_decision_matrix`.
+    #[test]
+    fn correction_decision_matrix_transcript() {
+        const ALL: [Key; 11] = [
+            Key::RightCtrl,
+            Key::LeftCtrl,
+            Key::RightShift,
+            Key::RightAlt,
+            Key::RightWin,
+            Key::CapsLock,
+            Key::ScrollLock,
+            Key::Pause,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+        ];
+
+        println!("\n=== Iris hotkey-correction decision matrix ===");
+        println!("Every configured hotkey against the two independent signals the");
+        println!("correction cross-checks, and the SendInput events it emits before");
+        println!("the text burst as a result.\n");
+        println!(
+            "{:<12} {:<16} {:<12}  {:<38} why",
+            "hotkey", "GetAsyncKeyState", "hook is_held", "correction emitted"
+        );
+        println!("{}", "-".repeat(110));
+
+        let mut fired = Vec::new();
+        for key in ALL {
+            for (down, held) in [(true, false), (true, true), (false, false)] {
+                let (corrections, keystrokes) = burst("ok ", key, down, held);
+
+                let emitted = match corrections.as_slice() {
+                    [] => "(none)".to_string(),
+                    [e] => format!(
+                        "key-up 0x{:02X}{}",
+                        e.vk,
+                        if e.extended {
+                            " | KEYEVENTF_EXTENDEDKEY"
+                        } else {
+                            ""
+                        }
+                    ),
+                    more => format!("{} events", more.len()),
+                };
+                let is_modifier = matches!(
+                    key,
+                    Key::RightCtrl
+                        | Key::LeftCtrl
+                        | Key::RightShift
+                        | Key::RightAlt
+                        | Key::RightWin
+                );
+                let why = match (down, held, key) {
+                    (false, _, _) => "hotkey not down — nothing to correct",
+                    (true, _, _) if !is_modifier => "not a modifier — cannot desync SendInput",
+                    (true, true, _) => "genuine repress for the next utterance — left alone",
+                    (true, false, Key::RightAlt) => {
+                        "genuine desync, but an orphan Alt release opens the menu bar"
+                    }
+                    (true, false, Key::RightWin) => {
+                        "genuine desync, but an orphan Win release opens the Start menu"
+                    }
+                    (true, false, _) => "desync: the reported bug — corrected",
+                };
+                println!(
+                    "{:<12} {:<16} {:<12}  {:<38} {why}",
+                    key.label(),
+                    if down { "down" } else { "up" },
+                    if held { "yes" } else { "no" },
+                    emitted,
+                );
+
+                // Whatever the decision, the transcript itself is untouched
+                // and the correction can never type.
+                assert_eq!(typed(&keystrokes), "ok ", "{key}");
+                assert!(corrections.iter().all(|e| e.key_up && !e.unicode), "{key}");
+                if !corrections.is_empty() {
+                    fired.push((key, down, held));
+                }
+            }
+        }
+
+        println!("\nno hook installed (`--speak-wav --really-inject`): correction skipped");
+        println!("entirely for every row above — with no hook there is no second signal,");
+        println!("and one signal alone cannot tell a stuck key from a held one.");
+
+        assert_eq!(
+            fired,
+            vec![
+                (Key::RightCtrl, true, false),
+                (Key::LeftCtrl, true, false),
+                (Key::RightShift, true, false),
+            ],
+            "exactly three rows may emit a correction: a genuine desync on a \
+             hotkey with no bare-tap meaning in the Windows shell"
+        );
+        println!("\ncorrections emitted: {} of 33 rows\n", fired.len());
+    }
+
     /// Renders the event stream above as a reviewable transcript. Run with
     /// `cargo test -p iris-core -- --nocapture injection_transcript`.
     #[test]

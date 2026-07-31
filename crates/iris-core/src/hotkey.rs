@@ -12,8 +12,11 @@
 //!   hook thread does nothing but pump messages, and the callback does nothing
 //!   but a non-blocking send.
 //! * **Our own `SendInput` comes back through the hook.** Injected events carry
-//!   `LLKHF_INJECTED`; without filtering them, injecting a transcript
-//!   containing the hotkey character would retrigger dictation.
+//!   `LLKHF_INJECTED` and are waved through untouched — including `inject.rs`'s
+//!   corrective key-up, which is the one injected event that carries the
+//!   hotkey's own virtual-key code and would otherwise be read back as a real
+//!   transition. See `is_hotkey_event` for why the flag is checked
+//!   unconditionally rather than only as a tie-breaker.
 
 use anyhow::{bail, Result};
 
@@ -506,6 +509,26 @@ mod tests {
         ] {
             assert!(!is_hotkey_event(VK_PACKET, key.vk(), true));
         }
+    }
+
+    /// The hookless-injection path (`--speak-wav --really-inject` builds a
+    /// `SystemInjector` without ever calling [`listen`]) must be visible as
+    /// such. `is_held` cannot say so — it defaults to `false`, which reads
+    /// identically to "a live hook says the hotkey is up" — so `inject.rs`
+    /// gates on this instead and skips the correction entirely.
+    ///
+    /// Deliberately never calls `listen`: installing a real low-level hook
+    /// would suppress the user's own hotkey on the live desktop, and this
+    /// assertion needs no hook to be meaningful. Reading the flag is a plain
+    /// atomic load — no `SendInput`, nothing that touches input state.
+    #[cfg(windows)]
+    #[test]
+    fn no_hook_installed_reports_not_listening() {
+        assert!(
+            !is_listening(),
+            "with no hook installed the correction must not trust is_held's default"
+        );
+        assert!(!is_held(), "and is_held's default is the ambiguous 'false'");
     }
 
     #[test]
