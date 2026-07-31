@@ -21,7 +21,7 @@ use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
 use iris_app::{App, Injector, RecordingInjector, RecordingPill, SessionLog};
 use iris_core::engine::{Engine, Session, TranscriptEvent};
-use iris_core::hotkey::HotkeyEvent;
+use iris_core::hotkey::{HotkeyEvent, Key};
 
 /// What the mock engine transcribes, before polish.
 const TRANSCRIPT: &str = iris_core::engine::mock::DEFAULT_TRANSCRIPT;
@@ -375,6 +375,7 @@ fn the_loop_runs_until_it_is_told_to_quit() {
     let rig = rig();
     let keys = rig.keys.clone();
     let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
     let commands = rig.commands.clone();
     let injector = rig.injector.clone();
     let keys_rx = rig.keys_rx.clone();
@@ -389,6 +390,9 @@ fn the_loop_runs_until_it_is_told_to_quit() {
     // than let them pile up into the next session.
     frames.send(vec![0i16; 320]).unwrap();
     keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    // Same gate as Rig::speak: the loop drains stale audio before arming, so
+    // utterance frames pushed earlier can be discarded under scheduling load.
+    armed.recv().expect("the dictation never armed capture");
     for chunk in speech().chunks(320) {
         frames.send(chunk.to_vec()).unwrap();
     }
@@ -485,6 +489,116 @@ fn a_tray_save_never_persists_a_cli_override() {
         Some("Yeti"),
         "--device leaked into the file"
     );
+}
+
+#[test]
+fn reload_keeps_in_force_settings_that_need_a_restart() {
+    // Reload must not pretend hotkey/audio/keys took effect: the hook and the
+    // mic were configured at startup, and promote_keys cannot run again. The
+    // in-memory config keeps what is actually in force so a second reload of
+    // the same file still has something to compare against.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.hotkey = Key::F9;
+    file_config.audio.device = Some("Yeti".into());
+    file_config.audio.warm = false;
+    file_config.keys.deepgram = Some("file-key".into());
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    let mut run_config = Config::default();
+    run_config.polish.llm = false;
+    // Distinct from the file so Reload has something to flag.
+    run_config.hotkey = Key::RightCtrl;
+    run_config.audio.device = Some("USB".into());
+    run_config.audio.warm = true;
+    run_config.keys.deepgram = Some("run-key".into());
+
+    let app = App::new(
+        run_config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app")
+    .with_file_config(file_config.clone());
+
+    let (commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    commands.send(Command::Reload).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let app = std::thread::spawn(move || {
+        let mut app = app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    })
+    .join()
+    .expect("the loop panicked")
+    .unwrap();
+
+    assert_eq!(app.config().hotkey, Key::RightCtrl);
+    assert_eq!(app.config().audio.device.as_deref(), Some("USB"));
+    assert!(app.config().audio.warm);
+    assert_eq!(app.config().keys.deepgram.as_deref(), Some("run-key"));
+}
+
+#[test]
+fn reload_does_not_persist_a_failed_engine_choice() {
+    // A file that asks for an engine we cannot build must not poison `saved`:
+    // the next tray persist would otherwise write a cold-start failure.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.engine = EngineChoice::Deepgram;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    let mut run_config = Config::default();
+    run_config.polish.llm = false;
+    run_config.engine = EngineChoice::Mock;
+
+    let app = App::new(
+        run_config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app")
+    .with_file_config({
+        let mut saved = Config::default();
+        saved.polish.llm = false;
+        saved.engine = EngineChoice::Mock;
+        saved
+    });
+
+    let (commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    commands.send(Command::Reload).unwrap();
+    // A tray change that persists: must not write deepgram into the file.
+    commands.send(Command::SetTheme(Theme::Light)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let app = std::thread::spawn(move || {
+        let mut app = app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    })
+    .join()
+    .expect("the loop panicked")
+    .unwrap();
+
+    assert_eq!(app.config().engine, EngineChoice::Mock);
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(saved.engine, EngineChoice::Mock);
+    assert_eq!(saved.theme, Theme::Light);
 }
 
 #[test]

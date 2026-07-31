@@ -276,32 +276,58 @@ impl<A: AudioSource> App<A> {
                 }
             }
             Command::Reload => match Config::load(&self.config_path) {
-                Ok(config) => {
+                Ok(loaded) => {
                     // The hotkey hook was installed in `main` and the audio
                     // source was configured there too; neither is rebuilt
                     // here, so a reload that changed them must say so instead
-                    // of claiming they took effect.
+                    // of claiming they took effect. Keys are the same story:
+                    // `promote_keys` ran once before any thread existed and
+                    // cannot safely run again, so a file edit there is a
+                    // restart too.
                     let mut needs_restart = Vec::new();
-                    if config.hotkey != self.config.hotkey {
+                    if loaded.hotkey != self.config.hotkey {
                         needs_restart.push("hotkey");
                     }
-                    if config.suppress_hotkey != self.config.suppress_hotkey {
+                    if loaded.suppress_hotkey != self.config.suppress_hotkey {
                         needs_restart.push("suppress_hotkey");
                     }
-                    if config.audio.device != self.config.audio.device {
+                    if loaded.audio.device != self.config.audio.device {
                         needs_restart.push("audio.device");
                     }
-                    if config.audio.warm != self.config.audio.warm {
+                    if loaded.audio.warm != self.config.audio.warm {
                         needs_restart.push("audio.warm");
                     }
-                    self.saved = config.clone();
-                    self.config = config;
-                    match engines::build(&self.config) {
-                        Ok(engine) => self.engine = engine,
-                        Err(e) => eprintln!("  keeping the previous engine: {e:#}"),
+                    if loaded.keys != self.config.keys {
+                        needs_restart.push("keys");
                     }
-                    self.polisher = polish::build(&self.config);
-                    self.history = open_history(&self.config, &self.config_path);
+
+                    // `saved` tracks the file. `config` is what this process
+                    // is actually running: keep the in-force values for
+                    // anything that needs a restart so a second reload of the
+                    // same file still warns, and so a tray persist cannot
+                    // smuggle unapplied settings into later comparisons.
+                    let mut saved = loaded.clone();
+                    let mut config = loaded;
+                    config.hotkey = self.config.hotkey;
+                    config.suppress_hotkey = self.config.suppress_hotkey;
+                    config.audio = self.config.audio.clone();
+                    config.keys = self.config.keys.clone();
+
+                    // Same rollback as SetEngine: a choice that cannot be
+                    // built must not land in `saved`, or the next theme
+                    // toggle would write a cold-start failure into the file.
+                    match engines::build(&config) {
+                        Ok(engine) => self.engine = engine,
+                        Err(e) => {
+                            config.engine = self.config.engine;
+                            saved.engine = self.saved.engine;
+                            eprintln!("  keeping the previous engine: {e:#}");
+                        }
+                    }
+                    self.polisher = polish::build(&config);
+                    self.history = open_history(&config, &self.config_path);
+                    self.config = config;
+                    self.saved = saved;
                     println!("  reloaded {}", self.config_path.display());
                     if !needs_restart.is_empty() {
                         println!(
