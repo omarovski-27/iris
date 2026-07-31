@@ -77,34 +77,6 @@ impl Dictation {
         })
     }
 
-    /// As [`Dictation::start_at`], but for a session opened *before* the key
-    /// went down rather than because of it.
-    ///
-    /// A network engine's connect latency (TLS handshake, first round trip)
-    /// is otherwise paid again on every single dictation. A caller that keeps
-    /// one spare session open ahead of time — opened right after the previous
-    /// dictation finished, so the wait overlaps idle time instead of speech —
-    /// can hand it here instead, and a hold shorter than that connect latency
-    /// still has a transport that is already up. [`Mark::SessionOpen`] is
-    /// still stamped at `key_down`: the session existing earlier doesn't make
-    /// the engine open faster, it just moves *when* that cost was paid.
-    pub fn start_with_session(
-        engine_name: &'static str,
-        session: Box<dyn Session>,
-        key_down: Instant,
-    ) -> Self {
-        let mut timeline = Timeline::start_at(engine_name, key_down);
-        timeline.mark(Mark::SessionOpen);
-        Self {
-            session,
-            timeline,
-            samples: 0,
-            latest_partial: String::new(),
-            finishing: false,
-            ended: None,
-        }
-    }
-
     pub fn timeline(&self) -> &Timeline {
         &self.timeline
     }
@@ -375,38 +347,6 @@ mod tests {
                 ((2.0 * std::f64::consts::PI * 220.0 * i as f64 / 16_000.0).sin() * 8000.0) as i16
             })
             .collect()
-    }
-
-    #[test]
-    fn start_with_session_skips_open_but_still_stamps_session_open() {
-        let engine = MockEngine::new(MockConfig::default());
-        let session = engine.open().unwrap();
-        let key_down = Instant::now();
-
-        let dictation = Dictation::start_with_session("mock", session, key_down);
-
-        assert_eq!(dictation.timeline().engine, "mock");
-        assert!(dictation.timeline().at(Mark::KeyDown).is_some());
-        assert!(
-            dictation.timeline().at(Mark::SessionOpen).is_some(),
-            "a pre-opened session must still stamp SessionOpen"
-        );
-    }
-
-    #[test]
-    fn a_prewarmed_session_drives_a_dictation_identically_to_a_fresh_one() {
-        let engine = MockEngine::new(MockConfig::default());
-        let session = engine.open().unwrap();
-
-        let mut dictation = Dictation::start_with_session("mock", session, Instant::now());
-        for chunk in tone(1.0).chunks(audio::FRAME_SAMPLES) {
-            dictation.feed(chunk).unwrap();
-        }
-        let outcome = dictation
-            .finish(Duration::from_secs(1), &mut |_| {})
-            .unwrap();
-
-        assert_eq!(outcome.text, crate::engine::mock::DEFAULT_TRANSCRIPT);
     }
 
     #[test]
