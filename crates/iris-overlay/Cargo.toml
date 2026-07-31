@@ -1,0 +1,39 @@
+[package]
+name = "iris-overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Iris pill overlay: an always-on-top, click-through, never-activating dictation HUD for Windows."
+readme = "README.md"
+keywords = ["overlay", "hud", "dictation", "windows", "win32"]
+categories = ["gui"]
+
+[dependencies]
+crossbeam-channel.workspace = true
+
+# CPU rasteriser. The pill window is ~330x135 device pixels, so a GPU device (and its
+# device-lost handling, adapter enumeration and driver surface) buys nothing
+# here — see README "Why a CPU raster path". tiny-skia is pure Rust and
+# cross-compiles to x86_64-pc-windows-gnu with no extra host toolchain.
+tiny-skia = "0.12"
+
+# Glyph rasteriser for the timer / latency / engine chip. Also pure Rust.
+fontdue = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
+
+[dev-dependencies]
+clap.workspace = true
+
+[[example]]
+name = "pill-demo"
+path = "examples/pill_demo.rs"

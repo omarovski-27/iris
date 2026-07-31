@@ -35,8 +35,9 @@ jobs:
       - name: latency harness (modelled cloud)
         run: cargo run --release --bin iris-harness -- --engine mock --runs 3 --simulate 120,160
 
-  # The Windows-only code (WASAPI capture, keyboard hook, SendInput) is
-  # type-checked and linted by cross-compiling. It is not *run*: see below.
+  # The Windows-only code (WASAPI capture, keyboard hook, SendInput, overlay
+  # window) is type-checked and linted by cross-compiling. It is not *run*:
+  # see below.
   windows-cross:
     name: cross-compile (windows-gnu)
     runs-on: ubuntu-latest
