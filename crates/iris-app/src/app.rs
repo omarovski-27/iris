@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver};
 use iris_core::dictation::{Dictation, DEFAULT_FINAL_TIMEOUT};
-use iris_core::engine::Engine;
+use iris_core::engine::{Engine, Session};
 use iris_core::hotkey::HotkeyEvent;
 use iris_core::latency::{ms, Mark, Timeline};
 use iris_core::text;
@@ -69,6 +69,14 @@ pub enum Command {
     Quit,
 }
 
+/// How long a prewarmed session (see [`App::prewarm`]) is trusted before it
+/// is discarded in favour of opening fresh. A network engine can have its
+/// connection closed server-side after enough idle time; reusing a session
+/// that is already dead would fail the very dictation prewarming exists to
+/// speed up, so this stays well under any plausible idle timeout rather than
+/// trying to detect one.
+const PREWARM_STALE_AFTER: Duration = Duration::from_secs(8);
+
 /// What one dictation produced.
 #[derive(Debug, Clone)]
 pub struct Dictated {
@@ -100,6 +108,8 @@ pub struct App<A: AudioSource> {
     count: usize,
     report: bool,
     final_timeout: Duration,
+    /// A session opened ahead of the next hotkey press. See [`App::prewarm`].
+    next_session: Option<(Instant, Box<dyn Session>)>,
 }
 
 impl<A: AudioSource> App<A> {
@@ -125,7 +135,7 @@ impl<A: AudioSource> App<A> {
         // before the first hotkey press.
         pill.set_engine(engine.name());
         pill.set_theme(config.theme);
-        Ok(Self {
+        let mut app = Self {
             saved: config.clone(),
             config,
             config_path,
@@ -138,7 +148,10 @@ impl<A: AudioSource> App<A> {
             count: 0,
             report: false,
             final_timeout: DEFAULT_FINAL_TIMEOUT,
-        })
+            next_session: None,
+        };
+        app.prewarm();
+        Ok(app)
     }
 
     /// Print a latency breakdown after every dictation.
@@ -174,6 +187,26 @@ impl<A: AudioSource> App<A> {
     pub fn set_engine(&mut self, engine: Arc<dyn Engine>) {
         self.pill.set_engine(engine.name());
         self.engine = engine;
+        // Whatever was prewarmed belongs to the old engine.
+        self.next_session = None;
+    }
+
+    /// Open a session ahead of the next hotkey press, so a network engine's
+    /// connect latency — TLS handshake, first round trip — overlaps idle time
+    /// between dictations instead of landing on the hold. A hold shorter than
+    /// that latency then has a transport that is already up rather than one
+    /// still handshaking; see `iris-core`'s `Dictation::start_with_session`.
+    ///
+    /// Best-effort and a no-op if one is already pending: a failure here (a
+    /// transient DNS hiccup, say) just means the next dictation opens fresh,
+    /// exactly as before this existed.
+    fn prewarm(&mut self) {
+        if self.next_session.is_some() {
+            return;
+        }
+        if let Ok(session) = self.engine.open() {
+            self.next_session = Some((Instant::now(), session));
+        }
     }
 
     /// The configuration in force.
@@ -247,6 +280,9 @@ impl<A: AudioSource> App<A> {
                     Ok(engine) => {
                         self.pill.set_engine(engine.name());
                         self.engine = engine;
+                        // Whatever was prewarmed belongs to the old engine.
+                        self.next_session = None;
+                        self.prewarm();
                         self.saved.engine = choice;
                         println!("  engine: {choice}");
                         self.persist();
@@ -336,6 +372,9 @@ impl<A: AudioSource> App<A> {
                         Ok(engine) => {
                             self.pill.set_engine(engine.name());
                             self.engine = engine;
+                            // Whatever was prewarmed belongs to the old engine.
+                            self.next_session = None;
+                            self.prewarm();
                         }
                         Err(e) => {
                             config.engine = self.config.engine;
@@ -430,9 +469,20 @@ impl<A: AudioSource> App<A> {
         frames: &Receiver<Vec<i16>>,
         keys: &Receiver<HotkeyEvent>,
     ) -> Result<Dictated> {
-        // The engine session first: for a streaming engine this starts the
-        // websocket handshake, which then overlaps with everything below.
-        let mut dictation = Dictation::start_at(&*self.engine, pressed_at)?;
+        // The engine session first: a prewarmed one (see `Self::prewarm`)
+        // already has its handshake overlapping the *previous* dictation, so
+        // a short hold doesn't have to wait through it at all; a fresh one
+        // still starts the websocket handshake now, which then overlaps
+        // everything below. Either way, immediately start opening the *next*
+        // session so its own connect latency overlaps this dictation instead
+        // of waiting for `capture` to return.
+        let mut dictation = match self.next_session.take() {
+            Some((opened_at, session)) if opened_at.elapsed() < PREWARM_STALE_AFTER => {
+                Dictation::start_with_session(self.engine.name(), session, pressed_at)
+            }
+            _ => Dictation::start_at(&*self.engine, pressed_at)?,
+        };
+        self.prewarm();
 
         // A warm microphone keeps producing frames while the previous dictation
         // was polishing and injecting, and the idle loop only discards them one

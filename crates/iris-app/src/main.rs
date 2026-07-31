@@ -283,13 +283,27 @@ fn speak_wav(
 
     let (keys_tx, keys) = crossbeam_channel::unbounded();
     let pressed_at = std::time::Instant::now();
+    let frame_time = std::time::Duration::from_millis(u64::from(iris_core::audio::FRAME_MS));
     let feeder = std::thread::spawn(move || {
         // Wait for the loop's stale-frame drain (which precedes arming), so no
         // utterance frame can be discarded as pre-key-press audio.
         if armed.recv().is_err() {
             return;
         }
-        for chunk in pcm.chunks(iris_core::audio::FRAME_SAMPLES) {
+        // Real-time pacing, not a burst: a live mic delivers one frame every
+        // 20 ms, so Deepgram is still transcribing the tail when the key
+        // comes up. Sending the whole file in one go finishes the utterance
+        // long before Finalize/CloseStream, which hides exactly the race a
+        // held key is meant to exercise. Deadline-based like
+        // `dictation::run_offline`'s `Pace::Realtime`, so per-frame overhead
+        // cannot accumulate into drift.
+        let started = std::time::Instant::now();
+        for (i, chunk) in pcm.chunks(iris_core::audio::FRAME_SAMPLES).enumerate() {
+            let deadline = started + frame_time * i as u32;
+            let now = std::time::Instant::now();
+            if now < deadline {
+                std::thread::sleep(deadline - now);
+            }
             if frames_tx.send(chunk.to_vec()).is_err() {
                 return;
             }
