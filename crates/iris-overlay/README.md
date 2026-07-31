@@ -207,6 +207,14 @@ the fill-width lesson the old row's bug taught. It sits in a band above the
 shape's centre, coexisting with the text and the core glyph rather than
 replacing either.
 
+That band has a hard lower bound. The text scrim is held below the row so it
+never darkens the bars, which means the row's bottom edge decides how much of
+the text the scrim can cover — reach too far down and the scrim gets clamped
+off the top of the ascenders, leaving them on bare glass. `WAVE_MAX_H` and
+`WAVE_Y_OFFSET` are sized to clear the tallest ink the live font can produce,
+and `the_wave_row_clears_the_live_text_ink_box` fails if either is retuned
+past that.
+
 ## Why a CPU raster path
 
 The pill is small — even at its widest (the open ribbon) the whole frame is a

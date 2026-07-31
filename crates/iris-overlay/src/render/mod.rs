@@ -95,8 +95,16 @@ const WAVE_TARGET_PITCH: f32 = 12.0;
 const WAVE_MIN_BARS: usize = 7;
 const WAVE_MAX_BARS: usize = 40;
 const WAVE_BAR_W_FRAC: f32 = 0.46;
-const WAVE_MAX_H: f32 = 8.0;
-const WAVE_Y_OFFSET: f32 = 10.0;
+/// Height of a bar at full deflection, and how far the row's centre sits
+/// above the shape's. Together they place the row's bottom edge — `h/2 -
+/// (WAVE_Y_OFFSET - WAVE_MAX_H/2)` — which has to stay clear of the top of
+/// the live text's ink box, or the text scrim (which is held below the row,
+/// see [`draw_ribbon`]) cannot cover the glyphs it exists to back.
+/// `the_wave_row_clears_the_live_text_ink_box` pins that relationship against
+/// the real font at every scale; it is the check to run before retuning
+/// either constant.
+const WAVE_MAX_H: f32 = 6.0;
+const WAVE_Y_OFFSET: f32 = 12.5;
 const WAVE_IDLE_FLOOR: f32 = 0.05;
 const WAVE_PROCESSING_ENV: f32 = 0.16;
 const WAVE_RESTING_ENV: f32 = 0.05;
@@ -1040,6 +1048,16 @@ mod tests {
         r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha()
     }
 
+    /// Alpha of a pixel in the shell body itself: off-centre and low enough to
+    /// be clear of the wave row, the core glyph and its halo, all of which
+    /// paint opaque colours over the glass.
+    fn body_alpha(r: &Renderer) -> u8 {
+        let l = r.layout();
+        let x = (l.center_x - 12.0 * l.scale) as u32;
+        let y = (l.center_y + 8.0 * l.scale) as u32;
+        r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha()
+    }
+
     #[test]
     fn a_hidden_pill_writes_no_pixels() {
         let (r, model) = drive(&[], 200, PRISM_DARK);
@@ -1047,19 +1065,58 @@ mod tests {
         assert_eq!(lit_pixels(r.pixmap()), 0, "hidden state left ink behind");
     }
 
+    /// The three things one listening frame has to get right at once, and the
+    /// only one of them that used to be checked was the corner. The centre
+    /// pixel is the live core dot, which is opaque `theme.rec`; the body
+    /// around it is glass at [`GLASS_FILL_ALPHA`] and must stay well short of
+    /// opaque, which is the whole point of the treatment and what a
+    /// reintroduced text-driven opacity ramp would break.
     #[test]
-    fn a_listening_orb_is_opaque_in_the_middle_and_clear_at_the_corners() {
+    fn a_listening_orb_is_glass_around_an_opaque_core_and_clear_at_the_corners() {
         let (r, _) = drive(
             &[Command::ShowListening, Command::Level(0.8)],
             400,
             PRISM_DARK,
         );
-        assert!(centre_alpha(&r) > 240, "shape body is not opaque");
+        assert!(centre_alpha(&r) > 240, "the live core dot is not opaque");
+        let body = body_alpha(&r);
+        assert!(body > 0, "the shell body drew nothing at all");
+        assert!(
+            body < 128,
+            "the shell body reads as opaque, not glass: alpha {body}"
+        );
         assert_eq!(
             r.pixmap().pixels()[0].alpha(),
             0,
             "corner is not transparent"
         );
+    }
+
+    /// The text scrim is held below the wave row, so the row's bottom edge is
+    /// what decides whether the scrim can cover the glyphs at all. Measured
+    /// against every printable ASCII character, because a `$` or a brace rides
+    /// higher than any letter and the scrim is sized to whatever the
+    /// transcript actually contains.
+    #[test]
+    fn the_wave_row_clears_the_live_text_ink_box() {
+        let printable: String = (0x20u8..0x7F).map(char::from).collect();
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let l = Layout::new(scale);
+            let mut atlas = FontAtlas::new();
+            let (ink_top, ink_bottom) = atlas.ink_extents(&printable, l.text_font);
+            let baseline = l.shape_h * 0.5 + (ink_top + ink_bottom) * 0.5;
+            let ink_box_top = baseline - ink_top;
+            let wave_bottom = l.shape_h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
+            assert!(
+                wave_bottom < ink_box_top,
+                "scale {scale}: wave row ends at {wave_bottom}, into an ink box starting at {ink_box_top}"
+            );
+            let wave_top = l.shape_h * 0.5 - (WAVE_Y_OFFSET + WAVE_MAX_H * 0.5) * l.scale;
+            assert!(
+                wave_top > 0.0,
+                "scale {scale}: wave row starts at {wave_top}, outside the shape"
+            );
+        }
     }
 
     #[test]
