@@ -139,6 +139,7 @@ impl Dictation {
                 // immediately and drops every later word. Until we have asked
                 // the engine to finalise, treat Final as a (sticky) partial.
                 if !self.finishing {
+                    let text = best_transcript(text, &self.latest_partial);
                     self.note_partial(text, on_partial);
                     return;
                 }
@@ -616,5 +617,81 @@ mod tests {
         assert_eq!(best_transcript("hi".into(), "hello there"), "hello there");
         assert_eq!(best_transcript("hello there".into(), "hi"), "hello there");
         assert_eq!(best_transcript("  same  ".into(), "same"), "same");
+    }
+
+    /// Short premature Final after a longer interim must not erase the interim
+    /// from `latest_partial` — finish salvages whatever is stored there.
+    struct ShortFinalAfterLongPartial;
+
+    struct ShortFinalAfterLongPartialSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        samples: usize,
+        phase: u8,
+        finished: bool,
+    }
+
+    impl Engine for ShortFinalAfterLongPartial {
+        fn name(&self) -> &'static str {
+            "short-final-after-long-partial"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            Ok(Box::new(ShortFinalAfterLongPartialSession {
+                tx,
+                rx,
+                samples: 0,
+                phase: 0,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for ShortFinalAfterLongPartialSession {
+        fn push(&mut self, pcm: &[i16]) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.samples += pcm.len();
+            let secs = audio::secs(self.samples);
+            if secs >= 0.4 && self.phase == 0 {
+                self.phase = 1;
+                let _ = self
+                    .tx
+                    .send(TranscriptEvent::Partial("hello there full sentence".into()));
+            }
+            if secs >= 0.8 && self.phase == 1 {
+                self.phase = 2;
+                let _ = self.tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn demoted_short_final_does_not_clobber_longer_partial() {
+        let mut partials = Vec::new();
+        let outcome = run_offline(&ShortFinalAfterLongPartial, &tone(1.2), Pace::Fast, &mut |p| {
+            partials.push(p.to_string())
+        })
+        .expect("should salvage longer partial");
+
+        assert!(
+            outcome.text.contains("full sentence"),
+            "short demoted Final must not erase longer interim; got {:?} (partials={partials:?})",
+            outcome.text
+        );
+        assert!(
+            partials.iter().any(|p| p.contains("full sentence")),
+            "overlay should keep the longer hypothesis: {partials:?}"
+        );
     }
 }
