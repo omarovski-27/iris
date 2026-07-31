@@ -77,6 +77,10 @@ max_entries = 500
 groq = "gsk_..."
 ```
 
+**Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
+`inject.rs` applies before every injection burst for the other choices, so they
+behave differently there.
+
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at
 startup, before any thread exists, because the engine and polisher constructors
