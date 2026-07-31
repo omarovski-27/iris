@@ -74,11 +74,35 @@ pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
 /// How many keystroke events `win::send_keystrokes` fits in one `SendInput`
 /// batch before it must flush and start another. 512 events (256 characters)
 /// keeps the temporary array comfortably small. Kept here, outside `mod win`,
-/// so [`effective_method`] can reason about it without an OS call.
+/// so [`MAX_SEND_INPUT_CHARS`] and [`effective_method`] can reason about it
+/// without an OS call.
 const BATCH: usize = 512;
 
+/// The longest transcript still delivered as [`Method::SendInput`] before
+/// [`effective_method`] escalates to [`Method::Clipboard`].
+///
+/// Exactly `BATCH / 2`, not a rounder or larger number: it is the one line
+/// this project has actual evidence for. Every Basic-Multilingual-Plane
+/// character plans to one `KeyUnit` — a down and an up, two `SendInput`
+/// events — so this is the largest text that still fits in the single batch
+/// every previously analysed failure also fit inside (the hotkey desync
+/// [`modifier_to_release`] corrects, not this one); this project's only
+/// evidence of the failure [`effective_method`] guards against is a
+/// transcript that needed a second batch. Drawing the line anywhere past
+/// this would be a guess this project cannot verify without the live
+/// testing `CLAUDE.md` forbids.
+///
+/// Characters outside the BMP (astral — emoji, for instance) are a
+/// surrogate pair, two `KeyUnit`s, and so cross the same *event* threshold
+/// at fewer *characters*; [`effective_method`] compares against planned
+/// units, not `chars().count()`, for exactly that reason — this constant
+/// names the common-case BMP number for readability, not the literal
+/// comparison.
+const MAX_SEND_INPUT_CHARS: usize = BATCH / 2;
+
 /// Escalate `requested` to [`Method::Clipboard`] when `text` would need more
-/// than one `SendInput` batch to deliver.
+/// than one `SendInput` batch to deliver — see [`MAX_SEND_INPUT_CHARS`] for
+/// the exact line and why it sits there.
 ///
 /// The reported failure this guards against: a 313-character transcript —
 /// transcribed perfectly, `SendInput` reporting full success — arrived in
@@ -100,20 +124,15 @@ const BATCH: usize = 512;
 ///
 /// `Method::Clipboard` sidesteps the whole class: four events land regardless
 /// of transcript length, so there is no sustained burst for a slow consumer
-/// to fall behind and no down/up pairing to desync. The threshold is
-/// deliberately exactly [`BATCH`], not a rounder or larger number: it is the
-/// one line this project has actual evidence for. Every previously analysed
-/// failure fit inside a single batch and was the hotkey desync
-/// [`modifier_to_release`] now corrects, not this; this is the first and only
-/// failure known to span two. Drawing the line anywhere past [`BATCH`] would
-/// be a guess this project cannot verify without the live testing
-/// `CLAUDE.md` forbids.
+/// to fall behind and no down/up pairing to desync — at the cost of
+/// clobbering the clipboard; see `win::paste`'s doc comment for why that
+/// trade is accepted as-is rather than mitigated with a restore.
 ///
 /// Never downgrades: a caller that already asked for `Clipboard` is
 /// unaffected, and a text that fits in one batch keeps whatever the caller
 /// requested.
 fn effective_method(text: &str, requested: Method) -> Method {
-    if requested == Method::SendInput && crate::text::plan(text).len() > BATCH / 2 {
+    if requested == Method::SendInput && crate::text::plan(text).len() > MAX_SEND_INPUT_CHARS {
         Method::Clipboard
     } else {
         requested
@@ -347,9 +366,37 @@ mod win {
 
     /// Set the clipboard, then send Ctrl+V.
     ///
-    /// Known limitation, kept out of the default path for exactly this reason:
-    /// the previous clipboard contents are lost. Restoring them requires waiting
-    /// for the target app to finish pasting, which is unbounded.
+    /// Known limitation, and now reached automatically past
+    /// `super::MAX_SEND_INPUT_CHARS` rather than only as a manual opt-in: the
+    /// previous clipboard contents are lost, with no restore. Restore was
+    /// evaluated, not merely skipped, and rejected as unsound rather than
+    /// just inconvenient:
+    ///
+    /// * Restoring as soon as `SendInput` returns races the target.
+    ///   `SendInput` returning only means the Ctrl+V keystrokes entered the
+    ///   input stream, not that the target has processed them, resolved its
+    ///   paste accelerator, and called `GetClipboardData` yet. Restore before
+    ///   that read happens and the target pastes the *old* contents —
+    ///   silently, since nothing fails — which is worse than the disclosed
+    ///   clobber: it looks like it worked.
+    /// * There is no OS signal to wait on instead. `GetClipboardSequenceNumber`
+    ///   and `AddClipboardFormatListener`/`WM_CLIPBOARDUPDATE` fire on a
+    ///   *write* (`SetClipboardData`); a plain read touches neither, by
+    ///   design, since the clipboard is meant to have multiple readers.
+    ///   Nothing here can be polled or subscribed to for "a reader finished."
+    /// * A fixed delay before restoring cannot be made both safe and free.
+    ///   Short enough to preserve the sub-second latency this product exists
+    ///   for, and it can still fire before a busy target has read the
+    ///   clipboard — the same silent-wrong-paste failure above. Long enough
+    ///   to be reliably safe, and it either blocks `inject` for that long or
+    ///   needs a background timer, which then races the *next* dictation's
+    ///   own `set_clipboard` call: back-to-back dictations are the documented
+    ///   common case for push-to-talk (see `modifier_to_release`), not a rare
+    ///   edge a timer could afford to ignore.
+    ///
+    /// So this clobbers the clipboard and says so — plainly, in the change
+    /// that made escalation automatic — rather than trade one silent
+    /// corruption bug for a subtler one.
     fn paste(text: &str, hotkey: Key) -> Result<()> {
         set_clipboard(text)?;
         // After the clipboard work, not before it: `set_clipboard` can block
@@ -445,16 +492,16 @@ mod tests {
 
     #[test]
     fn text_filling_exactly_one_batch_stays_on_send_input() {
-        // BATCH events at two per character is BATCH / 2 characters — the
-        // largest text `win::send_keystrokes` can still deliver in a single
-        // flush, which is the regime this project has evidence is sound.
-        let text = "a".repeat(BATCH / 2);
+        // MAX_SEND_INPUT_CHARS is the largest text `win::send_keystrokes`
+        // can still deliver in a single flush, which is the regime this
+        // project has evidence is sound.
+        let text = "a".repeat(MAX_SEND_INPUT_CHARS);
         assert_eq!(effective_method(&text, Method::SendInput), Method::SendInput);
     }
 
     #[test]
     fn text_needing_a_second_batch_is_escalated_to_clipboard() {
-        let text = "a".repeat(BATCH / 2 + 1);
+        let text = "a".repeat(MAX_SEND_INPUT_CHARS + 1);
         assert_eq!(effective_method(&text, Method::SendInput), Method::Clipboard);
     }
 
@@ -464,7 +511,7 @@ mod tests {
         // events regardless of length, so a short text must not be changed
         // any more than a long one already isn't.
         assert_eq!(effective_method("hi", Method::Clipboard), Method::Clipboard);
-        let long = "a".repeat(BATCH);
+        let long = "a".repeat(MAX_SEND_INPUT_CHARS * 2);
         assert_eq!(effective_method(&long, Method::Clipboard), Method::Clipboard);
     }
 
@@ -474,7 +521,7 @@ mod tests {
         // so far fewer *characters* are needed to cross the same *event*
         // threshold than for BMP text. Proves the check walks `text::plan`
         // rather than counting `chars()`.
-        let chars_needed = BATCH / 2 / 2 + 1;
+        let chars_needed = MAX_SEND_INPUT_CHARS / 2 + 1;
         let text = "\u{1F600}".repeat(chars_needed);
         assert_eq!(effective_method(&text, Method::SendInput), Method::Clipboard);
     }
@@ -495,7 +542,7 @@ mod tests {
         // byte-for-byte.)
         let spoken = "Test one, test two, test three. Although this is working fine. I'm currently testing it. And I was testing it on the terminal. It was working good. I'm now testing it because I want to see the bar Can I notice something that the waves and the coloring do not reach the end So, like, kind of gets cut off about 75%?";
         assert!(
-            spoken.chars().count() > BATCH / 2,
+            spoken.chars().count() > MAX_SEND_INPUT_CHARS,
             "the reported transcript must span more than one batch"
         );
         let text = crate::text::prepare(spoken, true);
