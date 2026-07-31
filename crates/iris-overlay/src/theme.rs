@@ -141,10 +141,6 @@ pub struct Theme {
     pub dark: bool,
 
     // ---- pill shell ----
-    /// Top stop of the pill's vertical body gradient.
-    pub shell_top: Rgba,
-    /// Bottom stop of the pill's vertical body gradient.
-    pub shell_bottom: Rgba,
     /// 1 px border stroked just inside the pill outline.
     pub border: Rgba,
     /// 1 px ring stroked just outside the pill outline (`0 0 0 1px` in CSS).
@@ -155,6 +151,12 @@ pub struct Theme {
     /// the glass "sheen" a curved translucent surface catches light with,
     /// distinct from `inner_highlight`'s crisp 1 px line.
     pub glass_sheen: Rgba,
+    /// Backing tint painted as a soft band behind live text only, guaranteed
+    /// to contrast with `ink`. The shell's own fill is a colour ramp in
+    /// service of looking like glass, not of legibility, so it cannot itself
+    /// promise contrast at every point along it — this is the local fix for
+    /// that, instead of pulling the whole surface back toward opaque.
+    pub text_scrim: Rgba,
     /// Colour of the ambient drop shadow.
     pub ambient_shadow: Rgba,
 
@@ -217,15 +219,11 @@ pub const PRISM_DARK: Theme = Theme {
     name: "prism-dark",
     dark: true,
 
-    // Translucent glass body: lighter/more open at the top, a touch denser
-    // at the bottom for grounding and text legibility. `draw_shell` boosts
-    // this further, dynamically, while the ribbon holds text.
-    shell_top: Rgba::hex_a(0x12_151C, 0.46),
-    shell_bottom: Rgba::hex_a(0x0E_1117, 0.66),
     border: Rgba::hex_a(0xFF_FFFF, 0.10),
     outer_ring: Rgba::hex_a(0x00_0000, 0.22),
     inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.16),
     glass_sheen: Rgba::hex_a(0xE4_F0_FF, 0.12),
+    text_scrim: Rgba::hex_a(0x08_0A0D, 0.55),
     ambient_shadow: Rgba::hex_a(0x00_0000, 0.50),
 
     // Soft cool halos only — no purple blob, no crimson listening glow.
@@ -278,12 +276,11 @@ pub const PORCELAIN_LIGHT: Theme = Theme {
     name: "porcelain-light",
     dark: false,
 
-    shell_top: Rgba::hex_a(0xFF_FFFF, 0.62),
-    shell_bottom: Rgba::hex_a(0xF8_F9_FC, 0.80),
     border: Rgba::hex_a(0x1C_2430, 0.08),
     outer_ring: Rgba::hex_a(0x1C_2430, 0.05),
     inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.90),
     glass_sheen: Rgba::hex_a(0xFF_FFFF, 0.38),
+    text_scrim: Rgba::hex_a(0xFF_FFFF, 0.60),
     ambient_shadow: Rgba::hex_a(0x1C_2430, 0.14),
 
     glow_idle: Rgba::hex_a(0x7A_A8_C8, 0.07),
@@ -384,12 +381,11 @@ mod tests {
     fn every_token_alpha_is_normalised() {
         for theme in THEMES {
             let mut all = vec![
-                theme.shell_top,
-                theme.shell_bottom,
                 theme.border,
                 theme.outer_ring,
                 theme.inner_highlight,
                 theme.glass_sheen,
+                theme.text_scrim,
                 theme.ambient_shadow,
                 theme.glow_idle,
                 theme.glow_listening,
@@ -423,27 +419,28 @@ mod tests {
         }
     }
 
-    /// The pill is drawn on top of an unknown desktop, so the *only* contrast
-    /// guarantee we control is ink against our own shell. The engine chip
-    /// (`ink_faint`) is the weakest text on the pill; hold it to a floor.
+    /// The pill is drawn on top of an unknown desktop, and its own shell
+    /// fill is a colour ramp (`theme.spectrum`) chosen for glassy variety,
+    /// not for legibility — it does not itself promise contrast at every
+    /// point along it. `text_scrim` is the token that carries that promise
+    /// instead: a soft band painted behind live text only (see
+    /// `render::draw_ribbon`). This test protects that guarantee, the one
+    /// contrast the pill actually controls regardless of shell or desktop.
     #[test]
-    fn ink_contrasts_with_its_own_shell() {
+    fn ink_contrasts_with_its_own_text_scrim() {
         for theme in THEMES {
-            let shell = theme
-                .shell_top
-                .lerp(theme.shell_bottom, 0.5)
-                .relative_luminance();
+            let scrim = theme.text_scrim.relative_luminance();
             for (label, ink) in [
                 ("ink", theme.ink),
                 ("ink_dim", theme.ink_dim),
                 ("ink_faint", theme.ink_faint),
             ] {
                 let l = ink.relative_luminance();
-                let (hi, lo) = if l > shell { (l, shell) } else { (shell, l) };
+                let (hi, lo) = if l > scrim { (l, scrim) } else { (scrim, l) };
                 let ratio = (hi + 0.05) / (lo + 0.05);
                 assert!(
                     ratio >= 2.5,
-                    "{} / {}: contrast ratio {ratio:.2} is too low to read",
+                    "{} / {}: contrast ratio {ratio:.2} is too low to read against text_scrim",
                     theme.name,
                     label
                 );

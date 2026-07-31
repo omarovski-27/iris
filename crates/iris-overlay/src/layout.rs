@@ -41,10 +41,6 @@ pub const RIBBON_MAX_W: f32 = 460.0;
 pub const RIBBON_PAD_X: f32 = 18.0;
 /// Live-text font size.
 pub const TEXT_FONT: f32 = 15.0;
-/// Latency-caption font size.
-pub const CAPTION_FONT: f32 = 11.0;
-/// Height reserved below the shape for the latency caption (insert-only).
-pub const CAPTION_H: f32 = 20.0;
 
 /// Transparent margin around the shape, every side, for the drop shadow and
 /// state glow to bleed into.
@@ -63,9 +59,10 @@ pub const WORK_AREA_GAP: f32 = 58.0;
 /// Overall window width in logical pixels: the widest ribbon state, plus
 /// shadow margins on both sides.
 pub const WINDOW_W: f32 = RIBBON_MAX_W + 2.0 * MARGIN;
-/// Overall window height in logical pixels: the shape, the caption row, and
-/// shadow margins above and below.
-pub const WINDOW_H: f32 = MARGIN + ORB_D + CAPTION_H + MARGIN;
+/// Overall window height in logical pixels: the shape plus shadow margins
+/// above and below. No caption row — see `render/mod.rs`'s module doc for
+/// why there is no text anywhere near the shape but inside it.
+pub const WINDOW_H: f32 = MARGIN + ORB_D + MARGIN;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,8 +147,8 @@ impl Placement {
     /// Bottom-centre of `work`, with the *shape's* bottom edge exactly
     /// [`WORK_AREA_GAP`] scaled pixels above the bottom of the work area.
     ///
-    /// The window is taller than the shape (shadow margin above, caption and
-    /// shadow margin below), so this is not simply "window bottom minus 58".
+    /// The window is taller than the shape (shadow margin above and below),
+    /// so this is not simply "window bottom minus 58".
     /// The window is fixed-size (see the module doc), so this never needs to
     /// be recomputed more often than a DPI or monitor change already causes.
     #[must_use]
@@ -214,10 +211,6 @@ pub struct Layout {
     pub text_pad_x: f32,
     /// Live-text font size, in device pixels.
     pub text_font: f32,
-    /// Vertical centre of the latency caption.
-    pub caption_y: f32,
-    /// Caption font size, in device pixels.
-    pub caption_font: f32,
 }
 
 impl Layout {
@@ -240,8 +233,6 @@ impl Layout {
             ribbon_max_w: px(RIBBON_MAX_W),
             text_pad_x: px(RIBBON_PAD_X),
             text_font: px(TEXT_FONT),
-            caption_y: px(MARGIN) + px(ORB_D) + px(CAPTION_H) * 0.5,
-            caption_font: px(CAPTION_FONT),
         }
     }
 }
@@ -260,18 +251,21 @@ mod tests {
     #[test]
     fn window_is_bigger_than_the_widest_shape() {
         let l = Layout::new(1.0);
-        assert_eq!((l.window_w, l.window_h), (528, 122));
+        assert_eq!((l.window_w, l.window_h), (528, 102));
         assert!(l.center_x > 0.0 && l.center_y > 0.0);
         assert!(l.center_x < l.window_w as f32);
         assert!(l.ribbon_max_w + 2.0 * MARGIN <= l.window_w as f32 + 0.5);
     }
 
+    /// No caption means no reason for the shape to sit off-centre vertically
+    /// any more — unlike the previous layout (shadow above, shape, caption,
+    /// shadow below), the margin above and below the shape is now identical.
     #[test]
-    fn the_caption_sits_below_the_shape_and_inside_the_window() {
+    fn the_shape_is_vertically_centred_in_the_window_with_no_caption_left_over() {
         let l = Layout::new(1.0);
-        let shape_bottom = l.center_y + l.shape_h * 0.5;
-        assert!(l.caption_y > shape_bottom);
-        assert!(l.caption_y < l.window_h as f32);
+        let above = l.center_y - l.shape_h * 0.5;
+        let below = l.window_h as f32 - (l.center_y + l.shape_h * 0.5);
+        assert!((above - below).abs() < 0.01, "above {above}, below {below}");
     }
 
     #[test]

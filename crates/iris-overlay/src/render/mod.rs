@@ -447,7 +447,6 @@ impl Renderer {
                 cached.map(|m| &m.clip),
             );
         }
-        draw_caption(pixmap, atlas, &ctx);
 
         &self.pixmap
     }
@@ -585,22 +584,106 @@ fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
 // drawing steps
 // ---------------------------------------------------------------------------
 
+/// Fills `shape` with the glass body: a horizontal ramp across the full
+/// `theme.spectrum` (literal refraction — light splitting into colour,
+/// which is also this crate's own visual language) plus a narrow bright
+/// streak that sweeps across the width on a steady cycle, light glinting
+/// off an edge rather than a fixed decal.
+///
+/// This is the survivor of three structurally different treatments rendered
+/// for the captain's second visual pass, after the first glass attempt was
+/// rejected outright ("just one colour, normal, boring" — real translucency
+/// was there, but the surface still read as a flat grey-black slab). The
+/// other two — a soft mint wash with a drifting radial highlight, and a
+/// bolder single-hue tint with a pulsing specular dot — are in the design
+/// report's rendered comparison, not in this codebase; once a decision was
+/// made there was no reason to ship the other two as dead code.
+#[allow(clippy::too_many_arguments)]
+fn fill_glass_shell(
+    pixmap: &mut Pixmap,
+    ctx: &Ctx<'_>,
+    shape: &Path,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    legibility: f32,
+    now: f32,
+    clip: Option<&Mask>,
+) {
+    let theme = ctx.theme;
+    let base_a = 0.20 + 0.44 * legibility;
+    let last = (theme.spectrum.len() - 1).max(1) as f32;
+    let stops: Vec<GradientStop> = theme
+        .spectrum
+        .iter()
+        .enumerate()
+        .map(|(i, c)| GradientStop::new(i as f32 / last, ctx.c(c.fade(base_a)).to_color()))
+        .collect();
+    let shader = LinearGradient::new(
+        Point::from_xy(x, y + h * 0.5),
+        Point::from_xy(x + w, y + h * 0.5),
+        stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .unwrap_or_else(|| Shader::SolidColor(ctx.c(theme.spectrum[0].fade(base_a)).to_color()));
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Paint::default()
+    };
+    pixmap.fill_path(shape, &paint, FillRule::Winding, ctx.xf, None);
+
+    // A narrow bright streak sweeping across the width on a steady cycle —
+    // light glinting off an edge, not a static highlight.
+    let period = 3200.0;
+    let phase = (now % period) / period;
+    let band = 0.16;
+    let lo = (phase - band).clamp(0.0, 1.0);
+    let mid = phase.clamp(0.0, 1.0);
+    let hi = (phase + band).clamp(0.0, 1.0);
+    let streak_stops = vec![
+        GradientStop::new(0.0, ctx.c(theme.glass_sheen.fade(0.0)).to_color()),
+        GradientStop::new(lo, ctx.c(theme.glass_sheen.fade(0.0)).to_color()),
+        GradientStop::new(mid, ctx.c(theme.glass_sheen.fade(2.0)).to_color()),
+        GradientStop::new(hi, ctx.c(theme.glass_sheen.fade(0.0)).to_color()),
+        GradientStop::new(1.0, ctx.c(theme.glass_sheen.fade(0.0)).to_color()),
+    ];
+    let streak = LinearGradient::new(
+        Point::from_xy(x, y),
+        Point::from_xy(x + w, y + h),
+        streak_stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    );
+    if let Some(shader) = streak {
+        let paint = Paint {
+            shader,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        pixmap.fill_path(shape, &paint, FillRule::Winding, ctx.xf, clip);
+    }
+}
+
 /// The shell: translucent glass body, a soft top sheen, two rings, and the
 /// lit top edge.
 ///
 /// **On the glass.** The overlay is already a per-pixel-alpha layered window,
-/// so the body's fill carries alpha straight from `theme.shell_top`/
-/// `shell_bottom` and the real desktop shows through underneath it — this is
-/// ordinary alpha compositing, the same mechanism `UpdateLayeredWindow`
-/// already does every frame, not a new capability. What this deliberately
-/// does *not* do is sample or blur whatever is behind the window (acrylic /
-/// Mica-style backdrop blur): a layered window does not get that behind-pixel
-/// read for free, and faking it by, say, blurring a guess at the desktop
-/// would be worse than not attempting it. The glass *impression* instead
-/// comes from three honest ingredients: translucency (the fill alpha
-/// itself), a soft directional sheen (`glass_sheen`, below, brighter at the
-/// top like light catching a curved glass surface), and the existing rim
-/// (`outer_ring`/`border`) plus the crisp `inner_highlight` line.
+/// so `fill_glass_shell`'s body carries alpha straight from `theme.spectrum`
+/// and the real desktop shows through underneath it — this is ordinary alpha
+/// compositing, the same mechanism `UpdateLayeredWindow` already does every
+/// frame, not a new capability. What this deliberately does *not* do is
+/// sample or blur whatever is behind the window (acrylic / Mica-style
+/// backdrop blur): a layered window does not get that behind-pixel read for
+/// free, and faking it by, say, blurring a guess at the desktop would be
+/// worse than not attempting it. The glass *impression* instead comes from
+/// honest ingredients: translucency (the fill alpha itself), colour that
+/// shifts across the surface instead of sitting at one flat tint (the
+/// horizontal spectrum ramp), a moving specular streak (`glass_sheen`), and
+/// the existing rim (`outer_ring`/`border`) plus the crisp `inner_highlight`
+/// line.
 ///
 /// **On legibility.** Live text sits directly on this surface once the
 /// ribbon opens, and it has to read over an arbitrary desktop, light or
@@ -625,52 +708,9 @@ fn draw_shell(
 ) {
     let s = ctx.layout.scale;
     let legibility = text_alpha(open);
-    let boosted = |c: Rgba| Rgba {
-        a: (c.a + (1.0 - c.a) * 0.62 * legibility).min(1.0),
-        ..c
-    };
+    let now = ctx.model.now_ms() as f32;
 
-    let shader = LinearGradient::new(
-        Point::from_xy(x + w * 0.5, y),
-        Point::from_xy(x + w * 0.5, y + h),
-        vec![
-            GradientStop::new(0.0, ctx.c(boosted(ctx.theme.shell_top)).to_color()),
-            GradientStop::new(1.0, ctx.c(boosted(ctx.theme.shell_bottom)).to_color()),
-        ],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
-    .unwrap_or_else(|| Shader::SolidColor(ctx.c(boosted(ctx.theme.shell_top)).to_color()));
-    let paint = Paint {
-        shader,
-        anti_alias: true,
-        ..Paint::default()
-    };
-    pixmap.fill_path(shape, &paint, FillRule::Winding, ctx.xf, None);
-
-    // Glass sheen: a soft wash brighter at the top, fading out by the
-    // vertical midpoint — the cue that reads as "curved glass catching
-    // light" rather than "flat tinted panel". Clipped to the shape itself
-    // (reusing the same cached mask the shadow/glow already built this
-    // frame) so it never bleeds past the rounded ends.
-    let sheen = LinearGradient::new(
-        Point::from_xy(x + w * 0.5, y),
-        Point::from_xy(x + w * 0.5, y + h * 0.62),
-        vec![
-            GradientStop::new(0.0, ctx.c(ctx.theme.glass_sheen).to_color()),
-            GradientStop::new(1.0, ctx.c(ctx.theme.glass_sheen.fade(0.0)).to_color()),
-        ],
-        SpreadMode::Pad,
-        Transform::identity(),
-    );
-    if let Some(shader) = sheen {
-        let paint = Paint {
-            shader,
-            anti_alias: true,
-            ..Paint::default()
-        };
-        pixmap.fill_path(shape, &paint, FillRule::Winding, ctx.xf, clip);
-    }
+    fill_glass_shell(pixmap, ctx, shape, x, y, w, h, legibility, now, clip);
 
     // `0 0 0 1px` — a hairline ring just outside the body.
     stroke(
@@ -836,6 +876,25 @@ fn draw_ribbon(
 
     let available = (w - 2.0 * l.text_pad_x).max(0.0);
     let shown = text::trailing_fit(atlas, ctx.model.text(), l.text_font, available);
+
+    // A soft band behind the run only — not the whole shell. `theme.spectrum`
+    // is a colour ramp chosen for glassy variety, and cannot itself promise
+    // contrast with `ink` at every point along it; `text_scrim` is the token
+    // that does, so this closes the legibility gap exactly where it matters
+    // instead of pulling the whole surface back toward opaque.
+    let text_w = atlas.measure(shown, l.text_font, 0.0);
+    if text_w > 0.0 {
+        let scrim_pad = l.text_pad_x * 0.4;
+        let band_right = (x + w - l.text_pad_x + scrim_pad).min(x + w);
+        let band_w = (text_w + 2.0 * scrim_pad).min(w);
+        let band_x = (band_right - band_w).max(x);
+        let band_h = h * 0.68;
+        let band_y = y + (h - band_h) * 0.5;
+        if let Some(path) = shapes::round_rect(band_x, band_y, band_w, band_h, band_h * 0.5) {
+            fill(pixmap, ctx, &path, ctx.c(theme.text_scrim.fade(alpha)));
+        }
+    }
+
     let (tx, ty) = ctx.map(x + w - l.text_pad_x, y + h * 0.5);
     atlas.draw(
         pixmap,
@@ -850,32 +909,13 @@ fn draw_ribbon(
     );
 }
 
-/// The latency caption below the shape, insert-only.
-fn draw_caption(pixmap: &mut Pixmap, atlas: &mut FontAtlas, ctx: &Ctx<'_>) {
-    let l = ctx.layout;
-    let theme = ctx.theme;
-    let model = ctx.model;
-
-    if model.state() != OverlayState::Inserted {
-        return;
-    }
-    let Some(latency) = model.latency_ms() else {
-        return;
-    };
-    let settle = 0.35 + 0.65 * model.cross();
-    let (x, y) = ctx.map(l.center_x, l.caption_y);
-    atlas.draw(
-        pixmap,
-        &format!("{latency} ms"),
-        l.caption_font,
-        0.0,
-        x,
-        y,
-        Align::Center,
-        TextPaint::Gradient(theme.latency.0, theme.latency.1),
-        ctx.alpha * settle,
-    );
-}
+// No caption: the captain's second visual pass rejected the under-pill
+// engine/model line and its geometry outright — "developer information on a
+// user surface" — and the latency figure that occupied the same slot went
+// with it as a direct consequence, not a separate decision (there was only
+// ever one line under the shape). `Model::latency_ms()` and `theme.latency`
+// still exist and are unused by rendering now; see the design report for
+// why they were left in place rather than removed unilaterally.
 
 // ---------------------------------------------------------------------------
 // paint helpers
@@ -1113,12 +1153,12 @@ mod tests {
     #[test]
     fn re_scaling_resizes_the_frame() {
         let mut r = Renderer::new(1.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (528, 122));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (528, 102));
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (1056, 244));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (1056, 204));
         assert!((r.layout().scale - 2.0).abs() < f32::EPSILON);
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (1056, 244));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (1056, 204));
     }
 
     #[test]

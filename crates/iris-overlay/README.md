@@ -156,27 +156,32 @@ and it must not be "simplified" away.
 
 A first pass of this shell shipped nearly opaque and dropped the 28-bar
 waveform for a plain pulsing dot. Direct captain feedback after living with
-it on a real desktop: *"I think if we make it glassy... because it's now just
-black. And I like the waves... maybe just improve the waves more when the
-volume is higher, so it's showing that it's clearly hearing you."* Both were
-addressed as refinements within this same direction, not a new one.
+it on a real desktop, across two rounds: round 1 asked for glass, the waves
+back, and a more dramatic volume response; round 2 rejected round 1's glass
+outright ("just one colour, normal, boring") and asked for the under-pill
+engine caption gone entirely. All addressed as refinements within this same
+direction, not a new one — full detail and the rendered evidence for both
+rounds: the design report.
 
-**Glass.** `theme::PRISM_DARK` / `PORCELAIN_LIGHT`'s `shell_top` and
-`shell_bottom` now carry alpha well under 1.0 — real translucency, not a
-faked effect, because the overlay is already a per-pixel-alpha layered window
-and this is the same compositing `UpdateLayeredWindow` was already doing
-every frame. What this is **not**: acrylic/Mica-style backdrop blur. A
-layered window does not get a read of what is behind it for free, and this
-crate does not fake one — no sampling, no guessed blur. The glass
-*impression* instead comes from three honest ingredients, all in
-`render/mod.rs`'s `draw_shell`: the translucent fill itself, a soft
-`glass_sheen` wash brighter at the top (light catching a curved surface), and
-the existing rim (`outer_ring`/`border`) plus the crisp `inner_highlight`
-line. Because live text has to stay legible over an arbitrary desktop, the
-fill's alpha is boosted smoothly as the ribbon opens — reusing `text_alpha`,
-the same curve that fades the words in — so legibility firms up exactly when
-there is text that needs it, and the shell stays at its most transparent at
-rest.
+**Glass, final (round 2).** The shell's fill is `theme.spectrum` sampled as a
+horizontal gradient — mint through sky through periwinkle — plus a narrow
+bright streak that sweeps across on a cycle (`render::fill_glass_shell`).
+This is the survivor of three structurally different treatments rendered and
+compared side by side over a busy backdrop (report: `glass-options/`); it won
+because it is the only one of the three where colour genuinely shifts across
+the surface rather than sitting at one tint. What this is **not**:
+acrylic/Mica-style backdrop blur. A layered window does not get a read of
+what is behind it for free, and this crate does not fake one — no sampling,
+no guessed blur. Translucency instead comes from real per-pixel alpha (the
+same compositing `UpdateLayeredWindow` was already doing every frame), a soft
+`glass_sheen` streak, and the existing rim (`outer_ring`/`border`) plus the
+crisp `inner_highlight` line. The colour ramp cannot itself promise contrast
+with the live text at every point along it — round 2 found this by test, not
+by eye, once the old near-black `shell_top`/`shell_bottom` (removed; the fill
+is not a vertical gradient any more) stopped accidentally providing it — so a
+dedicated `text_scrim` token paints a soft band behind the text run only,
+sized to the text and fading with it, in `draw_ribbon`. That is what actually
+guarantees legibility now; the shell fill is free to be purely aesthetic.
 
 **The wave.** `draw_wave` is a new, independently-tuned bar row, not a port
 of the deleted `spectrum.rs`. Two things are deliberately different, both to

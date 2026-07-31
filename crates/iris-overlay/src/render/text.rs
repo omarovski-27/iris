@@ -22,23 +22,28 @@ const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-Regula
 /// How the glyph coverage is coloured.
 #[derive(Clone, Copy, Debug)]
 pub enum TextPaint {
-    /// One flat colour.
+    /// One flat colour. The only variant the shipping design currently uses
+    /// — the live ribbon text.
     Solid(Rgba),
-    /// A left-to-right ramp across the whole run — the mockup paints the
-    /// latency figure with `linear-gradient(90deg, mint, sky)` clipped to text.
+    /// A left-to-right ramp across the whole run. Unused by the product
+    /// since the latency caption that used it was removed (captain's second
+    /// visual pass: "developer information on a user surface"), kept because
+    /// it is a real capability of this general-purpose rasteriser, not
+    /// design-specific dead weight — `render::text`'s own tests exercise it
+    /// directly.
+    #[allow(dead_code)]
     Gradient(Rgba, Rgba),
 }
 
 /// Horizontal alignment of a run against the x coordinate it is drawn at.
-///
-/// Only the two the pill actually uses: the engine chip is centred under the
-/// capsule, and the telemetry readout is right-aligned so its digits do not
-/// walk as the value changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
-    /// `x` is the centre of the run.
+    /// `x` is the centre of the run. Unused by the product for the same
+    /// reason as [`TextPaint::Gradient`] — kept for the same reason.
+    #[allow(dead_code)]
     Center,
-    /// `x` is the right edge of the run.
+    /// `x` is the right edge of the run — the live ribbon text, so its
+    /// newest characters do not walk as the string grows.
     Right,
 }
 
