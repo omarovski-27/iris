@@ -174,7 +174,7 @@ fn is_hotkey_event(vk_code: u32, target_vk: u32, injected: bool) -> bool {
 }
 
 #[cfg(windows)]
-pub use hook::{listen, Listener};
+pub use hook::{is_held, listen, Listener};
 
 #[cfg(windows)]
 mod hook {
@@ -290,6 +290,29 @@ mod hook {
             },
             rx,
         ))
+    }
+
+    /// Whether the hook currently believes the configured hotkey is held —
+    /// driven only by real, non-injected key transitions it has actually
+    /// seen (the same bookkeeping that decides whether to emit
+    /// [`HotkeyEvent::Down`]/[`HotkeyEvent::Up`]), never by polling live
+    /// keyboard state itself.
+    ///
+    /// This is the cross-check `inject.rs` needs before trusting
+    /// `GetAsyncKeyState`: a hotkey release is followed by transcription and
+    /// polish, easily hundreds of milliseconds, which is long enough for the
+    /// user to have genuinely pressed the hotkey again for their *next*
+    /// utterance. `GetAsyncKeyState` reading "down" at that point is not a
+    /// stuck leftover — it is correct, current state — and this function is
+    /// what lets the caller tell the difference without guessing at exactly
+    /// how Windows' asynchronous key state interacts with a suppressing
+    /// hook (a mechanism this project was not able to confirm; see
+    /// `inject.rs`'s `modifier_to_release`).
+    ///
+    /// Returns `false` before `listen` has ever been called, which is the
+    /// correct answer: nothing is held if there is no hook to hold it.
+    pub fn is_held() -> bool {
+        HELD.load(Ordering::Relaxed)
     }
 
     /// Runs on the hook thread for every keystroke in the system. Must be fast:

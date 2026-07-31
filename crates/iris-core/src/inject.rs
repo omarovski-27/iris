@@ -117,36 +117,52 @@ fn is_extended_modifier(vk: u16) -> bool {
 }
 
 /// Whether the configured hotkey needs a corrective key-up before a keystroke
-/// burst, given its current down/up state. Kept separate from the
-/// `GetAsyncKeyState` call that produces `hotkey_down` so the decision is
-/// testable without the OS.
+/// burst. Kept separate from the OS calls that produce `hotkey_down` and
+/// `genuinely_held` so the decision is testable without the OS.
 ///
 /// `SendInput`'s own documentation warns: "This function does not reset the
 /// keyboard's current state. Any keys that are already pressed when the
 /// function is called might interfere with the events that this function
 /// generates. To avoid this problem, check the keyboard's state with
-/// `GetAsyncKeyState`... and correct as necessary." Iris's push-to-talk
-/// hotkey is exactly this: the low-level hook (`hotkey.rs`) suppresses its
-/// key events end to end, so it is the one key that can plausibly still read
-/// as down when injection starts.
+/// `GetAsyncKeyState`... and correct as necessary." That is `hotkey_down`.
 ///
-/// This checks *only* `hotkey_vk`, deliberately, never a broader sweep of
-/// `MODIFIER_VKS`: injection runs after the hotkey's own `Up` event (see
-/// `iris-app/src/app.rs`), so any *other* modifier still reading as down is
-/// one the user is holding for their own reasons, unrelated to Iris.
-/// Synthesising a release for it would be Iris reaching into input it did
-/// not cause — and on Windows an orphan Alt release activates the menu bar,
-/// an orphan Win release opens the Start menu, either of which would fire on
-/// the user's own live desktop in the middle of a dictation. That is a worse
-/// regression than the corruption this correction exists to fix.
+/// It is not sufficient alone. Injection runs hundreds of milliseconds after
+/// the hotkey's own `Up` event — transcription, then polish — which is long
+/// enough for the user to have genuinely pressed the hotkey again for their
+/// *next* utterance. `GetAsyncKeyState` reading down at that point is not a
+/// stuck leftover then; it is correct, current state, and synthesising a
+/// release for it would be Iris injecting a key-up the user never made. That
+/// event carries `LLKHF_INJECTED`, so the hook's own `is_hotkey_event`
+/// correctly does not suppress it, and it reaches the focused app — on
+/// Windows an orphan Alt release activates the menu bar, an orphan Win
+/// release opens the Start menu, either of which would fire on the user's
+/// live desktop mid-dictation. That is a worse regression than the
+/// corruption this correction exists to fix, and it fires in exactly the
+/// case that matters: this whole thing is push-to-talk, so back-to-back
+/// dictations are the expected way to use it, not an edge case.
+///
+/// `genuinely_held` (`hotkey::is_held`) is Iris's own hook's answer to "is
+/// the hotkey currently held," driven only by real, non-injected key
+/// transitions it has actually seen — never by polling live keyboard state.
+/// A correction fires only when the two *disagree*: `GetAsyncKeyState` says
+/// down, but Iris's own hook says no real press is currently in progress.
+/// That disagreement is the actual signature of a desync, whatever produces
+/// it — which this project could not confirm without the live testing
+/// `CLAUDE.md` forbids, so this deliberately does not depend on a specific
+/// theory of the mechanism to be correct.
+///
+/// Checks *only* `hotkey_vk`, never a broader sweep of `MODIFIER_VKS`: any
+/// *other* modifier reading down is one the user is holding for their own
+/// reasons, unrelated to Iris, and touching it would be Iris reaching into
+/// input it did not cause.
 ///
 /// Returns `None` when the configured hotkey is not one of `MODIFIER_VKS`
 /// (F8, CapsLock, ScrollLock, Pause, F9, F10): those cannot desync
 /// `SendInput`'s modifier-state assumptions, because they are not modifiers.
 /// Nothing to correct there is the correct outcome, not a coverage gap.
 #[cfg(any(windows, test))]
-fn modifier_to_release(hotkey_vk: u16, hotkey_down: bool) -> Option<u16> {
-    (hotkey_down && MODIFIER_VKS.contains(&hotkey_vk)).then_some(hotkey_vk)
+fn modifier_to_release(hotkey_vk: u16, hotkey_down: bool, genuinely_held: bool) -> Option<u16> {
+    (hotkey_down && !genuinely_held && MODIFIER_VKS.contains(&hotkey_vk)).then_some(hotkey_vk)
 }
 
 #[cfg(windows)]
@@ -231,7 +247,8 @@ mod win {
     /// with a test that would only appear to cover it.
     fn release_hotkey_if_stuck(hotkey_vk: u16) -> Result<()> {
         let down = unsafe { GetAsyncKeyState(hotkey_vk as i32) } as u16 & 0x8000 != 0;
-        let Some(vk) = super::modifier_to_release(hotkey_vk, down) else {
+        let held = crate::hotkey::is_held();
+        let Some(vk) = super::modifier_to_release(hotkey_vk, down, held) else {
             return Ok(());
         };
         // The root cause is unreproducible off the user's desk, so the code
@@ -366,21 +383,32 @@ mod tests {
     }
 
     #[test]
-    fn a_stuck_hotkey_modifier_needs_releasing() {
-        // VK_RCONTROL, held — e.g. the default push-to-talk hotkey.
-        assert_eq!(modifier_to_release(0xA3, true), Some(0xA3));
+    fn a_genuinely_stuck_hotkey_modifier_needs_releasing() {
+        // GetAsyncKeyState says down; Iris's own hook says no real press is
+        // currently in progress. A genuine desync, whatever produces it.
+        assert_eq!(modifier_to_release(0xA3, true, false), Some(0xA3));
     }
 
     #[test]
     fn a_hotkey_modifier_reading_up_needs_nothing() {
-        assert_eq!(modifier_to_release(0xA3, false), None);
+        assert_eq!(modifier_to_release(0xA3, false, false), None);
+    }
+
+    #[test]
+    fn a_genuine_repress_for_the_next_utterance_is_left_alone() {
+        // The race this two-signal design exists to prevent: GetAsyncKeyState
+        // reads down because the user is legitimately holding the hotkey
+        // again for their next dictation, and Iris's own hook agrees (it saw
+        // a real, non-injected Down). Correcting here would inject an orphan
+        // key-up into the focused app for a press the user is still making.
+        assert_eq!(modifier_to_release(0xA3, true, true), None);
     }
 
     #[test]
     fn every_tracked_modifier_can_be_the_configured_hotkey() {
-        // Whichever of the 8 the user configures, holding it is caught.
+        // Whichever of the 8 the user configures, a genuine desync is caught.
         for vk in MODIFIER_VKS {
-            assert_eq!(modifier_to_release(vk, true), Some(vk), "0x{vk:02X}");
+            assert_eq!(modifier_to_release(vk, true, false), Some(vk), "0x{vk:02X}");
         }
     }
 
@@ -398,7 +426,7 @@ mod tests {
             Key::F10,
         ] {
             assert_eq!(
-                modifier_to_release(key.vk() as u16, true),
+                modifier_to_release(key.vk() as u16, true, false),
                 None,
                 "{key} is not a modifier"
             );
@@ -449,9 +477,15 @@ mod tests {
     }
 
     /// The two flushes `send_keystrokes` performs, in order: the corrective
-    /// key-up for the configured hotkey if it reads down, then the text burst.
-    fn burst(text: &str, hotkey_vk: u16, hotkey_down: bool) -> (Vec<Event>, Vec<Event>) {
-        let corrections = modifier_to_release(hotkey_vk, hotkey_down)
+    /// key-up for the configured hotkey if it reads down and Iris's own hook
+    /// does not believe it is genuinely held, then the text burst.
+    fn burst(
+        text: &str,
+        hotkey_vk: u16,
+        hotkey_down: bool,
+        genuinely_held: bool,
+    ) -> (Vec<Event>, Vec<Event>) {
+        let corrections = modifier_to_release(hotkey_vk, hotkey_down, genuinely_held)
             .into_iter()
             .map(|vk| Event {
                 vk,
@@ -495,12 +529,13 @@ mod tests {
     #[test]
     fn the_reported_failure_case_types_byte_for_byte_with_the_hotkey_still_down() {
         // The bug report: 25 characters spoken, 25 characters delivered, but
-        // everything after the first word arrived as literal 0x20. The state
-        // that produced it is push-to-talk (VK_RCONTROL) still reading as
-        // down when the burst starts, because the low-level hook suppresses
-        // its key-up end to end.
+        // everything after the first word arrived as literal 0x20. This
+        // reconstructs the scenario where push-to-talk (VK_RCONTROL) reads
+        // down at injection time with no genuine repress behind it — a
+        // desync `GetAsyncKeyState` alone cannot be trusted to explain, but
+        // one `modifier_to_release`'s cross-check still catches and corrects.
         let text = crate::text::prepare("This is a full sentence.", true);
-        let (corrections, keystrokes) = burst(&text, 0xA3, true);
+        let (corrections, keystrokes) = burst(&text, 0xA3, true, false);
 
         // The correction is one dedicated key-up, flushed before any text.
         assert_eq!(
@@ -537,15 +572,32 @@ mod tests {
         // The shorter dictation that came out byte-perfect on the same build:
         // with the hotkey not held there is no extra SendInput call at all,
         // so the correction cannot change the common path.
-        let (corrections, keystrokes) = burst("hello ", 0xA3, false);
+        let (corrections, keystrokes) = burst("hello ", 0xA3, false, false);
         assert!(corrections.is_empty());
         assert_eq!(typed(&keystrokes), "hello ");
     }
 
     #[test]
+    fn a_genuine_back_to_back_dictation_gets_no_orphan_keyup() {
+        // The race a single-signal design would get wrong: the user has
+        // already pressed the hotkey again for their next utterance while
+        // this one is still being injected. GetAsyncKeyState correctly reads
+        // down, Iris's own hook agrees a real press is in progress, and the
+        // burst must carry no correction at all — an orphan key-up here
+        // would reach the focused app (menu-bar/Start-menu activation risk)
+        // for a press the user is still actively making.
+        let (corrections, keystrokes) = burst("go ", 0xA3, true, true);
+        assert!(
+            corrections.is_empty(),
+            "a genuine repress must never be corrected"
+        );
+        assert_eq!(typed(&keystrokes), "go ");
+    }
+
+    #[test]
     fn every_tracked_modifier_is_corrected_when_configured_as_the_hotkey() {
         for vk in MODIFIER_VKS {
-            let (corrections, keystrokes) = burst("ok ", vk, true);
+            let (corrections, keystrokes) = burst("ok ", vk, true, false);
             assert_eq!(corrections.len(), 1, "0x{vk:02X}");
             assert_eq!(corrections[0].vk, vk);
             assert_eq!(typed(&keystrokes), "ok ");
@@ -565,13 +617,14 @@ mod tests {
 
         let spoken = "This is a full sentence.";
         let text = crate::text::prepare(spoken, true);
-        let (corrections, keystrokes) = burst(&text, 0xA3, true);
+        let (corrections, keystrokes) = burst(&text, 0xA3, true, false);
         let out = typed(&keystrokes);
 
         println!("\n=== Iris injection burst — reported failure case ===");
         println!("transcript to inject : {spoken:?}  (+1 trailing space)");
-        println!("state at burst time  : VK_RCONTROL (0xA3) reads as down");
-        println!("                       (push-to-talk, key-up suppressed by Iris's own hook)\n");
+        println!("state at burst time  : VK_RCONTROL (0xA3) reads down via GetAsyncKeyState,");
+        println!("                       but Iris's own hook reports no genuine press in");
+        println!("                       progress — the desync `modifier_to_release` corrects\n");
 
         println!(
             "SendInput call 1 — correction, {} event(s):",

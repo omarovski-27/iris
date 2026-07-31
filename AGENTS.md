@@ -97,18 +97,26 @@ Measured latency numbers, the budget breakdown, and open risks:
   low-level hook whose callback exceeds ~300 ms.
 - `inject.rs` corrects the configured hotkey — and *only* the configured
   hotkey, never a broader modifier sweep — before every burst in both
-  `send_keystrokes` and `paste`. `SendInput`'s own docs warn an
-  already-pressed key can corrupt the events it generates, and the
-  push-to-talk hotkey is exactly that key: the low-level hook suppresses its
-  events end to end (`hotkey.rs`), so it can still read as down after
-  release. The check is scoped to that one key deliberately: sweeping every
-  standard modifier would also release ones the user is genuinely holding for
-  unrelated reasons, and an orphan Alt/Win release is a live Windows UI
-  trigger (menu-bar activation, the Start menu) on the user's own desktop —
-  do not widen this back into a sweep. See `modifier_to_release` /
-  `release_hotkey_if_stuck`; do not remove thinking it's dead code. The
-  configured hotkey reaches the injector via `SystemInjector::new` (wired in
-  `main.rs`), not via `app.rs`.
+  `send_keystrokes` and `paste`, per `SendInput`'s own warning that an
+  already-pressed key can corrupt the events it generates. The correction
+  fires only when two independent signals *disagree*: `GetAsyncKeyState`
+  says the hotkey is down, but `hotkey::is_held()` — Iris's own hook,
+  driven only by real key transitions it has actually seen — says no
+  genuine press is in progress. Do not simplify this to `GetAsyncKeyState`
+  alone: injection runs hundreds of ms after the hotkey's `Up` (polish +
+  transcription), long enough for a genuine repress for the *next*
+  utterance, and a single-signal check cannot tell that apart from a stuck
+  reading — firing on a real repress injects an orphan, unsuppressed key-up
+  into the focused app (Alt → menu-bar activation, Win → the Start menu) on
+  the user's own desktop mid-dictation. (Note for future readers: hook
+  suppression was originally suspected to be *why* the hotkey could read
+  stuck, but that theory did not hold up — Windows appears to update
+  `GetAsyncKeyState` independently of whether a low-level hook suppresses
+  the resulting message, per Microsoft's own docs on hook/state ordering.
+  The two-signal design does not depend on knowing the real mechanism.) See
+  `modifier_to_release` / `release_hotkey_if_stuck`; do not remove thinking
+  either is dead code. The configured hotkey reaches the injector via
+  `SystemInjector::new` (wired in `main.rs`), not via `app.rs`.
 - The wiring inside `inject.rs`'s `mod win` — that a caller actually reaches
   `release_hotkey_if_stuck` with the right vk, with the right flags — is an
   accepted, permanent test gap: verifying it needs a real `SendInput` call,
