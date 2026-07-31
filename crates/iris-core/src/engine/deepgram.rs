@@ -27,15 +27,21 @@
 //! caught up with how much audio the pump actually sent — see `Transcript::
 //! caught_up`.
 //!
-//! That wait is bounded by `CATCHUP_CEILING`, an absolute deadline taken the
-//! moment `Finalize` goes out. It cannot be `FINALIZE_TIMEOUT`: that one is
-//! re-armed on every inbound message, so it only fires after that many seconds
-//! of *total* silence and is no backstop at all for coverage that simply never
-//! converges — which is the ordinary case of a user holding the key a second
-//! past their last word, where Deepgram has nothing more to say about the
-//! trailing silence. Hitting the ceiling sends `CloseStream` anyway and lets
-//! the session sign off normally: closing marginally early costs at most
-//! Deepgram's last update, whereas hanging is indistinguishable from a crash.
+//! That wait ends on *progress*, not on a fixed timer. Coverage often never
+//! converges at all — a user who holds the key a second past their last word
+//! has sent audio Deepgram will never report words for — so waiting out a
+//! fixed ceiling would put that whole ceiling on the perceived latency of an
+//! ordinary dictation, and this product's bar for key-release → text is
+//! ~300 ms (`docs/spike-findings.md`). Instead the socket is polled on
+//! `CATCHUP_STALL`, renewed every time anything arrives: Deepgram falling
+//! silent for that long *is* the signal that it has nothing further to send,
+//! and `CloseStream` goes out immediately. `FINALIZE_TIMEOUT` doubles as an
+//! absolute cap on the whole wait, measured from `Finalize`, purely against a
+//! socket that chatters without ever converging; reaching it in ordinary use
+//! would mean the stall detection is wrong, not that the cap is too tight.
+//! Either way the session then signs off normally — closing marginally early
+//! costs at most Deepgram's last update, whereas hanging is indistinguishable
+//! from a crash.
 
 use std::time::Duration;
 
@@ -61,12 +67,12 @@ const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `CloseStream` is sent — segment boundaries do not land on exact byte
 /// counts, so demanding exact equality would wait forever on a rounding gap.
 const CATCHUP_TOLERANCE_SECS: f64 = 0.5;
-/// The absolute ceiling on withholding `CloseStream` while waiting for
-/// Deepgram's reported coverage to reach what was sent. See the module doc for
-/// why this is not [`FINALIZE_TIMEOUT`]; deliberately well under it so trailing
-/// silence — audio Deepgram will never report words for — costs a fraction of
-/// a second rather than the whole finalise budget.
-const CATCHUP_CEILING: Duration = Duration::from_millis(1500);
+/// How long Deepgram may go quiet during the catch-up wait before the pump
+/// concludes it has nothing further to send and stops withholding
+/// `CloseStream`. A live post-`Finalize` flush was measured arriving 356 ms
+/// and then 78 ms apart, so this leaves margin over the slowest observed gap
+/// while keeping the worst case a fraction of the old fixed ceiling.
+const CATCHUP_STALL: Duration = Duration::from_millis(600);
 
 pub struct DeepgramEngine {
     key: String,
@@ -183,6 +189,47 @@ impl Session for DeepgramSession {
     }
 }
 
+/// The post-`Finalize` catch-up wait: how long `CloseStream` keeps being
+/// withheld while Deepgram works through audio it has not reported on yet.
+/// See the module doc for why this is progress-based rather than a fixed
+/// ceiling.
+#[derive(Clone, Copy)]
+struct CatchupWait {
+    /// Renewed by [`CatchupWait::progressed`] on every inbound message.
+    stall_at: tokio::time::Instant,
+    /// Absolute cap on the whole wait, from when `Finalize` went out. Only a
+    /// socket that talks without ever converging should reach it.
+    backstop_at: tokio::time::Instant,
+}
+
+impl CatchupWait {
+    fn start() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            stall_at: now + CATCHUP_STALL,
+            backstop_at: now + FINALIZE_TIMEOUT,
+        }
+    }
+
+    /// The instant to poll the socket until: whichever limit comes first.
+    fn deadline(self) -> tokio::time::Instant {
+        self.stall_at.min(self.backstop_at)
+    }
+
+    fn expired(self) -> bool {
+        self.deadline() <= tokio::time::Instant::now()
+    }
+
+    /// Something arrived, so Deepgram is still working: grant another stall
+    /// interval. The backstop is deliberately untouched.
+    fn progressed(self) -> Self {
+        Self {
+            stall_at: tokio::time::Instant::now() + CATCHUP_STALL,
+            ..self
+        }
+    }
+}
+
 /// Drives one websocket session to completion.
 async fn pump(
     url: String,
@@ -217,9 +264,9 @@ async fn pump(
     let mut sent_secs: f64 = 0.0;
     // Set once Finalize is sent while Deepgram has not yet reported covering
     // all the audio that was sent: `CloseStream` is withheld until it does or
-    // until this deadline passes, rather than following Finalize immediately.
-    // See the module doc.
-    let mut catchup_deadline: Option<tokio::time::Instant> = None;
+    // until Deepgram stops making progress, rather than following Finalize
+    // immediately. See the module doc.
+    let mut catchup: Option<CatchupWait> = None;
     // Whether `CloseStream` has actually gone out. Distinct from `closing`,
     // which only says Finalize was sent: between the two, Deepgram's Metadata
     // frame cannot be the sign-off, because it has not been asked to sign off.
@@ -233,10 +280,10 @@ async fn pump(
         // While the catch-up wait is pending the socket is polled on *its*
         // deadline: a Deepgram that just goes quiet must not hold the whole
         // dictation for the full finalise timeout.
-        let read_timeout = match catchup_deadline {
-            Some(deadline) => deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .min(FINALIZE_TIMEOUT),
+        let read_timeout = match catchup {
+            Some(wait) => wait
+                .deadline()
+                .saturating_duration_since(tokio::time::Instant::now()),
             None => FINALIZE_TIMEOUT,
         };
 
@@ -261,7 +308,6 @@ async fn pump(
                     // sees `acc.covered_secs` catch up with `sent_secs`.
                     Some(Command::Finish) | None => {
                         closing = true;
-                        acc.finalized = true;
                         let fin = socket
                             .send(Message::Text(r#"{"type":"Finalize"}"#.into()))
                             .await
@@ -276,8 +322,7 @@ async fn pump(
                                     .context("closing the Deepgram stream")
                             }
                             Ok(()) => {
-                                catchup_deadline =
-                                    Some(tokio::time::Instant::now() + CATCHUP_CEILING);
+                                catchup = Some(CatchupWait::start());
                                 Ok(())
                             }
                         }
@@ -290,16 +335,18 @@ async fn pump(
             },
 
             msg = tokio::time::timeout(read_timeout, socket.next()) => {
-                let expired = catchup_deadline
-                    .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+                // Snapshotted before this iteration can send anything: a frame
+                // that *triggers* the close is not a response to it, and must
+                // never be read back as its own acknowledgement.
+                let was_closed = closed_stream;
                 let msg = match msg {
                     Ok(m) => m,
-                    // Nothing on the wire, and the catch-up wait has run out:
-                    // stop withholding CloseStream and sign off on what we
-                    // have rather than sitting here.
-                    Err(_) if expired => {
-                        vlog!("deepgram never reported catching up; closing on what it sent");
-                        catchup_deadline = None;
+                    // Deepgram has stopped making progress on the backlog (or
+                    // the absolute cap ran out): stop withholding CloseStream
+                    // and sign off on what we have rather than sitting here.
+                    Err(_) if catchup.is_some() => {
+                        vlog!("deepgram stopped reporting progress; closing on what it sent");
+                        catchup = None;
                         closed_stream = true;
                         let closed = socket
                             .send(Message::Text(r#"{"type":"CloseStream"}"#.into()))
@@ -324,29 +371,34 @@ async fn pump(
                         }
                         // Deepgram has reported processing everything that was
                         // sent — or has run out of time to. Either way, ask it
-                        // to close.
-                        if catchup_deadline.is_some() && (acc.caught_up(sent_secs) || expired) {
-                            catchup_deadline = None;
-                            closed_stream = true;
-                            let closed = socket
-                                .send(Message::Text(r#"{"type":"CloseStream"}"#.into()))
-                                .await
-                                .context("closing the Deepgram stream");
-                            if let Err(e) = closed {
-                                failure = Some(e);
-                                break;
+                        // to close; anything short of that is progress, and
+                        // buys another stall interval.
+                        if let Some(wait) = catchup {
+                            if acc.caught_up(sent_secs) || wait.expired() {
+                                catchup = None;
+                                closed_stream = true;
+                                let closed = socket
+                                    .send(Message::Text(r#"{"type":"CloseStream"}"#.into()))
+                                    .await
+                                    .context("closing the Deepgram stream");
+                                if let Err(e) = closed {
+                                    failure = Some(e);
+                                    break;
+                                }
+                            } else {
+                                catchup = Some(wait.progressed());
                             }
                         }
                         // Deepgram may send a Metadata frame at open *and* as
                         // the post-CloseStream sign-off. Only the latter ends
                         // the session; segment `is_final` never does, and
-                        // neither does one that arrives while CloseStream is
-                        // still being withheld — a very short hold can drain
-                        // its whole audio backlog plus Finish before the
-                        // socket is polled once, so the *open* Metadata can
-                        // land after Finalize.
+                        // neither does one that arrives before CloseStream had
+                        // gone out — a very short hold can drain its whole
+                        // audio backlog plus Finish before the socket is
+                        // polled once, so the *open* Metadata can land after
+                        // Finalize.
                         if acc.done {
-                            if closed_stream {
+                            if was_closed {
                                 break;
                             }
                             // Spurious open Metadata: keep the socket open.
@@ -422,11 +474,6 @@ struct Transcript {
     /// regardless of whether that message carried any text. See
     /// [`Transcript::caught_up`].
     covered_secs: f64,
-    /// Set by [`pump`] when `Finalize` goes out. Past that point the key is up
-    /// and no further speech can arrive, which is what makes the duplicate
-    /// guard in [`Transcript::absorb`] safe to apply — and why it is confined
-    /// to this window.
-    finalized: bool,
 }
 
 impl Transcript {
@@ -477,22 +524,17 @@ impl Transcript {
             .unwrap_or(false);
 
         if is_final {
-            // A very short utterance can be fully finalised by endpointing
-            // before `finish()` ever runs; the `Finalize` sent regardless
-            // (see `pump`) then has nothing new to flush, and Deepgram can
-            // re-emit the same already-finalised segment rather than an
-            // empty one — observed live as "Extraordinary." arriving twice
-            // for a single-word hold.
-            //
-            // Only *after* Finalize, though. Mid-hold the user is still
-            // speaking, and "No. No." or "Okay. Okay." legitimately arrives
-            // as two identical finals under endpointing=300; collapsing those
-            // would delete words they said, which is the exact class of data
-            // loss this module exists to prevent. Past Finalize the key is
-            // already up, so a repeat can only be Deepgram re-emitting.
-            let duplicate =
-                self.finalized && self.finals.last().map(String::as_str) == Some(text.as_str());
-            if !text.is_empty() && !duplicate {
+            // Every finalised segment is kept, including one whose text
+            // repeats the segment before it. Deepgram does sometimes re-emit
+            // a segment it already finalised (observed live as
+            // "Extraordinary." arriving twice for a one-word hold), but text
+            // alone cannot tell that apart from a user genuinely saying
+            // "No. No." — which endpointing=300 splits into two identical
+            // finals, and which arrives entirely after `Finalize` on exactly
+            // the short hold this module exists to fix. A duplicated word is
+            // strictly better than a deleted one, so the duplicate stays
+            // until there is a discriminator that cannot delete real speech.
+            if !text.is_empty() {
                 self.finals.push(text);
             }
             self.interim.clear();
@@ -559,62 +601,25 @@ mod tests {
     }
 
     #[test]
-    fn a_final_identical_to_the_last_one_does_not_duplicate_after_finalize() {
-        // Live-observed on a one-word hold: endpointing fully finalises the
-        // utterance before `finish()` runs, `Finalize` is sent regardless
-        // (nothing to flush), and Deepgram can re-emit the very segment it
-        // already finalised rather than nothing — "Extraordinary." arriving
-        // twice for a single spoken word.
-        let mut t = Transcript::default();
-        t.absorb(&results("Extraordinary.", true));
-        t.finalized = true;
-        t.absorb(&results("Extraordinary.", true));
-        assert_eq!(t.finished_text(), "Extraordinary.");
-    }
-
-    #[test]
-    fn identical_finals_mid_hold_are_both_kept() {
-        // The user genuinely saying "No. No." — endpointing=300 splits it into
-        // two finals with identical text while the key is still down. The
-        // duplicate guard must not reach here, or the second word is deleted
-        // and never shown to anyone.
+    fn every_finalised_segment_is_kept_even_when_its_text_repeats() {
+        // "No. No." — endpointing=300 splits a genuinely repeated word into
+        // two finals with identical text, and on a hold shorter than
+        // Deepgram's first response *both* arrive after `Finalize`. Nothing
+        // in the text distinguishes that from Deepgram re-emitting a segment,
+        // so nothing may be dropped on text alone: a duplicated word is
+        // recoverable, a deleted one is gone.
         let mut t = Transcript::default();
         t.absorb(&results("No.", true));
         t.absorb(&results("No.", true));
         assert_eq!(t.finished_text(), "No. No.");
 
-        // And the same across an intervening interim, which does not touch
-        // `finals` and so leaves `finals.last()` still matching.
+        // Including across an intervening interim, which leaves the previous
+        // final in place.
         let mut t = Transcript::default();
         t.absorb(&results("Okay.", true));
         t.absorb(&results("oh", false));
         t.absorb(&results("Okay.", true));
         assert_eq!(t.finished_text(), "Okay. Okay.");
-    }
-
-    #[test]
-    fn a_genuinely_repeated_word_within_one_segment_is_kept() {
-        // The de-dup guard compares whole finalised segments, not words —
-        // a real repetition inside a single segment's own text must survive.
-        let mut t = Transcript::default();
-        t.absorb(&results("the the quick fox.", true));
-        assert_eq!(t.finished_text(), "the the quick fox.");
-    }
-
-    #[test]
-    fn distinct_finals_with_the_same_text_are_not_merged_across_a_gap() {
-        // Only *consecutive* identical finals are a duplicate-emission
-        // artifact; the same word said again later as its own segment must
-        // still count twice, even once Finalize has gone out.
-        let mut t = Transcript {
-            finalized: true,
-            ..Default::default()
-        };
-        t.absorb(&results("okay.", true));
-        t.absorb(&results("stop", false));
-        t.absorb(&results("stop.", true));
-        t.absorb(&results("okay.", true));
-        assert_eq!(t.finished_text(), "okay. stop. okay.");
     }
 
     #[test]
@@ -1025,13 +1030,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_deepgram_that_never_catches_up_still_closes_with_what_it_sent() {
-        // Trailing silence: the user holds the key ~1s past their last word,
-        // so Deepgram's reported coverage never reaches `sent_secs` and simply
-        // goes quiet. The catch-up wait must have its own bounded ceiling —
-        // `FINALIZE_TIMEOUT` is re-armed on every message and so is no
-        // backstop — and hitting it must close normally rather than hang or
-        // throw away the words already transcribed.
+    async fn a_deepgram_that_goes_quiet_closes_as_soon_as_progress_stalls() {
+        // Trailing silence: the user holds the key ~1 s past their last word,
+        // so Deepgram's reported coverage never reaches `sent_secs` and it
+        // simply goes quiet with nothing more to say. Waiting out a fixed
+        // ceiling would put that whole ceiling on an ordinary dictation's
+        // perceived latency, so the stall itself is the stop signal — and the
+        // words already transcribed must survive it.
         let started = std::time::Instant::now();
         let outcome = run_pump(
             |mut ws| async move {
@@ -1065,9 +1070,112 @@ mod tests {
             "giving up on catch-up must still return what was transcribed"
         );
         assert!(
-            elapsed < FINALIZE_TIMEOUT,
-            "the catch-up wait must be bounded by its own ceiling, not the finalise timeout; \
-             took {elapsed:?}"
+            elapsed < CATCHUP_STALL * 3,
+            "the wait must end on the stall, not on the absolute backstop; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_greeting_during_the_catch_up_wait_does_not_end_the_session() {
+        // The open-time Metadata arriving mid-wait must be treated as
+        // spurious, and the stall stop that follows must still leave the
+        // socket open long enough for Deepgram's flush to land.
+        let outcome = run_pump(
+            |mut ws| async move {
+                if !wait_for_text(&mut ws, "Finalize").await {
+                    return;
+                }
+                ws.send(Message::Text(
+                    r#"{"type":"Metadata","duration":0.0}"#.into(),
+                ))
+                .await
+                .unwrap();
+                // Nothing else until the client gives up waiting for coverage.
+                if !wait_for_text(&mut ws, "CloseStream").await {
+                    return;
+                }
+                ws.send(Message::Text(
+                    results_with_span("Everything I said.", true, 0.0, 3.0).into(),
+                ))
+                .await
+                .unwrap();
+                let _ = ws
+                    .send(Message::Text(
+                        r#"{"type":"Metadata","duration":3.0}"#.into(),
+                    ))
+                    .await;
+            },
+            3,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Some(TranscriptEvent::Final("Everything I said.".into())),
+            "a greeting read during the catch-up wait is not the sign-off"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chattering_socket_that_never_converges_hits_the_absolute_backstop() {
+        // Renewing the stall on every message means a server that talks
+        // without ever advancing its coverage would hold the wait open
+        // forever; `FINALIZE_TIMEOUT`, measured from `Finalize`, caps the
+        // whole thing, and the flush that follows CloseStream still lands.
+        let started = std::time::Instant::now();
+        let outcome = run_pump(
+            |mut ws| async move {
+                if !wait_for_text(&mut ws, "Finalize").await {
+                    return;
+                }
+                ws.send(Message::Text(
+                    results_with_span("Extraordinary.", true, 0.0, 1.0).into(),
+                ))
+                .await
+                .unwrap();
+                // Empty results, spaced well inside CATCHUP_STALL so the
+                // stall can never fire, and never advancing coverage past the
+                // first of the three seconds sent.
+                let deadline = tokio::time::Instant::now() + FINALIZE_TIMEOUT;
+                while tokio::time::Instant::now() < deadline {
+                    if ws
+                        .send(Message::Text(results_with_span("", false, 0.0, 1.0).into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(CATCHUP_STALL / 3).await;
+                }
+                if !wait_for_text(&mut ws, "CloseStream").await {
+                    return;
+                }
+                ws.send(Message::Text(
+                    results_with_span("Weather today.", true, 1.0, 2.0).into(),
+                ))
+                .await
+                .unwrap();
+                let _ = ws
+                    .send(Message::Text(
+                        r#"{"type":"Metadata","duration":3.0}"#.into(),
+                    ))
+                    .await;
+            },
+            3,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            Some(TranscriptEvent::Final(
+                "Extraordinary. Weather today.".into()
+            )),
+            "hitting the backstop must close normally, not discard the flush"
+        );
+        assert!(
+            elapsed >= FINALIZE_TIMEOUT,
+            "the backstop, not the stall, is what should have ended this wait; took {elapsed:?}"
         );
     }
 }

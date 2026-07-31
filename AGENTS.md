@@ -92,14 +92,23 @@ result is ~1-3 s; a hold shorter than that has nothing streamed back when the
 key comes up, so the entire transcript depends on one post-`Finalize` flush.
 `deepgram.rs`'s `pump` tracks `sent_secs` (audio actually forwarded) against
 `Transcript::covered_secs` (Deepgram's own reported `start + duration`) and
-withholds `CloseStream` until they converge — but never past `CATCHUP_CEILING`,
-an absolute deadline taken when `Finalize` goes out. `FINALIZE_TIMEOUT` cannot
-serve as that backstop: it is re-armed on every inbound message, so it only
-fires after total silence. Note the resulting distinction between `closing`
-(Finalize sent) and `closed_stream` (CloseStream sent) — only the latter makes
-an inbound Metadata frame the sign-off, because a very short hold can drain its
-whole audio backlog before the socket is polled once and read the *open-time*
-Metadata after Finalize. See the module doc for the full mechanism and
+withholds `CloseStream` until they converge. That wait ends on *progress*, not
+a fixed timer: coverage often never converges (trailing silence is audio
+Deepgram will never report words for), so waiting out a ceiling would spend it
+on every ordinary dictation against a ~300 ms perceived-latency bar. The socket
+is polled on `CATCHUP_STALL`, renewed by any inbound frame; silence for that
+long is the stop signal. `FINALIZE_TIMEOUT` is only the absolute cap on the
+whole wait, for a socket that chatters without converging — reaching it in
+ordinary use means the stall detection is wrong, not that the cap is too tight.
+Note the resulting distinction between `closing` (Finalize sent) and
+`closed_stream` (CloseStream sent) — only the latter, *snapshotted before the
+current frame is handled*, makes an inbound Metadata frame the sign-off,
+because a very short hold can drain its whole audio backlog before the socket
+is polled once and read the *open-time* Metadata after Finalize. Deepgram also
+re-emits an already-finalised segment sometimes; that duplicate is knowingly
+left in, because nothing in the text tells it apart from a user saying
+"No. No." and a deleted word is worse than a doubled one. See the module doc
+for the full mechanism and
 `a_hold_shorter_than_first_response_does_not_abandon_the_backlog` for the
 adversarial-fake-server regression test. `App` (`iris-app/src/app.rs`)
 attacks the same latency from the other side: `App::prewarm` opens the next
