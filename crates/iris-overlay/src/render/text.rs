@@ -108,7 +108,7 @@ impl FontAtlas {
     /// area, both measured upwards.
     ///
     /// Centring on the ink rather than on the font's line box is what keeps
-    /// `0:03` and `142 ms` optically centred in a 46 px pill; line-box centring
+    /// `0:03` and `142 ms` optically centred in the pill body; line-box centring
     /// would leave them sitting high, because the descender space is empty.
     pub fn ink_extents(&mut self, text: &str, px: f32) -> (f32, f32) {
         let (mut top, mut bottom) = (f32::MIN, f32::MAX);

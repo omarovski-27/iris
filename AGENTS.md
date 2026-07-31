@@ -123,9 +123,12 @@ When updating this file, preserve this bar for all agents and keep entries conci
   `crates/iris-overlay/README.md` for rendering/WSL notes.
 - The design is **captain-locked** (2026-07-31): Prism dark default, Porcelain
   light, listening-only telemetry chip, prism-triangle icon (tray uses the same
-  mark via `tray::icon_rgba`). Constants in `motion.rs` / `layout.rs` are
-  acceptance criteria — changing one is a captain decision. Source mockups:
+  mark via `tray::icon_rgba`). Source mockups:
   `/home/omar/firstmate/data/iris-design/`.
+- Geometry is a compact HUD chip (`188×34`, radius 17 in `layout.rs`) — desk
+  feedback tightened it from the mockup recorder bar so it does not read as a
+  digital recording strip. Motion timings in `motion.rs` and the token locks
+  stay captain criteria; size changes still need a product decision.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
 - The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is

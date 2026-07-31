@@ -29,14 +29,15 @@ use crate::theme::{sample_ramp, Rgba, Theme};
 
 /// Standard deviation of the pill's shadow blur, in logical pixels.
 ///
-/// CSS `box-shadow` blur-radius 28 is a Gaussian of sigma 14.
-const SHADOW_SIGMA: f32 = 14.0;
-/// Vertical offset of the ambient shadow, in logical pixels (`0 10px ...`).
-const SHADOW_DY: f32 = 10.0;
-/// Negative spread of the ambient shadow, in logical pixels (`... -8px`).
-const SHADOW_SPREAD: f32 = 8.0;
-/// Negative spread of the coloured state halo (`... -8px` / `-4px`).
-const GLOW_SPREAD: f32 = 4.0;
+/// Sized for the compact HUD chip: softer and tighter than a pro-meter bezel
+/// (CSS blur-radius ~22 ≈ Gaussian sigma 11).
+const SHADOW_SIGMA: f32 = 11.0;
+/// Vertical offset of the ambient shadow, in logical pixels.
+const SHADOW_DY: f32 = 7.0;
+/// Negative spread of the ambient shadow, in logical pixels.
+const SHADOW_SPREAD: f32 = 6.0;
+/// Negative spread of the coloured state halo.
+const GLOW_SPREAD: f32 = 3.0;
 
 /// Cached, transform-dependent masks. Rebuilt only when the pill moves, which
 /// in the steady state is never.
@@ -459,8 +460,10 @@ fn draw_capsule(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
     if listening > 0.001 {
         let t = (ctx.model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
         let grow = (t / 0.7).min(1.0);
-        let halo_r = l.cap_core_d * 0.5 + 7.0 * l.scale * grow;
-        let halo_a = 0.5 * (1.0 - grow) * listening;
+        // Keep the halo inside the ring so the rec core never reads as a
+        // chunky recorder button on the compact HUD chip.
+        let halo_r = l.cap_core_d * 0.5 + 4.0 * l.scale * grow;
+        let halo_a = 0.4 * (1.0 - grow) * listening;
         if halo_a > 0.001 {
             if let Some(path) = shapes::circle(cx, cy, halo_r) {
                 fill(pixmap, ctx, &path, ctx.c(theme.rec.fade(halo_a)));
@@ -508,7 +511,9 @@ fn draw_capsule(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
         let turn = (ctx.model.now_ms() % u64::from(SPINNER_PERIOD_MS)) as f32
             / SPINNER_PERIOD_MS as f32
             * 360.0;
-        let radius = (l.cap.w - 8.0 * l.scale) * 0.5 - l.cap_ring_w * 0.5;
+        // Track the ring, not a hard-coded inset, so the spinner stays
+        // proportional when the capsule shrinks with the HUD chip.
+        let radius = (l.cap_ring_d * 0.5 - l.cap_ring_w - 1.0 * l.scale).max(l.scale);
         for (offset, colour) in [(-45.0, theme.spinner.0), (45.0, theme.spinner.1)] {
             stroke(
                 pixmap,
@@ -738,7 +743,8 @@ mod tests {
             let mut cmds = commands;
             cmds.push(Command::Engine("groq · whisper-large-v3-turbo · en".into()));
             let (r, _) = drive(&cmds, 200, PRISM_DARK);
-            assert!(lit_pixels(r.pixmap()) > 5_000, "{name} drew almost nothing");
+            // Compact HUD chip is ~250×100; still plenty of ink when visible.
+            assert!(lit_pixels(r.pixmap()) > 2_500, "{name} drew almost nothing");
         }
     }
 
@@ -810,13 +816,13 @@ mod tests {
     #[test]
     fn re_scaling_resizes_the_frame() {
         let mut r = Renderer::new(1.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (328, 134));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (252, 103));
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (656, 268));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (504, 206));
         assert!((r.layout().scale - 2.0).abs() < f32::EPSILON);
         // Idempotent.
         r.set_scale(2.0);
-        assert_eq!((r.pixmap().width(), r.pixmap().height()), (656, 268));
+        assert_eq!((r.pixmap().width(), r.pixmap().height()), (504, 206));
     }
 
     #[test]

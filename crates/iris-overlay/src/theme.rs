@@ -216,14 +216,16 @@ pub const PRISM_DARK: Theme = Theme {
 
     shell_top: Rgba::hex(0x15_1922),
     shell_bottom: Rgba::hex(0x0C_0F15),
-    border: Rgba::hex_a(0xFF_FFFF, 0.10),
-    outer_ring: Rgba::hex_a(0x00_0000, 0.50),
-    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.06),
-    ambient_shadow: Rgba::hex_a(0x00_0000, 0.85),
+    // Lighter bezel than the mockup recorder strip — enough edge for dark
+    // wallpapers, not a heavy pro-audio meter frame.
+    border: Rgba::hex_a(0xFF_FFFF, 0.07),
+    outer_ring: Rgba::hex_a(0x00_0000, 0.35),
+    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.05),
+    ambient_shadow: Rgba::hex_a(0x00_0000, 0.70),
 
-    glow_idle: Rgba::hex_a(0x8B_7BFF, 0.18),
-    glow_listening: Rgba::hex_a(0xFF_6B8A, 0.22),
-    glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.20),
+    glow_idle: Rgba::hex_a(0x8B_7BFF, 0.14),
+    glow_listening: Rgba::hex_a(0xFF_6B8A, 0.18),
+    glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.16),
 
     hairline: &[
         Rgba::TRANSPARENT,
@@ -284,14 +286,15 @@ pub const PORCELAIN_LIGHT: Theme = Theme {
 
     shell_top: Rgba::hex(0xFF_FFFF),
     shell_bottom: Rgba::hex(0xF7_F8FB),
-    border: Rgba::hex_a(0x1C_2430, 0.08),
-    outer_ring: Rgba::hex_a(0x1C_2430, 0.06),
+    // Match the tighter HUD chip: soft edge, not a heavy bezel.
+    border: Rgba::hex_a(0x1C_2430, 0.06),
+    outer_ring: Rgba::hex_a(0x1C_2430, 0.05),
     inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.95),
-    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.16),
+    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.12),
 
-    glow_idle: Rgba::hex_a(0xA7_8BDA, 0.10),
-    glow_listening: Rgba::hex_a(0xE8_6A7A, 0.16),
-    glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.16),
+    glow_idle: Rgba::hex_a(0xA7_8BDA, 0.08),
+    glow_listening: Rgba::hex_a(0xE8_6A7A, 0.12),
+    glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.12),
 
     hairline: &[
         Rgba::TRANSPARENT,
