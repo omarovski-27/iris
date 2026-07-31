@@ -39,10 +39,12 @@
 //! `Transcript::finalize_acked`) to arrive reliably whenever any audio was
 //! actually sent, including for holds under 0.5s and for holds containing
 //! only silence (an empty-but-`from_finalize`-tagged result). It does *not*
-//! arrive when literally nothing was sent, so that case is short-circuited:
-//! see `NEGLIGIBLE_AUDIO_SECS` in `pump`. `FINALIZE_ACK_TIMEOUT` is a bounded
-//! safety net under this for protocol failure only — a missing or malformed
-//! signal — and should never be reached in normal operation.
+//! arrive when literally nothing was sent, so that case is short-circuited on
+//! `sent_secs == 0.0` in `pump_inner` — exact, not a small-but-nonzero
+//! threshold; see `NEGLIGIBLE_AUDIO_SECS`'s own doc for why those two checks
+//! must stay separate. `FINALIZE_ACK_TIMEOUT` is a bounded safety net under
+//! this for protocol failure only — a missing or malformed signal — and
+//! should never be reached in normal operation.
 
 use std::time::{Duration, Instant};
 
@@ -74,10 +76,18 @@ const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 /// was consistently 200-550ms; this leaves a wide margin without adding
 /// meaningful latency to any real session, and it should never be reached.
 const FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
-/// Below this, treat a session as having sent no audio worth transcribing —
-/// Deepgram does not emit a `from_finalize` result for a session with
-/// nothing to flush (live-verified), so there is nothing to wait for and
-/// `CloseStream` follows `Finalize` immediately. See [`conclude`].
+/// Below this, [`conclude`]'s empty-transcript error names the hold as the
+/// cause rather than silence. Wording only — a user who released this fast
+/// should be told they released too early, not that Deepgram heard them and
+/// stayed quiet. This must never gate whether `pump_inner` *waits* for
+/// `from_finalize`: live evidence shows Deepgram acks a 50 ms hold, well
+/// under this, so any audio-vs-silence threshold here would skip the wait
+/// for real speech. That decision uses `sent_secs == 0.0` directly (see
+/// `pump_inner`) — genuinely zero audio, not a smaller version of this
+/// constant. Keeping these as two unrelated checks, not one shared
+/// threshold, is deliberate: reusing a single constant for "how should we
+/// word this" and "should we wait" is exactly the bug class this module's
+/// rejected stall-detector design shipped with.
 const NEGLIGIBLE_AUDIO_SECS: f64 = 0.1;
 
 pub struct DeepgramEngine {
@@ -289,7 +299,15 @@ async fn pump_inner(
                             .context("finalising the Deepgram stream");
                         match fin {
                             Err(e) => Err(e),
-                            Ok(()) if sent_secs < NEGLIGIBLE_AUDIO_SECS => {
+                            // Exactly zero, not a smaller version of
+                            // NEGLIGIBLE_AUDIO_SECS: sent_secs only ever
+                            // grows from real byte counts, so this is exact
+                            // and safe, and it is the only duration
+                            // live-verified not to produce a from_finalize
+                            // ack. Anything above it — even the 50 ms this
+                            // module's tests hold it to — can carry real
+                            // speech and must wait.
+                            Ok(()) if sent_secs == 0.0 => {
                                 send_close_stream(&mut socket, &mut closed_stream).await
                             }
                             Ok(()) => {
@@ -445,8 +463,11 @@ impl Transcript {
         match value.get("type").and_then(|t| t.as_str()) {
             Some("Metadata") => {
                 // Deepgram sends Metadata at open and again after CloseStream.
-                // `done` is sticky here; the pump clears it when `closing` is
-                // still false so only the post-CloseStream frame ends the loop.
+                // `done` is sticky here; the pump clears it unless CloseStream
+                // has actually been sent (`was_closed_stream`), so only the
+                // post-CloseStream frame ends the loop — a Metadata frame
+                // that arrives merely after Finalize/`closing` started is not
+                // enough, since CloseStream itself may not be out yet.
                 self.done = true;
                 return None;
             }
@@ -898,6 +919,82 @@ mod tests {
             final_transcript(&event_rx).as_deref(),
             Some("No."),
             "a hold under 0.5s must still wait for the from_finalize flush, not skip waiting"
+        );
+    }
+
+    /// `negligible-audio-threshold-skips-wait`: `NEGLIGIBLE_AUDIO_SECS` (0.1s)
+    /// must never gate the wait itself — only `sent_secs == 0.0` may. Live
+    /// evidence showed Deepgram acks a real ~50ms hold, so this drives that
+    /// exact duration (comfortably inside the old 0.1s threshold, and an
+    /// order of magnitude under the 0.5s one) through the same
+    /// withhold-then-flush server and requires the flush to still be waited
+    /// for, not skipped as "basically no audio".
+    #[tokio::test]
+    async fn a_50ms_hold_still_waits_for_the_flush() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
+
+            let rushed = tokio::time::timeout(Duration::from_millis(50), ws.next())
+                .await
+                .is_ok();
+            if rushed {
+                let _ = ws
+                    .send(Message::Text(
+                        r#"{"type":"Metadata","duration":0.05}"#.into(),
+                    ))
+                    .await;
+                return;
+            }
+
+            ws.send(Message::Text(results_from_finalize("Hi.", true).into()))
+                .await
+                .unwrap();
+
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"type":"Metadata","duration":0.05}"#.into(),
+                ))
+                .await;
+        });
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        // ~50ms: the exact duration live-verified (near_silence.wav) to still
+        // get a from_finalize ack, well inside NEGLIGIBLE_AUDIO_SECS (0.1s) —
+        // the threshold that must select error wording only, never gate this
+        // wait.
+        let fifty_ms = vec![0u8; (crate::audio::SAMPLE_RATE as f64 * 0.05) as usize * 2];
+        audio_tx.send(Command::Audio(fifty_ms)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        run_pump(audio_rx, event_tx.clone(), addr, FINALIZE_ACK_TIMEOUT).await;
+        server.await.unwrap();
+
+        assert_eq!(
+            final_transcript(&event_rx).as_deref(),
+            Some("Hi."),
+            "50ms of real audio is not zero audio and must still wait for from_finalize"
         );
     }
 
