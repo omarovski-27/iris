@@ -990,6 +990,7 @@ dependencies = [
  "crossbeam-channel",
  "iris-core",
  "iris-engine-local",
+ "iris-overlay",
  "iris-polish",
  "serde",
  "serde_json",

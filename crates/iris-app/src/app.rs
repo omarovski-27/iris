@@ -7,7 +7,10 @@
 //!   │   idle   │───────────────►│   capturing   │─────────────►│ finalising │
 //!   └──────────┘                └───────────────┘              └────────────┘
 //!         ▲                        frames → engine              polish, inject,
-//!         └───────────────────────────────────────────────────  log, hide pill
+//!         │                                                     log session
+//!         │                          ┌── inserted ── self-dismiss (~550 ms)
+//!         └──────────────────────────┤
+//!                                    └── cancel/empty/error ── hide pill
 //! ```
 //!
 //! Two properties are worth defending when changing this file.
@@ -56,7 +59,7 @@ pub enum Command {
     SetDevice(Option<String>),
     /// Turn transcript cleanup on or off.
     SetPolish(bool),
-    /// Switch theme (the overlay's, once it lands).
+    /// Switch theme (Dark → Prism, Light → Porcelain on the overlay).
     SetTheme(Theme),
     /// Open `config.toml` in the user's editor.
     OpenSettings,
@@ -117,6 +120,11 @@ impl<A: AudioSource> App<A> {
         let engine = engines::build(&config)?;
         let polisher = polish::build(&config);
         let history = open_history(&config, &config_path);
+        let mut pill = pill;
+        // Push initial engine label and theme so the pill matches config
+        // before the first hotkey press.
+        pill.set_engine(engine.name());
+        pill.set_theme(config.theme);
         Ok(Self {
             saved: config.clone(),
             config,
@@ -164,6 +172,7 @@ impl<A: AudioSource> App<A> {
     /// Replace the engine, bypassing [`Config`]. For tests that need an engine
     /// that fails on purpose.
     pub fn set_engine(&mut self, engine: Arc<dyn Engine>) {
+        self.pill.set_engine(engine.name());
         self.engine = engine;
     }
 
@@ -236,6 +245,7 @@ impl<A: AudioSource> App<A> {
                 self.config.engine = choice;
                 match engines::build(&self.config) {
                     Ok(engine) => {
+                        self.pill.set_engine(engine.name());
                         self.engine = engine;
                         self.saved.engine = choice;
                         println!("  engine: {choice}");
@@ -268,6 +278,7 @@ impl<A: AudioSource> App<A> {
             Command::SetTheme(theme) => {
                 self.config.theme = theme;
                 self.saved.theme = theme;
+                self.pill.set_theme(theme);
                 self.persist();
             }
             Command::OpenSettings => {
@@ -322,7 +333,10 @@ impl<A: AudioSource> App<A> {
                     // built must not land in `saved`, or the next theme
                     // toggle would write a cold-start failure into the file.
                     match engines::build(&config) {
-                        Ok(engine) => self.engine = engine,
+                        Ok(engine) => {
+                            self.pill.set_engine(engine.name());
+                            self.engine = engine;
+                        }
                         Err(e) => {
                             config.engine = self.config.engine;
                             saved.engine = self.saved.engine;
@@ -331,6 +345,7 @@ impl<A: AudioSource> App<A> {
                     }
                     self.polisher = polish::build(&config);
                     self.history = open_history(&config, &self.config_path);
+                    self.pill.set_theme(config.theme);
                     self.config = config;
                     self.saved = saved;
                     println!("  reloaded {}", self.config_path.display());
@@ -368,7 +383,13 @@ impl<A: AudioSource> App<A> {
 
         let outcome = self.capture(pressed_at, frames, keys);
 
-        self.pill.hide();
+        // After a successful insert the overlay holds the confirmation (~550 ms)
+        // then exits itself. Calling hide() immediately would cancel that.
+        // Hide only on cancel / empty / error paths (no successful insert).
+        let inserted_ok = matches!(&outcome, Ok(d) if d.record.injected);
+        if !inserted_ok {
+            self.pill.hide();
+        }
         self.audio.disarm();
 
         let dictated = match outcome {
@@ -430,7 +451,6 @@ impl<A: AudioSource> App<A> {
 
         self.audio.arm().context("starting capture")?;
 
-        let mut on_partial = |text: &str| iris_core::vlog!("~ {text}");
         let events = dictation.events();
 
         let released_at = loop {
@@ -441,7 +461,13 @@ impl<A: AudioSource> App<A> {
                     dictation.feed(&frame)?;
                 }
                 recv(events) -> event => match event {
-                    Ok(event) => dictation.absorb_event(event, &mut on_partial),
+                    Ok(event) => {
+                        let pill = &mut self.pill;
+                        dictation.absorb_event(event, &mut |text: &str| {
+                            iris_core::vlog!("~ {text}");
+                            pill.set_partial_len(text.chars().count());
+                        });
+                    }
                     // The engine hung up; finish() turns that into a message.
                     Err(_) => break Instant::now(),
                 },
@@ -469,7 +495,13 @@ impl<A: AudioSource> App<A> {
         dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
         self.pill.processing();
 
-        let outcome = dictation.finish(self.final_timeout, &mut on_partial)?;
+        let outcome = {
+            let pill = &mut self.pill;
+            dictation.finish(self.final_timeout, &mut |text: &str| {
+                iris_core::vlog!("~ {text}");
+                pill.set_partial_len(text.chars().count());
+            })?
+        };
         let mut timeline = outcome.timeline;
         let raw = outcome.text.trim().to_string();
 
@@ -491,7 +523,14 @@ impl<A: AudioSource> App<A> {
             Ok(()) => {
                 timeline.mark(Mark::Injected);
                 record.injected = true;
-                self.pill.inserted();
+                // Key-release → text on screen: the number the pill prints.
+                let latency_ms = timeline
+                    .perceived()
+                    .map(ms)
+                    .unwrap_or(0.0)
+                    .round()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32;
+                self.pill.inserted(latency_ms);
             }
             Err(e) => {
                 // The transcript is good; only the delivery failed. Say so, and

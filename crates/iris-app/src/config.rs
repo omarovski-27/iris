@@ -112,15 +112,14 @@ impl fmt::Display for EngineChoice {
     }
 }
 
-/// Light or dark. Consumed by the tray icon now and by `iris-overlay` once the
-/// adapter lands.
+/// Light or dark. Maps onto the overlay palettes: Dark → Prism, Light → Porcelain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
-    /// For dark desktops. The default: dictation overlays sit over editors.
+    /// Prism dark — the locked v1 default.
     #[default]
     Dark,
-    /// For light desktops.
+    /// Porcelain light — day-one light theme, same geometry.
     Light,
 }
 

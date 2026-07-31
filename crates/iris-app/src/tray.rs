@@ -87,33 +87,113 @@ pub fn theme_id(theme: Theme) -> String {
     format!("{THEME_PREFIX}{theme}")
 }
 
-/// A 32×32 RGBA tray icon: a filled dot in the accent colour on transparency.
+/// A 32×32 RGBA tray icon: the captain-locked **prism triangle** mark.
 ///
-/// Drawn in code rather than shipped as a `.ico` so there is no binary asset to
-/// keep in step with the theme, and no file to fail to find next to the `.exe`.
+/// Rasterised in code from the same geometry as `iris-overlay`'s
+/// `assets/iris-prism.svg` (the filled wedge only — at tray sizes the rays and
+/// outline drop out). No violet filled-dot placeholder. Drawn rather than
+/// shipped as a `.ico` so there is no binary asset to keep in step and no file
+/// to fail to find next to the `.exe`.
+///
+/// `theme` picks the plate behind the wedge so the mark stays legible on both
+/// dark and light taskbars; the spectrum fill is shared.
 pub fn icon_rgba(theme: Theme, size: u32) -> Vec<u8> {
-    let (r, g, b) = match theme {
-        // Iris violet on dark; a deeper shade on light, so it stays visible on
-        // a white taskbar.
-        Theme::Dark => (167u8, 139u8, 250u8),
-        Theme::Light => (91u8, 33u8, 182u8),
+    // Plate matches the SVG's dark plate / a light inverse for light theme.
+    let (plate_r, plate_g, plate_b, plate_a) = match theme {
+        Theme::Dark => (20u8, 24u8, 34u8, 255u8),     // #141822
+        Theme::Light => (237u8, 239u8, 245u8, 255u8), // soft porcelain plate
     };
-    let centre = (size as f32 - 1.0) / 2.0;
-    let radius = size as f32 * 0.42;
+
+    // Equilateral-ish wedge: apex at top centre, base near the bottom.
+    // Coordinates in unit space matching the SVG wedge `M32 18 L45 45 L19 45`
+    // inside a 64×64 viewBox, mapped into the icon with a little padding.
+    let s = size as f32;
+    let pad = s * 0.12;
+    let apex = (s * 0.5, pad + s * 0.08);
+    let bl = (pad + s * 0.08, s - pad);
+    let br = (s - pad - s * 0.08, s - pad);
 
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 - centre;
-            let dy = y as f32 - centre;
-            let distance = (dx * dx + dy * dy).sqrt();
-            // One pixel of feather, so the dot does not look like a QR code at
-            // 16 px, which is what the taskbar actually renders it at.
-            let alpha = ((radius - distance).clamp(0.0, 1.0) * 255.0) as u8;
-            rgba.extend_from_slice(&[r, g, b, alpha]);
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let inside = point_in_triangle(px, py, apex, bl, br);
+            if inside {
+                // Spectrum along the base (left → right), matching the SVG
+                // linearGradient rose → amber → mint → sky → violet.
+                let t = ((px - bl.0) / (br.0 - bl.0)).clamp(0.0, 1.0);
+                let (r, g, b) = spectrum_sample(t);
+                // Soft vertical sheen: slightly brighter toward the apex.
+                let sheen = 1.0 + 0.12 * (1.0 - ((py - apex.1) / (bl.1 - apex.1)).clamp(0.0, 1.0));
+                let r = ((r as f32) * sheen).min(255.0) as u8;
+                let g = ((g as f32) * sheen).min(255.0) as u8;
+                let b = ((b as f32) * sheen).min(255.0) as u8;
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            } else {
+                // Rounded plate behind the wedge (reads as the SVG rounded rect
+                // at small sizes when the wedge alone would be too thin).
+                let cx = s * 0.5;
+                let cy = s * 0.5;
+                let half = s * 0.48;
+                let dx = (px - cx).abs();
+                let dy = (py - cy).abs();
+                // Squircle-ish plate; feather the edge one pixel.
+                let edge = (half - dx.max(dy)).clamp(0.0, 1.0);
+                let alpha = (edge * f32::from(plate_a)) as u8;
+                rgba.extend_from_slice(&[plate_r, plate_g, plate_b, alpha]);
+            }
         }
     }
     rgba
+}
+
+/// Barycentric point-in-triangle test.
+fn point_in_triangle(px: f32, py: f32, a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
+    let v0 = (c.0 - a.0, c.1 - a.1);
+    let v1 = (b.0 - a.0, b.1 - a.1);
+    let v2 = (px - a.0, py - a.1);
+    let dot00 = v0.0 * v0.0 + v0.1 * v0.1;
+    let dot01 = v0.0 * v1.0 + v0.1 * v1.1;
+    let dot02 = v0.0 * v2.0 + v0.1 * v2.1;
+    let dot11 = v1.0 * v1.0 + v1.1 * v1.1;
+    let dot12 = v1.0 * v2.0 + v1.1 * v2.1;
+    let denom = dot00 * dot11 - dot01 * dot01;
+    if denom.abs() < f32::EPSILON {
+        return false;
+    }
+    let inv = 1.0 / denom;
+    let u = (dot11 * dot02 - dot01 * dot12) * inv;
+    let v = (dot00 * dot12 - dot01 * dot02) * inv;
+    u >= 0.0 && v >= 0.0 && (u + v) <= 1.0
+}
+
+/// Sample the locked spectrum ramp (same stops as `iris-prism.svg`).
+fn spectrum_sample(t: f32) -> (u8, u8, u8) {
+    // stops: #FF6B8A, #FFB86B, #6BFFB8, #6BCBFF, #8B7BFF
+    const STOPS: [(f32, u8, u8, u8); 5] = [
+        (0.00, 255, 107, 138),
+        (0.25, 255, 184, 107),
+        (0.50, 107, 255, 184),
+        (0.75, 107, 203, 255),
+        (1.00, 139, 123, 255),
+    ];
+    let t = t.clamp(0.0, 1.0);
+    for i in 0..STOPS.len() - 1 {
+        let (t0, r0, g0, b0) = STOPS[i];
+        let (t1, r1, g1, b1) = STOPS[i + 1];
+        if t <= t1 {
+            let u = if (t1 - t0).abs() < f32::EPSILON {
+                0.0
+            } else {
+                (t - t0) / (t1 - t0)
+            };
+            let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * u) as u8;
+            return (lerp(r0, r1), lerp(g0, g1), lerp(b0, b1));
+        }
+    }
+    let last = STOPS[STOPS.len() - 1];
+    (last.1, last.2, last.3)
 }
 
 /// The tooltip: what a user hovering the icon needs to know.
@@ -446,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn the_icon_is_a_dot_of_the_right_size() {
+    fn the_icon_is_a_prism_wedge_of_the_right_size() {
         let size = 32;
         let rgba = icon_rgba(Theme::Dark, size);
         assert_eq!(rgba.len() as u32, size * size * 4);
@@ -455,10 +535,25 @@ mod tests {
             let i = ((y * size + x) * 4) as usize;
             (rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
         };
-        // Opaque in the middle, transparent in the corner.
-        assert_eq!(pixel(16, 16).3, 255);
+        // Transparent in the corner (outside the plate).
         assert_eq!(pixel(0, 0).3, 0);
-        // The two themes are visibly different colours.
+        // The wedge centre is opaque spectrum, not a flat violet filled-dot.
+        let centre = pixel(16, 20);
+        assert_eq!(centre.3, 255, "wedge centre should be opaque");
+        // Not the old violet placeholder (167, 139, 250).
+        assert!(
+            !(centre.0 == 167 && centre.1 == 139 && centre.2 == 250),
+            "tray icon must not be the violet filled-dot placeholder: {centre:?}"
+        );
+        // Spectrum has real colour variation across the base.
+        let left = pixel(10, 24);
+        let right = pixel(22, 24);
+        assert_ne!(
+            (left.0, left.1, left.2),
+            (right.0, right.1, right.2),
+            "spectrum should vary across the wedge base"
+        );
+        // Light theme plate differs from dark.
         assert_ne!(icon_rgba(Theme::Light, size)[0], rgba[0]);
     }
 

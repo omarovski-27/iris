@@ -184,10 +184,9 @@ section 2 reads the way it does.
 **Where the overlay hooks in.** `Dictation::events()` hands out a receiver of
 `TranscriptEvent`, and `absorb_event` folds one into the timeline. The spike
 already uses this seam to print live partials to the terminal (`pipeline.rs`).
-The pill itself lives in `crates/iris-overlay` and is driven through
-`OverlayHandle` (listening / level / partial length / processing / inserted) —
-it never holds or draws transcript text. App wiring maps hotkey, audio level,
-and those events onto the handle; see `crates/iris-overlay/README.md`.
+The pill itself lives in `crates/iris-overlay` (`OverlayHandle`) and never
+holds or draws transcript text. App wiring is `iris-app::pill::OverlayPill`
+(a `PillSink`); see `crates/iris-app/README.md`.
 
 This matters for perceived speed beyond the measured numbers: the pill is on
 screen for the whole utterance (spectrum + telemetry), so key-release is a
