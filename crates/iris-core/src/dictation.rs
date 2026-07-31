@@ -186,6 +186,10 @@ impl Dictation {
         if matches!(self.ended, Some(Ending::Final(_))) {
             self.ended = None;
         }
+        // Absorb anything already queued while still pre-finish so a segment
+        // Final sitting on the channel is demoted into latest_partial rather
+        // than short-circuiting the wait below before session.finish() runs.
+        self.poll(on_partial);
         self.finishing = true;
         self.session.finish()?;
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
@@ -692,6 +696,76 @@ mod tests {
         assert!(
             partials.iter().any(|p| p.contains("full sentence")),
             "overlay should keep the longer hypothesis: {partials:?}"
+        );
+    }
+
+    /// Queues a short Final before `finish()` is called, then emits a longer
+    /// Final from `Session::finish`. Mimics the app `select!` race where key-up
+    /// and a channel Final are both ready and the Final has not been absorb()ed
+    /// yet — draining must demote it so the post-finish Final still wins.
+    struct QueuedFinalBeforeFinish;
+
+    struct QueuedFinalBeforeFinishSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        finished: bool,
+    }
+
+    impl Engine for QueuedFinalBeforeFinish {
+        fn name(&self) -> &'static str {
+            "queued-final-before-finish"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            let _ = tx.send(TranscriptEvent::Partial("hello".into()));
+            let _ = tx.send(TranscriptEvent::Final("hello".into()));
+            Ok(Box::new(QueuedFinalBeforeFinishSession {
+                tx,
+                rx,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for QueuedFinalBeforeFinishSession {
+        fn push(&mut self, _: &[i16]) -> Result<()> {
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.finished = true;
+            // Yield so a buggy finish() that arms finishing before draining
+            // would already have consumed the queued Final and returned.
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = self
+                .tx
+                .send(TranscriptEvent::Final("hello world more speech after keyup".into()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_drains_queued_final_before_waiting_for_post_finish() {
+        let mut dictation = Dictation::start(&QueuedFinalBeforeFinish).unwrap();
+        // Deliberately do not poll/absorb — leave the short Final sitting on
+        // the channel the way the app loop can when key-up wins select!.
+        dictation.feed(&tone(0.2)).unwrap();
+
+        let mut partials = Vec::new();
+        let outcome = dictation
+            .finish(Duration::from_secs(2), &mut |p| partials.push(p.to_string()))
+            .expect("dictation");
+
+        assert!(
+            outcome.text.contains("more speech"),
+            "queued pre-finish Final must not short-circuit wait; got {:?} (partials={partials:?})",
+            outcome.text
         );
     }
 }
