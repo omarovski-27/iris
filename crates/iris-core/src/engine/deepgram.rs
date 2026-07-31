@@ -3,8 +3,10 @@
 //! Audio goes up as raw 16 kHz linear PCM the moment it is captured, and
 //! Deepgram returns interim hypotheses continuously. By the time the user lets
 //! go of the hotkey, everything but the last fragment of speech has already been
-//! transcribed, so `finish()` costs one flush round-trip rather than a whole
-//! inference over the utterance.
+//! transcribed, so `finish()` costs a Finalize + CloseStream flush rather than
+//! a whole inference over the utterance. Segment `is_final` frames and the
+//! open-time Metadata message never end the session — only Metadata after
+//! CloseStream (or socket death) does, via the pump's `conclude` helper.
 //!
 //! The connection is established *concurrently with the first frames*: `open()`
 //! returns immediately and audio queues in an unbounded channel until the socket
@@ -192,11 +194,25 @@ async fn pump(
                         socket.send(Message::Binary(bytes.into())).await
                             .context("sending audio to Deepgram")
                     }
-                    // `finish()` or a dropped session: ask Deepgram to flush.
+                    // `finish()` or a dropped session: flush then close.
+                    // Finalize asks Deepgram to emit finals for buffered audio
+                    // without tearing down the socket; CloseStream then signs
+                    // off with Metadata. Sending both is belt-and-braces for
+                    // the last segment after a long hold.
                     Some(Command::Finish) | None => {
                         closing = true;
-                        socket.send(Message::Text(r#"{"type":"CloseStream"}"#.into())).await
-                            .context("closing the Deepgram stream")
+                        let fin = socket
+                            .send(Message::Text(r#"{"type":"Finalize"}"#.into()))
+                            .await
+                            .context("finalising the Deepgram stream");
+                        if fin.is_err() {
+                            fin
+                        } else {
+                            socket
+                                .send(Message::Text(r#"{"type":"CloseStream"}"#.into()))
+                                .await
+                                .context("closing the Deepgram stream")
+                        }
                     }
                 };
                 if let Err(e) = sent {
@@ -219,8 +235,15 @@ async fn pump(
                         if let Some(update) = acc.absorb(&text) {
                             let _ = events.send(TranscriptEvent::Partial(update));
                         }
+                        // Deepgram may send a Metadata frame at open *and* as
+                        // the post-CloseStream sign-off. Only the latter ends
+                        // the session; segment `is_final` never does.
                         if acc.done {
-                            break;
+                            if closing {
+                                break;
+                            }
+                            // Spurious open Metadata: keep the socket open.
+                            acc.done = false;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -276,7 +299,9 @@ impl Transcript {
 
         match value.get("type").and_then(|t| t.as_str()) {
             Some("Metadata") => {
-                // Deepgram's sign-off after CloseStream.
+                // Deepgram sends Metadata at open and again after CloseStream.
+                // `done` is sticky here; the pump clears it when `closing` is
+                // still false so only the post-CloseStream frame ends the loop.
                 self.done = true;
                 return None;
             }
@@ -378,6 +403,56 @@ mod tests {
         t.absorb(r#"{"type":"Metadata","duration":5.4}"#);
         assert!(t.done);
         assert_eq!(t.finished_text(), "done.");
+    }
+
+    #[test]
+    fn segment_finals_never_mark_the_session_done() {
+        // endpointing=300 produces many is_final segments mid-hold; none of
+        // them may conclude the session — only Metadata after CloseStream.
+        let mut t = Transcript::default();
+        t.absorb(&results("Hello.", true));
+        assert!(!t.done);
+        t.absorb(&results("Why are you not", false));
+        t.absorb(&results(
+            "Why are you not taking the first words only.",
+            true,
+        ));
+        assert!(!t.done);
+        assert_eq!(
+            t.finished_text(),
+            "Hello. Why are you not taking the first words only."
+        );
+        t.absorb(r#"{"type":"Metadata","duration":8.9}"#);
+        assert!(t.done);
+    }
+
+    #[test]
+    fn multi_segment_json_fixture_accumulates_like_a_long_hold() {
+        // Fixture shaped like a real Deepgram stream: interims, segment final,
+        // more interims, segment final, then CloseStream Metadata.
+        let msgs = [
+            results("hello", false),
+            results("hello there", false),
+            results("Hello there.", true),
+            results("this is the rest", false),
+            results("this is the rest of the utterance", false),
+            results("This is the rest of the utterance.", true),
+            r#"{"type":"Metadata","duration":12.0,"channels":1}"#.to_string(),
+        ];
+        let mut t = Transcript::default();
+        let mut last = String::new();
+        for m in &msgs {
+            if let Some(update) = t.absorb(m) {
+                last = update;
+            }
+        }
+        assert!(t.done, "Metadata must end the accumulator");
+        assert_eq!(
+            t.finished_text(),
+            "Hello there. This is the rest of the utterance."
+        );
+        // Last Partial update was the second segment final (Metadata yields None).
+        assert_eq!(last, "Hello there. This is the rest of the utterance.");
     }
 
     #[test]

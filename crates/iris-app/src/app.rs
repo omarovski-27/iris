@@ -452,15 +452,29 @@ impl<A: AudioSource> App<A> {
         self.audio.arm().context("starting capture")?;
 
         let events = dictation.events();
+        // When the engine hangs up mid-hold we must *not* treat that as a key
+        // release: doing so finalises on a partial segment and injects truncated
+        // text while the user is still speaking. Keep capturing until the real
+        // key-up; `finish()` surfaces the engine failure or salvages partials.
+        //
+        // crossbeam `select!` has no `if` guard on `recv`, so after disconnect
+        // we swap in a never-ready receiver and keep waiting on frames/keys.
+        let never_events = crossbeam_channel::never();
+        let mut engine_events_open = true;
 
         let released_at = loop {
+            let event_rx = if engine_events_open {
+                &events
+            } else {
+                &never_events
+            };
             select! {
                 recv(frames) -> frame => {
                     let frame = frame.context("the audio thread stopped")?;
                     self.pill.update_level(audio::level(&frame));
                     dictation.feed(&frame)?;
                 }
-                recv(events) -> event => match event {
+                recv(event_rx) -> event => match event {
                     Ok(event) => {
                         let pill = &mut self.pill;
                         dictation.absorb_event(event, &mut |text: &str| {
@@ -468,8 +482,12 @@ impl<A: AudioSource> App<A> {
                             pill.set_partial_len(text.chars().count());
                         });
                     }
-                    // The engine hung up; finish() turns that into a message.
-                    Err(_) => break Instant::now(),
+                    Err(_) => {
+                        iris_core::vlog!(
+                            "engine event channel closed mid-hold; waiting for key-up"
+                        );
+                        engine_events_open = false;
+                    }
                 },
                 recv(keys) -> event => {
                     match event.context("the hotkey thread stopped")? {

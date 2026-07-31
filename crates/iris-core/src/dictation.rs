@@ -4,6 +4,15 @@
 //! Windows pipeline wraps it with those; the harness wraps it with a WAV file.
 //! Both produce a [`Timeline`] from the same code, so a number measured in CI is
 //! the same number measured on a desk.
+//!
+//! # Hold integrity
+//!
+//! A continuous key-hold is one utterance. [`TranscriptEvent::Final`] before
+//! [`Dictation::finish`] is demoted to a partial so segment-oriented or buggy
+//! engines cannot truncate mid-hold; `finish` always calls [`Session::finish`]
+//! and waits. On timeout, close, or error, a non-empty `latest_partial` is
+//! salvaged so words already shown on the overlay are not discarded. Prefer the
+//! longer of Final vs latest partial when both exist.
 
 use std::time::{Duration, Instant};
 
@@ -30,6 +39,9 @@ pub struct Dictation {
     timeline: Timeline,
     samples: usize,
     latest_partial: String,
+    /// Set when [`Dictation::finish`] starts. Premature terminal events before
+    /// this are not allowed to end the utterance (see [`Dictation::absorb`]).
+    finishing: bool,
     ended: Option<Ending>,
 }
 
@@ -60,6 +72,7 @@ impl Dictation {
             timeline,
             samples: 0,
             latest_partial: String::new(),
+            finishing: false,
             ended: None,
         })
     }
@@ -126,19 +139,38 @@ impl Dictation {
         match event {
             TranscriptEvent::Connected => self.timeline.mark(Mark::StreamReady),
             TranscriptEvent::Partial(text) => {
-                self.timeline.mark(Mark::FirstPartial);
-                self.timeline.partials += 1;
-                self.latest_partial = text;
-                on_partial(&self.latest_partial);
+                self.note_partial(text, on_partial);
             }
             TranscriptEvent::Final(text) => {
+                // A streaming ASR may emit segment-level "finals" or even a
+                // premature session Final while the user is still holding the
+                // key. Accepting that as terminal makes `finish()` return
+                // immediately and drops every later word. Until we have asked
+                // the engine to finalise, treat Final as a (sticky) partial.
+                if !self.finishing {
+                    let text = best_transcript(text, &self.latest_partial);
+                    self.note_partial(text, on_partial);
+                    return;
+                }
                 self.timeline.mark(Mark::FinalTranscript);
+                let text = best_transcript(text, &self.latest_partial);
+                self.latest_partial = text.clone();
                 self.ended = Some(Ending::Final(text));
             }
             TranscriptEvent::Error(message) => {
+                // Errors are real even mid-hold (missing key, socket death).
+                // Keep the richest partial we saw so finish can salvage words
+                // when the engine died after producing useful text.
                 self.ended = Some(Ending::Error(message));
             }
         }
+    }
+
+    fn note_partial(&mut self, text: String, on_partial: &mut dyn FnMut(&str)) {
+        self.timeline.mark(Mark::FirstPartial);
+        self.timeline.partials += 1;
+        self.latest_partial = text;
+        on_partial(&self.latest_partial);
     }
 
     /// End of speech. Stamps [`Mark::KeyUp`], tells the engine to finalise, then
@@ -147,12 +179,27 @@ impl Dictation {
     /// The wait is where perceived latency lives, so `on_partial` keeps firing
     /// throughout: an overlay can keep updating right up to the moment the real
     /// text lands.
+    ///
+    /// A terminal event that arrived *before* this call (a premature Final from
+    /// a buggy or segment-oriented engine) does not short-circuit the wait:
+    /// [`Session::finish`] is always invoked, and a later, richer Final or the
+    /// best partial wins.
     pub fn finish(
         mut self,
         timeout: Duration,
         on_partial: &mut dyn FnMut(&str),
     ) -> Result<DictationOutcome> {
         self.timeline.mark(Mark::KeyUp);
+        // Drop any premature terminal Final so we wait for the post-finish one.
+        // Errors stay: the engine already failed and finish cannot un-fail it.
+        if matches!(self.ended, Some(Ending::Final(_))) {
+            self.ended = None;
+        }
+        // Absorb anything already queued while still pre-finish so a segment
+        // Final sitting on the channel is demoted into latest_partial rather
+        // than short-circuiting the wait below before session.finish() runs.
+        self.poll(on_partial);
+        self.finishing = true;
         self.session.finish()?;
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
@@ -173,8 +220,17 @@ impl Dictation {
 
         self.timeline.audio_secs = self.audio_secs();
 
+        // Prefer a real Final; otherwise salvage the best partial rather than
+        // discarding words the user already saw on the overlay.
+        let salvaged = (!self.latest_partial.trim().is_empty()).then(|| {
+            let text = self.latest_partial.clone();
+            self.timeline.mark(Mark::FinalTranscript);
+            text
+        });
+
         match self.ended {
             Some(Ending::Final(text)) => {
+                let text = best_transcript(text, salvaged.as_deref().unwrap_or(""));
                 self.timeline.transcript = text.clone();
                 Ok(DictationOutcome {
                     text,
@@ -182,18 +238,53 @@ impl Dictation {
                 })
             }
             Some(Ending::Error(message)) => {
-                Err(anyhow!("{} engine: {message}", self.timeline.engine))
+                if let Some(text) = salvaged {
+                    vlog!(
+                        "engine error after partial transcript; salvaging {} chars",
+                        text.chars().count()
+                    );
+                    self.timeline.transcript = text.clone();
+                    Ok(DictationOutcome {
+                        text,
+                        timeline: self.timeline,
+                    })
+                } else {
+                    Err(anyhow!("{} engine: {message}", self.timeline.engine))
+                }
             }
-            Some(Ending::Closed) => Err(anyhow!(
-                "{} engine closed without returning a transcript",
-                self.timeline.engine
-            )),
-            None => Err(anyhow!(
-                "{} engine did not return a transcript within {:.1}s",
-                self.timeline.engine,
-                timeout.as_secs_f64()
-            )),
+            Some(Ending::Closed) | None => {
+                if let Some(text) = salvaged {
+                    self.timeline.transcript = text.clone();
+                    Ok(DictationOutcome {
+                        text,
+                        timeline: self.timeline,
+                    })
+                } else if matches!(self.ended, Some(Ending::Closed)) {
+                    Err(anyhow!(
+                        "{} engine closed without returning a transcript",
+                        self.timeline.engine
+                    ))
+                } else {
+                    Err(anyhow!(
+                        "{} engine did not return a transcript within {:.1}s",
+                        self.timeline.engine,
+                        timeout.as_secs_f64()
+                    ))
+                }
+            }
         }
+    }
+}
+
+/// Prefer the longer hypothesis. Streaming engines sometimes emit a short
+/// session Final while a richer partial still holds the rest of the utterance.
+fn best_transcript(final_text: String, partial: &str) -> String {
+    let final_text = final_text.trim();
+    let partial = partial.trim();
+    if partial.chars().count() > final_text.chars().count() {
+        partial.to_string()
+    } else {
+        final_text.to_string()
     }
 }
 
@@ -381,5 +472,314 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("did not return a transcript"), "{err}");
+    }
+
+    /// Engine that emits a terminal Final after the first half-second of audio
+    /// while more audio is still being fed — the Deepgram-segment / pump-exit
+    /// failure mode that used to make `finish()` return "hello" and drop the rest.
+    struct EarlyFinalEngine;
+
+    struct EarlyFinalSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        samples: usize,
+        sent_early: bool,
+        finished: bool,
+    }
+
+    impl Engine for EarlyFinalEngine {
+        fn name(&self) -> &'static str {
+            "early-final"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            Ok(Box::new(EarlyFinalSession {
+                tx,
+                rx,
+                samples: 0,
+                sent_early: false,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for EarlyFinalSession {
+        fn push(&mut self, pcm: &[i16]) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.samples += pcm.len();
+            let secs = audio::secs(self.samples);
+            if secs >= 0.5 && !self.sent_early {
+                self.sent_early = true;
+                let _ = self.tx.send(TranscriptEvent::Partial("hello".into()));
+                let _ = self.tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            if secs >= 1.5 && self.sent_early {
+                let _ = self
+                    .tx
+                    .send(TranscriptEvent::Partial("hello world more speech".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.finished = true;
+            let _ = self.tx.send(TranscriptEvent::Final(
+                "hello world more speech after keyup".into(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn early_final_does_not_truncate_the_utterance() {
+        let mut partials = Vec::new();
+        let outcome = run_offline(&EarlyFinalEngine, &tone(2.0), Pace::Fast, &mut |p| {
+            partials.push(p.to_string())
+        })
+        .expect("dictation");
+
+        assert!(
+            outcome.text.contains("more speech"),
+            "premature Final must not win; got {:?} (partials={partials:?})",
+            outcome.text
+        );
+        assert!(
+            partials.iter().any(|p| p.contains("more speech")),
+            "later audio must still produce partials: {partials:?}"
+        );
+    }
+
+    /// Engine that dies after an early Final and never emits another — finish
+    /// must salvage the richest partial rather than return only the first word.
+    struct EarlyFinalThenDie;
+
+    struct EarlyFinalThenDieSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        samples: usize,
+        sent_early: bool,
+        finished: bool,
+    }
+
+    impl Engine for EarlyFinalThenDie {
+        fn name(&self) -> &'static str {
+            "early-final-die"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            Ok(Box::new(EarlyFinalThenDieSession {
+                tx,
+                rx,
+                samples: 0,
+                sent_early: false,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for EarlyFinalThenDieSession {
+        fn push(&mut self, pcm: &[i16]) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.samples += pcm.len();
+            if audio::secs(self.samples) >= 0.4 && !self.sent_early {
+                self.sent_early = true;
+                let _ = self.tx.send(TranscriptEvent::Partial("hello".into()));
+                let _ = self.tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            if audio::secs(self.samples) >= 1.0 {
+                let _ = self
+                    .tx
+                    .send(TranscriptEvent::Partial("hello there full sentence".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            // No terminal event after finish — forces salvage of latest_partial.
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_salvages_latest_partial_when_final_never_arrives() {
+        let outcome = run_offline(&EarlyFinalThenDie, &tone(1.5), Pace::Fast, &mut |_| {})
+            .expect("should salvage partial");
+        assert!(
+            outcome.text.contains("full sentence"),
+            "expected salvage of richest partial, got {:?}",
+            outcome.text
+        );
+    }
+
+    #[test]
+    fn best_transcript_prefers_the_longer_hypothesis() {
+        assert_eq!(best_transcript("hi".into(), "hello there"), "hello there");
+        assert_eq!(best_transcript("hello there".into(), "hi"), "hello there");
+        assert_eq!(best_transcript("  same  ".into(), "same"), "same");
+    }
+
+    /// Short premature Final after a longer interim must not erase the interim
+    /// from `latest_partial` — finish salvages whatever is stored there.
+    struct ShortFinalAfterLongPartial;
+
+    struct ShortFinalAfterLongPartialSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        samples: usize,
+        phase: u8,
+        finished: bool,
+    }
+
+    impl Engine for ShortFinalAfterLongPartial {
+        fn name(&self) -> &'static str {
+            "short-final-after-long-partial"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            Ok(Box::new(ShortFinalAfterLongPartialSession {
+                tx,
+                rx,
+                samples: 0,
+                phase: 0,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for ShortFinalAfterLongPartialSession {
+        fn push(&mut self, pcm: &[i16]) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.samples += pcm.len();
+            let secs = audio::secs(self.samples);
+            if secs >= 0.4 && self.phase == 0 {
+                self.phase = 1;
+                let _ = self
+                    .tx
+                    .send(TranscriptEvent::Partial("hello there full sentence".into()));
+            }
+            if secs >= 0.8 && self.phase == 1 {
+                self.phase = 2;
+                let _ = self.tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn demoted_short_final_does_not_clobber_longer_partial() {
+        let mut partials = Vec::new();
+        let outcome = run_offline(
+            &ShortFinalAfterLongPartial,
+            &tone(1.2),
+            Pace::Fast,
+            &mut |p| partials.push(p.to_string()),
+        )
+        .expect("should salvage longer partial");
+
+        assert!(
+            outcome.text.contains("full sentence"),
+            "short demoted Final must not erase longer interim; got {:?} (partials={partials:?})",
+            outcome.text
+        );
+        assert!(
+            partials.iter().any(|p| p.contains("full sentence")),
+            "overlay should keep the longer hypothesis: {partials:?}"
+        );
+    }
+
+    /// Queues a short Final before `finish()` is called, then emits a longer
+    /// Final from `Session::finish`. Mimics the app `select!` race where key-up
+    /// and a channel Final are both ready and the Final has not been absorb()ed
+    /// yet — draining must demote it so the post-finish Final still wins.
+    struct QueuedFinalBeforeFinish;
+
+    struct QueuedFinalBeforeFinishSession {
+        tx: crossbeam_channel::Sender<TranscriptEvent>,
+        rx: crossbeam_channel::Receiver<TranscriptEvent>,
+        finished: bool,
+    }
+
+    impl Engine for QueuedFinalBeforeFinish {
+        fn name(&self) -> &'static str {
+            "queued-final-before-finish"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            let _ = tx.send(TranscriptEvent::Partial("hello".into()));
+            let _ = tx.send(TranscriptEvent::Final("hello".into()));
+            Ok(Box::new(QueuedFinalBeforeFinishSession {
+                tx,
+                rx,
+                finished: false,
+            }))
+        }
+    }
+
+    impl Session for QueuedFinalBeforeFinishSession {
+        fn push(&mut self, _: &[i16]) -> Result<()> {
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.rx
+        }
+        fn finish(&mut self) -> Result<()> {
+            if self.finished {
+                return Ok(());
+            }
+            self.finished = true;
+            // Yield so a buggy finish() that arms finishing before draining
+            // would already have consumed the queued Final and returned.
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = self.tx.send(TranscriptEvent::Final(
+                "hello world more speech after keyup".into(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_drains_queued_final_before_waiting_for_post_finish() {
+        let mut dictation = Dictation::start(&QueuedFinalBeforeFinish).unwrap();
+        // Deliberately do not poll/absorb — leave the short Final sitting on
+        // the channel the way the app loop can when key-up wins select!.
+        dictation.feed(&tone(0.2)).unwrap();
+
+        let mut partials = Vec::new();
+        let outcome = dictation
+            .finish(Duration::from_secs(2), &mut |p| {
+                partials.push(p.to_string())
+            })
+            .expect("dictation");
+
+        assert!(
+            outcome.text.contains("more speech"),
+            "queued pre-finish Final must not short-circuit wait; got {:?} (partials={partials:?})",
+            outcome.text
+        );
     }
 }

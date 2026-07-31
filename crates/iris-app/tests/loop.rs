@@ -754,3 +754,124 @@ impl Engine for FailingEngine {
         Ok(Box::new(FixedSession { text: "", tx, rx }))
     }
 }
+
+/// Emits a premature Final after the first frames, then drops the event
+/// sender — the Deepgram pump-exit shape that used to make the hold loop treat
+/// channel disconnect as a key-up and inject only the first word.
+struct PrematureFinalEngine;
+
+struct PrematureFinalSession {
+    tx: Option<Sender<TranscriptEvent>>,
+    rx: Receiver<TranscriptEvent>,
+    samples: usize,
+    fired: bool,
+}
+
+impl Engine for PrematureFinalEngine {
+    fn name(&self) -> &'static str {
+        "premature-final"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PrematureFinalSession {
+            tx: Some(tx),
+            rx,
+            samples: 0,
+            fired: false,
+        }))
+    }
+}
+
+impl Session for PrematureFinalSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        self.samples += pcm.len();
+        if !self.fired && self.samples >= 3_200 {
+            self.fired = true;
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(TranscriptEvent::Partial("hello".into()));
+                let _ = tx.send(TranscriptEvent::Final("hello".into()));
+            }
+            // Pump exit: dropping the sender disconnects the event channel.
+            self.tx = None;
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.rx
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        // No further terminal event — dictation must salvage the partial.
+        Ok(())
+    }
+}
+
+#[test]
+fn engine_disconnect_mid_hold_waits_for_key_up_and_keeps_the_words() {
+    // Regression: event-channel disconnect used to break the capture loop as if
+    // the key were released, finalising on the first segment while the user was
+    // still holding. The loop must wait for the real key-up; dictation salvages
+    // the richest partial so words are not silently dropped.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.polish.llm = false;
+    let audio = ChannelAudio::new();
+    let frames = audio.sender();
+    let armed = audio.armed();
+    let injector = Arc::new(RecordingInjector::new());
+    let pill = RecordingPill::new();
+    let mut app = App::new(
+        config,
+        &config_path,
+        audio,
+        injector.clone() as Arc<dyn Injector>,
+        Box::new(pill.clone()),
+    )
+    .expect("app")
+    .with_final_timeout(Duration::from_millis(300));
+    app.set_engine(Arc::new(PrematureFinalEngine));
+
+    let (keys_tx, keys_rx) = crossbeam_channel::unbounded();
+    let app_frames = app.frames();
+
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("arm");
+        // More than enough audio that a mid-hold disconnect (at ~0.2 s of
+        // samples) would under-count if the loop treated it as key-up.
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        while !frames.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Deliberate pause after engine would have disconnected: proves the
+        // loop is still in the hold, waiting on the real key-up.
+        std::thread::sleep(Duration::from_millis(80));
+        keys_tx
+            .send(HotkeyEvent::Up(Instant::now()))
+            .expect("key up");
+    });
+
+    let dictated = app
+        .dictate(Instant::now(), &app_frames, &keys_rx)
+        .expect("dictation should salvage the partial");
+    speaker.join().expect("speaker");
+
+    // Rule polish capitalises and punctuates; the raw words must still be there.
+    assert!(
+        dictated.record.text.to_ascii_lowercase().contains("hello"),
+        "premature Final text must still be recovered, got {:?}",
+        dictated.record.text
+    );
+    assert!(
+        dictated.record.latency.audio_secs > 0.8,
+        "must keep capturing until key-up, not stop at engine disconnect; got {:.2}s",
+        dictated.record.latency.audio_secs
+    );
+    assert!(
+        dictated.record.injected,
+        "salvaged words must still be injected"
+    );
+    assert_eq!(injector.inserted().len(), 1);
+}
