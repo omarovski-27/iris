@@ -81,10 +81,27 @@ hold for any new engine.
 `Dictation` (`iris-core/src/dictation.rs`) is the portable driver shared by the
 live Windows pipeline and the CI harness, so latency measured in CI is
 comparable to latency measured on a desk. `Dictation::events()` is the seam the
-overlay UI hangs off.
+overlay UI hangs off. `Dictation::start_with_session` takes an already-open
+`Session` instead of opening one — see `App::prewarm` below.
 
 Measured latency numbers, the budget breakdown, and open risks:
 `docs/spike-findings.md`.
+
+**A short hold can end before Deepgram says anything at all.** Connect + first
+result is ~1-3 s; a hold shorter than that has nothing streamed back when the
+key comes up, so the entire transcript depends on one post-`Finalize` flush.
+`deepgram.rs`'s `pump` tracks `sent_secs` (audio actually forwarded) against
+`Transcript::covered_secs` (Deepgram's own reported `start + duration`) and
+withholds `CloseStream` until they converge, so a slow-to-respond Deepgram
+still gets to finish transcribing already-sent audio instead of having the
+socket pulled out from under it. See the module doc for the full mechanism and
+`a_hold_shorter_than_first_response_does_not_abandon_the_backlog` for the
+adversarial-fake-server regression test. `App` (`iris-app/src/app.rs`)
+attacks the same latency from the other side: `App::prewarm` opens the next
+session right after each dictation (and once at startup) so a network
+engine's connect cost overlaps idle time instead of the next hold; `capture`
+consumes it via `Dictation::start_with_session` when it is fresh enough
+(`PREWARM_STALE_AFTER`), falling back to opening fresh otherwise.
 
 ## Sharp edges
 
@@ -112,6 +129,11 @@ Measured latency numbers, the budget breakdown, and open risks:
   before touching this; none of it is dead code. The configured hotkey
   reaches the injector via `SystemInjector::new` (wired in `main.rs`), not
   via `app.rs`.
+- A failed dictation's `DictationRecord` in `history.jsonl` gets a fresh,
+  zeroed `Timeline` (`App::dictate`'s `Err` arm), not the one `capture` was
+  actually tracking. `"audio_secs":0.0` on an errored record is consistent
+  with *some* audio having been captured before the failure, not proof that
+  literally none was — don't over-read that field on error rows.
 
 ## Maintaining this file
 

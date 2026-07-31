@@ -11,6 +11,7 @@
 //! is why `SystemInjector` is never constructed here, and why the loop takes an
 //! injector rather than calling `iris_core::inject` directly.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -385,6 +386,74 @@ fn an_engine_failure_is_reported_and_recorded() {
 }
 
 #[test]
+fn a_session_is_prewarmed_ahead_of_each_hotkey_press() {
+    // A connection opened only at key-down pays its connect latency on the
+    // hold every single time. `capture` should instead consume a session
+    // opened *before* this press and immediately start the next one, so that
+    // latency overlaps idle time and the current dictation instead.
+    let opens = Arc::new(AtomicUsize::new(0));
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(CountingEngine {
+        opens: opens.clone(),
+        text: "hello",
+    }));
+    // `set_engine` is deliberately minimal (see its doc) and does not itself
+    // prewarm, so nothing has opened yet.
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+    rig.dictate().expect("first");
+    // No prewarmed session existed yet for this just-set engine, so this
+    // dictation opened fresh (1) — then `capture` immediately opened a
+    // second one to have ready for next time.
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+
+    rig.dictate().expect("second");
+    // The session prewarmed above is consumed with no fresh open; only the
+    // new prewarm for the press after *this* one adds to the count.
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        3,
+        "the second dictation should have reused the prewarmed session"
+    );
+}
+
+#[test]
+fn switching_engines_prewarms_the_new_one_not_the_old() {
+    // Polish is irrelevant to what this test checks and would otherwise
+    // reshape the fixed transcript (capitalising and punctuating "new").
+    let mut rig = rig_with(|c| c.polish.enabled = false);
+    let old_opens = Arc::new(AtomicUsize::new(0));
+    rig.app.set_engine(Arc::new(CountingEngine {
+        opens: old_opens.clone(),
+        text: "old",
+    }));
+    rig.dictate().expect("first, on the old engine");
+    let old_count_after_first = old_opens.load(Ordering::SeqCst);
+    assert_eq!(old_count_after_first, 2, "one open plus one prewarm");
+
+    let new_opens = Arc::new(AtomicUsize::new(0));
+    rig.app.set_engine(Arc::new(CountingEngine {
+        opens: new_opens.clone(),
+        text: "new",
+    }));
+    // The old engine's prewarmed session (if any) must not linger and get
+    // used once the engine has moved on.
+    assert_eq!(
+        old_opens.load(Ordering::SeqCst),
+        old_count_after_first,
+        "the old engine must not be opened again after switching away from it"
+    );
+
+    let dictated = rig.dictate().expect("second, on the new engine");
+    assert_eq!(dictated.record.text, "new");
+    assert_eq!(
+        new_opens.load(Ordering::SeqCst),
+        2,
+        "one open plus one prewarm, same as any first use"
+    );
+}
+
+#[test]
 fn back_to_back_dictations_do_not_leak_audio_into_each_other() {
     let mut rig = rig();
     rig.dictate().expect("first");
@@ -700,6 +769,29 @@ fn wait_for(mut condition: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for the loop");
+}
+
+/// An engine that counts every [`Engine::open`] call, to observe *when* the
+/// loop opens a session rather than just what it transcribes.
+struct CountingEngine {
+    opens: Arc<AtomicUsize>,
+    text: &'static str,
+}
+
+impl Engine for CountingEngine {
+    fn name(&self) -> &'static str {
+        "counting"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(FixedSession {
+            text: self.text,
+            tx,
+            rx,
+        }))
+    }
 }
 
 /// An engine that returns a fixed transcript the instant it is asked to
