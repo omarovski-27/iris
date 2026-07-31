@@ -429,7 +429,7 @@ fn draw_signal(pixmap: &mut Pixmap, ctx: &Ctx<'_>, clip: Option<&Mask>) {
     }
 }
 
-/// The capsule on the left: ring, recording core, spinner, check.
+/// The capsule on the left: ring, live core, spinner, check.
 fn draw_capsule(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
     let l = ctx.layout;
     let theme = ctx.theme;
@@ -456,7 +456,7 @@ fn draw_capsule(pixmap: &mut Pixmap, ctx: &Ctx<'_>) {
     let processing = ctx.state_alpha(OverlayState::Processing);
     let inserted = ctx.state_alpha(OverlayState::Inserted);
 
-    // Recording pulse: an expanding, fading halo around the core.
+    // Listening pulse: an expanding, fading halo around the live core.
     if listening > 0.001 {
         let t = (ctx.model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
         let grow = (t / 0.7).min(1.0);

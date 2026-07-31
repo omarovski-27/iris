@@ -181,7 +181,7 @@ pub struct Theme {
     pub ink_faint: Rgba,
 
     // ---- capsule ----
-    /// Recording dot.
+    /// Live core fill (mint/sky — never a rec-red cue).
     pub rec: Rgba,
     /// Success accent — the inserted check.
     pub ok: Rgba,

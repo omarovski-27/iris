@@ -414,7 +414,7 @@ mod tests {
         // Radius is exactly half the height: the ends are true semicircles.
         assert_eq!(PILL_RADIUS * 2.0, PILL_H);
         // Stay clearly smaller than the mockup recorder proportions.
-        assert!(PILL_W < 180.0 && PILL_H < 40.0);
+        const { assert!(PILL_W < 180.0 && PILL_H < 40.0) };
     }
 
     #[test]

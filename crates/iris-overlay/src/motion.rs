@@ -35,7 +35,7 @@ pub const CHECK_DRAW_MS: u32 = 240;
 /// `inserted()` to a blank screen is therefore `INSERTED_HOLD_MS + EXIT_MS`.
 pub const INSERTED_HOLD_MS: u32 = 550;
 
-/// Period of the recording dot's pulse.
+/// Period of the live-core listening pulse.
 pub const REC_PULSE_MS: u32 = 1400;
 
 /// Period of one full turn of the processing spinner.
