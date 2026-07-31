@@ -82,6 +82,21 @@ mod tests {
     }
 
     #[test]
+    fn the_reported_regression_string_plans_without_substitution() {
+        // "This is a full sentence." injected as 21 literal 0x20 bytes after
+        // the first word. Every unit here must be its own character's exact
+        // UTF-16 code point, one per character, none repeated or dropped —
+        // proving `plan` cannot be where the substitution happens; see
+        // `inject.rs`'s modifier-state correction for the actual fix.
+        let text = prepare("This is a full sentence.", true);
+        assert_eq!(text, "This is a full sentence. ");
+        let units = plan(&text);
+        let expected: Vec<KeyUnit> = text.chars().map(|c| KeyUnit::Unicode(c as u16)).collect();
+        assert_eq!(units, expected);
+        assert_eq!(units.len(), 25, "25 bytes landed in the hex dump");
+    }
+
+    #[test]
     fn accented_and_symbol_characters_survive() {
         // Single BMP code units, sent verbatim regardless of keyboard layout.
         assert_eq!(plan("ü"), vec![KeyUnit::Unicode(0x00FC)]);

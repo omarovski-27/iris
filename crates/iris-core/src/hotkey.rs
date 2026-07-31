@@ -147,6 +147,28 @@ impl HotkeyEvent {
     }
 }
 
+/// `VK_PACKET`: the virtual-key code a low-level hook sees for a
+/// `KEYEVENTF_UNICODE` event (the character itself rides in `scanCode`
+/// instead). Exposed so both the hook and its tests can reason about the one
+/// vkCode text injection can ever produce.
+pub const VK_PACKET: u32 = 0xE7;
+
+/// Whether a low-level keyboard message is a genuine press/release of the
+/// configured hotkey — i.e. one the hook should act on, rather than a message
+/// to wave through untouched via `CallNextHookEx`.
+///
+/// `injected` is checked unconditionally, not just as a tie-breaker: a
+/// `KEYEVENTF_UNICODE` character always carries `vkCode == VK_PACKET`
+/// (`0xE7`), never a configured hotkey's own code, so `vk_code == target_vk`
+/// alone already excludes every character Iris injects. The `injected` check
+/// is what also covers the case where Iris (or `paste`'s Ctrl+V) injects a
+/// *virtual-key* event — `VK_RETURN`, `VK_TAB`, or generic `VK_CONTROL` — so
+/// that a future hotkey choice sharing one of those codes can never be
+/// mistaken for a real press either.
+pub fn is_hotkey_event(vk_code: u32, target_vk: u32, injected: bool) -> bool {
+    vk_code == target_vk && !injected
+}
+
 #[cfg(windows)]
 pub use hook::{listen, Listener};
 
@@ -165,7 +187,7 @@ mod hook {
         WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
-    use super::{HotkeyEvent, Key};
+    use super::{is_hotkey_event, HotkeyEvent, Key};
 
     /// The hook callback is a bare `extern "system" fn`, so its state has to be
     /// global. One hook per process is all we want anyway.
@@ -275,12 +297,10 @@ mod hook {
         }
 
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let is_ours = info.vkCode == TARGET_VK.load(Ordering::Relaxed);
-        // Ignore what we synthesised ourselves, or injecting a transcript could
-        // retrigger dictation.
         let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
+        let is_ours = is_hotkey_event(info.vkCode, TARGET_VK.load(Ordering::Relaxed), injected);
 
-        if is_ours && !injected {
+        if is_ours {
             let now = std::time::Instant::now();
             let event = match wparam.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -340,5 +360,55 @@ mod tests {
     fn left_and_right_modifiers_are_distinct() {
         // The whole point of using a low-level hook rather than RegisterHotKey.
         assert_ne!(Key::RightCtrl.vk(), Key::LeftCtrl.vk());
+    }
+
+    #[test]
+    fn a_genuine_press_of_the_configured_hotkey_is_recognised() {
+        assert!(is_hotkey_event(
+            Key::RightCtrl.vk(),
+            Key::RightCtrl.vk(),
+            false
+        ));
+    }
+
+    #[test]
+    fn other_real_keys_are_never_mistaken_for_the_hotkey() {
+        assert!(!is_hotkey_event(
+            Key::LeftCtrl.vk(),
+            Key::RightCtrl.vk(),
+            false
+        ));
+    }
+
+    #[test]
+    fn injected_unicode_keystrokes_are_never_treated_as_the_hotkey() {
+        // This is the shape every character Iris injects actually takes: the
+        // hook sees vkCode == VK_PACKET, not the character, with LLKHF_INJECTED
+        // set. Proves the burst that types a transcript can never retrigger or
+        // otherwise be treated as a hotkey press, for every configured hotkey.
+        for key in [
+            Key::RightCtrl,
+            Key::LeftCtrl,
+            Key::RightShift,
+            Key::RightAlt,
+            Key::RightWin,
+            Key::CapsLock,
+            Key::ScrollLock,
+            Key::Pause,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+        ] {
+            assert!(!is_hotkey_event(VK_PACKET, key.vk(), true));
+        }
+    }
+
+    #[test]
+    fn the_injected_flag_is_authoritative_even_on_a_vk_collision() {
+        // Even in the pathological case where a future hotkey's own vk code
+        // happened to equal VK_PACKET, `injected` alone must still veto it —
+        // the vk match is necessary but never sufficient.
+        assert!(!is_hotkey_event(VK_PACKET, VK_PACKET, true));
+        assert!(is_hotkey_event(VK_PACKET, VK_PACKET, false));
     }
 }

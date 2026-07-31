@@ -95,6 +95,12 @@ Measured latency numbers, the budget breakdown, and open risks:
   and nasm to cross-compile.
 - The hotkey thread must only pump messages: Windows silently uninstalls a
   low-level hook whose callback exceeds ~300 ms.
+- `send_keystrokes` clears stuck modifiers (`GetAsyncKeyState` on the 8
+  standard L/R Ctrl/Shift/Alt/Win codes) before every `SendInput` burst.
+  `SendInput`'s own docs warn that an already-pressed key can corrupt the
+  events it generates, and the push-to-talk hotkey — suppressed end-to-end by
+  the low-level hook — is exactly that key. Do not remove this thinking it's
+  dead code; see `inject.rs`'s `stuck_modifiers`/`release_stuck_modifiers`.
 
 ## Maintaining this file
 

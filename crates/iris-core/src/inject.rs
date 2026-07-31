@@ -66,6 +66,48 @@ fn imp(_text: &str, _method: Method) -> Result<()> {
     bail!("text injection is only implemented on Windows")
 }
 
+/// Virtual-key codes for the eight standard modifiers (left/right Ctrl,
+/// Shift, Alt, Win) — plain `u16`s rather than the `windows` crate's typed
+/// constants so this list, and the decision below, stay portable.
+///
+/// `SendInput`'s own documentation warns: "This function does not reset the
+/// keyboard's current state. Any keys that are already pressed when the
+/// function is called might interfere with the events that this function
+/// generates. To avoid this problem, check the keyboard's state with
+/// `GetAsyncKeyState`... and correct as necessary." Iris's push-to-talk
+/// hotkey is one of these on every modifier-based configuration, and the
+/// low-level hook suppresses its key events end to end (see `hotkey.rs`), so
+/// it is the one most likely to still read as down when injection starts.
+///
+/// `cfg(any(windows, test))`: the only non-test consumer is `mod win`, so a
+/// plain non-Windows build has nothing that reaches this — but `cargo test`
+/// must still see it, per this crate's rule that decision logic is testable
+/// without the OS.
+#[cfg(any(windows, test))]
+const MODIFIER_VKS: [u16; 8] = [
+    0xA2, // VK_LCONTROL
+    0xA3, // VK_RCONTROL
+    0xA0, // VK_LSHIFT
+    0xA1, // VK_RSHIFT
+    0xA4, // VK_LMENU (left Alt)
+    0xA5, // VK_RMENU (right Alt)
+    0x5B, // VK_LWIN
+    0x5C, // VK_RWIN
+];
+
+/// Which of `MODIFIER_VKS` need a corrective key-up before a keystroke burst,
+/// given each one's current (virtual-key, is-down) state. Kept separate from
+/// the `GetAsyncKeyState` calls that produce `state` so the decision is
+/// testable without the OS.
+#[cfg(any(windows, test))]
+fn stuck_modifiers(state: &[(u16, bool)]) -> Vec<u16> {
+    state
+        .iter()
+        .filter(|(_, down)| *down)
+        .map(|(vk, _)| *vk)
+        .collect()
+}
+
 #[cfg(windows)]
 mod win {
     use anyhow::{bail, Context, Result};
@@ -75,8 +117,8 @@ mod win {
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, VIRTUAL_KEY,
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
     };
 
     use crate::text::{self, KeyUnit};
@@ -105,6 +147,8 @@ mod win {
     }
 
     fn send_keystrokes(text: &str) -> Result<()> {
+        release_stuck_modifiers()?;
+
         let mut inputs = Vec::with_capacity(BATCH);
         for unit in text::plan(text) {
             let (scan, vk, extra) = match unit {
@@ -119,6 +163,34 @@ mod win {
             }
         }
         flush(&mut inputs)
+    }
+
+    /// Correct any modifier Windows still thinks is down before typing.
+    ///
+    /// One dedicated `SendInput` call, issued and flushed before the text
+    /// burst, so the correction is fully processed first rather than merely
+    /// ordered first within a single array (see `super::MODIFIER_VKS`).
+    fn release_stuck_modifiers() -> Result<()> {
+        let state: Vec<(u16, bool)> = super::MODIFIER_VKS
+            .iter()
+            .map(|&vk| {
+                let down = unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+                (vk, down)
+            })
+            .collect();
+
+        let mut corrections: Vec<INPUT> = super::stuck_modifiers(&state)
+            .into_iter()
+            .map(|vk| key_event(vk, 0, KEYEVENTF_KEYUP))
+            .collect();
+        if corrections.is_empty() {
+            return Ok(());
+        }
+        vlog!(
+            "releasing {} modifier(s) still reported down before injecting",
+            corrections.len()
+        );
+        flush(&mut corrections)
     }
 
     fn key_event(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -237,5 +309,28 @@ mod tests {
     fn injecting_nothing_is_a_no_op_everywhere() {
         // Guards the early return: without it this would fail on Linux.
         assert!(inject("", Method::SendInput).is_ok());
+    }
+
+    #[test]
+    fn stuck_modifiers_is_empty_when_nothing_is_held() {
+        let state: Vec<(u16, bool)> = MODIFIER_VKS.iter().map(|&vk| (vk, false)).collect();
+        assert!(stuck_modifiers(&state).is_empty());
+    }
+
+    #[test]
+    fn stuck_modifiers_returns_only_the_ones_reported_down() {
+        let state = [
+            (0xA2u16, false), // VK_LCONTROL, up
+            (0xA3u16, true),  // VK_RCONTROL, down — e.g. the push-to-talk hotkey
+            (0xA0u16, false), // VK_LSHIFT, up
+            (0x5Cu16, true),  // VK_RWIN, down
+        ];
+        assert_eq!(stuck_modifiers(&state), vec![0xA3, 0x5C]);
+    }
+
+    #[test]
+    fn stuck_modifiers_covers_every_tracked_modifier() {
+        let state: Vec<(u16, bool)> = MODIFIER_VKS.iter().map(|&vk| (vk, true)).collect();
+        assert_eq!(stuck_modifiers(&state), MODIFIER_VKS.to_vec());
     }
 }
