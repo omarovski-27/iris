@@ -26,6 +26,7 @@ local-native = ["iris-engine-local/native"]
 iris-core = { path = "../iris-core" }
 iris-polish = { path = "../iris-polish" }
 iris-engine-local = { path = "../iris-engine-local" }
+iris-overlay = { path = "../iris-overlay" }
 
 anyhow.workspace = true
 clap.workspace = true

@@ -10,11 +10,12 @@ instrumentation are [`iris-core`](../iris-core); transcript cleanup is
 the loop that holds them together, the settings, the tray, the session log.
 
 ```bash
-# Windows (the real thing)
+# Windows (the real thing — tray, hotkey, mic, Prism pill, inject)
 cargo build --release --target x86_64-pc-windows-gnu -p iris-app
 ./target/x86_64-pc-windows-gnu/release/iris.exe
 
-# Anywhere (no microphone, no hotkey, no injection)
+# Anywhere (no microphone, no hotkey; dry-run inject; real pill adapter)
+cargo run -p iris-app -- --demo-dictation
 cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
 cargo run -p iris-app -- --history
 ```
@@ -28,7 +29,7 @@ cargo run -p iris-app -- --history
                                             │
                                             ├─► polish   (LLM, rule fallback, 150 ms budget)
                                             ├─► inject   (SendInput / clipboard)
-                                            ├─► overlay  (PillSink: inserted → hide)
+                                            ├─► overlay  (PillSink: inserted(ms) self-exits)
                                             └─► session log (jsonl)
 ```
 
@@ -100,9 +101,10 @@ reload settings, quit. "Open settings" opens `config.toml` in the user's editor
 — the file is already the source of truth and is commented; a bespoke settings
 window would be the same thing built twice.
 
-The icon is drawn in code (`tray::icon_rgba`) rather than shipped as a `.ico`,
-so there is no binary asset to keep in step with the theme and no file to fail
-to find next to the `.exe`.
+The icon is the captain-locked **prism triangle** (spectrum wedge on a plate),
+drawn in code (`tray::icon_rgba`) from the same mark as
+`iris-overlay/assets/iris-prism.svg`. No binary `.ico` to keep in step with the
+theme and no file to fail to find next to the `.exe`.
 
 ### Known limitations
 
@@ -116,20 +118,32 @@ menu is a remote control, not a display. Reconciling it would need the item
 handles kept on the tray thread plus a state-update message from the loop, a
 deliberate non-goal for v1.
 
-## Overlay seam
+## Overlay
 
-`iris-overlay` is being built in parallel. The loop drives a `PillSink`, whose
-five methods mirror that crate's handle API exactly:
+The loop drives a `PillSink`. On Windows the resident app spawns
+`iris-overlay` at startup and feeds it through `OverlayPill`:
 
 ```rust
-show_listening() → update_level(f32)* → processing() → inserted() → hide()
+set_engine / set_theme                     // startup + tray
+show_listening() → update_level* / set_partial_len*
+  → processing() → inserted(latency_ms)    // success: pill auto-exits after ~550 ms
+  → hide()                                 // cancel / empty / error only
 ```
 
-`hide()` runs on every path, including every failure, so a sink never needs a
-timeout to clean up, and `inserted()` runs only when text actually reached the
-window. Two implementations ship today — `NoopPill` (default) and `LogPill`
-(`--verbose`) — plus `RecordingPill` for tests. The adapter to the real overlay
-is a new type in `pill.rs` that forwards each method; no change to the loop.
+`Theme::Dark` maps to Prism, `Theme::Light` to Porcelain. After a successful
+insert the overlay holds the confirmation then exits itself — the loop does
+**not** call `hide()` immediately, or the hold would be cancelled.
+
+| Sink | When |
+|---|---|
+| `OverlayPill` | Windows resident loop; `--demo-dictation` / `--speak-wav` when the overlay starts |
+| `LogPill` | `--verbose` fallback |
+| `NoopPill` | non-Windows CI paths when no overlay is up |
+| `RecordingPill` | tests |
+
+`--demo-dictation` forces the mock engine, dry-run inject, synthetic levels, and
+the real pill adapter (visible on Windows; headless state machine elsewhere).
+**Never** constructs `SystemInjector`.
 
 ## Session log
 
@@ -186,6 +200,6 @@ network, and a `RecordingInjector` instead of `SendInput`.
 > `Injector` trait exists to make that structural rather than a rule someone has
 > to remember. Real typing is verified by a person running the app.
 
-`--speak-wav <file>` runs one full dictation — engine, polish, session log,
-latency report — from a WAV, with `--dry-run` injection, on any platform. It is
-the portable way to see the loop work end to end.
+`--demo-dictation` and `--speak-wav <file>` run one full dictation — engine,
+polish, session log, latency report, pill adapter — with dry-run injection, on
+any platform. They are the portable way to see the loop work end to end.

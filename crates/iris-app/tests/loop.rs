@@ -165,14 +165,50 @@ fn the_overlay_sees_the_whole_state_sequence() {
     let mut rig = rig();
     rig.dictate().expect("dictation");
 
-    assert_eq!(
-        rig.pill.events(),
-        [
-            PillEvent::ShowListening,
-            PillEvent::Processing,
-            PillEvent::Inserted,
-            PillEvent::Hide,
-        ]
+    let events = rig.pill.events();
+    // Startup pushes engine + theme before any dictation.
+    assert!(
+        events.contains(&PillEvent::SetEngine),
+        "engine label should reach the pill: {events:?}"
+    );
+    assert!(
+        events.contains(&PillEvent::SetTheme(Theme::Dark)),
+        "default theme should reach the pill: {events:?}"
+    );
+    // Happy path: listening → processing → inserted(ms). No hide after insert
+    // (the overlay self-dismisses after the confirmation hold).
+    let core: Vec<_> = events
+        .iter()
+        .copied()
+        .filter(|e| {
+            matches!(
+                e,
+                PillEvent::ShowListening
+                    | PillEvent::Processing
+                    | PillEvent::Inserted { .. }
+                    | PillEvent::Hide
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            core.as_slice(),
+            [
+                PillEvent::ShowListening,
+                PillEvent::Processing,
+                PillEvent::Inserted { .. },
+            ]
+        ),
+        "unexpected core sequence: {core:?}"
+    );
+    assert!(
+        !core.contains(&PillEvent::Hide),
+        "hide must not follow a successful insert"
+    );
+    // Mock streams partials; at least one length should have been pushed.
+    assert!(
+        !rig.pill.partial_lens().is_empty(),
+        "partial lengths should reach the pill"
     );
     let levels = rig.pill.levels();
     assert!(!levels.is_empty(), "the meter never moved");
@@ -235,9 +271,24 @@ fn a_failed_injection_still_saves_the_words() {
     assert!(!records[0].injected);
     assert!(records[0].error.as_deref().unwrap().contains("elevated"));
 
-    // The overlay must not claim text appeared when it did not.
+    // The overlay must not claim text appeared when it did not, and hide
+    // must run so the pill leaves the screen.
+    let core: Vec<_> = rig
+        .pill
+        .events()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e,
+                PillEvent::ShowListening
+                    | PillEvent::Processing
+                    | PillEvent::Inserted { .. }
+                    | PillEvent::Hide
+            )
+        })
+        .collect();
     assert_eq!(
-        rig.pill.events(),
+        core,
         [
             PillEvent::ShowListening,
             PillEvent::Processing,
@@ -289,8 +340,22 @@ fn silence_injects_nothing_and_claims_nothing() {
     assert!(dictated.record.text.is_empty());
     assert!(!dictated.record.injected);
     assert!(rig.injector.inserted().is_empty());
+    let core: Vec<_> = rig
+        .pill
+        .events()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e,
+                PillEvent::ShowListening
+                    | PillEvent::Processing
+                    | PillEvent::Inserted { .. }
+                    | PillEvent::Hide
+            )
+        })
+        .collect();
     assert_eq!(
-        rig.pill.events(),
+        core,
         [
             PillEvent::ShowListening,
             PillEvent::Processing,

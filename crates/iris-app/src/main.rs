@@ -17,7 +17,7 @@ use clap::Parser;
 use iris_app::audio::AudioSource;
 use iris_app::config::{self, Config, EngineChoice};
 use iris_app::inject::{DryRunInjector, Injector};
-use iris_app::pill::{LogPill, NoopPill, PillSink};
+use iris_app::pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillSink};
 use iris_app::{App, SessionLog};
 use iris_core::hotkey::Key;
 use iris_core::inject::Method;
@@ -87,6 +87,12 @@ struct Args {
     /// keystrokes go to whatever window happens to be focused.
     #[arg(long)]
     really_inject: bool,
+
+    /// Drive one full mock dictation with synthetic levels and the real pill
+    /// (headless off Windows). Never uses live SendInput — always dry-run
+    /// inject so the session log records a mock insert safely.
+    #[arg(long)]
+    demo_dictation: bool,
 }
 
 fn main() -> Result<()> {
@@ -117,6 +123,9 @@ fn main() -> Result<()> {
     if let Some(n) = args.history {
         return print_history(&config, &config_path, n);
     }
+    if args.demo_dictation {
+        return demo_dictation(config, &config_path, &args);
+    }
     if let Some(wav) = args.speak_wav.clone() {
         return speak_wav(config, &config_path, &args, &wav);
     }
@@ -142,13 +151,33 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     }
 }
 
-fn pill_for(args: &Args) -> Box<dyn PillSink> {
-    // Until `iris-overlay` merges there is nothing to show; --verbose at least
-    // makes the state machine visible.
+/// Build a pill sink. On Windows the resident path prefers a live overlay;
+/// elsewhere (and when the overlay fails to start) fall back to log/noop so
+/// CI and non-Windows paths stay green.
+fn pill_for(args: &Args, overlay: Option<&iris_overlay::Overlay>) -> Box<dyn PillSink> {
+    if let Some(overlay) = overlay {
+        return Box::new(OverlayPill::new(overlay.handle()));
+    }
     if args.verbose {
         Box::new(LogPill)
     } else {
         Box::new(NoopPill)
+    }
+}
+
+/// Start the overlay thread. Returns `None` only if spawn fails (logged);
+/// callers keep working with a Noop/Log pill in that case.
+fn try_spawn_overlay(config: &Config) -> Option<iris_overlay::Overlay> {
+    let engine_label = config.engine.as_str().to_string();
+    match iris_overlay::spawn(iris_overlay::OverlayConfig {
+        theme: overlay_theme(config.theme),
+        engine: engine_label,
+    }) {
+        Ok(overlay) => Some(overlay),
+        Err(e) => {
+            eprintln!("  overlay unavailable: {e:#}");
+            None
+        }
     }
 }
 
@@ -180,11 +209,20 @@ fn run(
     let (_listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
         .context("installing the push-to-talk hook")?;
 
-    let mut app = App::new(config, config_path, audio, injector, pill_for(args))?
+    // Overlay owns its thread for process life; App drives it via OverlayPill.
+    let overlay = try_spawn_overlay(&config);
+    let pill = pill_for(args, overlay.as_ref());
+
+    let mut app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
         .with_file_config(file_config);
     banner(&app, config_path);
-    app.run(&keys, &commands)
+    let result = app.run(&keys, &commands);
+    // Explicit shutdown so the window is gone before we exit.
+    if let Some(overlay) = overlay {
+        overlay.shutdown();
+    }
+    result
 }
 
 /// There is no hotkey, no microphone and no injection off Windows, so the
@@ -233,10 +271,14 @@ fn speak_wav(
         false => Arc::new(DryRunInjector),
     };
 
+    // Optional real pill for offline demos; never required for correctness.
+    let overlay = try_spawn_overlay(&config);
+    let pill = pill_for(args, overlay.as_ref());
+
     let audio = ChannelAudio::new();
     let frames_tx = audio.sender();
     let armed = audio.armed();
-    let mut app = App::new(config, config_path, audio, injector, pill_for(args))?.with_report(true);
+    let mut app = App::new(config, config_path, audio, injector, pill)?.with_report(true);
     let frames = app.frames();
 
     let (keys_tx, keys) = crossbeam_channel::unbounded();
@@ -260,8 +302,88 @@ fn speak_wav(
 
     let dictated = app.dictate(pressed_at, &frames, &keys)?;
     let _ = feeder.join();
+    // Let the inserted confirmation hold finish when a real overlay is up.
+    if overlay.is_some() && dictated.record.injected {
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::from(iris_overlay::motion::INSERTED_HOLD_MS)
+                + u64::from(iris_overlay::motion::EXIT_MS)
+                + 50,
+        ));
+    }
     println!("  {}", dictated.record.text);
+    if let Some(overlay) = overlay {
+        overlay.shutdown();
+    }
     Ok(())
+}
+
+/// Full mock dictation cycle: synthetic audio levels, dry-run inject, real pill.
+///
+/// Safe for automated smoke — never constructs `SystemInjector`. On Windows the
+/// pill is visible; elsewhere the overlay runs headless so CI still exercises
+/// the adapter path.
+fn demo_dictation(mut config: Config, config_path: &std::path::Path, args: &Args) -> Result<()> {
+    use iris_app::audio::ChannelAudio;
+    use iris_core::hotkey::HotkeyEvent;
+
+    // Force the offline mock so the demo never needs a network key.
+    config.engine = EngineChoice::Mock;
+    // Demo never injects live keystrokes, even if the caller forgot --dry-run.
+    let injector: Arc<dyn Injector> = Arc::new(DryRunInjector);
+
+    let pcm = synthetic_demo_pcm();
+    let overlay = try_spawn_overlay(&config);
+    let pill = pill_for(args, overlay.as_ref());
+
+    let audio = ChannelAudio::new();
+    let frames_tx = audio.sender();
+    let armed = audio.armed();
+    let mut app = App::new(config, config_path, audio, injector, pill)?.with_report(true);
+    let frames = app.frames();
+
+    let (keys_tx, keys) = crossbeam_channel::unbounded();
+    let pressed_at = std::time::Instant::now();
+    let feeder = std::thread::spawn(move || {
+        if armed.recv().is_err() {
+            return;
+        }
+        for chunk in pcm.chunks(iris_core::audio::FRAME_SAMPLES) {
+            if frames_tx.send(chunk.to_vec()).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = keys_tx.send(HotkeyEvent::Up(std::time::Instant::now()));
+    });
+
+    let dictated = app.dictate(pressed_at, &frames, &keys)?;
+    let _ = feeder.join();
+    if overlay.is_some() && dictated.record.injected {
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::from(iris_overlay::motion::INSERTED_HOLD_MS)
+                + u64::from(iris_overlay::motion::EXIT_MS)
+                + 50,
+        ));
+    }
+    println!("  demo: {}", dictated.record.text);
+    println!(
+        "  injected={} (dry-run)  engine={}",
+        dictated.record.injected, dictated.record.engine
+    );
+    if let Some(overlay) = overlay {
+        overlay.shutdown();
+    }
+    Ok(())
+}
+
+/// About one second of a 220 Hz tone — enough for the mock engine to stream
+/// partials and for the pill meter to move.
+fn synthetic_demo_pcm() -> Vec<i16> {
+    (0..16_000)
+        .map(|i| {
+            ((2.0 * std::f64::consts::PI * 220.0 * i as f64 / 16_000.0).sin() * 8_000.0) as i16
+        })
+        .collect()
 }
 
 fn list_devices() -> Result<()> {

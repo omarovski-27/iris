@@ -23,18 +23,25 @@ CI-testable at all.
 
 `crates/iris-app/` is the product — the resident tray app that wires the other
 crates into a working dictation loop. Its README is the map: the loop, the
-config file, the tray, the overlay seam, the session log.
+config file, the tray, the overlay, the session log.
 
-Two things there are load-bearing beyond that crate:
+Load-bearing beyond that crate:
 
 - **`Injector` is a trait so no test can ever type into the user's desktop.**
   `SystemInjector` is constructed in `main` and nowhere else; see the rule below.
 - **Keys reach engines through the environment only.** `Config::promote_keys`
   copies file keys into the process environment in `main`, before any thread
   exists, because that is the only point at which mutating it is safe.
+- **`PillSink` → `OverlayPill` → `OverlayHandle`.** On Windows, `main` spawns
+  `iris-overlay` for process life and the loop drives it through `PillSink`.
+  After a successful `inserted(latency_ms)` do **not** call `hide()` — the
+  overlay self-exits after the ~550 ms confirmation hold. `hide` is for
+  cancel/empty/error only. Theme: `Dark→PRISM_DARK`, `Light→PORCELAIN_LIGHT`.
 
-`cargo run -p iris-app -- --speak-wav assets/speech-16k.wav` runs one full
-dictation offline on any platform: the portable way to exercise the whole loop.
+```bash
+cargo run -p iris-app -- --demo-dictation                 # mock + dry-run + pill
+cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
+```
 
 ## iris-polish layout
 
@@ -57,10 +64,10 @@ already disrupted real work once during development.
 checklist in `crates/iris-spike/README.md` is the sole verification path for
 it. In `iris-app` the same rule is structural: the loop takes an `Injector`,
 and `SystemInjector` — the only implementation that reaches the OS — is built in
-`main` and never in a test (`--dry-run` and `--speak-wav` are the safe paths).
-Injection logic that *can* be tested
-without the OS lives in `iris-core/src/text.rs` (UTF-16, surrogate pairs,
-control characters) and is unit-tested.
+`main` and never in a test (`--dry-run`, `--demo-dictation`, and `--speak-wav`
+are the safe paths). Injection logic that *can* be tested without the OS lives
+in `iris-core/src/text.rs` (UTF-16, surrogate pairs, control characters) and is
+unit-tested.
 
 ## Architecture
 
@@ -111,14 +118,14 @@ When updating this file, preserve this bar for all agents and keep entries conci
 
 ## Pill overlay (`iris-overlay`)
 
-- Crate: `crates/iris-overlay/`. `OverlayHandle` is the contract the app drives
-  it through; rendering-stack rationale and the WSL loop are in
-  `crates/iris-overlay/README.md`.
+- Crate: `crates/iris-overlay/`. App adapter: `iris-app::pill::OverlayPill`
+  (implements `PillSink`). `OverlayHandle` is the low-level contract; see
+  `crates/iris-overlay/README.md` for rendering/WSL notes.
 - The design is **captain-locked** (2026-07-31): Prism dark default, Porcelain
-  light, listening-only telemetry chip, prism-triangle icon. The constants in
-  `motion.rs` and `layout.rs` are acceptance criteria with tests that pin them —
-  changing one is a captain decision, not a commit. Source mockups live outside
-  the repo at `/home/omar/firstmate/data/iris-design/`.
+  light, listening-only telemetry chip, prism-triangle icon (tray uses the same
+  mark via `tray::icon_rgba`). Constants in `motion.rs` / `layout.rs` are
+  acceptance criteria — changing one is a captain decision. Source mockups:
+  `/home/omar/firstmate/data/iris-design/`.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
 - The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is

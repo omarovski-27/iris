@@ -32,6 +32,7 @@
 //! | hotkey | [`iris_core::hotkey`] | pumps messages only; Windows uninstalls a slow hook |
 //! | audio | WASAPI via cpal | never blocks; hands 16 kHz frames to a channel |
 //! | tray | [`tray`] | pumps messages, sends [`Command`]s |
+//! | overlay | [`iris_overlay`] via [`pill::OverlayPill`] | paints the pill; never blocks the loop |
 //! | main | [`App`] | owns the engine, the timeline, injection and the log |
 //!
 //! Nothing is shared behind a lock, so no part of the latency budget is spent
@@ -67,4 +68,4 @@ pub use app::{App, Command, Dictated};
 pub use config::{Config, EngineChoice, Theme};
 pub use history::{DictationRecord, LatencyBreakdown, SessionLog};
 pub use inject::{Injector, RecordingInjector};
-pub use pill::{LogPill, NoopPill, PillSink, RecordingPill};
+pub use pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillEvent, PillSink, RecordingPill};
