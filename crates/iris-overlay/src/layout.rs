@@ -76,7 +76,10 @@ const WAVE_PAD: f32 = 4.0;
 /// Width of one bar.
 const BAR_W: f32 = 1.5;
 /// Gap between bars.
-const BAR_GAP: f32 = 1.6;
+///
+/// Pitch is tight enough that all [`BAR_COUNT`] bars sit inside the waveform's
+/// padded interior at [`PILL_W`] with [`META_SLOT`] reserved for `1000 ms`.
+const BAR_GAP: f32 = 1.5;
 /// Height of a bar at `scaleY(1)`.
 const BAR_H: f32 = 16.0;
 
@@ -467,12 +470,20 @@ mod tests {
             let l = Layout::new(scale);
             let first = l.bar_rect(0, 1.0);
             let last = l.bar_rect(BAR_COUNT - 1, 1.0);
-            assert!(first.x >= l.wave.x, "bars overflow left at {scale}x");
+            let pad = WAVE_PAD * scale;
+            let inner_l = l.wave.x + pad;
+            let inner_r = l.wave.right() - pad;
             assert!(
-                last.right() <= l.wave.right(),
-                "bars overflow right at {scale}x"
+                first.x + 0.01 >= inner_l,
+                "bars overflow padded left at {scale}x: {} < {inner_l}",
+                first.x
             );
-            // Centred within the box.
+            assert!(
+                last.right() <= inner_r + 0.01,
+                "bars overflow padded right at {scale}x: {} > {inner_r}",
+                last.right()
+            );
+            // Centred within the outer wave box (and therefore the pad).
             let lead = first.x - l.wave.x;
             let trail = l.wave.right() - last.right();
             assert!((lead - trail).abs() < 0.5, "bars off-centre at {scale}x");
