@@ -15,13 +15,17 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 
 Early development. Windows first; macOS and Linux planned.
 
-The **latency spike** is in: a working end-to-end pipeline (global hotkey →
-WASAPI capture → streaming transcription → text injection) with latency
-instrumentation throughout. The pill overlay crate (`iris-overlay`) is in;
-app wiring that drives it from the live pipeline is not yet.
+`iris` (`crates/iris-app`) is the resident tray app: hold a hotkey, speak,
+release — the transcript is polished and injected into the focused window. The
+latency spike and harness that proved the pipeline live in `crates/iris-spike`.
+The pill overlay crate (`iris-overlay`) is in; app wiring that drives it from
+the live pipeline is not yet.
 
 ```bash
-# See what it measures — no API key, no microphone, runs anywhere
+# Full loop offline — no API key, no microphone, no injection
+cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
+
+# Latency harness
 cargo run --release --bin iris-harness -- --engine mock
 ```
 
@@ -29,8 +33,11 @@ cargo run --release --bin iris-harness -- --engine mock
 
 | | |
 | --- | --- |
+| `crates/iris-app` | **the application**: `iris`, the resident tray app |
 | `crates/iris-core` | the pipeline: audio, the `Engine` trait, injection, latency |
-| `crates/iris-spike` | `iris-spike` (the app) and `iris-harness` (measurement) |
+| `crates/iris-polish` | transcript cleanup: rule engine + LLM, deadline-bounded |
+| `crates/iris-engine-local` | on-device ASR: streaming Zipformer + Whisper finalizer |
+| `crates/iris-spike` | latency spike (`iris-spike`) and harness (`iris-harness`) |
 | `crates/iris-overlay` | the pill HUD (always-on-top, click-through, never-activating) |
 
 Everything except microphone capture, the hotkey hook, text injection, and the
@@ -39,6 +46,8 @@ run anywhere.
 
 ## Docs
 
+- [`crates/iris-app/README.md`](crates/iris-app/README.md) — the app: the
+  dictation loop, configuration, the tray, the session log
 - [`crates/iris-spike/README.md`](crates/iris-spike/README.md) — running the
   spike, and how to read the latency report
 - [`crates/iris-overlay/README.md`](crates/iris-overlay/README.md) — the pill
