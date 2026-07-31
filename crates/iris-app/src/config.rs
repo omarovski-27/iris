@@ -388,6 +388,28 @@ impl Config {
         Ok(format!("{HEADER}\n{body}"))
     }
 
+    /// Render to TOML with every key value replaced by a placeholder.
+    ///
+    /// This is what `--print-config` shows: which keys are configured, never
+    /// what they are. [`Config::save`] keeps the real values — that is how a
+    /// key in the file survives a tray-driven save — so the redaction lives
+    /// here, on the printing path, and nowhere near serialisation.
+    pub fn to_redacted_toml(&self) -> Result<String> {
+        let mut redacted = self.clone();
+        for key in [
+            &mut redacted.keys.deepgram,
+            &mut redacted.keys.groq,
+            &mut redacted.keys.llm,
+        ] {
+            *key = key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(|_| "<redacted>".into());
+        }
+        redacted.to_toml()
+    }
+
     /// Load from `path`, or return the defaults if it does not exist.
     ///
     /// A file that exists but does not parse *is* an error: silently falling
@@ -630,6 +652,27 @@ mod tests {
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(rendered.contains("<set>"));
         assert!(format!("{:?}", Keys::default()).contains("<unset>"));
+    }
+
+    #[test]
+    fn the_print_path_redacts_keys_but_saving_keeps_them() {
+        let mut config = Config::default();
+        config.keys.deepgram = Some("dg_super_secret".into());
+        config.keys.groq = Some("gsk_super_secret".into());
+
+        let rendered = config.to_redacted_toml().unwrap();
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("deepgram = \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("groq = \"<redacted>\""), "{rendered}");
+        // The unset llm key is simply absent, so the output still says which
+        // keys are configured.
+        assert_eq!(rendered.matches("<redacted>").count(), 2, "{rendered}");
+
+        // The file, unlike the print path, must carry the real values.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().keys, config.keys);
     }
 
     #[test]

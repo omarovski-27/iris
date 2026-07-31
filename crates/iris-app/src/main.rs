@@ -94,8 +94,11 @@ fn main() -> Result<()> {
     iris_core::log::set_verbose(args.verbose);
 
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let mut config = Config::load_or_create(&config_path)
+    // Kept as loaded: `config` below takes the CLI overrides, which are
+    // run-only and must never be written back to the file.
+    let file_config = Config::load_or_create(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
+    let mut config = file_config.clone();
     apply_overrides(&mut config, &args);
 
     // Before any thread exists: see Config::promote_keys.
@@ -104,7 +107,7 @@ fn main() -> Result<()> {
     }
 
     if args.print_config {
-        println!("{}", config.to_toml()?);
+        println!("{}", config.to_redacted_toml()?);
         println!("# path: {}", config_path.display());
         return Ok(());
     }
@@ -118,7 +121,7 @@ fn main() -> Result<()> {
         return speak_wav(config, &config_path, &args, &wav);
     }
 
-    run(config, &config_path, &args)
+    run(config, file_config, &config_path, &args)
 }
 
 fn apply_overrides(config: &mut Config, args: &Args) {
@@ -151,7 +154,12 @@ fn pill_for(args: &Args) -> Box<dyn PillSink> {
 
 /// The resident loop.
 #[cfg(windows)]
-fn run(config: Config, config_path: &std::path::Path, args: &Args) -> Result<()> {
+fn run(
+    config: Config,
+    file_config: Config,
+    config_path: &std::path::Path,
+    args: &Args,
+) -> Result<()> {
     use iris_app::audio::MicAudio;
     use iris_app::inject::SystemInjector;
     use iris_app::tray;
@@ -172,8 +180,9 @@ fn run(config: Config, config_path: &std::path::Path, args: &Args) -> Result<()>
     let (_listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
         .context("installing the push-to-talk hook")?;
 
-    let mut app =
-        App::new(config, config_path, audio, injector, pill_for(args))?.with_report(args.report);
+    let mut app = App::new(config, config_path, audio, injector, pill_for(args))?
+        .with_report(args.report)
+        .with_file_config(file_config);
     banner(&app, config_path);
     app.run(&keys, &commands)
 }
@@ -183,7 +192,12 @@ fn run(config: Config, config_path: &std::path::Path, args: &Args) -> Result<()>
 /// polish, the session log, `--speak-wav` — works, which is what keeps this
 /// crate testable in CI.
 #[cfg(not(windows))]
-fn run(_config: Config, _config_path: &std::path::Path, _args: &Args) -> Result<()> {
+fn run(
+    _config: Config,
+    _file_config: Config,
+    _config_path: &std::path::Path,
+    _args: &Args,
+) -> Result<()> {
     anyhow::bail!(
         "the resident loop needs Windows: the global hotkey hook, microphone capture and text \
          injection are all Win32.\nOn this host you can still use --speak-wav to run a dictation \
@@ -221,12 +235,18 @@ fn speak_wav(
 
     let audio = ChannelAudio::new();
     let frames_tx = audio.sender();
+    let armed = audio.armed();
     let mut app = App::new(config, config_path, audio, injector, pill_for(args))?.with_report(true);
     let frames = app.frames();
 
     let (keys_tx, keys) = crossbeam_channel::unbounded();
     let pressed_at = std::time::Instant::now();
     let feeder = std::thread::spawn(move || {
+        // Wait for the loop's stale-frame drain (which precedes arming), so no
+        // utterance frame can be discarded as pre-key-press audio.
+        if armed.recv().is_err() {
+            return;
+        }
         for chunk in pcm.chunks(iris_core::audio::FRAME_SAMPLES) {
             if frames_tx.send(chunk.to_vec()).is_err() {
                 return;

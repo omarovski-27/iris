@@ -192,6 +192,12 @@ impl SessionLog {
         &self.path
     }
 
+    /// Whether records are actually written. A disabled log has no path worth
+    /// showing to the user.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// How many entries the file is allowed to hold.
     pub fn max_entries(&self) -> usize {
         self.max_entries

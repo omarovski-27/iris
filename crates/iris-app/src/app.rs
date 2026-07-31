@@ -82,6 +82,11 @@ pub struct Dictated {
 /// chosen at startup and never swapped.
 pub struct App<A: AudioSource> {
     config: Config,
+    /// What belongs on disk. Distinct from `config` because CLI flags like
+    /// `--engine` are documented as run-only: they change the config in force,
+    /// and this shadow — updated by tray commands, written by `persist` — is
+    /// how a tray theme toggle never smuggles one into the file.
+    saved: Config,
     config_path: std::path::PathBuf,
     engine: Arc<dyn Engine>,
     polisher: Option<Arc<dyn Polisher>>,
@@ -113,6 +118,7 @@ impl<A: AudioSource> App<A> {
         let polisher = polish::build(&config);
         let history = open_history(&config, &config_path);
         Ok(Self {
+            saved: config.clone(),
             config,
             config_path,
             engine,
@@ -138,6 +144,20 @@ impl<A: AudioSource> App<A> {
     #[must_use]
     pub fn with_final_timeout(mut self, timeout: Duration) -> Self {
         self.final_timeout = timeout;
+        self
+    }
+
+    /// The configuration as it stands on disk, when CLI flags overrode parts
+    /// of it for this run.
+    ///
+    /// `--engine`, `--device`, `--inject` and `--no-polish` are documented as
+    /// not changing the saved setting, so a tray command persists this file
+    /// config — with the tray's change applied — rather than the config in
+    /// force. Without it the two are the same, which is what a test driving
+    /// the app directly wants.
+    #[must_use]
+    pub fn with_file_config(mut self, saved: Config) -> Self {
+        self.saved = saved;
         self
     }
 
@@ -217,6 +237,7 @@ impl<A: AudioSource> App<A> {
                 match engines::build(&self.config) {
                     Ok(engine) => {
                         self.engine = engine;
+                        self.saved.engine = choice;
                         println!("  engine: {choice}");
                         self.persist();
                     }
@@ -230,7 +251,8 @@ impl<A: AudioSource> App<A> {
             }
             Command::SetDevice(device) => match self.audio.set_device(device.clone()) {
                 Ok(()) => {
-                    self.config.audio.device = device;
+                    self.config.audio.device = device.clone();
+                    self.saved.audio.device = device;
                     println!("  microphone: {}", self.audio.describe());
                     self.persist();
                 }
@@ -238,12 +260,14 @@ impl<A: AudioSource> App<A> {
             },
             Command::SetPolish(enabled) => {
                 self.config.polish.enabled = enabled;
+                self.saved.polish.enabled = enabled;
                 self.polisher = polish::build(&self.config);
                 println!("  polish: {}", if enabled { "on" } else { "off" });
                 self.persist();
             }
             Command::SetTheme(theme) => {
                 self.config.theme = theme;
+                self.saved.theme = theme;
                 self.persist();
             }
             Command::OpenSettings => {
@@ -253,6 +277,24 @@ impl<A: AudioSource> App<A> {
             }
             Command::Reload => match Config::load(&self.config_path) {
                 Ok(config) => {
+                    // The hotkey hook was installed in `main` and the audio
+                    // source was configured there too; neither is rebuilt
+                    // here, so a reload that changed them must say so instead
+                    // of claiming they took effect.
+                    let mut needs_restart = Vec::new();
+                    if config.hotkey != self.config.hotkey {
+                        needs_restart.push("hotkey");
+                    }
+                    if config.suppress_hotkey != self.config.suppress_hotkey {
+                        needs_restart.push("suppress_hotkey");
+                    }
+                    if config.audio.device != self.config.audio.device {
+                        needs_restart.push("audio.device");
+                    }
+                    if config.audio.warm != self.config.audio.warm {
+                        needs_restart.push("audio.warm");
+                    }
+                    self.saved = config.clone();
                     self.config = config;
                     match engines::build(&self.config) {
                         Ok(engine) => self.engine = engine,
@@ -261,6 +303,12 @@ impl<A: AudioSource> App<A> {
                     self.polisher = polish::build(&self.config);
                     self.history = open_history(&self.config, &self.config_path);
                     println!("  reloaded {}", self.config_path.display());
+                    if !needs_restart.is_empty() {
+                        println!(
+                            "  {} changed: restart Iris for that to take effect",
+                            needs_restart.join(", ")
+                        );
+                    }
                 }
                 Err(e) => eprintln!("  cannot reload the configuration: {e:#}"),
             },
@@ -269,7 +317,7 @@ impl<A: AudioSource> App<A> {
     }
 
     fn persist(&self) {
-        if let Err(e) = self.config.save(&self.config_path) {
+        if let Err(e) = self.saved.save(&self.config_path) {
             eprintln!("  cannot save {}: {e:#}", self.config_path.display());
         }
     }
@@ -333,13 +381,14 @@ impl<A: AudioSource> App<A> {
         // The engine session first: for a streaming engine this starts the
         // websocket handshake, which then overlaps with everything below.
         let mut dictation = Dictation::start_at(&*self.engine, pressed_at)?;
-        self.audio.arm().context("starting capture")?;
 
         // A warm microphone keeps producing frames while the previous dictation
         // was polishing and injecting, and the idle loop only discards them one
         // select at a time. Anything queued now was captured before this key
         // press: transcribing it would put words the user said to someone else
-        // in front of the ones they just dictated.
+        // in front of the ones they just dictated. Drained before `arm`, so a
+        // producer that waits for the arm signal ([`ChannelAudio::armed`]) can
+        // never have its frames mistaken for stale ones.
         let stale = frames.len();
         for _ in 0..stale {
             let _ = frames.try_recv();
@@ -347,6 +396,8 @@ impl<A: AudioSource> App<A> {
         if stale > 0 {
             iris_core::vlog!("discarded {stale} frames captured before the key press");
         }
+
+        self.audio.arm().context("starting capture")?;
 
         let mut on_partial = |text: &str| iris_core::vlog!("~ {text}");
         let events = dictation.events();
@@ -413,9 +464,15 @@ impl<A: AudioSource> App<A> {
             }
             Err(e) => {
                 // The transcript is good; only the delivery failed. Say so, and
-                // make sure the record below carries the text.
+                // make sure the record below carries the text. With history off
+                // there is no file to point at, so the console gets the words
+                // themselves — they must be recoverable from somewhere.
                 eprintln!("  could not insert the text: {e:#}");
-                eprintln!("  it is in {}", self.history.path().display());
+                if self.history.enabled() {
+                    eprintln!("  it is in {}", self.history.path().display());
+                } else {
+                    eprintln!("  it was: {text}");
+                }
                 record.error = Some(format!("injection failed: {e:#}"));
             }
         }

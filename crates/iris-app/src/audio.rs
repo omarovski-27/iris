@@ -54,6 +54,8 @@ pub trait AudioSource: Send {
 pub struct ChannelAudio {
     tx: Sender<Vec<i16>>,
     rx: Receiver<Vec<i16>>,
+    armed_tx: Sender<()>,
+    armed_rx: Receiver<()>,
 }
 
 impl Default for ChannelAudio {
@@ -66,12 +68,28 @@ impl ChannelAudio {
     /// An empty source.
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        Self { tx, rx }
+        let (armed_tx, armed_rx) = crossbeam_channel::unbounded();
+        Self {
+            tx,
+            rx,
+            armed_tx,
+            armed_rx,
+        }
     }
 
     /// A handle for pushing frames in, as the audio callback would.
     pub fn sender(&self) -> Sender<Vec<i16>> {
         self.tx.clone()
+    }
+
+    /// Delivers one `()` per [`AudioSource::arm`] call.
+    ///
+    /// The dictation loop drains stale frames *before* arming, so a producer
+    /// that waits on this channel before sending can never have real utterance
+    /// audio discarded as stale — the synchronisation that makes `--speak-wav`
+    /// and the loop tests deterministic rather than usually-right.
+    pub fn armed(&self) -> Receiver<()> {
+        self.armed_rx.clone()
     }
 }
 
@@ -81,6 +99,7 @@ impl AudioSource for ChannelAudio {
     }
 
     fn arm(&mut self) -> anyhow::Result<()> {
+        let _ = self.armed_tx.send(());
         Ok(())
     }
 

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use iris_app::app::Command;
 use iris_app::audio::ChannelAudio;
-use iris_app::config::{Config, EngineChoice};
+use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
 use iris_app::{App, Injector, RecordingInjector, RecordingPill, SessionLog};
 use iris_core::engine::{Engine, Session, TranscriptEvent};
@@ -30,6 +30,7 @@ const TRANSCRIPT: &str = iris_core::engine::mock::DEFAULT_TRANSCRIPT;
 struct Rig {
     app: App<ChannelAudio>,
     frames: Sender<Vec<i16>>,
+    armed: Receiver<()>,
     keys: Sender<HotkeyEvent>,
     keys_rx: Receiver<HotkeyEvent>,
     commands: Sender<Command>,
@@ -58,6 +59,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
 
     let audio = ChannelAudio::new();
     let frames = audio.sender();
+    let armed = audio.armed();
     let pill = RecordingPill::new();
 
     let app = App::new(
@@ -77,6 +79,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     Rig {
         app,
         frames,
+        armed,
         keys,
         keys_rx,
         commands,
@@ -107,14 +110,19 @@ impl Rig {
     /// Speak, then release the key — from another thread, because
     /// [`App::dictate`] blocks on this one.
     ///
-    /// The release waits until the loop has actually taken every frame.
-    /// Queueing the audio and the key-up together would let `select!` pick the
-    /// key-up first and turn the whole utterance into tail audio, which is a
-    /// legitimate thing for the loop to do and a useless thing to test.
+    /// The first frame waits for the arm signal, which the loop raises only
+    /// after draining stale audio — otherwise the drain could race the feeder
+    /// and discard real utterance frames as pre-key-press audio. The release
+    /// then waits until the loop has actually taken every frame. Queueing the
+    /// audio and the key-up together would let `select!` pick the key-up first
+    /// and turn the whole utterance into tail audio, which is a legitimate
+    /// thing for the loop to do and a useless thing to test.
     fn speak(&self) -> std::thread::JoinHandle<()> {
         let frames = self.frames.clone();
+        let armed = self.armed.clone();
         let keys = self.keys.clone();
         std::thread::spawn(move || {
+            armed.recv().expect("the dictation never armed capture");
             for chunk in speech().chunks(320) {
                 frames.send(chunk.to_vec()).expect("frame");
             }
@@ -421,6 +429,62 @@ fn a_tray_command_changes_and_persists_the_setting() {
     // ...and it survives a restart.
     let saved = Config::load(&config_path).expect("the config was written");
     assert!(!saved.polish.enabled);
+}
+
+#[test]
+fn a_tray_save_never_persists_a_cli_override() {
+    // --no-polish and --device are documented as run-only. A tray change that
+    // saves the config must write the file's values for those fields, not the
+    // overridden ones the loop is running with.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.audio.device = Some("Yeti".into());
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    // What main's apply_overrides would produce for `--no-polish --device USB`.
+    let mut run_config = file_config.clone();
+    run_config.polish.enabled = false;
+    run_config.audio.device = Some("USB".into());
+
+    let app = App::new(
+        run_config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app")
+    .with_file_config(file_config);
+
+    let (commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    commands.send(Command::SetTheme(Theme::Light)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    // The loop keeps running with the overrides...
+    assert!(!app.config().polish.enabled);
+    assert_eq!(app.config().audio.device.as_deref(), Some("USB"));
+
+    // ...but the file got the tray's change and nothing else.
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(saved.theme, Theme::Light);
+    assert!(saved.polish.enabled, "--no-polish leaked into the file");
+    assert_eq!(
+        saved.audio.device.as_deref(),
+        Some("Yeti"),
+        "--device leaked into the file"
+    );
 }
 
 #[test]

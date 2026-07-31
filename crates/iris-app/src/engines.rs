@@ -205,6 +205,11 @@ impl iris_core::engine::Session for LocalAdapterSession {
                 drop(session);
             })
             .context("spawning the local-engine finalise thread")?;
+        // The finalise thread now owns the session, so the pump outlives this
+        // adapter by exactly one Whisper batch. Detach it: joining from Drop
+        // would park the dictation thread until finalise completes, which is
+        // the very wait the finish-timeout exists to escape.
+        self.pump = None;
         Ok(())
     }
 }
@@ -213,7 +218,8 @@ impl Drop for LocalAdapterSession {
     fn drop(&mut self) {
         // Dropping a session that was never finished must not leave the pump
         // thread alive: dropping the local session closes its channel, the pump
-        // sees the close and returns.
+        // sees the close and returns. After `finish` the pump is already
+        // detached and this join is skipped.
         self.session = None;
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
@@ -263,6 +269,63 @@ mod tests {
         // The pump thread is joined in Drop; if the mapping leaked a sender
         // this would hang instead of returning.
         drop(session);
+    }
+
+    /// A local engine whose finalise takes long enough to trip the finish
+    /// timeout — the case where the caller gives up and drops the session.
+    struct SlowFinalizeEngine;
+
+    struct SlowFinalizeSession {
+        tx: crossbeam_channel::Sender<iris_engine_local::LocalEvent>,
+        rx: crossbeam_channel::Receiver<iris_engine_local::LocalEvent>,
+    }
+
+    impl iris_engine_local::LocalEngine for SlowFinalizeEngine {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn start(&self) -> Result<Box<dyn iris_engine_local::LocalSession>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(iris_engine_local::LocalEvent::Ready).unwrap();
+            Ok(Box::new(SlowFinalizeSession { tx, rx }))
+        }
+    }
+
+    impl iris_engine_local::LocalSession for SlowFinalizeSession {
+        fn feed(&mut self, _pcm: &[i16]) -> Result<()> {
+            Ok(())
+        }
+        fn partials(&self) -> &crossbeam_channel::Receiver<iris_engine_local::LocalEvent> {
+            &self.rx
+        }
+        fn finalize(&mut self) -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = self
+                .tx
+                .send(iris_engine_local::LocalEvent::Final("late".into()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dropping_a_finished_session_does_not_wait_for_finalize() {
+        // A finish timeout only means anything if giving up is fast: the
+        // whole point of moving finalise to a thread is that a slow Whisper
+        // batch never parks the dictation loop.
+        let engine = LocalAdapter::new(Arc::new(SlowFinalizeEngine));
+        let mut session = engine.open().unwrap();
+        session.push(&[0i16; 320]).unwrap();
+        session.finish().unwrap();
+
+        let dropped_in = {
+            let start = std::time::Instant::now();
+            drop(session);
+            start.elapsed()
+        };
+        assert!(
+            dropped_in < std::time::Duration::from_secs(1),
+            "drop blocked on finalise for {dropped_in:?}"
+        );
     }
 
     #[test]

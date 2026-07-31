@@ -21,10 +21,11 @@
 //!
 //! # Non-Windows
 //!
-//! [`spawn`] is a no-op that returns a dead command channel, so `main` compiles
-//! and runs on Linux with the hotkey and the tray simply absent. `tray-icon`
-//! needs GTK on Linux, which would put a system dependency on a crate that is
-//! otherwise CI-testable anywhere — not worth it for a Windows-first product.
+//! [`spawn`] is a no-op that returns a command channel nothing ever sends on,
+//! so `main` compiles and runs on Linux with the hotkey and the tray simply
+//! absent. `tray-icon` needs GTK on Linux, which would put a system dependency
+//! on a crate that is otherwise CI-testable anywhere — not worth it for a
+//! Windows-first product.
 
 use crossbeam_channel::Receiver;
 
@@ -131,6 +132,11 @@ pub struct Tray {
     /// thread, which removes the icon on its way out.
     #[cfg(windows)]
     _inner: win::TrayThread,
+    /// Keeps the command channel connected: a receiver whose only sender was
+    /// dropped reads as *disconnected*, which the loop treats as "the tray
+    /// died, exit" — the opposite of "there is no tray, run forever".
+    #[cfg(not(windows))]
+    _commands: crossbeam_channel::Sender<Command>,
 }
 
 /// Start the tray, returning it and the channel its menu sends [`Command`]s on.
@@ -147,11 +153,12 @@ pub fn spawn(config: &Config, devices: Vec<String>) -> anyhow::Result<(Tray, Rec
     #[cfg(not(windows))]
     {
         let _ = (config, devices);
-        // A channel with no sender: the loop selects on it forever and the app
-        // is driven entirely by the hotkey, which is the right behaviour on a
+        // A channel that never carries anything: the sender lives in the
+        // returned `Tray`, so the loop selects on the receiver forever and the
+        // app is driven entirely by the hotkey — the right behaviour on a
         // platform where there is no tray to click.
-        let (_tx, rx) = crossbeam_channel::bounded(0);
-        Ok((Tray {}, rx))
+        let (tx, rx) = crossbeam_channel::bounded(0);
+        Ok((Tray { _commands: tx }, rx))
     }
 }
 
@@ -466,8 +473,13 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn without_a_tray_the_command_channel_is_simply_empty() {
+    fn without_a_tray_the_command_channel_is_empty_but_not_disconnected() {
         let (_tray, commands) = spawn(&Config::default(), Vec::new()).unwrap();
-        assert!(commands.try_recv().is_err());
+        // Empty and Disconnected are both `Err`; the loop exits on the latter,
+        // so the distinction is the whole point of this test.
+        assert_eq!(
+            commands.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        );
     }
 }

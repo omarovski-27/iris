@@ -104,6 +104,18 @@ The icon is drawn in code (`tray::icon_rgba`) rather than shipped as a `.ico`,
 so there is no binary asset to keep in step with the theme and no file to fail
 to find next to the `.exe`.
 
+### Known limitations
+
+The menu's check marks and the tooltip are fire-and-forget. `muda` check items
+toggle their own checked state on click and the engine / microphone / theme
+submenus are not radio groups, so after a switch the previously selected item
+stays checked; a rejected switch (e.g. deepgram with no key, which the loop
+rolls back) can leave the wrong item checked; and the tooltip shows the state
+at startup only. The config file and the loop remain the source of truth — the
+menu is a remote control, not a display. Reconciling it would need the item
+handles kept on the tray thread plus a state-update message from the loop, a
+deliberate non-goal for v1.
+
 ## Overlay seam
 
 `iris-overlay` is being built in parallel. The loop drives a `PillSink`, whose
