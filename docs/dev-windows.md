@@ -52,8 +52,11 @@ cargo run --release --bin iris-harness -- --engine mock
 # The Windows binaries
 cargo build --release --target x86_64-pc-windows-gnu
 
-# Run them as real Windows processes, straight from WSL
-./target/x86_64-pc-windows-gnu/release/iris-spike.exe --list-devices
+# The product app (tray, config, session log)
+./target/x86_64-pc-windows-gnu/release/iris.exe --list-devices
+./target/x86_64-pc-windows-gnu/release/iris.exe --speak-wav assets/speech-16k.wav
+
+# The latency spike (interactive checklist still lives here)
 ./target/x86_64-pc-windows-gnu/release/iris-spike.exe --self-test
 ./target/x86_64-pc-windows-gnu/release/iris-spike.exe --engine mock
 ```

@@ -368,15 +368,15 @@ same inputs.
 
 ## Building
 
-The crate is self-contained and builds standalone:
+`iris-polish` is a workspace member. From the repository root:
 
 ```bash
-cd crates/iris-polish && cargo build
+cargo test -p iris-polish
+cargo check -p iris-polish --all-targets --target x86_64-pc-windows-gnu
 ```
 
-There is no workspace root manifest in the repository yet; when one lands, adding
-`crates/iris-polish` to its `members` is the only change needed. Until then the
-crate tracks its own `Cargo.lock` so standalone builds stay reproducible.
+A leftover `Cargo.lock` under this directory is unused; the workspace lock is
+authoritative.
 
 Windows is the primary target. `x86_64-pc-windows-gnu` cross-compiles cleanly
 because the TLS stack is pinned to rustls with the pure-Rust `ring` provider

@@ -15,7 +15,7 @@ cargo build --release --target x86_64-pc-windows-gnu -p iris-app
 ./target/x86_64-pc-windows-gnu/release/iris.exe
 
 # Anywhere (no microphone, no hotkey, no injection)
-cargo run -p iris-app -- --speak-wav ../../assets/speech-16k.wav
+cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
 cargo run -p iris-app -- --history
 ```
 
