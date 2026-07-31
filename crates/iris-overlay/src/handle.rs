@@ -19,6 +19,17 @@ use crate::OverlayError;
 /// is to drop stale frames' worth of levels, not to back-pressure capture.
 const QUEUE_DEPTH: usize = 256;
 
+/// Flips the liveness flag when the overlay thread ends, however it ends:
+/// living on the thread's stack, its `Drop` runs on normal return and on
+/// panic unwind alike, and the panic still propagates to `join()`.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Startup options.
 #[derive(Clone, Debug)]
 pub struct OverlayConfig {
@@ -100,8 +111,8 @@ pub fn spawn(config: OverlayConfig) -> Result<Overlay, OverlayError> {
         std::thread::Builder::new()
             .name("iris-overlay".to_string())
             .spawn(move || {
+                let _alive = AliveGuard(alive);
                 window::run(rx, config, &ready_tx);
-                alive.store(false, Ordering::Release);
             })
             .map_err(|e| OverlayError::Platform(format!("could not start overlay thread: {e}")))?
     };
@@ -220,8 +231,10 @@ impl OverlayHandle {
 
     /// Whether the overlay thread is still running.
     ///
-    /// Useful for a supervisor that wants to notice the pill has died; the
-    /// send methods do not need it, they simply drop commands.
+    /// Reports the thread being gone for any reason, including a panic: the
+    /// flag is flipped by a guard on the thread's stack, so it drops on
+    /// unwind too. Useful for a supervisor that wants to notice the pill has
+    /// died; the send methods do not need it, they simply drop commands.
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.alive.load(Ordering::Acquire)
@@ -367,6 +380,26 @@ mod tests {
         flooding.store(false, Ordering::Relaxed);
         producer.join().unwrap();
         assert!(stopped, "shutdown deadlocked behind a full command queue");
+    }
+
+    /// A panic on the overlay thread must still flip the liveness flag: the
+    /// guard drops during unwind, exactly as it sits on the stack of the
+    /// thread `spawn` starts.
+    #[test]
+    fn a_panicking_overlay_thread_is_observed_as_disconnected() {
+        let (h, _rx) = wired();
+        let thread = {
+            let alive = Arc::clone(&h.alive);
+            std::thread::Builder::new()
+                .name("iris-overlay-panics".to_string())
+                .spawn(move || {
+                    let _alive = AliveGuard(alive);
+                    panic!("overlay thread died mid-frame");
+                })
+                .unwrap()
+        };
+        assert!(thread.join().is_err(), "the panic should still propagate");
+        assert!(!h.is_connected(), "a panicked thread must read as dead");
     }
 
     #[test]

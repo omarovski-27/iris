@@ -51,7 +51,8 @@ struct Args {
     #[arg(long, value_parser = ["prism", "porcelain"], default_value = "prism")]
     theme: String,
 
-    /// How many times to run the cycle. 0 runs until interrupted.
+    /// How many times to run the cycle. In live mode 0 runs until
+    /// interrupted; filmstrip mode always writes at least one cycle.
     #[arg(long, default_value_t = 3)]
     cycles: u32,
 
