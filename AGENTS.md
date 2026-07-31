@@ -14,10 +14,10 @@ cargo build --release --target x86_64-pc-windows-gnu    # produces runnable .exe
 ./target/x86_64-pc-windows-gnu/release/iris-spike.exe   # WSL runs it as a real Windows process
 ```
 
-Everything except microphone capture, the hotkey hook and text injection is
-portable and `#[cfg(windows)]`-free, so tests and the latency harness run
-natively on Linux. Keep it that way — it is what makes the project CI-testable
-at all.
+Everything except microphone capture, the hotkey hook, text injection, and the
+overlay window is portable and `#[cfg(windows)]`-free, so tests and the latency
+harness run natively on Linux. Keep it that way — it is what makes the project
+CI-testable at all.
 
 ## iris-polish layout
 

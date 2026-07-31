@@ -13,7 +13,7 @@ categories = ["gui"]
 [dependencies]
 crossbeam-channel.workspace = true
 
-# CPU rasteriser. The pill is ~300x90 device pixels, so a GPU device (and its
+# CPU rasteriser. The pill window is ~330x135 device pixels, so a GPU device (and its
 # device-lost handling, adapter enumeration and driver surface) buys nothing
 # here — see README "Why a CPU raster path". tiny-skia is pure Rust and
 # cross-compiles to x86_64-pc-windows-gnu with no extra host toolchain.
