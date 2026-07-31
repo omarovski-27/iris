@@ -181,7 +181,7 @@ pub struct Theme {
     pub ink_faint: Rgba,
 
     // ---- capsule ----
-    /// Recording dot.
+    /// Live core fill (mint/sky — never a rec-red cue).
     pub rec: Rgba,
     /// Success accent — the inserted check.
     pub ok: Rgba,
@@ -207,52 +207,50 @@ pub struct Theme {
 
 /// Prism — the locked v1 dark default.
 ///
-/// Tokens lifted from `c-prism/index.html`: dark instrument shell, full
-/// spectrum reserved for the live signal (bars, scan, top hairline), one
-/// accent everywhere else.
+/// Quiet instrument shell: spectrum lives only on the live signal path. Solid
+/// UI accents are cool mint/sky — never a red "recording" cue.
 pub const PRISM_DARK: Theme = Theme {
     name: "prism-dark",
     dark: true,
 
-    shell_top: Rgba::hex(0x15_1922),
-    shell_bottom: Rgba::hex(0x0C_0F15),
-    border: Rgba::hex_a(0xFF_FFFF, 0.10),
-    outer_ring: Rgba::hex_a(0x00_0000, 0.50),
-    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.06),
-    ambient_shadow: Rgba::hex_a(0x00_0000, 0.85),
+    // Nearly flat dark shell — refined HUD, not glossy glass.
+    shell_top: Rgba::hex(0x12_151C),
+    shell_bottom: Rgba::hex(0x0E_1117),
+    border: Rgba::hex_a(0xFF_FFFF, 0.06),
+    outer_ring: Rgba::hex_a(0x00_0000, 0.28),
+    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.03),
+    ambient_shadow: Rgba::hex_a(0x00_0000, 0.55),
 
-    glow_idle: Rgba::hex_a(0x8B_7BFF, 0.18),
-    glow_listening: Rgba::hex_a(0xFF_6B8A, 0.22),
-    glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.20),
+    // Soft cool halos only — no purple blob, no crimson listening glow.
+    glow_idle: Rgba::hex_a(0x6B_CBFF, 0.08),
+    glow_listening: Rgba::hex_a(0x5C_E6A8, 0.10),
+    glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.12),
 
+    // Refined hairline: cool mint→sky→soft periwinkle, low opacity.
     hairline: &[
         Rgba::TRANSPARENT,
-        Rgba::hex(0xFF_6B8A),
-        Rgba::hex(0xFF_E66B),
+        Rgba::hex(0x6B_E0C0),
         Rgba::hex(0x6B_CBFF),
-        Rgba::hex(0x8B_7BFF),
+        Rgba::hex(0x8A_9B_E0),
         Rgba::TRANSPARENT,
     ],
-    hairline_opacity: 0.55,
-    // The nine authored bar hues, straight out of the mockup's `HUES`.
+    hairline_opacity: 0.32,
+    // Live waveform only: muted cool instrument spectrum (no rose/red candy).
     spectrum: &[
-        Rgba::hex(0xFF_6B8A),
-        Rgba::hex(0xFF_9A6B),
-        Rgba::hex(0xFF_D66B),
-        Rgba::hex(0xA8_F06B),
-        Rgba::hex(0x6B_FFB8),
-        Rgba::hex(0x6B_CBFF),
-        Rgba::hex(0x7B_8BFF),
-        Rgba::hex(0xB0_7BFF),
-        Rgba::hex(0xD6_6BFF),
+        Rgba::hex(0xB8_C4_A0),
+        Rgba::hex(0x8A_D4_B0),
+        Rgba::hex(0x6B_E0_C0),
+        Rgba::hex(0x6B_D0_D8),
+        Rgba::hex(0x6B_CB_FF),
+        Rgba::hex(0x7B_A8_E8),
+        Rgba::hex(0x8A_9B_E0),
+        Rgba::hex(0x9A_90_D0),
     ],
     scan: &[
         Rgba::TRANSPARENT,
-        Rgba::hex(0xFF_6B8A),
-        Rgba::hex(0xFF_B86B),
-        Rgba::hex(0x6B_FFB8),
-        Rgba::hex(0x6B_CBFF),
-        Rgba::hex(0x8B_7BFF),
+        Rgba::hex(0x6B_E0_C0),
+        Rgba::hex(0x6B_CB_FF),
+        Rgba::hex(0x8A_9B_E0),
         Rgba::TRANSPARENT,
     ],
 
@@ -260,58 +258,58 @@ pub const PRISM_DARK: Theme = Theme {
     ink_dim: Rgba::hex(0x9A_A3B5),
     ink_faint: Rgba::hex(0x5E_6778),
 
-    rec: Rgba::hex(0xFF_5C7A),
+    // Live core: mint spectrum tip — never solid rec-red.
+    rec: Rgba::hex(0x5C_E6A8),
     ok: Rgba::hex(0x5C_E6A8),
-    accent: Rgba::hex(0x8B_7BFF),
-    ring_idle: Rgba::hex_a(0xFF_FFFF, 0.14),
-    ring_listening: Rgba::hex_a(0xFF_5C7A, 0.30),
+    accent: Rgba::hex(0x6B_CBFF),
+    ring_idle: Rgba::hex_a(0xFF_FFFF, 0.12),
+    ring_listening: Rgba::hex_a(0x5C_E6A8, 0.28),
     ring_processing: Rgba::hex_a(0xFF_FFFF, 0.06),
-    ring_inserted: Rgba::hex_a(0x5C_E6A8, 0.32),
-    spinner: (Rgba::hex(0x6B_CBFF), Rgba::hex(0x8B_7BFF)),
+    ring_inserted: Rgba::hex_a(0x5C_E6A8, 0.30),
+    spinner: (Rgba::hex(0x6B_CBFF), Rgba::hex(0x8A_9B_E0)),
 
     processing_ink: Rgba::hex(0x6B_CBFF),
-    latency: (Rgba::hex(0x6B_FFB8), Rgba::hex(0x6B_CBFF)),
+    latency: (Rgba::hex(0x6B_E0_C0), Rgba::hex(0x6B_CBFF)),
 };
 
 /// Porcelain — the light theme, shipping day one.
 ///
-/// Tokens lifted from `b-porcelain/index.html`. Same geometry, same motion,
-/// same states; a soft white shell and a rose→lilac→sky ramp in place of the
-/// full spectrum.
+/// Same geometry and motion as Prism; soft white shell with a cool mint→sky
+/// live path. No rose/rec-red accents.
 pub const PORCELAIN_LIGHT: Theme = Theme {
     name: "porcelain-light",
     dark: false,
 
     shell_top: Rgba::hex(0xFF_FFFF),
-    shell_bottom: Rgba::hex(0xF7_F8FB),
-    border: Rgba::hex_a(0x1C_2430, 0.08),
-    outer_ring: Rgba::hex_a(0x1C_2430, 0.06),
-    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.95),
-    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.16),
+    shell_bottom: Rgba::hex(0xF8_F9_FC),
+    border: Rgba::hex_a(0x1C_2430, 0.05),
+    outer_ring: Rgba::hex_a(0x1C_2430, 0.04),
+    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.90),
+    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.10),
 
-    glow_idle: Rgba::hex_a(0xA7_8BDA, 0.10),
-    glow_listening: Rgba::hex_a(0xE8_6A7A, 0.16),
-    glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.16),
+    glow_idle: Rgba::hex_a(0x7A_A8_C8, 0.07),
+    glow_listening: Rgba::hex_a(0x3D_BF8A, 0.09),
+    glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.10),
 
     hairline: &[
         Rgba::TRANSPARENT,
-        Rgba::hex(0xE8_A0B8),
-        Rgba::hex(0xB8_A0E8),
-        Rgba::hex(0x8E_C5E8),
+        Rgba::hex(0x8E_C5_C0),
+        Rgba::hex(0x8E_C5_E8),
+        Rgba::hex(0xA0_B0_D8),
         Rgba::TRANSPARENT,
     ],
-    hairline_opacity: 0.50,
+    hairline_opacity: 0.36,
     spectrum: &[
-        Rgba::hex(0xE8_A0B8),
-        Rgba::hex(0xD0_A0E0),
-        Rgba::hex(0xB8_A0E8),
-        Rgba::hex(0x9E_B0E8),
-        Rgba::hex(0x8E_C5E8),
+        Rgba::hex(0x9A_C8_B0),
+        Rgba::hex(0x8E_C5_C8),
+        Rgba::hex(0x8E_C5_E8),
+        Rgba::hex(0x9E_B0_E0),
+        Rgba::hex(0xA8_A8_D0),
     ],
     scan: &[
         Rgba::TRANSPARENT,
-        Rgba::hex(0xB8_A0E8),
-        Rgba::hex(0xE8_A0B8),
+        Rgba::hex(0x8E_C5_C8),
+        Rgba::hex(0x8E_C5_E8),
         Rgba::TRANSPARENT,
     ],
 
@@ -319,17 +317,18 @@ pub const PORCELAIN_LIGHT: Theme = Theme {
     ink_dim: Rgba::hex(0x5A_6678),
     ink_faint: Rgba::hex(0x8B_97A8),
 
-    rec: Rgba::hex(0xE8_6A7A),
+    // Live core: mint — never rose/rec-red.
+    rec: Rgba::hex(0x3D_BF8A),
     ok: Rgba::hex(0x3D_BF8A),
-    accent: Rgba::hex(0xA7_8BDA),
-    ring_idle: Rgba::hex_a(0x1C_2430, 0.12),
-    ring_listening: Rgba::hex_a(0xE8_6A7A, 0.28),
+    accent: Rgba::hex(0x6E_9F_C8),
+    ring_idle: Rgba::hex_a(0x1C_2430, 0.10),
+    ring_listening: Rgba::hex_a(0x3D_BF8A, 0.26),
     ring_processing: Rgba::hex_a(0x1C_2430, 0.06),
-    ring_inserted: Rgba::hex_a(0x3D_BF8A, 0.35),
-    spinner: (Rgba::hex(0xA7_8BDA), Rgba::hex_a(0xA7_8BDA, 0.40)),
+    ring_inserted: Rgba::hex_a(0x3D_BF8A, 0.30),
+    spinner: (Rgba::hex(0x6E_9F_C8), Rgba::hex_a(0x6E_9F_C8, 0.40)),
 
-    processing_ink: Rgba::hex(0xA7_8BDA),
-    latency: (Rgba::hex(0x3D_BF8A), Rgba::hex(0x6E_CFB0)),
+    processing_ink: Rgba::hex(0x6E_9F_C8),
+    latency: (Rgba::hex(0x3D_BF8A), Rgba::hex(0x6E_CF_B0)),
 };
 
 /// Both shipping palettes, in the order they are offered to the user.
@@ -493,5 +492,27 @@ mod tests {
         assert_ne!(PRISM_DARK.name, PORCELAIN_LIGHT.name);
         const { assert!(PRISM_DARK.dark) };
         const { assert!(!PORCELAIN_LIGHT.dark) };
+    }
+
+    /// Captain desk rule: solid UI accents must never read as rec-red.
+    /// Spectrum may carry multi-hue on the live path only; the core, ring, and
+    /// listening glow stay cool mint/sky.
+    #[test]
+    fn solid_accents_are_not_rec_red() {
+        let not_red = |c: Rgba, label: &str, theme: &str| {
+            // "Rec-red" = red channel clearly dominates green and blue.
+            assert!(
+                !(c.r > c.g.saturating_add(30) && c.r > c.b.saturating_add(30)),
+                "{theme} {label} is rec-red: #{:02X}{:02X}{:02X}",
+                c.r,
+                c.g,
+                c.b
+            );
+        };
+        for theme in THEMES {
+            not_red(theme.rec, "rec", theme.name);
+            not_red(theme.glow_listening, "glow_listening", theme.name);
+            not_red(theme.ring_listening, "ring_listening", theme.name);
+        }
     }
 }

@@ -8,7 +8,8 @@
 //! it.
 //!
 //! Three box-blur passes approximate a Gaussian closely enough that no one can
-//! tell at 300x114 px, and cost a couple of hundred microseconds.
+//! tell at the HUD chip's ~224×106 px window, and cost a couple of hundred
+//! microseconds.
 
 use tiny_skia::Mask;
 

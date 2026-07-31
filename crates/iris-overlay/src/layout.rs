@@ -1,12 +1,13 @@
 //! Geometry: the pill's logical measurements, and the DPI-scaled device-pixel
 //! rectangles the renderer draws into.
 //!
-//! Every constant here is in *logical* pixels at 100 % scale, taken from the
-//! Prism spec card (`248 × 46`, radius 23, bottom-centre, 58 px above the work
-//! area). [`Layout::new`] multiplies them by the monitor's scale factor, which
-//! is the whole of this crate's per-monitor-V2 DPI story: nothing is rasterised
-//! at 96 dpi and stretched, the pill is re-laid-out and re-rasterised at the
-//! monitor's real scale.
+//! Every constant here is in *logical* pixels at 100 % scale. The locked Prism
+//! placement is still bottom-centre, 58 px above the work area; the body itself
+//! is a compact HUD chip (`168 × 34`, radius 17) rather than the original mockup
+//! recorder bar (`248 × 46`). [`Layout::new`] multiplies them by the monitor's
+//! scale factor, which is the whole of this crate's per-monitor-V2 DPI story:
+//! nothing is rasterised at 96 dpi and stretched, the pill is re-laid-out and
+//! re-rasterised at the monitor's real scale.
 //!
 //! Geometry is deliberately *not* a theme property — see [`crate::theme`].
 
@@ -17,11 +18,11 @@ use crate::spectrum::BAR_COUNT;
 // ---------------------------------------------------------------------------
 
 /// Pill width.
-pub const PILL_W: f32 = 248.0;
+pub const PILL_W: f32 = 168.0;
 /// Pill height.
-pub const PILL_H: f32 = 46.0;
+pub const PILL_H: f32 = 34.0;
 /// Pill corner radius. Exactly half the height, so the ends are true semicircles.
-pub const PILL_RADIUS: f32 = 23.0;
+pub const PILL_RADIUS: f32 = 17.0;
 
 /// Distance from the bottom of the pill to the bottom of the monitor's work
 /// area. Above the taskbar, below anything the user is reading.
@@ -30,73 +31,79 @@ pub const WORK_AREA_GAP: f32 = 58.0;
 /// Transparent margin left and right of the pill, inside the window, for the
 /// drop shadow to bleed into.
 ///
-/// The shadow is a Gaussian of sigma 14 (CSS blur-radius 28), whose tail is
+/// The shadow is a Gaussian of sigma 11 (CSS blur-radius ~22), whose tail is
 /// still faintly non-zero two standard deviations out. Anything less than
 /// ~2.5 sigma of margin and the halo is cut off square at the window edge,
 /// which on a dark wallpaper reads as a visible rectangle around the pill.
-pub const MARGIN_X: f32 = 40.0;
+pub const MARGIN_X: f32 = 28.0;
 /// Transparent margin above the pill.
-pub const MARGIN_TOP: f32 = 34.0;
+pub const MARGIN_TOP: f32 = 28.0;
 /// Transparent margin below the engine chip.
-pub const MARGIN_BOTTOM: f32 = 34.0;
+pub const MARGIN_BOTTOM: f32 = 28.0;
 
 /// Gap between the bottom of the pill and the top of the engine chip.
-pub const CHIP_GAP: f32 = 10.0;
+pub const CHIP_GAP: f32 = 7.0;
 /// Height of the engine chip's text box.
-pub const CHIP_H: f32 = 10.0;
+pub const CHIP_H: f32 = 9.0;
 
 /// Left padding inside the pill, before the capsule.
-const PAD_L: f32 = 8.0;
+const PAD_L: f32 = 5.0;
 /// The capsule's square box.
-const CAP_BOX: f32 = 30.0;
+const CAP_BOX: f32 = 18.0;
 /// Gap between the capsule box and the waveform.
 const CAP_GAP: f32 = 2.0;
 /// Diameter of the capsule ring.
-const CAP_RING_D: f32 = 22.0;
+const CAP_RING_D: f32 = 14.0;
 /// Stroke width of the capsule ring.
-const CAP_RING_W: f32 = 1.5;
-/// Diameter of the capsule core (the recording dot).
-const CAP_CORE_D: f32 = 8.0;
+const CAP_RING_W: f32 = 1.2;
+/// Diameter of the capsule core (live indicator — not a rec-button red).
+const CAP_CORE_D: f32 = 5.0;
 
 /// Width reserved on the right for the telemetry readout, including the pill's
 /// own right padding. Fixed, so the waveform never reflows when the readout
 /// changes from `0:03` to `142 ms` — the report forbids layout thrash.
-const META_SLOT: f32 = 56.0;
+///
+/// Holds Cascadia Mono at [`META_FONT`] through `1000 ms` (~41 px advance plus
+/// [`META_PAD_R`]) without the right-aligned run entering the waveform.
+const META_SLOT: f32 = 52.0;
 /// Distance from the pill's right edge to the right edge of the readout text.
-const META_PAD_R: f32 = 14.0;
+const META_PAD_R: f32 = 10.0;
 
 /// Height of the waveform box.
-const WAVE_H: f32 = 26.0;
+const WAVE_H: f32 = 18.0;
 /// Inner padding at each end of the waveform box.
-const WAVE_PAD: f32 = 8.0;
+const WAVE_PAD: f32 = 4.0;
 /// Width of one bar.
-const BAR_W: f32 = 2.0;
+const BAR_W: f32 = 1.5;
 /// Gap between bars.
-const BAR_GAP: f32 = 2.5;
+///
+/// Pitch is tight enough that all [`BAR_COUNT`] bars sit inside the waveform's
+/// padded interior at [`PILL_W`] with [`META_SLOT`] reserved for `1000 ms`.
+const BAR_GAP: f32 = 1.5;
 /// Height of a bar at `scaleY(1)`.
-const BAR_H: f32 = 24.0;
+const BAR_H: f32 = 16.0;
 
 /// Inset of the spectrum hairline from each end of the pill.
-const HAIRLINE_INSET: f32 = 12.0;
+const HAIRLINE_INSET: f32 = 10.0;
 /// Thickness of the spectrum hairline.
 const HAIRLINE_H: f32 = 1.0;
 
 /// Left edge of the processing scan track.
-const SCAN_L: f32 = 38.0;
+const SCAN_L: f32 = 26.0;
 /// Distance from the pill's right edge to the right edge of the scan track.
-const SCAN_R: f32 = 62.0;
+const SCAN_R: f32 = 46.0;
 /// Thickness of the scan band.
-const SCAN_H: f32 = 2.0;
+const SCAN_H: f32 = 1.5;
 
 /// Distance from the pill's bottom edge to the partial-transcript ribbon.
-const RIBBON_UP: f32 = 5.0;
+const RIBBON_UP: f32 = 4.0;
 /// Thickness of the partial-transcript ribbon.
-const RIBBON_H: f32 = 1.5;
+const RIBBON_H: f32 = 1.25;
 
 /// Font size of the telemetry readout.
-const META_FONT: f32 = 11.0;
+const META_FONT: f32 = 10.0;
 /// Font size of the engine chip.
-const CHIP_FONT: f32 = 10.0;
+const CHIP_FONT: f32 = 9.0;
 /// Letter-spacing of the engine chip, in em.
 const CHIP_TRACKING_EM: f32 = 0.08;
 
@@ -397,19 +404,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logical_geometry_is_the_prism_spec() {
-        assert_eq!(PILL_W, 248.0);
-        assert_eq!(PILL_H, 46.0);
-        assert_eq!(PILL_RADIUS, 23.0);
+    fn logical_geometry_is_the_hud_chip_spec() {
+        // Compact HUD chip: smaller than the original Prism mockup bar so the
+        // pill reads as status chrome, not a digital recorder strip.
+        assert_eq!(PILL_W, 168.0);
+        assert_eq!(PILL_H, 34.0);
+        assert_eq!(PILL_RADIUS, 17.0);
         assert_eq!(WORK_AREA_GAP, 58.0);
         // Radius is exactly half the height: the ends are true semicircles.
         assert_eq!(PILL_RADIUS * 2.0, PILL_H);
+        // Stay clearly smaller than the mockup recorder proportions.
+        const { assert!(PILL_W < 180.0 && PILL_H < 40.0) };
     }
 
     #[test]
     fn window_is_bigger_than_the_pill_it_contains() {
         let l = Layout::new(1.0);
-        assert_eq!((l.window_w, l.window_h), (328, 134));
+        assert_eq!((l.window_w, l.window_h), (224, 106));
         assert!(l.pill.x > 0.0 && l.pill.y > 0.0);
         assert!(l.pill.right() < l.window_w as f32);
         // The chip lives below the pill and inside the window.
@@ -445,6 +456,11 @@ mod tests {
                 l.meta_right > l.wave.right(),
                 "readout overlaps wave at {scale}x"
             );
+            let budget = l.meta_right - l.wave.right();
+            assert!(
+                budget + 0.05 >= 41.0 * scale,
+                "meta budget {budget} too tight for 1000 ms at {scale}x"
+            );
         }
     }
 
@@ -454,12 +470,20 @@ mod tests {
             let l = Layout::new(scale);
             let first = l.bar_rect(0, 1.0);
             let last = l.bar_rect(BAR_COUNT - 1, 1.0);
-            assert!(first.x >= l.wave.x, "bars overflow left at {scale}x");
+            let pad = WAVE_PAD * scale;
+            let inner_l = l.wave.x + pad;
+            let inner_r = l.wave.right() - pad;
             assert!(
-                last.right() <= l.wave.right(),
-                "bars overflow right at {scale}x"
+                first.x + 0.01 >= inner_l,
+                "bars overflow padded left at {scale}x: {} < {inner_l}",
+                first.x
             );
-            // Centred within the box.
+            assert!(
+                last.right() <= inner_r + 0.01,
+                "bars overflow padded right at {scale}x: {} > {inner_r}",
+                last.right()
+            );
+            // Centred within the outer wave box (and therefore the pad).
             let lead = first.x - l.wave.x;
             let trail = l.wave.right() - last.right();
             assert!((lead - trail).abs() < 0.5, "bars off-centre at {scale}x");
