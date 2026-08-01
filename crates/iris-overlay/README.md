@@ -1,20 +1,22 @@
 # iris-overlay
 
 The Iris pill: a small always-on-top shape that appears bottom-centre while
-you hold the dictation hotkey. A quiet orb while it waits for speech, opening
-into a capsule that shows the live transcript as words arrive, then
-collapsing back into a checkmark the instant text lands — and taking itself
-off screen a moment later.
+you hold the dictation hotkey. By default it is a quiet glass capsule holding
+a wave row (it grows with your voice) and an elapsed-recording timer,
+collapsing into a checkmark the instant text lands — and taking itself off
+screen a moment later. A config opt-in (`show_live_text`, off by default —
+see "Round 3", below) widens the same shape further into a ribbon that shows
+the live transcript as words arrive.
 
 It is the product's hero surface. It never takes focus, never accepts a
 click, and **never types**: text injection lives in `iris-core` and is not
 reachable from here.
 
 ```
-listening, quiet          listening, words arriving              inserted
-     ⬤              ─────▶   ╭──────────────────────────╮   ─────▶    ⓥ
-                              │  ...the report needs three │           134 ms
-                              ╰──────────────────────────╯
+listening, default              listening, opt-in text open       inserted
+╭────────╮               ─────▶ ╭──────────────────────────╮ ──▶     ⓥ
+│ ⬤   0:07│                     │  ...the report needs three │
+╰────────╯                      ╰──────────────────────────╯
 ```
 
 ## Using it
@@ -92,25 +94,27 @@ feature than the one that was actually approved.
 
 ## The shape
 
-A capsule whose corner radius is always exactly half its height. At minimum
-width that makes it a true circle — the orb — with no visible seam; at any
-wider width it is a capsule holding the live transcript. There is one shape,
-not two: only its width animates. Height, placement, and every motion timing
-are unchanged from before.
+A capsule whose corner radius is always exactly half its height. There is one
+shape, not two: only its width animates. Height, placement, and every motion
+timing are unchanged from before.
 
-- `layout::ORB_D` (34) is both the orb's diameter and the ribbon's constant
-  height — deliberately equal to the previous design's `PILL_H`, both as
-  continuity and because it is what makes the morph seamless.
-- `layout::RIBBON_MAX_W` (460) is the widest the ribbon grows before new words
-  start scrolling the oldest ones off the left edge (`render::text::trailing_fit`)
-  instead of growing further.
+- `layout::ORB_D` (34) is the shape's constant height, at every width.
+- `layout::REST_W` (128) is the width at rest — no live text on screen, which
+  is the default and what most users ever see. Noticeably narrower than the
+  previous signed-off pill's 168×34 (round 3: "it was really wide, we need to
+  narrow it down"), and wide enough relative to `ORB_D` to read unmistakably
+  as a capsule, not a circle. It holds the wave row and the elapsed-recording
+  timer side by side — see "Round 3", below.
+- `layout::RIBBON_MAX_W` (460) is the widest the shape grows, once live text
+  is opted back in, before new words start scrolling the oldest ones off the
+  left edge (`render::text::trailing_fit`) instead of growing further.
 - The window is **fixed-size**, sized for the widest state up front
   (`layout::WINDOW_W` / `WINDOW_H`). Only the shape drawn inside it animates —
   see `window/win32.rs`'s `Surface::present`, which already hands a fresh size
   to `UpdateLayeredWindow` every frame regardless of whether it changed. This
   was the lower-risk of two options (the other being a window that resizes
-  live), and the fixed transparent margin around a narrow orb costs nothing
-  extra to composite.
+  live), and the fixed transparent margin around the shape costs nothing extra
+  to composite.
 - `layout::WORK_AREA_GAP` (58) is unchanged from the previous pill on purpose:
   this direction changes the shape, not where the eye has to look for it.
 
@@ -215,6 +219,60 @@ off the top of the ascenders, leaving them on bare glass. `WAVE_MAX_H` and
 and `the_wave_row_clears_the_live_text_ink_box` fails if either is retuned
 past that.
 
+## Round 3: text off by default, a narrower capsule, and a timer
+
+Direct captain feedback after living with the orb-to-ribbon design on a real
+desktop, round 3 (2026-08-01): *"I'm pretty sure it's better, to remove the
+transcription, because it's very slow. ... I like it more if it's not just a
+dot or a circle, more like the pipe thing. ... We need to narrow it down. But
+the glassy part is really good looking. The part that is ruining it is the
+highlights behind the wording, because it's also black."* A follow-up
+confirmed the direction and added one thing: *"Maybe just have some sort of
+waves that get bigger whenever the voice is louder. The timer beside it, of
+course."*
+
+Three changes, all in `iris-app` and this crate together:
+
+- **`show_live_text` defaults to `false`** (`iris-app::config::Config`). Not
+  removed — the captain reached this by living with the feature, not by
+  rejecting it outright, and a default flip costs nothing to reverse. See that
+  crate's config doc comment.
+- **The resting shape is `layout::REST_W`, a capsule, not `layout::ORB_D`, a
+  circle.** Previously the shape's *base* width in `render::Renderer::draw`
+  was hard-coded to `layout.shape_h` and only `open` (the live-text tween)
+  ever widened it — with text off by default, that base was all any user
+  would see, and it was a circle. The base is `layout.rest_w` now; `open`
+  still widens further, toward the ribbon, exactly as before. Getting this
+  wrong is a one-line regression (swapping `rest_w` back to `shape_h` in that
+  formula) with no compiler error to catch it, which is why
+  `the_resting_shape_is_the_capsule_width_not_a_circle` pins the *drawn* pixel
+  width, not just the constant.
+- **An elapsed-recording timer shares the capsule with the wave row**
+  (`render::draw_timer`), built entirely from machinery that already existed
+  unrendered in `state.rs` (`listen_started_at`, `freeze_timer`,
+  `Model::listening_ms`, `format_timer`) — no second timer was built. It
+  crossfades with the same `glyph_alpha(open)` token the closed-state core
+  glyph already used, so it is what occupies the default presentation and
+  steps aside the instant live text opens the ribbon; `render::draw_wave`
+  gained a `right_reserve` parameter that shrinks in lockstep so the wave row
+  reclaims the freed width rather than the two overlapping. Cascadia Mono is
+  monospaced (`the_face_is_monospaced` pins this, with the timer named in the
+  test itself), so the digits never jitter as seconds tick over. Legibility is
+  solved without a dark backing plate — the captain's exact complaint this
+  round — by drawing the run a second time at a sub-pixel offset in the same
+  ink colour at low alpha before the crisp pass: a soft, colour-matched glow
+  instead of a plate sitting on the glass.
+- **`theme.text_scrim` was already correctly gated** — `render::mod.rs`'s
+  `draw_ribbon` (the only place it paints) is called only when the ribbon is
+  meaningfully open *and* live text is non-empty, so turning `show_live_text`
+  off makes it unreachable by construction rather than needing a fix.
+  `text_scrim_never_paints_in_the_default_no_text_presentation` pins this
+  against real pixels so a future change cannot reopen the gap.
+- **The glass itself was not touched.** `fill_glass_shell`, the spectrum ramp,
+  the sheen streak, the rim — none of it was retuned. What the captain praised
+  stays; what they flagged (the black scrim, the wide rectangle, the plain
+  circle) is what changed.
+
 ## Why a CPU raster path
 
 The pill is small — even at its widest (the open ribbon) the whole frame is a
@@ -304,21 +362,23 @@ it appears under the app you are dictating into, not always on the primary.
 cargo run --example pill-demo
 cargo run --example pill-demo -- --theme porcelain --utterance short --cycles 0   # until Ctrl-C
 
-# A PNG filmstrip of the same frames. Works anywhere, including Linux CI.
+# A PNG filmstrip of the same frames — the shipped default (capsule, waves,
+# timer; no live text). Works anywhere, including Linux CI.
 cargo run --example pill-demo -- --filmstrip /tmp/iris-pill
 cargo run --example pill-demo -- --filmstrip /tmp/iris-pill --utterance long --scale 1.5
 
-# The orb-only presentation, as `iris-app`'s show_live_text = false gives it.
-cargo run --example pill-demo -- --filmstrip /tmp/iris-orb --live-text off
+# The opt-in ribbon, as `iris-app`'s show_live_text = true gives it.
+cargo run --example pill-demo -- --filmstrip /tmp/iris-ribbon --live-text on
 ```
 
 The demo drives a full cycle with a synthetic speech envelope — syllables
 riding on a phrase-length swell — and a scripted utterance revealed one word
 at a time (`--utterance short` fits comfortably; `--utterance long`, the
 default, overflows the ribbon on purpose so the marquee-tail scroll is easy to
-review). `--live-text off` sends no partial text at all, which is exactly what
-the app's opt-out does to this crate, so the orb-only presentation is
-reviewable the same way.
+review, when `--live-text on`). `--live-text off`, the demo's own default,
+sends no partial text at all — exactly what `show_live_text = false` does to
+this crate in the shipped app — so the default capsule-with-waves-and-timer
+presentation is reviewable the same way.
 
 ### From WSL
 

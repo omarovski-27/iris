@@ -569,7 +569,7 @@ fn a_tray_save_never_persists_a_cli_override() {
 /// `set_show_live_text_moves_the_real_gate_both_ways`.
 #[test]
 fn reload_pushes_the_live_text_opt_out_down_without_a_restart() {
-    let mut rig = rig();
+    let mut rig = rig_with(|c| c.show_live_text = true);
     rig.dictate().expect("first dictation");
     assert!(
         !rig.pill.partial_texts().is_empty(),

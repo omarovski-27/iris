@@ -88,10 +88,11 @@ struct Args {
 
     /// Whether the live transcript reaches the overlay at all.
     ///
-    /// `off` sends no partial text, which is exactly what `iris-app`'s
-    /// `Config::show_live_text = false` opt-out does to this crate: the orb
-    /// never opens into a ribbon. Use it to review that presentation.
-    #[arg(long, value_parser = ["on", "off"], default_value = "on")]
+    /// Defaults to `off`, matching `iris-app`'s shipped default
+    /// (`Config::show_live_text = false`, round 3): no partial text reaches
+    /// the shape, so it never widens past the resting capsule. Pass `on` to
+    /// review the opt-in ribbon presentation instead.
+    #[arg(long, value_parser = ["on", "off"], default_value = "off")]
     live_text: String,
 
     /// Monitor scale to render at in filmstrip mode (1.0 = 100 %, 1.5 = 150 %).

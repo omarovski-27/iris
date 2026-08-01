@@ -241,25 +241,34 @@ When updating this file, preserve this bar for all agents and keep entries conci
   WSL notes — that file is the authority on exact geometry and colour tokens,
   not this one.
 - The design is **captain-decided** (2026-07-31, superseding the prior
-  captain-locked fixed capsule of the same date): a shape-shifting orb that
-  opens into a live-text ribbon, Prism dark default, Porcelain light,
+  captain-locked fixed capsule of the same date; round 3 on 2026-08-01
+  superseded the default — see below): a shape-shifting shape that can open
+  into a live-text ribbon, Prism dark default, Porcelain light,
   prism-triangle icon unchanged (tray uses the same mark via
   `tray::icon_rgba`). Full rationale and the two rejected alternatives:
   `data/iris-ui-directions/report.md` in the fleet's records.
-- Geometry is one capsule whose width animates between an orb (`layout::ORB_D`)
-  and an open ribbon (`layout::RIBBON_MAX_W`) — there is no fixed pill size any
-  more. No solid rec-red (mint/sky live core). Motion timings in `motion.rs`
-  are unchanged and stay captain criteria; every one is imported by the new
-  shape, not copied.
+- **Round 3 (2026-08-01):** `show_live_text` defaults to `false`
+  (`iris-app::config::Config`) — most users now only ever see the resting
+  capsule, never the ribbon. That capsule holds a wave row and an
+  elapsed-recording timer side by side, not a bare circle. See
+  `crates/iris-overlay/README.md`'s "Round 3" section before touching
+  `layout::REST_W`, `render::draw_timer`, or the width formula in
+  `Renderer::draw`.
+- Geometry is one capsule whose width animates between the rest capsule
+  (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) — there is no
+  fixed pill size and no true circle in normal operation any more.
+  `layout::ORB_D` is now just the shape's constant height. No solid rec-red
+  (mint/sky live core). Motion timings in `motion.rs` are unchanged and stay
+  captain criteria; every one is imported by the new shape, not copied.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
 - The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is
   the only `cfg(windows)` file. That is what lets `cargo run --example pill-demo
   -- --filmstrip <dir>` produce reviewable PNGs of the real frames from Linux.
 - The pill is a display: it never activates, never hit-tests, and never
-  injects input. It **does** now hold the live transcript text on screen while
-  the ribbon is open — a deliberate, captain-approved reversal of the previous
-  "never holds transcript text" rule, with a config opt-out
-  (`iris-app::config::Config`) that falls back to the orb-only presentation.
-  See `crates/iris-overlay/README.md` "The contract changed, and here is why"
+  injects input. It **can** hold the live transcript text on screen while the
+  ribbon is open, gated behind the opt-in `show_live_text` config flag (off by
+  default since round 3) — a deliberate, captain-approved reversal of the
+  original "never holds transcript text" rule. See
+  `crates/iris-overlay/README.md` "The contract changed, and here is why"
   before touching this again.

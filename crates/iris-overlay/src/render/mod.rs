@@ -41,7 +41,7 @@ use crate::motion::{
     one_pole, CHECK_DRAW_MS, EASE_IN, EASE_OUT, ENTER_MS, LEVEL_ATTACK_MS, LEVEL_RELEASE_MS,
     REC_PULSE_MS, SCAN_PERIOD_MS, SPINNER_PERIOD_MS,
 };
-use crate::state::{Model, OverlayState};
+use crate::state::{format_timer, Model, OverlayState};
 use crate::theme::{sample_ramp, Rgba, Theme};
 
 /// Alpha the glass body's spectrum ramp is painted at, at every moment of the
@@ -113,6 +113,10 @@ const WAVE_RESTING_ENV: f32 = 0.05;
 /// scrim's rounded edge starts, in logical pixels.
 const SCRIM_PAD_Y: f32 = 3.0;
 
+/// Gap between the wave row's right edge and the timer's left edge, so the
+/// two read as sharing the capsule rather than colliding. See [`draw_timer`].
+const WAVE_TIMER_GAP: f32 = 8.0;
+
 /// scaleY for one wave bar. `p` is its position across the row, 0.0–1.0;
 /// `i` is its raw index, used only to decorrelate neighbours.
 fn wave_bar_scale(p: f32, i: f32, env: f32, now_ms: u64) -> f32 {
@@ -142,6 +146,14 @@ fn wave_alpha(listening: f32, processing: f32, inserted: f32) -> f32 {
 /// from the shape's current width every frame, sitting in a band above the
 /// shape's centre so it coexists with the text and the core glyph rather
 /// than competing with either.
+///
+/// `right_reserve` is the device-pixel zone [`draw_timer`] needs at the right
+/// edge, in the default (no live text) presentation — the wave row's usable
+/// width shrinks to leave it room rather than the two overlapping. It shrinks
+/// to zero in lockstep with the timer's own fade as live text opens the
+/// ribbon, so the row smoothly reclaims the full width exactly as the timer
+/// vacates it.
+#[allow(clippy::too_many_arguments)]
 fn draw_wave(
     pixmap: &mut Pixmap,
     ctx: &Ctx<'_>,
@@ -149,6 +161,7 @@ fn draw_wave(
     y: f32,
     w: f32,
     h: f32,
+    right_reserve: f32,
     clip: Option<&Mask>,
 ) {
     let l = ctx.layout;
@@ -167,7 +180,7 @@ fn draw_wave(
         + WAVE_RESTING_ENV * (1.0 - listening - processing).max(0.0);
 
     let inset = WAVE_INSET * l.scale;
-    let usable = (w - 2.0 * inset).max(0.0);
+    let usable = (w - 2.0 * inset - right_reserve.max(0.0)).max(0.0);
     if usable <= 0.0 {
         return;
     }
@@ -308,7 +321,7 @@ impl Renderer {
         let layout = Layout::new(scale);
         let pixmap = Pixmap::new(layout.window_w, layout.window_h)
             .expect("overlay pixmap allocation failed");
-        let measured_w = layout.shape_h;
+        let measured_w = layout.rest_w;
         Self {
             layout,
             pixmap,
@@ -383,11 +396,14 @@ impl Renderer {
             let text_w =
                 self.atlas
                     .measure_capped(model.text(), self.layout.text_font, 0.0, budget);
+            // Floored at the rest width, not the bare shape height: the
+            // ribbon never reads narrower than the capsule most users see at
+            // rest, even for a single short word.
             (text_w + 2.0 * self.layout.text_pad_x)
-                .max(self.layout.shape_h)
+                .max(self.layout.rest_w)
                 .min(self.layout.ribbon_max_w)
         } else {
-            self.layout.shape_h
+            self.layout.rest_w
         };
         let tau = if target_w > self.measured_w {
             LEVEL_ATTACK_MS
@@ -422,7 +438,9 @@ impl Renderer {
 
         let theme = *model.theme();
         let open = openness.eval();
-        let w = layout.shape_h + (*measured_w - layout.shape_h).max(0.0) * open;
+        // The shape's base width is the rest capsule, not a bare circle —
+        // `open` only ever widens it further, toward the live-text ribbon.
+        let w = layout.rest_w + (*measured_w - layout.rest_w).max(0.0) * open;
         let h = layout.shape_h;
         let r = h * 0.5;
         let x = layout.center_x - w * 0.5;
@@ -456,9 +474,27 @@ impl Renderer {
             fill_through(pixmap, &m.glow, glow.fade(presence));
         }
 
+        // The timer shares the closed-state glyph's crossfade: it fades out
+        // exactly as live text fades in, so the two never fight over the
+        // same right-aligned zone. See `draw_wave`'s `right_reserve`.
+        let glyph_a = glyph_alpha(open);
+        let timer_text = format_timer(model.listening_ms());
+        let timer_w = atlas.measure(&timer_text, layout.text_font, 0.0);
+        let timer_zone = (layout.text_pad_x + timer_w + WAVE_TIMER_GAP * layout.scale) * glyph_a;
+
         draw_shell(pixmap, &ctx, &shape, x, y, w, h, r, cached.map(|m| &m.clip));
-        draw_wave(pixmap, &ctx, x, y, w, h, cached.map(|m| &m.clip));
-        draw_glyph(pixmap, &ctx, glyph_alpha(open));
+        draw_wave(
+            pixmap,
+            &ctx,
+            x,
+            y,
+            w,
+            h,
+            timer_zone,
+            cached.map(|m| &m.clip),
+        );
+        draw_glyph(pixmap, &ctx, glyph_a);
+        draw_timer(pixmap, &ctx, atlas, x, y, w, h, glyph_a, &timer_text);
         if open > 0.02 && has_text {
             draw_ribbon(
                 pixmap,
@@ -905,6 +941,76 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
     }
 }
 
+/// The elapsed-recording timer: `m:ss`, right-aligned in the same row the
+/// live-text ribbon used, sharing the capsule with the wave row rather than
+/// sitting under it — this design's second round rejected an under-pill
+/// caption outright, and the fix here is not to resurrect that placement in
+/// a new form. `alpha` is [`glyph_alpha`], the same crossfade the closed-state
+/// core glyph uses, so the timer is what occupies this row's default (no
+/// live text) state and steps aside the instant real words arrive.
+///
+/// Cascadia Mono is monospaced (`the_face_is_monospaced` pins this), so every
+/// digit and the colon share one advance width: the run never reshuffles
+/// itself as the seconds tick, only grows a character every ten minutes of
+/// continuous listening.
+///
+/// Legibility is solved without a dark backing plate — the captain's
+/// complaint this round is specifically that something black behind text
+/// ruins the glass. Instead the run is drawn a second time, offset by a
+/// sub-pixel in four directions at low alpha in the same ink colour before
+/// the crisp full-alpha pass: a soft, colour-matched glow that thickens the
+/// strokes rather than a plate that sits on top of the surface.
+#[allow(clippy::too_many_arguments)]
+fn draw_timer(
+    pixmap: &mut Pixmap,
+    ctx: &Ctx<'_>,
+    atlas: &mut FontAtlas,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    alpha: f32,
+    text: &str,
+) {
+    if alpha <= 0.001 {
+        return;
+    }
+    let l = ctx.layout;
+    let theme = ctx.theme;
+    let a = ctx.alpha * alpha;
+
+    let (tx, ty) = ctx.map(x + w - l.text_pad_x, y + h * 0.5);
+
+    let halo_a = a * 0.35;
+    if halo_a > 0.001 {
+        let d = 0.6 * l.scale;
+        for (ox, oy) in [(-d, 0.0), (d, 0.0), (0.0, -d), (0.0, d)] {
+            atlas.draw(
+                pixmap,
+                text,
+                l.text_font,
+                0.0,
+                tx + ox,
+                ty + oy,
+                Align::Right,
+                TextPaint::Solid(theme.ink),
+                halo_a,
+            );
+        }
+    }
+    atlas.draw(
+        pixmap,
+        text,
+        l.text_font,
+        0.0,
+        tx,
+        ty,
+        Align::Right,
+        TextPaint::Solid(theme.ink),
+        a,
+    );
+}
+
 /// Top and bottom of the live text's scrim band, in device pixels.
 ///
 /// Takes no text on purpose. The band and the run it backs are both placed
@@ -1154,6 +1260,119 @@ mod tests {
         let (r, model) = drive(&[], 200, PRISM_DARK);
         assert!(model.is_idle());
         assert_eq!(lit_pixels(r.pixmap()), 0, "hidden state left ink behind");
+    }
+
+    /// The horizontal span of every meaningfully-visible pixel at `y`, in
+    /// device px. `min_alpha` excludes the blurred ambient-shadow and glow
+    /// halos' long, near-invisible tails (alpha in the single digits out of
+    /// 255), which bleed many px past the shape's actual edge and would
+    /// otherwise be measured as part of it.
+    fn lit_span_at(r: &Renderer, y: u32, min_alpha: u8) -> Option<(u32, u32)> {
+        let l = r.layout();
+        let row = y * l.window_w;
+        let mut span = None;
+        for x in 0..l.window_w {
+            if r.pixmap().pixels()[(row + x) as usize].alpha() > min_alpha {
+                span = Some(match span {
+                    None => (x, x),
+                    Some((lo, _)) => (lo, x),
+                });
+            }
+        }
+        span
+    }
+
+    /// Round 3 of captain feedback: the resting shape (no live text — the
+    /// shipped default) must read as a capsule, not the old true circle. This
+    /// pins the actual drawn width to `layout.rest_w`, not `layout.shape_h`,
+    /// which is the exact regression a stray `shape_h` left in `draw`'s width
+    /// formula would reintroduce.
+    #[test]
+    fn the_resting_shape_is_the_capsule_width_not_a_circle() {
+        let (r, _) = drive(&[Command::ShowListening], 400, PRISM_DARK);
+        let l = r.layout();
+        let (lo, hi) = lit_span_at(&r, l.center_y as u32, 30).expect("nothing drawn at centre row");
+        let width = (hi - lo) as f32;
+        assert!(
+            width > l.shape_h * 1.5,
+            "resting width {width} reads as a circle (shape_h {})",
+            l.shape_h
+        );
+        // Within a shadow-blur's worth of the exact rest width — the shell
+        // itself, not the ambient shadow bleeding a few px wider.
+        assert!(
+            (width - l.rest_w).abs() < 8.0,
+            "resting width {width} is not close to layout.rest_w {}",
+            l.rest_w
+        );
+    }
+
+    /// The captain's round-3 complaint was specifically the black band behind
+    /// live text ruining the glass. Turning live text off by default (the
+    /// fix) only holds if the scrim genuinely never paints without it: this
+    /// drives the shipped default (no `PartialText` ever sent) through a full
+    /// listening period and asserts no pixel in the row the scrim would
+    /// occupy is anywhere near the scrim's own near-black RGB.
+    #[test]
+    fn text_scrim_never_paints_in_the_default_no_text_presentation() {
+        let (r, _) = drive(
+            &[Command::ShowListening, Command::Level(0.9)],
+            1500,
+            PRISM_DARK,
+        );
+        let l = r.layout();
+        let y = l.center_y as u32;
+        let (lo, hi) = lit_span_at(&r, y, 30).expect("nothing drawn at centre row");
+        // Excludes a few px at each edge: that is the shape's own 1 px
+        // `outer_ring`/`border` hairline (near-black by design, `0 0 0 1px`
+        // in the original CSS spec), not the scrim, which paints a wide band
+        // in the *interior* sized to the text run.
+        let (lo, hi) = (lo + 4, hi.saturating_sub(4));
+        for x in lo..=hi {
+            let p = r.pixmap().pixels()[(y * l.window_w + x) as usize];
+            // Below this the pixel is an imperceptible tail of the blurred
+            // ambient shadow or state glow, not anything a person would read
+            // as "a dark band on the glass".
+            if p.alpha() <= 30 {
+                continue;
+            }
+            let luminance = u32::from(p.red()) + u32::from(p.green()) + u32::from(p.blue());
+            assert!(
+                luminance > 15,
+                "near-black pixel at x={x}: rgb=({},{},{}) alpha={} — looks like text_scrim \
+                 painted without live text",
+                p.red(),
+                p.green(),
+                p.blue(),
+                p.alpha()
+            );
+        }
+    }
+
+    /// The addendum's second requirement: an elapsed-recording timer shares
+    /// the capsule with the wave row in the default presentation. This does
+    /// not assert exact digits (that's `state::tests::timer_formats_like_a_stopwatch`
+    /// and `the_timer_freezes_when_speech_ends`) — just that *something* is
+    /// drawn in the right-aligned zone `draw_timer` owns, and that it is
+    /// `theme.ink`, never the near-black scrim.
+    #[test]
+    fn the_timer_draws_ink_coloured_pixels_beside_the_waves() {
+        let (r, _) = drive(
+            &[Command::ShowListening, Command::Level(0.5)],
+            1200,
+            PRISM_DARK,
+        );
+        let l = r.layout();
+        let y = l.center_y as u32;
+        let right_edge = (l.center_x + l.rest_w * 0.5) as u32;
+        let zone_start = right_edge.saturating_sub(l.text_pad_x as u32 + 40);
+        let mut lit = 0;
+        for x in zone_start..right_edge {
+            if r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha() > 0 {
+                lit += 1;
+            }
+        }
+        assert!(lit > 3, "timer zone drew almost nothing: {lit} px");
     }
 
     /// The three things one listening frame has to get right at once, and the

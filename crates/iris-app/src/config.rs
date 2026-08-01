@@ -369,15 +369,18 @@ pub struct Config {
     /// Show the live partial transcript in the overlay's ribbon while
     /// listening.
     ///
-    /// On by default — this is the reason the current overlay design was
-    /// chosen over its alternatives, not an incidental feature (see
+    /// Off by default (captain feedback, round 3: "maybe we could remove
+    /// that feature" — ambivalent, not certain, so the toggle stays and the
+    /// feature stays reachable, but it no longer opts a user in by surprise).
+    /// The overlay design that made live text the reason to ship (see
     /// `crates/iris-overlay/README.md` "The contract changed, and here is
-    /// why"). Off leaves the overlay in its orb-only presentation: a quiet
-    /// dot that pulses with the microphone and never shows any transcript
-    /// text, which is a complete design on its own, not a degraded one. This
-    /// authorises *displaying* the transcript; it does not change what is
-    /// persisted or logged — the history file's own `enabled` setting is the
-    /// control for that.
+    /// why") is still there behind this flag. Off leaves the overlay in its
+    /// resting capsule presentation: a quiet shape that pulses with the
+    /// microphone and never shows any transcript text, which is the default
+    /// most users will ever see, not a degraded fallback. This authorises
+    /// *displaying* the transcript; it does not change what is persisted or
+    /// logged — the history file's own `enabled` setting is the control for
+    /// that.
     pub show_live_text: bool,
     /// Transcript cleanup.
     pub polish: PolishConfig,
@@ -402,7 +405,7 @@ impl Default for Config {
             hotkey: Key::default(),
             suppress_hotkey: true,
             theme: Theme::default(),
-            show_live_text: true,
+            show_live_text: false,
             polish: PolishConfig::default(),
             audio: AudioConfig::default(),
             inject: InjectConfig::default(),
@@ -624,8 +627,8 @@ mod tests {
         assert!(config.suppress_hotkey);
         assert_eq!(config.theme, Theme::Dark);
         assert!(
-            config.show_live_text,
-            "live text ships on by default per the design decision"
+            !config.show_live_text,
+            "live text is off by default per captain feedback round 3"
         );
         assert!(config.polish.enabled);
         assert_eq!(config.inject.method, Method::SendInput);
@@ -664,13 +667,13 @@ mod tests {
         // Untouched by the file, so still the default.
         assert!(config.polish.llm);
         assert_eq!(config.hotkey, Key::RightCtrl);
-        assert!(config.show_live_text);
+        assert!(!config.show_live_text);
     }
 
     #[test]
-    fn show_live_text_can_be_turned_off_from_the_file() {
-        let config = Config::from_toml("show_live_text = false\n").unwrap();
-        assert!(!config.show_live_text);
+    fn show_live_text_can_be_turned_on_from_the_file() {
+        let config = Config::from_toml("show_live_text = true\n").unwrap();
+        assert!(config.show_live_text);
         // Nothing else moves.
         assert_eq!(config.engine, EngineChoice::Mock);
     }

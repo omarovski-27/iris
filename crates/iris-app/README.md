@@ -54,7 +54,7 @@ engine = "mock"           # mock | deepgram | groq | local
 hotkey = "right-ctrl"     # rctrl, lctrl, rshift, ralt, rwin, capslock, ...
 suppress_hotkey = true    # stop the hotkey reaching the focused app
 theme = "dark"            # dark | light
-show_live_text = true     # false keeps the overlay a quiet orb, no transcript
+show_live_text = false    # true opens a live-text ribbon showing dictated words
 
 [polish]
 enabled = true
@@ -270,9 +270,10 @@ insert the overlay holds the confirmation then exits itself — the loop does
 **not** call `hide()` immediately, or the hold would be cancelled.
 
 `set_partial_text` is what opens the overlay's live-transcript ribbon.
-`show_live_text = false` in the config makes `OverlayPill` swallow it, so the
-overlay never sees a partial and stays the quiet orb — the opt-out for anyone
-who does not want dictated words on screen. It is pushed through
+`show_live_text = false` (the default) makes `OverlayPill` swallow it, so the
+overlay never sees a partial and stays its resting capsule — the presentation
+most users see, not a fallback. `show_live_text = true` is the opt-in for
+anyone who wants dictated words on screen. It is pushed through
 `PillSink::set_show_live_text` at startup and again on every "reload
 settings", the same way the theme is, so editing it takes effect without a
 restart.
