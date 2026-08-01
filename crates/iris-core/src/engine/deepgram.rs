@@ -427,8 +427,8 @@ fn conclude(acc: &Transcript, sent_secs: f64, failure: Option<String>) -> Transc
         (false, _) => TranscriptEvent::Final(text),
         (true, Some(err)) => TranscriptEvent::Error(err),
         (true, None) if sent_secs < NEGLIGIBLE_AUDIO_SECS => TranscriptEvent::Error(
-            "no audio reached the transcription engine — the key was likely released before \
-             recording could start; try holding it a little longer"
+            "almost no audio reached the transcription engine — the key was likely released \
+             before recording could start; try holding it a little longer"
                 .into(),
         ),
         (true, None) => TranscriptEvent::Error(
@@ -767,6 +767,12 @@ mod tests {
         })
     }
 
+    /// How long the fake server watches for a rushed `CloseStream` after
+    /// `Finalize`. Long enough that a client racing ahead is caught, short
+    /// enough that a correctly-waiting client (which sends nothing until it
+    /// has the ack) does not slow the test down.
+    const RUSH_WINDOW: Duration = Duration::from_millis(80);
+
     /// A minimal, adversarial fake Deepgram: it withholds any response until
     /// `Finalize` arrives (nothing streamed back during the hold — exactly a
     /// hold shorter than connect-plus-first-result), then only hands over the
@@ -775,12 +781,19 @@ mod tests {
     /// `Finalize` gets an early Metadata sign-off and permanently loses the
     /// flush — reproducing the real bug on a real, if fake, wire rather than
     /// a hand-written two-message fixture.
-    #[tokio::test]
-    async fn a_hold_shorter_than_first_response_does_not_abandon_the_backlog() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
+    ///
+    /// Every hold shape below drives this same server; the only thing that
+    /// varies is the audio fed in, plus the transcript and `duration` it
+    /// reports back.
+    fn spawn_withhold_then_flush_server(
+        listener: tokio::net::TcpListener,
+        reply_text: &'static str,
+        metadata_duration: f64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let metadata =
+                serde_json::json!({ "type": "Metadata", "duration": metadata_duration })
+                    .to_string();
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
 
@@ -793,24 +806,14 @@ mod tests {
             }
 
             // Did the client rush to close instead of waiting for the flush?
-            let rushed = tokio::time::timeout(Duration::from_millis(80), ws.next())
-                .await
-                .is_ok();
+            let rushed = tokio::time::timeout(RUSH_WINDOW, ws.next()).await.is_ok();
             if rushed {
-                let _ = ws
-                    .send(Message::Text(
-                        r#"{"type":"Metadata","duration":3.0}"#.into(),
-                    ))
-                    .await;
+                let _ = ws.send(Message::Text(metadata.into())).await;
                 return;
             }
 
             ws.send(Message::Text(
-                results_from_finalize(
-                    "It's not working correctly. I've been having trouble.",
-                    true,
-                )
-                .into(),
+                results_from_finalize(reply_text, true).into(),
             ))
             .await
             .unwrap();
@@ -822,12 +825,19 @@ mod tests {
                     _ => return,
                 }
             }
-            let _ = ws
-                .send(Message::Text(
-                    r#"{"type":"Metadata","duration":3.0}"#.into(),
-                ))
-                .await;
-        });
+            let _ = ws.send(Message::Text(metadata.into())).await;
+        })
+    }
+
+    #[tokio::test]
+    async fn a_hold_shorter_than_first_response_does_not_abandon_the_backlog() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_withhold_then_flush_server(
+            listener,
+            "It's not working correctly. I've been having trouble.",
+            3.0,
+        );
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -859,48 +869,7 @@ mod tests {
     async fn a_hold_under_half_a_second_still_waits_for_the_flush() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
-            }
-
-            let rushed = tokio::time::timeout(Duration::from_millis(50), ws.next())
-                .await
-                .is_ok();
-            if rushed {
-                let _ = ws
-                    .send(Message::Text(
-                        r#"{"type":"Metadata","duration":0.3}"#.into(),
-                    ))
-                    .await;
-                return;
-            }
-
-            ws.send(Message::Text(results_from_finalize("No.", true).into()))
-                .await
-                .unwrap();
-
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
-            }
-            let _ = ws
-                .send(Message::Text(
-                    r#"{"type":"Metadata","duration":0.3}"#.into(),
-                ))
-                .await;
-        });
+        let server = spawn_withhold_then_flush_server(listener, "No.", 0.3);
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -933,48 +902,7 @@ mod tests {
     async fn a_50ms_hold_still_waits_for_the_flush() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
-            }
-
-            let rushed = tokio::time::timeout(Duration::from_millis(50), ws.next())
-                .await
-                .is_ok();
-            if rushed {
-                let _ = ws
-                    .send(Message::Text(
-                        r#"{"type":"Metadata","duration":0.05}"#.into(),
-                    ))
-                    .await;
-                return;
-            }
-
-            ws.send(Message::Text(results_from_finalize("Hi.", true).into()))
-                .await
-                .unwrap();
-
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
-            }
-            let _ = ws
-                .send(Message::Text(
-                    r#"{"type":"Metadata","duration":0.05}"#.into(),
-                ))
-                .await;
-        });
+        let server = spawn_withhold_then_flush_server(listener, "Hi.", 0.05);
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
