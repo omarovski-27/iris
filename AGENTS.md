@@ -149,10 +149,15 @@ in practice.
   drawn exactly at `BATCH` and not a rounder number.
 - Three things veto that paste, and each falls back to keystrokes rather than
   failing: a target whose Ctrl+V is not paste (`inject::accepts_paste`, a
-  documented default-allow deny-list of terminals/RDP/vim), a hotkey still
-  down that would turn Ctrl+V into another accelerator
-  (`inject::paste_accelerator_survives`), and a clipboard held open by
-  another process. The fallback is only safe because `inject::pacing` splits
+  default-allow deny-list of terminals/RDP/vim/Emacs that is explicitly
+  best-effort and permanently incomplete — do not treat adding entries as
+  progress towards coverage; what bounds a miss is that the text stays on the
+  clipboard and in the session log, which is documented for users), a hotkey
+  still down that would turn Ctrl+V into another accelerator
+  (`inject::paste_accelerator_survives`, checked both before and after
+  `set_clipboard` — the early check spares the clipboard on a hotkey that can
+  never be corrected, the late one catches a press during a blocked
+  `set_clipboard`), and a clipboard held open by another process. The fallback is only safe because `inject::pacing` splits
   a burst past the threshold into smaller `SendInput` calls with a gap
   between them, so nothing lands on the unpaced burst the escalation exists
   to avoid. `paste_accelerator_survives` is the *only* sanctioned way to

@@ -25,16 +25,30 @@
 //! * The clipboard can simply be unavailable, held open by another process.
 //!
 //! Every one of those routes back to keystrokes, and a keystroke burst past
-//! [`MAX_SEND_INPUT_CHARS`] is *paced* ([`pacing`]) rather than sent flat out,
-//! so the fallback is not the same sustained burst the escalation exists to
-//! avoid. No transcript is left on a path this project has evidence corrupts
-//! it.
+//! [`MAX_SEND_INPUT_CHARS`] is *paced* ([`pacing`]) rather than sent flat out.
+//! What that is worth differs by route, and the difference matters: declining
+//! to paste into a terminal puts the text where this project's evidence says
+//! it already arrives intact, while a clipboard failure puts an *ordinary*
+//! target — the kind the corruption was reported in — on a burst that is
+//! merely paced, and the pacing constants are a reasoned guess, not a
+//! measurement (see [`pacing`]). So nothing here is left on the *unpaced*
+//! burst the escalation exists to avoid; that is the claim this module can
+//! actually support.
+//!
+//! Nothing in this module can tell whether the target rendered the text. Every
+//! success here means "delivered into the system's input stream" — the same
+//! thing `SendInput` reported when it returned full success for the burst
+//! Notepad garbled. There is no OS signal for the stronger claim, so the
+//! recoverability of the text elsewhere (the clipboard it is left on, the
+//! session log) is what bounds the damage, not a confirmation this layer
+//! could check.
 //!
 //! Both are measured; see `docs/spike-findings.md`.
 
 use anyhow::{bail, Result};
 
 use crate::hotkey::Key;
+use crate::vlog;
 
 /// How to deliver text to the focused window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -83,8 +97,23 @@ pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    let target = focused_target();
-    imp(text, effective_method(text, method, target.as_ref()), hotkey)
+    // Only a transcript long enough to be escalated ever consults the target,
+    // so the ordinary short dictation — the overwhelming common case — pays
+    // none of the OS calls `focused_target` makes.
+    let target = (crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS)
+        .then(focused_target)
+        .flatten();
+    let effective = effective_method(text, method, target.as_ref());
+    if let (Method::SendInput, Some(target)) = (effective, &target) {
+        vlog!(
+            "{} ({}) does not take Ctrl+V as paste; typing this {}-character \
+             transcript in paced bursts instead",
+            target.process,
+            target.class,
+            text.chars().count()
+        );
+    }
+    imp(text, effective, hotkey)
 }
 
 /// The window that will receive the text, as far as [`accepts_paste`] needs
@@ -112,30 +141,49 @@ fn focused_target() -> Option<Target> {
 
 /// Window classes that do not treat Ctrl+V as paste, or bind it to their own
 /// meaning. Matched case-insensitively against [`Target::class`].
+///
+/// Best-effort and permanently incomplete — see [`accepts_paste`]. Entries
+/// are added when a family is both known-hostile and actually identifiable;
+/// the list is not working towards covering every such app, because it
+/// cannot.
 const PASTE_HOSTILE_CLASSES: &[&str] = &[
     "consolewindowclass",           // conhost: cmd, powershell, ssh sessions
     "cascadia_hosting_window_class", // Windows Terminal
+    "virtualconsoleclass",          // ConEmu, and Cmder which embeds it
     "putty",
     "mintty",
     "tscshellcontainerclass", // mstsc, the Remote Desktop client
     "vmplayerframewindow",    // VMware Workstation Player
     "vmuiframe",              // VMware Workstation
     "vim",                    // gvim
+    // C-v is scroll-up-command in default Emacs bindings, so an escalated
+    // paste scrolls the buffer and inserts nothing at all.
+    "emacs",
 ];
 
 /// The same, by executable name — the class name of a window is up to its
 /// author and several of these apps host themselves in a generic one.
+///
+/// This is the only way to reach an Electron terminal: Hyper and Tabby both
+/// register the generic `Chrome_WidgetWin_1` class they share with every
+/// other Electron app, including ones that paste perfectly well, so that
+/// class must never go in the list above.
 const PASTE_HOSTILE_PROCESSES: &[&str] = &[
     "vim.exe",
     "gvim.exe",
     "nvim.exe",
     "nvim-qt.exe",
     "neovide.exe",
+    "emacs.exe",
     "conhost.exe",
     "cmd.exe",
     "powershell.exe",
     "pwsh.exe",
     "windowsterminal.exe",
+    "conemu64.exe",
+    "cmder.exe",
+    "hyper.exe",
+    "tabby.exe",
     "mintty.exe",
     "putty.exe",
     "kitty.exe",
@@ -161,14 +209,27 @@ const PASTE_HOSTILE_PROCESSES: &[&str] = &[
 /// [`effective_method`]), so declining to paste into them costs nothing — the
 /// keystroke path is exactly where the evidence says they are safe.
 ///
-/// This is a deny-list, and therefore a heuristic: it cannot enumerate every
-/// paste-hostile app, and it cannot see a *mode* (vim run inside a terminal
-/// is caught by the terminal, but an embedded terminal inside an editor is
-/// not). It is default-*allow* on purpose, so its two failure directions are
-/// asymmetric and both bounded: a hostile app this list misses pastes, which
-/// is the behaviour that existed before it; a harmless app wrongly listed
-/// gets a paced keystroke burst, which is correct, just slower. An
-/// unidentifiable window (`None` — no foreground window, or a process this
+/// This is a deny-list, and it is **best-effort and permanently incomplete**,
+/// not a completeness mechanism working towards full coverage. It cannot
+/// enumerate every paste-hostile app, it cannot see a *mode* (vim run inside
+/// a terminal is caught by the terminal, but an embedded terminal inside an
+/// editor is not), and it can only name families that are actually
+/// identifiable from a window class or an image name. Anything else would be
+/// an arms race this project cannot win, and pretending otherwise would be
+/// the more dangerous error.
+///
+/// What makes that acceptable is not the list's reach but the fact that a
+/// miss is recoverable rather than silent. It is default-*allow*, so its two
+/// failure directions are asymmetric and both bounded: a harmless app wrongly
+/// listed gets a paced keystroke burst, which is correct, just slower; a
+/// hostile app the list misses pastes nothing into the target — and the
+/// transcript is still on the clipboard afterwards (`win::paste` never
+/// restores the previous contents, so the user can paste it themselves with
+/// whatever key that app does use) and still in the session log. That is the
+/// documented recovery path, stated for users in
+/// `crates/iris-app/README.md`, not an accident of the restore decision.
+///
+/// An unidentifiable window (`None` — no foreground window, or a process this
 /// one may not query) is treated the same as an unlisted one, which is what
 /// keeps the originally reported failure — a plain edit control — fixed.
 fn accepts_paste(target: Option<&Target>) -> bool {
@@ -202,6 +263,9 @@ fn accepts_paste(target: Option<&Target>) -> bool {
 /// then types the transcript instead — the same fallback a held clipboard
 /// takes. Declining to paste injects nothing, so unlike a correction it is
 /// safe for exactly the keys the correction must not touch.
+///
+/// `win::paste` asks this twice, before and after writing the clipboard, for
+/// reasons given there; both answers come from this one rule.
 #[cfg(any(windows, test))]
 fn paste_accelerator_survives(hotkey: Key, hotkey_down: bool) -> bool {
     !(hotkey_down && hotkey.alters_paste_chord())
@@ -317,6 +381,22 @@ const MAX_SEND_INPUT_CHARS: usize = BATCH / 2;
 /// Never downgrades: a caller that already asked for `Clipboard` is
 /// unaffected, and a text that fits in one batch keeps whatever the caller
 /// requested.
+///
+/// **Wanted, and not yet expressible here:** a user who writes
+/// `method = "sendinput"` in `config.toml` deliberately — to protect their
+/// clipboard, or because their app is one no deny-list will ever name —
+/// should be exempt from escalation entirely, while the default stays
+/// automatic. That is the override that answers "my app is not on your list"
+/// without a list. It cannot be decided in this function as it stands:
+/// [`Method`] has two variants and `Method::SendInput` is both the default
+/// and the explicit choice, so `requested` cannot carry the distinction. The
+/// signal has to come from the config layer, which knows whether the key was
+/// present in the file — `iris-app`'s `config.rs` and the `SystemInjector`
+/// construction in `main.rs`, neither of which this change may touch (a
+/// concurrent branch owns that surface, and `InjectConfig::default()` calls
+/// `Method::default()`, so manufacturing the distinction by flipping the
+/// `Default` impl would break a pinned test there instead of adding the
+/// feature).
 fn effective_method(text: &str, requested: Method, target: Option<&Target>) -> Method {
     if requested == Method::SendInput
         && crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS
@@ -513,6 +593,17 @@ mod win {
         flush(&mut inputs)
     }
 
+    /// Reports whether Windows currently believes `key` is down.
+    ///
+    /// This is the raw `GetAsyncKeyState` reading that both
+    /// `super::modifier_to_release` and `super::paste_accelerator_survives`
+    /// are handed as their `hotkey_down` argument. It is only ever one of the
+    /// two signals a correction needs — see `release_hotkey_if_stuck` for why
+    /// it is never trusted alone.
+    fn reads_down(key: Key) -> bool {
+        unsafe { GetAsyncKeyState(key.vk() as i32) as u16 & 0x8000 != 0 }
+    }
+
     /// Sampling `GetAsyncKeyState` and `hotkey::is_held` at exactly the same
     /// instant can land in the gap between them: on a genuine repress they
     /// update via genuinely independent paths (see `super::modifier_to_release`),
@@ -553,13 +644,6 @@ mod win {
     /// not, and cannot be without relaxing that constraint. This is
     /// deliberate, not an oversight: recorded here rather than papered over
     /// with a test that would only appear to cover it.
-    /// `GetAsyncKeyState`'s answer for `key`, the reading
-    /// `super::modifier_to_release` and `super::paste_accelerator_survives`
-    /// are both handed.
-    fn reads_down(key: Key) -> bool {
-        unsafe { GetAsyncKeyState(key.vk() as i32) as u16 & 0x8000 != 0 }
-    }
-
     fn release_hotkey_if_stuck(hotkey: Key) -> Result<()> {
         if !crate::hotkey::is_listening() {
             return Ok(());
@@ -668,7 +752,29 @@ mod win {
     /// spoils the accelerator. Both fall back to `send_keystrokes`, which
     /// `super::pacing` makes a safe landing for a long transcript rather than
     /// a return to the reported bug.
+    ///
+    /// The accelerator is therefore checked twice, and both are load-bearing.
+    /// The early one is what keeps a `ralt`/`rwin` user — the hotkeys
+    /// `super::modifier_to_release` may never correct, so the veto below is
+    /// certain, not hypothetical — from spending their clipboard on a paste
+    /// that was never going to be sent. The late one cannot be dropped in its
+    /// favour: `set_clipboard` can block for as long as another process holds
+    /// the clipboard, and a hotkey pressed during that wait would otherwise
+    /// reach the burst unnoticed.
+    ///
+    /// Returning `Ok` means the four events entered the input stream. Whether
+    /// the target resolved Ctrl+V as paste, and pasted correctly, is not
+    /// observable from here — see the module docs.
     fn paste(text: &str, hotkey: Key) -> Result<()> {
+        release_hotkey_if_stuck(hotkey)?;
+        if !super::paste_accelerator_survives(hotkey, reads_down(hotkey)) {
+            vlog!(
+                "the hotkey ({}) is down and would change Ctrl+V into another accelerator; \
+                 typing the transcript instead, and leaving the clipboard alone",
+                hotkey.label()
+            );
+            return send_keystrokes(text, hotkey);
+        }
         // Clipboard managers, Office and RDP redirection all open the
         // clipboard briefly and routinely, so this fails transiently for
         // reasons that have nothing to do with the transcript. Losing a long
@@ -677,20 +783,16 @@ mod win {
             vlog!("clipboard unavailable ({e:#}); typing the transcript instead");
             return send_keystrokes(text, hotkey);
         }
-        // After the clipboard work, not before it: `set_clipboard` can block
-        // on another application holding the clipboard, and any gap between
-        // checking the hotkey and sending the burst is a window for the
-        // hotkey to change state again. This mirrors `send_keystrokes`,
-        // where the correction already immediately precedes its burst.
+        // Again, immediately before the burst: any gap between checking the
+        // hotkey and using that reading is a window for the hotkey to change
+        // state, and `set_clipboard` above is exactly such a gap. This
+        // mirrors `send_keystrokes`, where the correction already immediately
+        // precedes its burst.
         release_hotkey_if_stuck(hotkey)?;
-        // Sampled after the correction has had its chance, so this only
-        // fires for a hotkey the correction is not allowed to touch — see
-        // `super::paste_accelerator_survives`. The clipboard is already
-        // clobbered by this point, which is the disclosed cost either way.
         if !super::paste_accelerator_survives(hotkey, reads_down(hotkey)) {
             vlog!(
-                "the hotkey ({}) is still down and would change Ctrl+V into another \
-                 accelerator; typing the transcript instead",
+                "the hotkey ({}) went down while the clipboard was being written; typing \
+                 the transcript instead",
                 hotkey.label()
             );
             return send_keystrokes(text, hotkey);
@@ -706,7 +808,10 @@ mod win {
         if sent as usize != inputs.len() {
             bail!("SendInput could not deliver Ctrl+V ({sent}/4)");
         }
-        vlog!("pasted {} chars via the clipboard", text.chars().count());
+        vlog!(
+            "sent Ctrl+V for {} chars left on the clipboard",
+            text.chars().count()
+        );
         Ok(())
     }
 
@@ -870,6 +975,50 @@ mod tests {
     }
 
     #[test]
+    fn the_named_gaps_from_review_are_covered() {
+        // Emacs is the sharpest of these: C-v is scroll-up-command in the
+        // default bindings, so an escalated paste scrolls and inserts
+        // nothing. ConEmu/Cmder share a window class; Hyper and Tabby can
+        // only be reached by image name, because the Electron class they
+        // register is shared with apps that paste perfectly well.
+        for target in [
+            Target {
+                class: "Emacs".to_string(),
+                process: "emacs.exe".to_string(),
+            },
+            Target {
+                class: "VirtualConsoleClass".to_string(),
+                process: "ConEmu64.exe".to_string(),
+            },
+            Target {
+                class: "VirtualConsoleClass".to_string(),
+                process: "Cmder.exe".to_string(),
+            },
+            Target {
+                class: "Chrome_WidgetWin_1".to_string(),
+                process: "Hyper.exe".to_string(),
+            },
+            Target {
+                class: "Chrome_WidgetWin_1".to_string(),
+                process: "Tabby.exe".to_string(),
+            },
+        ] {
+            assert!(!accepts_paste(Some(&target)), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn the_shared_electron_class_alone_is_never_treated_as_hostile() {
+        // Listing `Chrome_WidgetWin_1` would take every Electron app with
+        // it — Slack, VS Code, Discord — none of which have any trouble
+        // pasting. Only the terminal image names may match.
+        assert!(accepts_paste(Some(&Target {
+            class: "Chrome_WidgetWin_1".to_string(),
+            process: "slack.exe".to_string(),
+        })));
+    }
+
+    #[test]
     fn a_hostile_process_is_caught_even_in_an_anonymous_window_class() {
         // Window class names are up to the app; several terminals host
         // themselves in a generic one, so the executable is checked too.
@@ -1030,6 +1179,94 @@ mod tests {
         // releases, so a stuck Ctrl leaves paste meaning paste.
         for key in [Key::RightCtrl, Key::LeftCtrl, Key::F8, Key::CapsLock] {
             assert!(paste_accelerator_survives(key, true), "{key}");
+        }
+    }
+
+    /// What `win::paste` does, in order, for a given pair of hotkey
+    /// readings — the early one before the clipboard is written and the late
+    /// one immediately before the burst. Reconstructed from the same portable
+    /// decision function the real code calls, exactly as `burst` and `calls`
+    /// are, and for the same reason: `mod win` is `cfg(windows)` and the only
+    /// way to observe it for real is to execute the injection path, which
+    /// this project forbids.
+    #[derive(Debug, PartialEq, Eq)]
+    enum PasteStep {
+        Correct,
+        WriteClipboard,
+        SendAccelerator,
+        FallBackToKeystrokes,
+    }
+
+    fn paste_steps(hotkey: Key, early_down: bool, late_down: bool) -> Vec<PasteStep> {
+        let mut steps = vec![PasteStep::Correct];
+        if !paste_accelerator_survives(hotkey, early_down) {
+            steps.push(PasteStep::FallBackToKeystrokes);
+            return steps;
+        }
+        steps.push(PasteStep::WriteClipboard);
+        steps.push(PasteStep::Correct);
+        if !paste_accelerator_survives(hotkey, late_down) {
+            steps.push(PasteStep::FallBackToKeystrokes);
+            return steps;
+        }
+        steps.push(PasteStep::SendAccelerator);
+        steps
+    }
+
+    #[test]
+    fn a_vetoed_paste_never_touches_the_clipboard() {
+        // RightAlt and RightWin are exactly the hotkeys `modifier_to_release`
+        // may never correct, so with either of them down the veto is
+        // certain — and a certain veto must not cost the user their
+        // clipboard on the way to typing the transcript anyway.
+        for key in [Key::RightAlt, Key::RightWin, Key::RightShift] {
+            let steps = paste_steps(key, true, true);
+            assert_eq!(
+                steps,
+                vec![PasteStep::Correct, PasteStep::FallBackToKeystrokes],
+                "{key}"
+            );
+            assert!(!steps.contains(&PasteStep::WriteClipboard), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_hotkey_pressed_while_the_clipboard_is_written_still_vetoes_the_paste() {
+        // The reason the late check cannot be dropped in favour of the early
+        // one: `set_clipboard` blocks for as long as another process holds
+        // the clipboard, and a hotkey pressed during that wait would reach
+        // the burst uncaught. The clipboard is spent here, which is the
+        // disclosed cost — but the transcript still arrives.
+        assert_eq!(
+            paste_steps(Key::RightShift, false, true),
+            vec![
+                PasteStep::Correct,
+                PasteStep::WriteClipboard,
+                PasteStep::Correct,
+                PasteStep::FallBackToKeystrokes
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unobstructed_paste_writes_the_clipboard_then_sends_the_accelerator() {
+        for (key, down) in [
+            (Key::RightCtrl, true),
+            (Key::LeftCtrl, true),
+            (Key::RightShift, false),
+            (Key::RightAlt, false),
+            (Key::F8, true),
+        ] {
+            assert_eq!(
+                paste_steps(key, down, down),
+                vec![
+                    PasteStep::Correct,
+                    PasteStep::WriteClipboard,
+                    PasteStep::Correct,
+                    PasteStep::SendAccelerator
+                ],
+                "{key}"
+            );
         }
     }
 

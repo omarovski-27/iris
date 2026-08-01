@@ -103,12 +103,34 @@ reasoning is in `win::paste`'s doc comment in `iris-core/src/inject.rs` (commit
 `e2aac70`). If you keep something on the clipboard you cannot lose, copy it back
 after a long dictation, or keep dictations short.
 
-Windows that do not treat Ctrl+V as paste — terminals, Remote Desktop and VM
-client windows, vim — never get the paste; they receive keystrokes, sent in
-smaller groups with a short pause between them so a long transcript still
-arrives intact. The same keystroke fallback catches a clipboard that another
-application is holding open, so a long dictation degrades instead of being lost.
-`--verbose` logs whenever a fallback fires.
+Windows that do not treat Ctrl+V as paste — terminals (including ConEmu/Cmder,
+Hyper and Tabby), Remote Desktop and VM client windows, vim, Emacs — never get
+the paste; they receive keystrokes, sent in smaller groups with a short pause
+between them so a long transcript still arrives intact. The same keystroke
+fallback catches a clipboard that another application is holding open, and a
+hotkey still held down that would turn Ctrl+V into a different shortcut. All
+three fallbacks are logged under `--verbose`.
+
+**If a long dictation does not appear, it is not lost.** That list of
+paste-hostile apps is best-effort and always will be — it can only name
+application families that are actually identifiable, and no list can cover
+every app that binds Ctrl+V to something of its own. So the escalated paste is
+built to fail recoverably rather than silently:
+
+- **The text is still on your clipboard.** Iris does not restore the previous
+  contents (see above), which means the transcript is sitting there — press
+  whatever paste key that app *does* use.
+- **The text is in the session log**, with `[history] enabled = true`. That log
+  is the durable record of every dictation, and it is where the words go when
+  delivery fails for any reason. A Settings window with a History tab that
+  lists it with one-click copy is in development; until it lands, the log file
+  itself is the recovery path, and `--verbose` prints where it is.
+
+Note that "delivered" here only ever means the keystrokes or the paste
+shortcut reached Windows' input queue. Neither Windows nor Iris can confirm
+that the app on the other end rendered them correctly — that gap is exactly
+what the original bug was — so the timing shown on the pill is a delivery
+time, not a receipt.
 
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at
