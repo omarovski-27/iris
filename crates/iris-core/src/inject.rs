@@ -358,15 +358,19 @@ const BATCH: usize = 512;
 ///
 /// Characters outside the BMP (astral — emoji, for instance) are a
 /// surrogate pair, two `KeyUnit`s, and so cross the same *event* threshold
-/// at fewer *characters*; [`effective_method`] compares against planned
-/// units, not `chars().count()`, for exactly that reason — this constant
-/// names the common-case BMP number for readability, not the literal
-/// comparison.
+/// at fewer *characters*; [`needs_more_than_one_batch`] — the one place the
+/// length question is asked — compares against planned units, not
+/// `chars().count()`, for exactly that reason. This constant names the
+/// common-case BMP number for readability, not the literal comparison.
 const MAX_SEND_INPUT_CHARS: usize = BATCH / 2;
 
-/// Escalate `requested` to [`Method::Clipboard`] when `text` would need more
-/// than one `SendInput` batch to deliver — see [`MAX_SEND_INPUT_CHARS`] for
-/// the exact line and why it sits there.
+/// Escalate `requested` to [`Method::Clipboard`] when the transcript needs
+/// more than one `SendInput` batch to deliver.
+///
+/// `needs_second_batch` is that answer, not the text it was derived from:
+/// [`needs_more_than_one_batch`] asks the length question, [`inject`] asks it
+/// once and passes the result down here — see [`MAX_SEND_INPUT_CHARS`] for
+/// where the line sits and why.
 ///
 /// The reported failure this guards against: a 313-character transcript —
 /// transcribed perfectly, `SendInput` reporting full success — arrived in

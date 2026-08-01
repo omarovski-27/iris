@@ -103,27 +103,6 @@ reasoning is in `win::paste`'s doc comment in `iris-core/src/inject.rs` (commit
 `e2aac70`). If you keep something on the clipboard you cannot lose, copy it back
 after a long dictation, or keep dictations short.
 
-**Where an escalated transcript can end up.** Clobbering is not the only cost of
-going through the clipboard: anything on it can be picked up by other software,
-and a dictation is not necessarily something you want kept. Iris asks Windows to
-keep the item out of **Clipboard History (Win+V)** and off **Cloud Clipboard
-sync**, using the three registered formats Windows documents for exactly that
-(`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`
-and `CanUploadToCloudClipboard`; see `decline_history_and_cloud_sync` in
-`iris-core/src/inject.rs`). Two limits on that, both real:
-
-- It is a request to the system, not a guarantee about other programs. **A
-  third-party clipboard manager is separate software that is free to ignore
-  it** — if you run one, assume it captures long dictations, and check its own
-  settings if that matters to you.
-- Iris cannot verify it from inside the app. This path only runs during real
-  injection, which this project does not execute unattended (see `CLAUDE.md`),
-  so the opt-out is the documented Windows mechanism applied as documented,
-  not something a test on your machine has confirmed.
-
-The transcript still sits on the live clipboard afterwards either way — that is
-deliberate, and it is the recovery path described below.
-
 That automatic escalation skips windows that do not treat Ctrl+V as paste —
 terminals (including ConEmu/Cmder, Hyper and Tabby), Remote Desktop and VM
 client windows, vim, Emacs. They keep the keystrokes, sent in smaller groups
@@ -145,6 +124,31 @@ honoured as one: every dictation is pasted, at any length, into whatever window
 has focus, including the paste-hostile ones above. Iris never overrides an
 explicit method in either direction, so a `clipboard` config is not filtered
 through that list.
+
+**Where a pasted transcript can end up.** This one is not escalation-specific:
+it applies to *every* paste Iris makes, whether you were escalated into it or
+chose `method = "clipboard"` yourself. Clobbering is not the only cost of going
+through the clipboard — anything on it can be picked up by other software, and a
+dictation is not necessarily something you want kept. So Iris asks Windows to
+keep the item out of **Clipboard History (Win+V)** and off **Cloud Clipboard
+sync**, using the three registered formats Windows documents for exactly that
+(`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`
+and `CanUploadToCloudClipboard`; see `decline_history_and_cloud_sync` in
+`iris-core/src/inject.rs`). If you were relying on Win+V to get a dictation
+back, use `iris --history` instead — see below. Two limits on the opt-out, both
+real:
+
+- It is a request to the system, not a guarantee about other programs. **A
+  third-party clipboard manager is separate software that is free to ignore
+  it** — if you run one, assume it captures anything Iris pastes, and check its
+  own settings if that matters to you.
+- Iris cannot verify it from inside the app. This path only runs during real
+  injection, which this project does not execute unattended (see `CLAUDE.md`),
+  so the opt-out is the documented Windows mechanism applied as documented,
+  not something a test on your machine has confirmed.
+
+The transcript still sits on the live clipboard afterwards either way — that is
+deliberate, and it is the recovery path described next.
 
 **If a long dictation does not appear, it is not lost.** That list of
 paste-hostile apps is best-effort and always will be — it can only name
