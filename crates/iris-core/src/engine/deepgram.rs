@@ -63,6 +63,31 @@
 //! exactly once at the bottom of `pump_inner` after the session actually
 //! closes, and the sign-off round trip is accepted rather than traded for a
 //! transcript that can be short.
+//!
+//! Gating on the session close is what makes sending `CloseStream` on the
+//! first ack safe, and the reason is structural rather than a won race. Three
+//! things hold in `pump_inner`: `acc.absorb` runs on every inbound Text frame
+//! unconditionally, with no guard that could suppress it once `CloseStream`
+//! has gone out; the loop breaks only on the Metadata sign-off that follows
+//! `CloseStream`, a socket Close/None, or a failure, and every one of those
+//! paths falls through to the single `conclude(&acc, ..)` at the bottom; and
+//! one websocket over one TCP connection delivers frames in exactly the order
+//! the server sent them, so no reordering is possible. Together those mean
+//! anything Deepgram actually transmits before its own sign-off is absorbed
+//! and reported — a continuation landing between `CloseStream` and the
+//! Metadata is still the user's text.
+//!
+//! What that reasoning does *not* cover is Deepgram sending its sign-off
+//! before it finished transmitting a multi-part flush it had already started
+//! — the server abandoning its own in-progress response on `CloseStream`
+//! instead of completing it. That is a question about server behaviour, not a
+//! client-side timing race, and it would contradict the meaning of
+//! Metadata-after-`CloseStream` ("I am done responding") that this whole
+//! mechanism already rests on. It has never been observed here: the
+//! 24.6/152.6/246.0ms cadence above is evidence about ordinary streaming, not
+//! about flush abandonment. Closing it would need the quiet window that was
+//! measured and rejected on latency grounds, so it stands as a known residual
+//! risk.
 
 use std::time::{Duration, Instant};
 
@@ -388,6 +413,14 @@ async fn pump_inner(
                         }
                         if finalize_ack_deadline.is_some() && acc.finalize_acked {
                             finalize_ack_deadline = None;
+                            // Closing here costs nothing the user can lose:
+                            // frames arrive in send order, `absorb` above runs
+                            // on every one of them regardless of this, and the
+                            // single `conclude` at the bottom reports whatever
+                            // has accumulated by the sign-off. The residual
+                            // risk is the server abandoning its own
+                            // in-progress flush before that sign-off — see the
+                            // module doc.
                             if let Err(e) = send_close_stream(&mut socket, &mut closed_stream).await {
                                 failure = Some(e);
                                 break;

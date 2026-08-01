@@ -172,8 +172,11 @@ In priority order:
    benchmark: live protocol verification of the `from_finalize` wait (see
    `AGENTS.md`) saw acks arrive in roughly 200-550 ms across a handful of hold
    shapes — which straddles the ~280 ms bar in section 3, so it is not safe to
-   assume that bar holds for every hold. Ad-hoc observations on a few holds are
-   not a p95; run the harness above to settle it.
+   assume that bar holds for every hold. The ack is not the whole number: per
+   section 3, the `CloseStream` + Metadata sign-off round trip sits on top of
+   that ack latency, since the final transcript is reported on the session
+   close. Ad-hoc observations on a few holds are not a p95; run the harness
+   above to settle it.
 3. **Real microphone end-to-end**, via the checklist in the spike README.
 
 *Resolved since:* **connection reuse.** A pre-warmed spare connection was built
