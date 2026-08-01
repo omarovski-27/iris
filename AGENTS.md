@@ -92,18 +92,19 @@ key comes up, so the entire transcript depends on one post-`Finalize` flush,
 and sending `CloseStream` immediately after `Finalize` can pull the socket out
 from under that flush before Deepgram gets to it. `deepgram.rs`'s `pump` waits
 for `from_finalize` — a boolean Deepgram itself sets on the Results message
-that answers a `Finalize`, live-verified to arrive (usually 200-550ms) for any
-session that was sent real audio, including holds under 0.5s and holds
-containing only silence — before sending `CloseStream`; `FINALIZE_ACK_TIMEOUT`
-is a bounded safety net under that for protocol failure only. The ack decides
-when `CloseStream` goes out and nothing else: reporting `Final` on it too was
-built and reverted, because the ack proves the flush *started*, not that it
-fit in one frame, and live cadence measurements found inter-message gaps
-(24.6/152.6/246.0ms) too wide for any quiet window that still fits the ~280ms
-budget — so `Final` waits for the sign-off. Three earlier designs (unbounded
-coverage-catch-up, a fixed ceiling, a stall detector) were tried and rejected
-first — see the module doc's history for why an inferred "Deepgram is probably
-done" always loses to this authoritative signal. Session
+that answers a `Finalize`, live-verified to arrive for any session that was
+sent real audio, including holds under 0.5s and holds containing only silence
+— before sending `CloseStream`; `FINALIZE_ACK_TIMEOUT` is a bounded safety net
+under that for protocol failure only. The ack decides when `CloseStream` goes
+out and nothing else: reporting `Final` on it too was built and reverted,
+because the ack proves the flush *started*, not that it fit in one frame, and a
+live cadence measurement found inter-message gaps too wide for any quiet window
+to both cover them and fit the perceived-latency budget — so `Final` is gated on
+the session close instead. Three earlier designs (unbounded coverage-catch-up, a
+fixed ceiling, a stall detector) were tried and rejected first. The measured
+figures and the full reasoning — including why an inferred "Deepgram is probably
+done" always loses to this authoritative signal — live in the module doc of
+`crates/iris-core/src/engine/deepgram.rs`, beside the constants they set. Session
 prewarming was also tried and dropped: a live idle probe found Deepgram closes
 an unused connection in roughly 12-15s (see Sharp edges), far short of real
 gaps between dictations, so it protected against a race that barely occurred

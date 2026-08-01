@@ -180,10 +180,10 @@ In priority order:
 3. **Real microphone end-to-end**, via the checklist in the spike README.
 
 *Resolved since:* **connection reuse.** A pre-warmed spare connection was built
-and then measured out — Deepgram closes an idle socket in roughly 12-15 s,
-far short of the gaps between real dictations. The short-utterance case it was
-meant to help is covered instead by the `from_finalize` wait. See `AGENTS.md`
-(Sharp edges) for the measurement.
+and then measured out — Deepgram closes an idle socket far short of the gaps
+between real dictations; see `AGENTS.md` (Sharp edges) for the measured window.
+The short-utterance case it was meant to help is covered instead by the
+`from_finalize` wait.
 
 ## 7. Architecture recommendation
 
