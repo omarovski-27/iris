@@ -67,7 +67,7 @@ device = "Yeti"           # substring of the device name; omit for the default
 warm = true               # keep the mic stream open (opening it costs ~30 ms)
 
 [inject]
-method = "sendinput"      # sendinput | clipboard
+method = "sendinput"      # sendinput | clipboard; long transcripts paste anyway
 trailing_space = true
 
 [history]
@@ -80,7 +80,114 @@ groq = "gsk_..."
 
 **Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
 `inject.rs` applies before every injection burst for the other choices, so they
-behave differently there.
+behave differently there. They are also the two that cannot receive a clipboard
+paste while still held, because Ctrl+V becomes Ctrl+Alt+V or Ctrl+Win+V; Iris
+types the transcript instead when that happens.
+
+**Injection method — what `method` decides.** `method` is a request, not a
+guarantee. Under the default `sendinput`, two things must *both* be true before
+Iris pastes anything. The first is length: a transcript longer than 256
+characters (roughly 30 seconds of speech) is delivered as a **clipboard paste
+even under `sendinput`**, because a keystroke burst that long arrives garbled in
+some apps — a reported 313-character dictation reached Notepad as a handful of
+correct characters followed by one repeated key and a run of spaces, while the
+same text typed into a terminal fine. The second is the window: that escalation
+is skipped for targets that do not treat Ctrl+V as paste — terminals (including
+ConEmu/Cmder, Hyper and Tabby), Remote Desktop and VM client windows, vim,
+Emacs — which keep the keystrokes instead. Anything under the threshold, or
+aimed at one of those windows, is typed, and your clipboard is never touched.
+
+**`method = "clipboard"` drops both of those gates, not just the window list.**
+Setting it is your own choice and is honoured as one, but it is a larger change
+than "also paste into terminals": *every* dictation is pasted, at any length,
+into whatever window has focus. A five-word dictation that the default would
+have typed without going near your clipboard now clobbers it, and so does the
+next one. Everything in the two sections below then applies to you exactly as it
+applies to an automatically escalated dictation — it all lives in the paste
+itself, not in the decision to paste.
+
+**What every paste does, however Iris got there.** A paste **overwrites whatever
+was on your clipboard, and the previous contents are not restored.** This is a
+deliberate trade, not an oversight: restoring the old contents is unsound rather
+than merely awkward — Windows offers no signal for "the target has finished
+reading the clipboard", so any restore either races the paste (and the app
+silently pastes your *old* clipboard, which looks like it worked) or needs a
+delay long enough to cost the sub-second latency this app exists for and to race
+the next dictation. The full reasoning is in `win::paste`'s doc comment in
+`iris-core/src/inject.rs`. If you keep something on the clipboard you cannot
+lose, copy it back afterwards. Keeping dictations under the threshold avoids the
+paste altogether, but only under the default — with `method = "clipboard"`
+there is no length short enough to stay off the clipboard.
+
+A paste can also decline itself and type the transcript instead. Two things
+cause that, and neither depends on how the paste was chosen: a hotkey still
+reading down that would turn Ctrl+V into a different shortcut (checked both
+before and after the clipboard is written — the early check spares your
+clipboard, the late one catches a key pressed while Iris was waiting for it),
+and a clipboard another application is holding open — a collision that is
+usually momentary, so Iris asks a few times over a few tens of milliseconds
+before giving up and typing instead. Both are logged under `--verbose`, as is
+the paste-hostile skip above.
+
+Clobbering is not the only cost of going through the clipboard: anything on it
+can be picked up by other software, and a dictation is not necessarily something
+you want kept. So Iris asks Windows to keep the item out of **Clipboard History
+(Win+V)** and off **Cloud Clipboard sync**, using the three registered formats
+Windows documents for exactly that
+(`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`
+and `CanUploadToCloudClipboard`; see `decline_history_and_cloud_sync` in
+`iris-core/src/inject.rs`). If you were relying on Win+V to get a dictation
+back, use `iris --history` instead — see below. Two limits on the opt-out, both
+real:
+
+- It is a request to the system, not a guarantee about other programs. **A
+  third-party clipboard manager is separate software that is free to ignore
+  it** — if you run one, assume it captures anything Iris pastes, and check its
+  own settings if that matters to you.
+- Iris cannot verify it from inside the app. This path only runs during real
+  injection, which this project does not execute unattended (see `CLAUDE.md`),
+  so the opt-out is the documented Windows mechanism applied as documented,
+  not something a test on your machine has confirmed.
+
+The transcript still sits on the live clipboard afterwards either way — that is
+deliberate, and it is the recovery path described further down.
+
+**What every long keystroke burst does.** Whenever a transcript is typed rather
+than pasted *and* it is long enough to need it, the keystrokes go out in smaller
+groups with a short pause between them, so a slow app has room to keep up. This
+covers every route onto the keystroke path — a paste-hostile window, either
+hotkey veto, an unavailable clipboard — and is not specific to any of them.
+
+Those pauses have a flip side worth knowing: anything *you* type during them
+lands in the middle of the transcript. Starting your next dictation while a long
+one is still being typed out is the likely way to see it. Long transcripts were
+already split into several bursts before the pauses existed, so this widens the
+window rather than creating it — and unlike the garbling it prevents, it is
+visible on screen.
+
+**If a long dictation does not appear, it is not lost.** That list of
+paste-hostile apps is best-effort and always will be — it can only name
+application families that are actually identifiable, and no list can cover
+every app that binds Ctrl+V to something of its own. So a paste is built to fail
+recoverably rather than silently:
+
+- **The text is still on your clipboard.** Iris does not restore the previous
+  contents (see above), which means the transcript is sitting there — press
+  whatever paste key that app *does* use.
+- **The text is in the session log**, with `[history] enabled = true`. That log
+  is the durable record of every dictation, recorded whether or not delivery
+  worked — which matters here, because a paste into a misidentified app *is*
+  reported as delivered. Run `iris --history` to print the last ten dictations,
+  or `iris --history 50` for more; it ends with the log file's own path, so it
+  is also how you find the file to copy from. A Settings window with a History
+  tab that lists them with one-click copy is in development; until it lands,
+  `--history` is the way in.
+
+Note that "delivered" here only ever means the keystrokes or the paste
+shortcut reached Windows' input queue. Neither Windows nor Iris can confirm
+that the app on the other end rendered them correctly — that gap is exactly
+what the original bug was — so the timing shown on the pill is a delivery
+time, not a receipt.
 
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at
@@ -169,8 +276,9 @@ at `max_entries`:
 ```
 
 **Every** dictation is recorded, including the ones where injection failed —
-that record is the user's only way to recover words that never made it onto the
-screen. `iris --history` prints the tail of it.
+that record is how a user recovers words that never made it onto the screen, and
+the durable half of it: the transcript a paste leaves on the clipboard survives
+only until the next copy. `iris --history` prints the tail of it.
 
 A record with an `error` carries a zeroed `latency` block (`App::dictate`'s
 `Err` arm builds a fresh record rather than the timeline it was tracking), so

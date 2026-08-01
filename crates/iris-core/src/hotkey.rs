@@ -118,6 +118,31 @@ impl Key {
         matches!(self, Key::RightCtrl | Key::LeftCtrl | Key::RightShift)
     }
 
+    /// Whether holding this key changes what a Ctrl+V chord means to the
+    /// focused app.
+    ///
+    /// `inject.rs` sends Ctrl+V for [`crate::inject::Method::Clipboard`], and
+    /// a hotkey still reading down turns it into a different accelerator —
+    /// Ctrl+Shift+V, Ctrl+Alt+V (AltGr+V), Ctrl+Win+V — which pastes nothing
+    /// in most apps and types something in a few. Ctrl itself is not here:
+    /// the chord already presses and releases Ctrl, so a stuck Ctrl leaves
+    /// "paste" meaning paste.
+    ///
+    /// Deliberately *not* the same set as
+    /// [`Key::is_correctable_modifier`]. That method answers "may Iris
+    /// synthesise a key-up for this?" and excludes `RightAlt`/`RightWin`
+    /// because the correction itself is the hazard. This one answers "would
+    /// this key spoil the paste chord?", which is a fact about the keyboard,
+    /// true for exactly the keys the correction cannot help with. Where the
+    /// two disagree, `inject.rs` declines to paste rather than widening the
+    /// correction — see `inject::paste_accelerator_survives`.
+    ///
+    /// `cfg(any(windows, test))`: same reason as the two methods above.
+    #[cfg(any(windows, test))]
+    pub(crate) fn alters_paste_chord(self) -> bool {
+        matches!(self, Key::RightShift | Key::RightAlt | Key::RightWin)
+    }
+
     /// Whether a synthesised key-up for this hotkey must carry
     /// `KEYEVENTF_EXTENDEDKEY`. `SendInput` fills in the scan code from the
     /// virtual-key when none is supplied, and the mapping is not injective:

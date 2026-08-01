@@ -116,6 +116,15 @@ on a real desktop — the spike still ships with `--inject sendinput` as the
 default, per the brief, and both paths are implemented and switchable with one
 flag.
 
+**Acted on since, and not quite as recommended.** A real desktop produced
+*garbled* text rather than merely slow text, so `SendInput` stays the default
+and only a transcript too long for one batch escalates to a paste; and the
+previous clipboard contents are deliberately **not** restored, restore having
+been evaluated and rejected as unsound rather than skipped. That decision is
+owned by `inject::effective_method` and `win::paste` in
+`crates/iris-core/src/inject.rs`, with the user-facing disclosure in
+`crates/iris-app/README.md`. The measurements above are unchanged.
+
 ### Why injection cannot be tested automatically
 
 Windows delivers synthetic input only on the **input desktop** — the one the

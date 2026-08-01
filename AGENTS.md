@@ -136,6 +136,20 @@ in practice.
   before touching this; none of it is dead code. The configured hotkey
   reaches the injector via `SystemInjector::new` (wired in `main.rs`), not
   via `app.rs`.
+- A transcript needing more than one `SendInput` batch is rerouted to
+  `Method::Clipboard` even under a `sendinput` config, so a long dictation
+  can clobber the clipboard. Read `inject::effective_method`'s doc comment
+  before changing the threshold, and keep the user-facing disclosure (the
+  clobber, the Clipboard History/Cloud Clipboard opt-out and its limits, the
+  recovery path) in `crates/iris-app/README.md`.
+- Three vetoes send that paste back to keystrokes — `inject::accepts_paste`,
+  `inject::paste_accelerator_survives`, an unavailable clipboard — and
+  `inject::pacing` is what makes that landing safe. Their doc comments carry
+  the reasoning; two rules are easy to break from outside them: the
+  deny-list is best-effort and permanently incomplete, so adding entries is
+  not progress towards coverage, and declining the paste is the *only*
+  sanctioned way to cover `RightAlt`/`RightWin` — never widen the correction
+  in `modifier_to_release`.
 - Deepgram closes an idle websocket connection (no audio sent) in roughly
   12-15s, live-measured. Relevant to any future connection-reuse idea: it
   only pays off within that window of the last dictation, not across the
