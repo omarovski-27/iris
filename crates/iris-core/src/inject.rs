@@ -100,7 +100,7 @@ pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     // Only a transcript long enough to be escalated ever consults the target,
     // so the ordinary short dictation — the overwhelming common case — pays
     // none of the OS calls `focused_target` makes.
-    let target = (crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS)
+    let target = needs_more_than_one_batch(text)
         .then(focused_target)
         .flatten();
     let effective = effective_method(text, method, target.as_ref());
@@ -398,14 +398,25 @@ const MAX_SEND_INPUT_CHARS: usize = BATCH / 2;
 /// `Default` impl would break a pinned test there instead of adding the
 /// feature).
 fn effective_method(text: &str, requested: Method, target: Option<&Target>) -> Method {
-    if requested == Method::SendInput
-        && crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS
-        && accepts_paste(target)
-    {
+    if requested == Method::SendInput && needs_more_than_one_batch(text) && accepts_paste(target) {
         Method::Clipboard
     } else {
         requested
     }
+}
+
+/// Whether `text` would need more than one `SendInput` batch — the single
+/// length question this module asks, named once so its two callers cannot
+/// drift apart.
+///
+/// [`effective_method`] asks it to decide whether to escalate; [`inject`]
+/// asks it first, to decide whether looking the target up is worth the OS
+/// calls. Were the second ever narrower than the first, `effective_method`
+/// would be handed `None` for a window it was supposed to examine and would
+/// escalate into it — silently, since the log line that explains a declined
+/// escalation only fires when there is a target to name.
+fn needs_more_than_one_batch(text: &str) -> bool {
+    crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS
 }
 
 #[cfg(windows)]
@@ -918,6 +929,30 @@ mod tests {
             effective_method(&text, Method::SendInput, Some(&ordinary_window())),
             Method::Clipboard
         );
+    }
+
+    #[test]
+    fn the_target_lookup_and_the_escalation_share_one_length_predicate() {
+        // `inject` gates the target lookup on this predicate and
+        // `effective_method` escalates on it. If the first were ever narrower
+        // than the second, a window that should have been examined would be
+        // pasted into with no target consulted and nothing logged, which is
+        // exactly the failure the deny-list exists to prevent.
+        for units in [
+            0,
+            1,
+            MAX_SEND_INPUT_CHARS - 1,
+            MAX_SEND_INPUT_CHARS,
+            MAX_SEND_INPUT_CHARS + 1,
+            MAX_SEND_INPUT_CHARS * 2,
+        ] {
+            let text = "a".repeat(units);
+            assert_eq!(
+                needs_more_than_one_batch(&text),
+                effective_method(&text, Method::SendInput, None) == Method::Clipboard,
+                "{units} units"
+            );
+        }
     }
 
     #[test]

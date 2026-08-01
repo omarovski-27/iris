@@ -103,13 +103,20 @@ reasoning is in `win::paste`'s doc comment in `iris-core/src/inject.rs` (commit
 `e2aac70`). If you keep something on the clipboard you cannot lose, copy it back
 after a long dictation, or keep dictations short.
 
-Windows that do not treat Ctrl+V as paste — terminals (including ConEmu/Cmder,
-Hyper and Tabby), Remote Desktop and VM client windows, vim, Emacs — never get
-the paste; they receive keystrokes, sent in smaller groups with a short pause
-between them so a long transcript still arrives intact. The same keystroke
-fallback catches a clipboard that another application is holding open, and a
-hotkey still held down that would turn Ctrl+V into a different shortcut. All
-three fallbacks are logged under `--verbose`.
+That automatic escalation skips windows that do not treat Ctrl+V as paste —
+terminals (including ConEmu/Cmder, Hyper and Tabby), Remote Desktop and VM
+client windows, vim, Emacs. They keep the keystrokes, sent in smaller groups
+with a short pause between them so a long transcript still arrives intact. The
+same keystroke fallback catches a clipboard that another application is holding
+open, and a hotkey still held down that would turn Ctrl+V into a different
+shortcut. All three fallbacks are logged under `--verbose`.
+
+All of that applies to the automatic escalation only — that is, to the default
+`method = "sendinput"`. Setting `method = "clipboard"` is your own choice and is
+honoured as one: every dictation is pasted, at any length, into whatever window
+has focus, including the paste-hostile ones above. Iris never overrides an
+explicit method in either direction, so a `clipboard` config is not filtered
+through that list.
 
 **If a long dictation does not appear, it is not lost.** That list of
 paste-hostile apps is best-effort and always will be — it can only name
@@ -121,10 +128,13 @@ built to fail recoverably rather than silently:
   contents (see above), which means the transcript is sitting there — press
   whatever paste key that app *does* use.
 - **The text is in the session log**, with `[history] enabled = true`. That log
-  is the durable record of every dictation, and it is where the words go when
-  delivery fails for any reason. A Settings window with a History tab that
-  lists it with one-click copy is in development; until it lands, the log file
-  itself is the recovery path, and `--verbose` prints where it is.
+  is the durable record of every dictation, recorded whether or not delivery
+  worked — which matters here, because a paste into a misidentified app *is*
+  reported as delivered. Run `iris --history` to print the last ten dictations,
+  or `iris --history 50` for more; it ends with the log file's own path, so it
+  is also how you find the file to copy from. A Settings window with a History
+  tab that lists them with one-click copy is in development; until it lands,
+  `--history` is the way in.
 
 Note that "delivered" here only ever means the keystrokes or the paste
 shortcut reached Windows' input queue. Neither Windows nor Iris can confirm
