@@ -71,7 +71,10 @@ So the target holds **iff Deepgram's finalisation flush is under roughly
 280 ms.** That is the single number to measure the moment a key exists. (That
 flush is now awaited explicitly: `finish()` waits for Deepgram's own
 `from_finalize` acknowledgement before `CloseStream` rather than closing
-immediately — see `AGENTS.md` and `crates/iris-core/src/engine/deepgram.rs`.)
+immediately — see `AGENTS.md` and `crates/iris-core/src/engine/deepgram.rs`.
+The ack *is* the finish line: the final transcript is reported the moment it
+lands, so `CloseStream` and the Metadata sign-off are teardown and add no
+round trip to the number above.)
 
 ## 4. Injection is the unexpected risk
 

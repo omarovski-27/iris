@@ -5,8 +5,9 @@
 //! go of the hotkey, everything but the last fragment of speech has *usually*
 //! already been transcribed, so `finish()` costs a Finalize + CloseStream flush
 //! rather than a whole inference over the utterance. Segment `is_final` frames
-//! and the open-time Metadata message never end the session — only Metadata
-//! after CloseStream (or socket death) does, via the pump's `conclude` helper.
+//! and the open-time Metadata message never end the session — only Deepgram's
+//! `from_finalize` acknowledgement does, with Metadata after CloseStream (or
+//! socket death) as the fallback, both via the pump's `conclude` helper.
 //!
 //! The connection is established *concurrently with the first frames*: `open()`
 //! returns immediately and audio queues in an unbounded channel until the socket
@@ -45,6 +46,11 @@
 //! must stay separate. `FINALIZE_ACK_TIMEOUT` is a bounded safety net under
 //! this for protocol failure only — a missing or malformed signal — and
 //! should never be reached in normal operation.
+//!
+//! Because the ack is authoritative, it is also what `TranscriptEvent::Final`
+//! fires on: `CloseStream` and the Metadata sign-off that follow are teardown
+//! and no longer sit between the user and their text, which would otherwise
+//! have added a whole round trip to every dictation.
 
 use std::time::{Duration, Instant};
 
@@ -267,6 +273,13 @@ async fn pump_inner(
     // the segments already finalised are the user's words, and `conclude`
     // still gets to return them.
     let mut failure: Option<anyhow::Error> = None;
+    // Whether the one terminal event has already gone out. `from_finalize` is
+    // authoritative that the transcript is complete, so the application is
+    // told the moment it lands and `CloseStream` + the Metadata sign-off run
+    // afterwards as pure teardown — off the user's perceived latency. Set
+    // there and checked at the bottom so the terminal event is sent exactly
+    // once, whichever way the loop ends.
+    let mut concluded = false;
 
     loop {
         let poll_timeout = match finalize_ack_deadline {
@@ -356,10 +369,21 @@ async fn pump_inner(
                         // own sign-off.
                         let was_closed_stream = closed_stream;
                         if let Some(update) = acc.absorb(&text) {
-                            let _ = events.send(TranscriptEvent::Partial(update));
+                            // Nothing may follow the terminal event, so a
+                            // straggler arriving during teardown is dropped
+                            // rather than surfaced as a Partial after Final.
+                            if !concluded {
+                                let _ = events.send(TranscriptEvent::Partial(update));
+                            }
                         }
                         if finalize_ack_deadline.is_some() && acc.finalize_acked {
                             finalize_ack_deadline = None;
+                            // Deepgram has confirmed the flush, so the
+                            // transcript is complete: report it now instead of
+                            // spending another round trip on CloseStream and
+                            // the Metadata sign-off first.
+                            let _ = events.send(conclude(&acc, sent_secs, None));
+                            concluded = true;
                             if let Err(e) = send_close_stream(&mut socket, &mut closed_stream).await {
                                 failure = Some(e);
                                 break;
@@ -390,7 +414,12 @@ async fn pump_inner(
     if let Some(e) = &failure {
         vlog!("deepgram session failed; salvaging the transcript: {e:#}");
     }
-    let _ = events.send(conclude(&acc, sent_secs, failure.map(|e| format!("{e:#}"))));
+    // Already told the application on the `from_finalize` ack; a failure that
+    // happened during teardown afterwards is not the user's problem, which is
+    // the same precedence `conclude` gives text over a socket error.
+    if !concluded {
+        let _ = events.send(conclude(&acc, sent_secs, failure.map(|e| format!("{e:#}"))));
+    }
     Ok(())
 }
 
@@ -415,11 +444,14 @@ where
 /// finalise-timeout path already does — and an error only when there is
 /// genuinely nothing to return.
 ///
-/// The two ways to reach an empty transcript are not the same failure and
-/// must not share a message: `sent_secs` (tracked in [`pump_inner`] from what
+/// The three ways to reach an empty transcript are not the same failure and
+/// must not share a message. `sent_secs` (tracked in [`pump_inner`] from what
 /// was actually forwarded to the socket, independent of anything Deepgram
-/// sends back) says which one happened. Blaming the microphone when the real
-/// cause is that nothing was captured yet sends the user chasing a hardware
+/// sends back) separates "nothing was captured yet" from the rest, and
+/// [`Transcript::finalize_acked`] separates "Deepgram confirmed the flush and
+/// had no words" from "Deepgram never confirmed anything" — the protocol
+/// failure [`FINALIZE_ACK_TIMEOUT`] exists to bound. Reporting silence for
+/// either of the other two sends the user chasing a microphone or a volume
 /// problem that does not exist.
 fn conclude(acc: &Transcript, sent_secs: f64, failure: Option<String>) -> TranscriptEvent {
     let text = acc.finished_text();
@@ -429,6 +461,11 @@ fn conclude(acc: &Transcript, sent_secs: f64, failure: Option<String>) -> Transc
         (true, None) if sent_secs < NEGLIGIBLE_AUDIO_SECS => TranscriptEvent::Error(
             "almost no audio reached the transcription engine — the key was likely released \
              before recording could start; try holding it a little longer"
+                .into(),
+        ),
+        (true, None) if !acc.finalize_acked => TranscriptEvent::Error(
+            "the transcription engine never confirmed receiving the audio in time, so nothing \
+             came back; please try again"
                 .into(),
         ),
         (true, None) => TranscriptEvent::Error(
@@ -715,13 +752,34 @@ mod tests {
 
     #[test]
     fn audio_sent_but_nothing_transcribed_reads_as_silence_not_a_hold_problem() {
-        // Real audio reached Deepgram (unlike the case above) and it just had
-        // nothing to say about it — a genuinely different situation that must
-        // not share a message with the zero-audio case.
-        match conclude(&Transcript::default(), 2.5, None) {
+        // Real audio reached Deepgram (unlike the case above), it acknowledged
+        // the flush, and it just had nothing to say about it — a genuinely
+        // different situation that must not share a message with the
+        // zero-audio case.
+        let mut t = Transcript::default();
+        t.absorb(&results_from_finalize("", true));
+        assert!(t.finalize_acked);
+        match conclude(&t, 2.5, None) {
             TranscriptEvent::Error(msg) => {
                 assert!(msg.contains("silence"), "{msg}");
                 assert!(!msg.contains("released"), "{msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_finalize_ack_is_not_reported_as_silence() {
+        // The safety-net path: real audio went out, nothing came back, and
+        // Deepgram never acknowledged the flush. Claiming it "heard the audio"
+        // and blaming silence is exactly the misleading diagnosis this branch
+        // set out to remove — the engine confirmed nothing at all.
+        match conclude(&Transcript::default(), 2.5, None) {
+            TranscriptEvent::Error(msg) => {
+                assert!(!msg.contains("silence"), "{msg}");
+                assert!(!msg.to_lowercase().contains("mic"), "{msg}");
+                assert!(msg.contains("confirm"), "{msg}");
+                assert!(msg.contains("try again"), "{msg}");
             }
             other => panic!("expected an error, got {other:?}"),
         }
@@ -783,12 +841,13 @@ mod tests {
     /// a hand-written two-message fixture.
     ///
     /// Every hold shape below drives this same server; the only thing that
-    /// varies is the audio fed in, plus the transcript and `duration` it
-    /// reports back.
+    /// varies is the audio fed in, the transcript and `duration` it reports
+    /// back, and the [`Quirk`] it plays after the flush.
     fn spawn_withhold_then_flush_server(
         listener: tokio::net::TcpListener,
         reply_text: &'static str,
         metadata_duration: f64,
+        quirk: Quirk,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let metadata = serde_json::json!({ "type": "Metadata", "duration": metadata_duration })
@@ -804,6 +863,17 @@ mod tests {
                 }
             }
 
+            if quirk == Quirk::LateOpenMetadata {
+                // The open-time Metadata frame, delayed until the hold is
+                // already over — the whole press can fit inside the connect
+                // window, so the client may not have polled the socket once
+                // before Finalize went out. It is *not* the sign-off, and a
+                // client that treats it as one loses the flush below.
+                ws.send(Message::Text(metadata.clone().into()))
+                    .await
+                    .unwrap();
+            }
+
             // Did the client rush to close instead of waiting for the flush?
             let rushed = tokio::time::timeout(RUSH_WINDOW, ws.next()).await.is_ok();
             if rushed {
@@ -817,6 +887,20 @@ mod tests {
             .await
             .unwrap();
 
+            if quirk == Quirk::GarbageAfterFlush {
+                // A well-formed text frame (FIN, opcode 1, 2 unmasked bytes)
+                // whose payload is not UTF-8 — a genuine, deterministic socket
+                // error landing *after* the flush, which must not displace the
+                // text already handed over.
+                use tokio::io::AsyncWriteExt;
+                ws.get_mut()
+                    .write_all(&[0x81, 0x02, 0xFF, 0xFF])
+                    .await
+                    .unwrap();
+                let _ = ws.get_mut().flush().await;
+                return;
+            }
+
             loop {
                 match ws.next().await {
                     Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
@@ -824,8 +908,74 @@ mod tests {
                     _ => return,
                 }
             }
+            if let Quirk::DelayedSignOff(delay) = quirk {
+                // Stall the sign-off so a test can tell whether Final was
+                // gated on the flush or on this frame.
+                tokio::time::sleep(delay).await;
+            }
             let _ = ws.send(Message::Text(metadata.into())).await;
         })
+    }
+
+    /// What [`spawn_withhold_then_flush_server`] does around the flush, beyond
+    /// the plain withhold-then-flush behaviour every case shares.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quirk {
+        None,
+        /// Emit the open-time Metadata after `Finalize` but before the flush.
+        LateOpenMetadata,
+        /// Wait before the post-`CloseStream` Metadata sign-off.
+        DelayedSignOff(Duration),
+        /// Break the socket right after the flush.
+        GarbageAfterFlush,
+    }
+
+    /// A fake Deepgram that answers `Finalize` with nothing at all — no
+    /// `from_finalize`, no results — and only signs off once the client gives
+    /// up and sends `CloseStream` on its own. Covers both the protocol-failure
+    /// safety net and the zero-audio short-circuit, which differ in *why* the
+    /// client closes without an ack, not in what the server does.
+    fn spawn_silent_until_close_server(
+        listener: tokio::net::TcpListener,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"type":"Metadata","duration":1.0}"#.into(),
+                ))
+                .await;
+        })
+    }
+
+    /// Drain everything the pump has emitted so far, appending to `seen`.
+    fn drain(events: &Receiver<TranscriptEvent>, seen: &mut Vec<TranscriptEvent>) {
+        seen.extend(events.try_iter());
+    }
+
+    fn finals(seen: &[TranscriptEvent]) -> Vec<&str> {
+        seen.iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Final(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -836,6 +986,7 @@ mod tests {
             listener,
             "It's not working correctly. I've been having trouble.",
             3.0,
+            Quirk::None,
         );
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
@@ -868,7 +1019,7 @@ mod tests {
     async fn a_hold_under_half_a_second_still_waits_for_the_flush() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = spawn_withhold_then_flush_server(listener, "No.", 0.3);
+        let server = spawn_withhold_then_flush_server(listener, "No.", 0.3, Quirk::None);
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -901,7 +1052,7 @@ mod tests {
     async fn a_50ms_hold_still_waits_for_the_flush() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = spawn_withhold_then_flush_server(listener, "Hi.", 0.05);
+        let server = spawn_withhold_then_flush_server(listener, "Hi.", 0.05, Quirk::None);
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -933,34 +1084,7 @@ mod tests {
     async fn a_missing_finalize_ack_closes_anyway_after_the_safety_net() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
-            }
-            // Never send anything carrying from_finalize - simulate a
-            // malformed/missing signal. Just wait for the client to give up
-            // and send CloseStream on its own, then sign off.
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
-            }
-            let _ = ws
-                .send(Message::Text(
-                    r#"{"type":"Metadata","duration":1.0}"#.into(),
-                ))
-                .await;
-        });
+        let server = spawn_silent_until_close_server(listener);
 
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -981,12 +1105,198 @@ mod tests {
             "the safety net must bound the wait, not hang: took {:?}",
             started.elapsed()
         );
-        let saw_error = event_rx
-            .try_iter()
-            .any(|e| matches!(e, TranscriptEvent::Error(_)));
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        let error = seen.iter().find_map(|e| match e {
+            TranscriptEvent::Error(m) => Some(m.as_str()),
+            _ => None,
+        });
+        let Some(error) = error else {
+            panic!(
+                "nothing was ever transcribed, so this must conclude as an error, \
+                 not silently succeed: {seen:?}"
+            );
+        };
         assert!(
-            saw_error,
-            "nothing was ever transcribed, so this must conclude as an error, not silently succeed"
+            !error.contains("silence"),
+            "the engine confirmed nothing; blaming silence is the misleading \
+             diagnosis this branch removes: {error}"
+        );
+    }
+
+    /// `untested-closed-stream-disambiguation`: the whole hold can fit inside
+    /// the connect window, so Deepgram's *open-time* Metadata can land after
+    /// `Finalize` but before `CloseStream` goes out. That frame is not the
+    /// sign-off, and a client that ends the session on it (gating on `closing`
+    /// rather than on `closed_stream`) loses the entire flush. No other server
+    /// variant reaches this window, so without this the gate could regress
+    /// silently.
+    #[tokio::test]
+    async fn a_late_open_metadata_is_not_mistaken_for_the_sign_off() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_withhold_then_flush_server(
+            listener,
+            "Late but not last.",
+            1.0,
+            Quirk::LateOpenMetadata,
+        );
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let one_second = vec![0u8; crate::audio::SAMPLE_RATE as usize * 2];
+        audio_tx.send(Command::Audio(one_second)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        run_pump(audio_rx, event_tx, addr, FINALIZE_ACK_TIMEOUT).await;
+        server.await.unwrap();
+
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        assert_eq!(
+            finals(&seen),
+            ["Late but not last."],
+            "a Metadata frame arriving before CloseStream must not end the session"
+        );
+    }
+
+    /// The `sent_secs == 0.0` short-circuit, at the pump level rather than
+    /// only inside `conclude`: with nothing ever sent there is no flush for
+    /// Deepgram to tag, so `CloseStream` must go out immediately instead of
+    /// burning the full (real, three-second) safety net waiting for a signal
+    /// that cannot come.
+    #[tokio::test]
+    async fn a_session_with_no_audio_closes_without_waiting_for_an_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_silent_until_close_server(listener);
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        // No Command::Audio at all — the key came up before a single frame
+        // was captured.
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        let started = Instant::now();
+        run_pump(audio_rx, event_tx, addr, FINALIZE_ACK_TIMEOUT).await;
+        server.await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "zero audio must skip the {FINALIZE_ACK_TIMEOUT:?} wait entirely: took {:?}",
+            started.elapsed()
+        );
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        match seen.iter().find(|e| matches!(e, TranscriptEvent::Error(_))) {
+            Some(TranscriptEvent::Error(msg)) => {
+                assert!(msg.contains("released") || msg.contains("longer"), "{msg}")
+            }
+            _ => panic!("expected the zero-audio error, got {seen:?}"),
+        }
+    }
+
+    /// `final-gated-on-metadata-adds-rtt`: `from_finalize` is authoritative, so
+    /// the transcript must reach the application on the flush itself, not one
+    /// round trip later after `CloseStream` and the Metadata sign-off. The
+    /// server stalls that sign-off; a Final that waited for it could not
+    /// possibly arrive before the stall is over.
+    #[tokio::test]
+    async fn final_fires_on_the_flush_not_on_the_sign_off() {
+        const SIGN_OFF_DELAY: Duration = Duration::from_millis(600);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_withhold_then_flush_server(
+            listener,
+            "Instant, please.",
+            1.0,
+            Quirk::DelayedSignOff(SIGN_OFF_DELAY),
+        );
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let one_second = vec![0u8; crate::audio::SAMPLE_RATE as usize * 2];
+        audio_tx.send(Command::Audio(one_second)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        let started = Instant::now();
+        let pump = tokio::spawn(run_pump(audio_rx, event_tx, addr, FINALIZE_ACK_TIMEOUT));
+
+        let mut seen = Vec::new();
+        let final_at = loop {
+            drain(&event_rx, &mut seen);
+            if !finals(&seen).is_empty() {
+                break started.elapsed();
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no Final ever arrived: {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            final_at < SIGN_OFF_DELAY,
+            "Final must not wait on the post-CloseStream sign-off: took {final_at:?}"
+        );
+
+        // Teardown still runs to completion afterwards, and the terminal event
+        // is emitted exactly once however the loop ends.
+        pump.await.unwrap();
+        server.await.unwrap();
+        assert!(
+            started.elapsed() >= SIGN_OFF_DELAY,
+            "the sign-off exchange must still have been completed, just off the critical path"
+        );
+        drain(&event_rx, &mut seen);
+        assert_eq!(finals(&seen), ["Instant, please."]);
+        assert!(
+            !seen.iter().any(|e| matches!(e, TranscriptEvent::Error(_))),
+            "a clean teardown must not add an error after the Final: {seen:?}"
+        );
+    }
+
+    /// The failure-path precedence, pinned rather than left to inspection: a
+    /// socket error *after* the flush must never displace the words Deepgram
+    /// already handed over.
+    #[tokio::test]
+    async fn a_socket_failure_after_the_flush_does_not_displace_the_transcript() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_withhold_then_flush_server(
+            listener,
+            "Say this anyway.",
+            1.0,
+            Quirk::GarbageAfterFlush,
+        );
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let one_second = vec![0u8; crate::audio::SAMPLE_RATE as usize * 2];
+        audio_tx.send(Command::Audio(one_second)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        run_pump(audio_rx, event_tx, addr, FINALIZE_ACK_TIMEOUT).await;
+        server.await.unwrap();
+
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        assert_eq!(
+            finals(&seen),
+            ["Say this anyway."],
+            "the transcript takes priority over a socket error that follows it"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, TranscriptEvent::Error(_))),
+            "a teardown failure must not be reported once the text is out: {seen:?}"
         );
     }
 }
