@@ -38,9 +38,18 @@ pub enum Key {
     CapsLock,
     ScrollLock,
     Pause,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
     F8,
     F9,
     F10,
+    F11,
+    F12,
 }
 
 impl Key {
@@ -56,9 +65,18 @@ impl Key {
         Key::CapsLock,
         Key::ScrollLock,
         Key::Pause,
+        Key::F1,
+        Key::F2,
+        Key::F3,
+        Key::F4,
+        Key::F5,
+        Key::F6,
+        Key::F7,
         Key::F8,
         Key::F9,
         Key::F10,
+        Key::F11,
+        Key::F12,
     ];
 
     /// The Win32 virtual-key code. A low-level hook reports the *specific*
@@ -74,9 +92,18 @@ impl Key {
             Key::CapsLock => 0x14,   // VK_CAPITAL
             Key::ScrollLock => 0x91, // VK_SCROLL
             Key::Pause => 0x13,      // VK_PAUSE
+            Key::F1 => 0x70,
+            Key::F2 => 0x71,
+            Key::F3 => 0x72,
+            Key::F4 => 0x73,
+            Key::F5 => 0x74,
+            Key::F6 => 0x75,
+            Key::F7 => 0x76,
             Key::F8 => 0x77,
             Key::F9 => 0x78,
             Key::F10 => 0x79,
+            Key::F11 => 0x7A,
+            Key::F12 => 0x7B,
         }
     }
 
@@ -90,9 +117,18 @@ impl Key {
             Key::CapsLock => "caps-lock",
             Key::ScrollLock => "scroll-lock",
             Key::Pause => "pause",
+            Key::F1 => "f1",
+            Key::F2 => "f2",
+            Key::F3 => "f3",
+            Key::F4 => "f4",
+            Key::F5 => "f5",
+            Key::F6 => "f6",
+            Key::F7 => "f7",
             Key::F8 => "f8",
             Key::F9 => "f9",
             Key::F10 => "f10",
+            Key::F11 => "f11",
+            Key::F12 => "f12",
         }
     }
 
@@ -106,9 +142,18 @@ impl Key {
         "capslock",
         "scrolllock",
         "pause",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
         "f8",
         "f9",
         "f10",
+        "f11",
+        "f12",
     ];
 
     /// Whether `inject.rs` may synthesise a corrective key-up for this hotkey
@@ -195,9 +240,18 @@ impl std::str::FromStr for Key {
             "capslock" | "caps" => Key::CapsLock,
             "scrolllock" | "scroll" => Key::ScrollLock,
             "pause" | "break" => Key::Pause,
+            "f1" => Key::F1,
+            "f2" => Key::F2,
+            "f3" => Key::F3,
+            "f4" => Key::F4,
+            "f5" => Key::F5,
+            "f6" => Key::F6,
+            "f7" => Key::F7,
             "f8" => Key::F8,
             "f9" => Key::F9,
             "f10" => Key::F10,
+            "f11" => Key::F11,
+            "f12" => Key::F12,
             _ => bail!(
                 "unknown hotkey {s:?} (expected one of: {})",
                 Key::NAMES.join(", ")
@@ -546,19 +600,7 @@ mod tests {
         // hook sees vkCode == VK_PACKET, not the character, with LLKHF_INJECTED
         // set. Proves the burst that types a transcript can never retrigger or
         // otherwise be treated as a hotkey press, for every configured hotkey.
-        for key in [
-            Key::RightCtrl,
-            Key::LeftCtrl,
-            Key::RightShift,
-            Key::RightAlt,
-            Key::RightWin,
-            Key::CapsLock,
-            Key::ScrollLock,
-            Key::Pause,
-            Key::F8,
-            Key::F9,
-            Key::F10,
-        ] {
+        for key in Key::ALL {
             assert!(!is_hotkey_event(VK_PACKET, key.vk(), true));
         }
     }
