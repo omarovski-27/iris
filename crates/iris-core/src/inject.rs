@@ -147,9 +147,9 @@ fn focused_target() -> Option<Target> {
 /// the list is not working towards covering every such app, because it
 /// cannot.
 const PASTE_HOSTILE_CLASSES: &[&str] = &[
-    "consolewindowclass",           // conhost: cmd, powershell, ssh sessions
+    "consolewindowclass",            // conhost: cmd, powershell, ssh sessions
     "cascadia_hosting_window_class", // Windows Terminal
-    "virtualconsoleclass",          // ConEmu, and Cmder which embeds it
+    "virtualconsoleclass",           // ConEmu, and Cmder which embeds it
     "putty",
     "mintty",
     "tscshellcontainerclass", // mstsc, the Remote Desktop client
@@ -1291,10 +1291,7 @@ mod tests {
         // Nothing to protect either way: Clipboard already delivers in four
         // events regardless of length, so a short text must not be changed
         // any more than a long one already isn't.
-        assert_eq!(
-            method_for("hi", Method::Clipboard, None),
-            Method::Clipboard
-        );
+        assert_eq!(method_for("hi", Method::Clipboard, None), Method::Clipboard);
         let long = "a".repeat(MAX_SEND_INPUT_CHARS * 2);
         assert_eq!(
             method_for(&long, Method::Clipboard, None),
@@ -2138,5 +2135,249 @@ mod tests {
             if out == text { "MATCH" } else { "MISMATCH" }
         );
         assert_eq!(out, text);
+    }
+
+    /// The transcript spoken in the bug report, retyped from it. Long enough
+    /// to need a second `SendInput` batch, which is the property the whole
+    /// escalation turns on.
+    const REPORTED: &str = "Test one, test two, test three. Although this is working fine. I'm currently testing it. And I was testing it on the terminal. It was working good. I'm now testing it because I want to see the bar Can I notice something that the waves and the coloring do not reach the end So, like, kind of gets cut off about 75%?";
+
+    /// What a user ends up with for the reported dictation, window by window,
+    /// rendered as one reviewable table rather than left to be inferred from
+    /// green test names. Every column is computed by the same functions
+    /// `inject` calls — `needs_more_than_one_batch`, `effective_method`,
+    /// `accepts_paste`, `pacing` and `paste_accelerator_survives` — so this is
+    /// the real decision path, not a description of it. What it cannot show is
+    /// `mod win` executing those decisions against Windows: that would mean
+    /// running the injection path, which `CLAUDE.md` forbids.
+    ///
+    /// Run with
+    /// `cargo test -p iris-core -- --nocapture escalated_delivery_transcript`.
+    #[test]
+    fn escalated_delivery_transcript() {
+        /// One row: a window, what the user configured, and whether the
+        /// hotkey still reads down when injection starts.
+        struct Scenario {
+            what: &'static str,
+            text: &'static str,
+            requested: Method,
+            target: Option<Target>,
+            hotkey: Key,
+            hotkey_down: bool,
+        }
+
+        fn window(class: &str, process: &str) -> Option<Target> {
+            Some(Target {
+                class: class.to_string(),
+                process: process.to_string(),
+            })
+        }
+
+        let scenarios = [
+            Scenario {
+                what: "Notepad — the reported failure",
+                text: REPORTED,
+                requested: Method::SendInput,
+                target: window("Notepad", "notepad.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+            Scenario {
+                what: "Windows Terminal — same words",
+                text: REPORTED,
+                requested: Method::SendInput,
+                target: window("CASCADIA_HOSTING_WINDOW_CLASS", "WindowsTerminal.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+            Scenario {
+                what: "gvim (insert mode)",
+                text: REPORTED,
+                requested: Method::SendInput,
+                target: window("Vim", "gvim.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+            Scenario {
+                what: "Slack (Electron, not a terminal)",
+                text: REPORTED,
+                requested: Method::SendInput,
+                target: window("Chrome_WidgetWin_1", "slack.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+            Scenario {
+                what: "Notepad, ralt hotkey still down",
+                text: REPORTED,
+                requested: Method::SendInput,
+                target: window("Notepad", "notepad.exe"),
+                hotkey: Key::RightAlt,
+                hotkey_down: true,
+            },
+            Scenario {
+                what: "Notepad, short dictation",
+                text: "Send it in five minutes. ",
+                requested: Method::SendInput,
+                target: window("Notepad", "notepad.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+            Scenario {
+                what: "method = \"clipboard\", short dictation",
+                text: "Send it in five minutes. ",
+                requested: Method::Clipboard,
+                target: window("Notepad", "notepad.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+            Scenario {
+                what: "method = \"clipboard\", into a terminal",
+                text: REPORTED,
+                requested: Method::Clipboard,
+                target: window("ConsoleWindowClass", "cmd.exe"),
+                hotkey: Key::RightCtrl,
+                hotkey_down: false,
+            },
+        ];
+
+        println!("\n=== Iris long-dictation delivery — what each window gets ===");
+        println!(
+            "Threshold: more than {MAX_SEND_INPUT_CHARS} planned units (one \
+             {BATCH}-event SendInput batch)."
+        );
+        println!(
+            "Pacing: {PACED_UNITS} units per call, {} ms between calls.\n",
+            PACE_GAP.as_millis()
+        );
+        println!(
+            "{:<38} {:<10} {:>6} {:>7}  {:<11}  how it goes out",
+            "window / config", "requested", "chars", "units", "delivered as"
+        );
+        println!("{}", "-".repeat(122));
+
+        for s in &scenarios {
+            let units = crate::text::plan_len(s.text);
+            let long = needs_more_than_one_batch(s.text);
+            let effective = effective_method(long, s.requested, s.target.as_ref());
+
+            let (delivered, how) = match effective {
+                Method::Clipboard => {
+                    let steps = paste_steps(s.hotkey, s.hotkey_down, s.hotkey_down);
+                    if steps.contains(&PasteStep::SendAccelerator) {
+                        (
+                            "clipboard",
+                            "Ctrl+V — 4 events, whatever the length; clipboard \
+                             clobbered, not restored"
+                                .to_string(),
+                        )
+                    } else {
+                        let split = calls(s.text).len();
+                        (
+                            "keystrokes",
+                            format!(
+                                "{} would spoil Ctrl+V — vetoed before the clipboard is \
+                                 written; typed in {split} paced calls",
+                                s.hotkey.label()
+                            ),
+                        )
+                    }
+                }
+                Method::SendInput => {
+                    let split = calls(s.text).len();
+                    let why = if !accepts_paste(s.target.as_ref()) {
+                        "Ctrl+V is not paste here — kept on keystrokes"
+                    } else {
+                        "under the threshold — clipboard never touched"
+                    };
+                    let shape = if pacing(units).is_some() {
+                        format!("{split} paced calls")
+                    } else {
+                        format!("{split} call, unpaced")
+                    };
+                    ("keystrokes", format!("{why}; {shape}"))
+                }
+            };
+
+            println!(
+                "{:<38} {:<10} {:>6} {:>7}  {:<11}  {}",
+                s.what,
+                s.requested.to_string(),
+                s.text.chars().count(),
+                units,
+                delivered,
+                how
+            );
+        }
+
+        // The four rows that carry the fix, pinned so the table cannot drift
+        // into telling a story the code does not.
+        let decide = |s: &Scenario| {
+            effective_method(
+                needs_more_than_one_batch(s.text),
+                s.requested,
+                s.target.as_ref(),
+            )
+        };
+        assert_eq!(decide(&scenarios[0]), Method::Clipboard, "Notepad");
+        assert_eq!(decide(&scenarios[1]), Method::SendInput, "terminal");
+        assert_eq!(decide(&scenarios[2]), Method::SendInput, "gvim");
+        assert_eq!(decide(&scenarios[3]), Method::Clipboard, "Slack");
+        assert_eq!(decide(&scenarios[5]), Method::SendInput, "short");
+        assert_eq!(decide(&scenarios[6]), Method::Clipboard, "explicit");
+        assert_eq!(decide(&scenarios[7]), Method::Clipboard, "explicit");
+        assert!(
+            !paste_steps(Key::RightAlt, true, true).contains(&PasteStep::WriteClipboard),
+            "a certain veto must not spend the user's clipboard"
+        );
+
+        // The other half of the fix: the words that survive the fallback.
+        // Everything above that says "keystrokes" goes out through the split
+        // below, so the split must lose nothing.
+        let delivered: String = {
+            let units: Vec<u16> = calls(REPORTED)
+                .iter()
+                .flatten()
+                .filter_map(|u| match u {
+                    crate::text::KeyUnit::Unicode(u) => Some(*u),
+                    crate::text::KeyUnit::Virtual(_) => None,
+                })
+                .collect();
+            String::from_utf16(&units).expect("the burst is valid UTF-16")
+        };
+        let split = calls(REPORTED);
+
+        println!("\n--- the paced keystroke fallback, character for character ---");
+        println!(
+            "spoken            : {:3} chars / {:3} units -> {} SendInput calls",
+            REPORTED.chars().count(),
+            crate::text::plan_len(REPORTED),
+            split.len()
+        );
+        println!(
+            "delivered (paced) : {:3} chars   {}",
+            delivered.chars().count(),
+            if delivered == REPORTED {
+                "MATCH — every character, in order"
+            } else {
+                "MISMATCH"
+            }
+        );
+        // What the bug report quoted Notepad as showing for these same words,
+        // described rather than reconstructed: the retyping above cannot
+        // promise the garbled bytes character for character.
+        println!(
+            "reported (before) : ~252 of 313 chars — \"Test i\" then \"ing\" then ~72x \
+             'm' then ~180 spaces"
+        );
+        println!(
+            "\nlargest call      : {} units (cap {PACED_UNITS}); no call ends mid-surrogate\n",
+            split.iter().map(Vec::len).max().unwrap_or(0)
+        );
+
+        assert_eq!(delivered, REPORTED);
+        assert!(split.len() > 1, "this transcript must be split");
+        assert!(split
+            .iter()
+            .all(|c| c.last().expect("no empty call").may_end_batch()));
     }
 }

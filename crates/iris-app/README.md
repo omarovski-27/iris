@@ -114,11 +114,10 @@ reading the clipboard", so any restore either races the paste (and the app
 silently pastes your *old* clipboard, which looks like it worked) or needs a
 delay long enough to cost the sub-second latency this app exists for and to race
 the next dictation. The full reasoning is in `win::paste`'s doc comment in
-`iris-core/src/inject.rs`. If you keep something on the
-clipboard you cannot lose, copy it back afterwards. Keeping dictations under the
-threshold avoids the paste altogether, but only under the default — with
-`method = "clipboard"` there is no length short enough to stay off the
-clipboard.
+`iris-core/src/inject.rs`. If you keep something on the clipboard you cannot
+lose, copy it back afterwards. Keeping dictations under the threshold avoids the
+paste altogether, but only under the default — with `method = "clipboard"`
+there is no length short enough to stay off the clipboard.
 
 A paste can also decline itself and type the transcript instead. Two things
 cause that, and neither depends on how the paste was chosen: a hotkey still
@@ -277,8 +276,9 @@ at `max_entries`:
 ```
 
 **Every** dictation is recorded, including the ones where injection failed —
-that record is the user's only way to recover words that never made it onto the
-screen. `iris --history` prints the tail of it.
+that record is how a user recovers words that never made it onto the screen, and
+the durable half of it: the transcript a paste leaves on the clipboard survives
+only until the next copy. `iris --history` prints the tail of it.
 
 A record with an `error` carries a zeroed `latency` block (`App::dictate`'s
 `Err` arm builds a fresh record rather than the timeline it was tracking), so

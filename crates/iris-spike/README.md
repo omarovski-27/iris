@@ -52,7 +52,7 @@ Keys are read only from the environment, never from a file or an argument.
 | --- | --- |
 | `--engine mock\|deepgram\|groq` | default `mock` |
 | `--hotkey rctrl\|f9\|rshift\|ralt\|capslock\|…` | default `rctrl` |
-| `--inject sendinput\|clipboard` | default `sendinput` |
+| `--inject sendinput\|clipboard` | default `sendinput`; a transcript too long for one `SendInput` batch pastes anyway, and clobbers the clipboard — see `crates/iris-app/README.md` |
 | `--dry-run` | print the transcript instead of injecting it |
 | `--warm-capture` | keep the microphone open between dictations |
 | `--no-suppress` | let the hotkey reach the focused app too |
@@ -119,6 +119,8 @@ definitely in the OS layer rather than the network.
    character by character rather than appearing at once, `--inject sendinput` is
    too slow for the budget — compare with `--inject clipboard`, and see the
    injection section of `docs/spike-findings.md`, which expects exactly this.
+   Keep the sentence short: a transcript past the escalation threshold pastes
+   under `--inject sendinput` too, so a long one measures the paste either way.
 3. **The hotkey is invisible to the app.** In Notepad, holding Right-Ctrl should
    not trigger anything. Then try a browser: Right-Ctrl must not fire Ctrl-based
    shortcuts. (Pass `--no-suppress` to see the difference.)
