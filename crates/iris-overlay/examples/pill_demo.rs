@@ -86,6 +86,14 @@ struct Args {
     #[arg(long, value_parser = ["short", "long"], default_value = "long")]
     utterance: String,
 
+    /// Whether the live transcript reaches the overlay at all.
+    ///
+    /// `off` sends no partial text, which is exactly what `iris-app`'s
+    /// `Config::show_live_text = false` opt-out does to this crate: the orb
+    /// never opens into a ribbon. Use it to review that presentation.
+    #[arg(long, value_parser = ["on", "off"], default_value = "on")]
+    live_text: String,
+
     /// Monitor scale to render at in filmstrip mode (1.0 = 100 %, 1.5 = 150 %).
     #[arg(long, default_value_t = 1.0)]
     scale: f32,
@@ -113,9 +121,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let cycle = Cycle::for_utterance(utterance);
 
+    let live_text = args.live_text == "on";
+
     match &args.filmstrip {
-        Some(dir) => filmstrip(&args, theme, utterance, &cycle, dir.clone()),
-        None => live(&args, theme, utterance, &cycle),
+        Some(dir) => filmstrip(&args, theme, utterance, live_text, &cycle, dir.clone()),
+        None => live(&args, theme, utterance, live_text, &cycle),
     }
 }
 
@@ -124,6 +134,7 @@ fn live(
     args: &Args,
     theme: Theme,
     utterance: &str,
+    live_text: bool,
     cycle: &Cycle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !cfg!(windows) {
@@ -156,7 +167,9 @@ fn live(
         while start.elapsed() < Duration::from_millis(cycle.listen_ms) {
             let t = start.elapsed().as_millis() as u64;
             pill.update_level(synthetic_level(t));
-            pill.set_partial_text(words_said_by(t, utterance));
+            if live_text {
+                pill.set_partial_text(words_said_by(t, utterance));
+            }
             std::thread::sleep(Duration::from_millis(16));
         }
 
@@ -187,6 +200,7 @@ fn filmstrip(
     args: &Args,
     theme: Theme,
     utterance: &str,
+    live_text: bool,
     cycle: &Cycle,
     dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -220,7 +234,9 @@ fn filmstrip(
                 pill.apply(Command::Processing);
             } else if elapsed < cycle.listen_ms {
                 pill.apply(Command::Level(synthetic_level(elapsed)));
-                pill.apply(Command::PartialText(words_said_by(elapsed, utterance)));
+                if live_text {
+                    pill.apply(Command::PartialText(words_said_by(elapsed, utterance)));
+                }
             }
             pill.tick(now);
             pill.render();

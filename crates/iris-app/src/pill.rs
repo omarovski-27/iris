@@ -66,7 +66,10 @@ pub trait PillSink: Send {
     /// for sinks that never forward it in the first place.
     fn set_show_live_text(&mut self, _on: bool) {}
 
-    /// Engine label for the chip (e.g. `mock`, `deepgram`). Default no-op.
+    /// Engine label (e.g. `mock`, `deepgram`). Default no-op.
+    ///
+    /// Still pushed at startup and on a tray switch; the current overlay
+    /// design carries it on the model but does not draw it.
     fn set_engine(&mut self, _label: &str) {}
 
     /// Map the app theme onto the overlay palette. Default no-op.
@@ -207,7 +210,8 @@ impl OverlayPill {
         }
     }
 
-    /// The underlying handle, for callers that need [`OverlayHandle::is_connected`].
+    /// The underlying handle, for callers that need
+    /// [`iris_overlay::OverlayHandle::is_connected`].
     #[must_use]
     pub fn handle(&self) -> &iris_overlay::OverlayHandle {
         &self.handle

@@ -177,9 +177,12 @@ pub struct Theme {
     // ---- ink ----
     /// Primary text.
     pub ink: Rgba,
-    /// Secondary text — the timer.
+    /// Secondary text. Belongs to the captions this design no longer draws
+    /// (see the note beside `render::draw_ribbon`); kept as a palette token,
+    /// not painted.
     pub ink_dim: Rgba,
-    /// Tertiary text — the engine chip, and the idle capsule core.
+    /// Tertiary text, and the idle capsule core. Same caption story as
+    /// [`Self::ink_dim`].
     pub ink_faint: Rgba,
 
     // ---- capsule ----

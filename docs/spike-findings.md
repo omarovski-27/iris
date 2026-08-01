@@ -184,14 +184,15 @@ section 2 reads the way it does.
 **Where the overlay hooks in.** `Dictation::events()` hands out a receiver of
 `TranscriptEvent`, and `absorb_event` folds one into the timeline. The spike
 already uses this seam to print live partials to the terminal (`pipeline.rs`).
-The pill itself lives in `crates/iris-overlay` (`OverlayHandle`) and never
-holds or draws transcript text. App wiring is `iris-app::pill::OverlayPill`
-(a `PillSink`); see `crates/iris-app/README.md`.
+The pill itself lives in `crates/iris-overlay` (`OverlayHandle`), which now
+holds and draws the live transcript while it is on screen — see that crate's
+`README.md` for the contract and the config opt-out. App wiring is
+`iris-app::pill::OverlayPill` (a `PillSink`); see `crates/iris-app/README.md`.
 
 This matters for perceived speed beyond the measured numbers: the pill is on
-screen for the whole utterance (spectrum + telemetry), so key-release is a
-state change on something already visible rather than a surface appearing from
-nothing, which reads as faster than it is.
+screen for the whole utterance (waveform, and the words as they arrive), so
+key-release is a state change on something already visible rather than a
+surface appearing from nothing, which reads as faster than it is.
 
 **Keep the `Engine` trait as-is.** It survived three implementations with very
 different shapes (streaming websocket, batch HTTP, synchronous mock) without

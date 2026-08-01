@@ -1,11 +1,11 @@
-//! Text for the timer, the latency figure and the engine chip.
+//! Text for the ribbon's live transcript.
 //!
-//! All three are mono in the Prism mockup (`--mono: "Cascadia Mono"`), so the
-//! pill needs exactly one face. Cascadia Mono is the font the design spec names
-//! and it is SIL OFL 1.1, so it ships in-crate rather than being looked up in
-//! the system font stack: the overlay then rasterises identically on Windows and
-//! in the headless Linux tests, which is what makes a rendered PNG a usable
-//! review artefact.
+//! Everything the pill draws is mono in the Prism mockup
+//! (`--mono: "Cascadia Mono"`), so it needs exactly one face. Cascadia Mono is
+//! the font the design spec names and it is SIL OFL 1.1, so it ships in-crate
+//! rather than being looked up in the system font stack: the overlay then
+//! rasterises identically on Windows and in the headless Linux tests, which is
+//! what makes a rendered PNG a usable review artefact.
 //!
 //! See `assets/fonts/OFL.txt` for the licence.
 

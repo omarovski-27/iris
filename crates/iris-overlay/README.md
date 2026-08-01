@@ -307,13 +307,18 @@ cargo run --example pill-demo -- --theme porcelain --utterance short --cycles 0 
 # A PNG filmstrip of the same frames. Works anywhere, including Linux CI.
 cargo run --example pill-demo -- --filmstrip /tmp/iris-pill
 cargo run --example pill-demo -- --filmstrip /tmp/iris-pill --utterance long --scale 1.5
+
+# The orb-only presentation, as `iris-app`'s show_live_text = false gives it.
+cargo run --example pill-demo -- --filmstrip /tmp/iris-orb --live-text off
 ```
 
 The demo drives a full cycle with a synthetic speech envelope — syllables
 riding on a phrase-length swell — and a scripted utterance revealed one word
 at a time (`--utterance short` fits comfortably; `--utterance long`, the
 default, overflows the ribbon on purpose so the marquee-tail scroll is easy to
-review).
+review). `--live-text off` sends no partial text at all, which is exactly what
+the app's opt-out does to this crate, so the orb-only presentation is
+reviewable the same way.
 
 ### From WSL
 
