@@ -556,6 +556,44 @@ fn a_tray_save_never_persists_a_cli_override() {
     );
 }
 
+/// `show_live_text` is the privacy opt-out the live-text ribbon was shipped
+/// on, so editing it and reloading has to take effect there and then — the
+/// same treatment `theme` already gets. Before this, the flag was frozen into
+/// the overlay sink at startup and the reload said "reloaded" while the
+/// transcript kept appearing on screen until the process restarted.
+#[test]
+fn reload_turning_off_live_text_stops_text_reaching_the_overlay() {
+    let mut rig = rig();
+    rig.dictate().expect("first dictation");
+    let before = rig.pill.partial_texts().len();
+    assert!(
+        before > 0,
+        "the live ribbon never got any text to begin with"
+    );
+
+    // The user edits config.toml and asks for a reload — no restart.
+    let mut off = Config::default();
+    off.polish.llm = false;
+    off.show_live_text = false;
+    off.save(&rig.config_path).expect("writing the config file");
+    rig.commands.send(Command::Reload).unwrap();
+    rig.commands.send(Command::Quit).unwrap();
+    rig.app
+        .run(&rig.keys_rx, &rig.commands_rx)
+        .expect("the loop should exit on Quit");
+    assert!(!rig.app.config().show_live_text, "the reload did not land");
+
+    rig.dictate().expect("second dictation");
+    assert_eq!(
+        rig.pill.partial_texts().len(),
+        before,
+        "partial text reached the overlay after the opt-out was turned on: {:?}",
+        rig.pill.partial_texts()
+    );
+    // ... and the dictation itself is untouched: only the display changed.
+    assert_eq!(rig.injector.inserted().len(), 2);
+}
+
 #[test]
 fn reload_keeps_in_force_settings_that_need_a_restart() {
     // Reload must not pretend hotkey/audio/keys/inject.method took effect:

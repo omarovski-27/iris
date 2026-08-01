@@ -131,7 +131,7 @@ and the motion budget are not.
 | Motion | `motion.rs` timings and curves | **Identical** — every constant is imported, none copied |
 | Colour | Prism dark / Porcelain light | Same two palettes, same tokens, no new colours needed |
 | Waveform | 28-bar spectrum (`spectrum.rs`) | A new, independently-tuned bar row in `render/mod.rs`'s `draw_wave` — see "Glass, and the wave came back", below. `spectrum.rs` itself is gone; nothing shares code with it. |
-| Shell | Opaque | Translucent glass, boosted dynamically for legibility while text shows |
+| Shell | Opaque | Translucent glass at a constant `GLASS_FILL_ALPHA`; legibility is `theme.text_scrim` behind the run alone, never a text-linked opacity ramp on the shell |
 | Transcript | Never held (`set_partial_len`, a count) | Held while on screen (`set_partial_text`, the string) |
 | Engine chip | Rendered below the pill | Carried on the model, not rendered — no room without competing with the words |
 

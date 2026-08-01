@@ -127,6 +127,17 @@ fn wave_bar_scale(p: f32, i: f32, env: f32, now_ms: u64) -> f32 {
     WAVE_IDLE_FLOOR + response * taper * wobble * (1.0 - WAVE_IDLE_FLOOR)
 }
 
+/// How visible the whole bar row is, given the three state weights.
+///
+/// The row belongs to listening and processing; `inserted` drives it down
+/// twice over so the confirmation reads as a single check and nothing else.
+/// That double suppression is only correct while `inserted` is *rising* —
+/// which is why [`Ctx::state_alpha`] freezes the cross-fade on the way out
+/// rather than letting it run back down to zero.
+fn wave_alpha(listening: f32, processing: f32, inserted: f32) -> f32 {
+    (1.0 - inserted).max(listening + processing).min(1.0) * (1.0 - inserted * 0.9)
+}
+
 /// The live waveform: a row of bars whose count and pitch are recomputed
 /// from the shape's current width every frame, sitting in a band above the
 /// shape's centre so it coexists with the text and the core glyph rather
@@ -147,7 +158,7 @@ fn draw_wave(
     let listening = ctx.state_alpha(OverlayState::Listening);
     let processing = ctx.state_alpha(OverlayState::Processing);
     let inserted = ctx.state_alpha(OverlayState::Inserted);
-    let alpha = (1.0 - inserted).max(listening + processing).min(1.0) * (1.0 - inserted * 0.9);
+    let alpha = wave_alpha(listening, processing, inserted);
     if alpha <= 0.001 {
         return;
     }
@@ -365,7 +376,13 @@ impl Renderer {
         self.openness.tick(target_open, dt);
 
         let target_w = if has_text {
-            let text_w = self.atlas.measure(model.text(), self.layout.text_font, 0.0);
+            // Capped at the widest run the ribbon can ever show: past that the
+            // `min` below discards the answer anyway, and the transcript being
+            // measured grows for as long as the user keeps talking.
+            let budget = (self.layout.ribbon_max_w - 2.0 * self.layout.text_pad_x).max(0.0);
+            let text_w =
+                self.atlas
+                    .measure_capped(model.text(), self.layout.text_font, 0.0, budget);
             (text_w + 2.0 * self.layout.text_pad_x)
                 .max(self.layout.shape_h)
                 .min(self.layout.ribbon_max_w)
@@ -476,7 +493,22 @@ impl Ctx<'_> {
     }
 
     /// How present `state` is, cross-fading with whatever we came from.
+    ///
+    /// The cross-fade is frozen while the shape is *leaving*. `Hidden` draws
+    /// nothing, so once it is the current state there is nothing to cross-fade
+    /// *into*: the exit is carried entirely by [`Model::presence`], and letting
+    /// the cross run as well means every term written as `1.0 - inserted`
+    /// (the core dot) or `1.0 - inserted * 0.9` (the wave row) *inverts* over
+    /// the 90 ms after the inserted hold expires — the checkmark dissolved
+    /// into a re-emerging mint dot and a full bar row while the shape faded
+    /// out. Holding the last visible state at full weight leaves presence as
+    /// the single thing that animates an exit, which is what it was always
+    /// meant to be. Enter, and every visible-to-visible transition, are
+    /// untouched.
     fn state_alpha(&self, state: OverlayState) -> f32 {
+        if !self.model.state().is_visible() {
+            return f32::from(self.model.previous_state() == state);
+        }
         fade_between(
             self.model.state() == state,
             self.model.previous_state() == state,
@@ -814,7 +846,16 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 
     if inserted > 0.001 {
         if let Some((path, length)) = shapes::check_mark(cx, cy, l.shape_h * 0.6) {
-            let progress = (model.age_ms() as f32 / CHECK_DRAW_MS as f32).clamp(0.0, 1.0);
+            // `age_ms` restarts at every transition, so once the pill has left
+            // `Inserted` it no longer measures how long the check has been
+            // drawing itself — reading it during the exit made a finished
+            // check erase and start over as the shape faded. It is finished by
+            // construction there: INSERTED_HOLD_MS outlasts CHECK_DRAW_MS.
+            let progress = if model.state() == OverlayState::Inserted {
+                (model.age_ms() as f32 / CHECK_DRAW_MS as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
             let mut paint = Paint::default();
             paint.set_color(ctx.c(theme.ok.fade(inserted * alpha)).to_color());
             paint.anti_alias = true;
@@ -828,6 +869,26 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
             pixmap.stroke_path(&path, &paint, &stroke_style, ctx.xf, None);
         }
     }
+}
+
+/// Top and bottom of the live text's scrim band, in device pixels.
+///
+/// Takes no text on purpose. The band and the run it backs are both placed
+/// from the face's fixed line metrics (see [`FontAtlas::baseline_offset`]),
+/// not from the ink of whichever suffix happens to be shown this frame, so
+/// neither moves as words scroll off the left — the band would otherwise
+/// breathe by a pixel or three every time a descender entered or left the
+/// window, and the run with it. The top is held at or below the waveform
+/// row's bottom edge, which
+/// `the_wave_row_clears_the_live_text_ink_box` pins against the real glyphs.
+fn text_band(atlas: &FontAtlas, l: &Layout, y: f32, h: f32) -> (f32, f32) {
+    let (ascent, descent) = atlas.line_extents(l.text_font);
+    let baseline = y + h * 0.5 + atlas.baseline_offset(l.text_font);
+    let pad_y = SCRIM_PAD_Y * l.scale;
+    let wave_bottom = y + h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
+    let top = (baseline - ascent - pad_y).max(wave_bottom);
+    let bottom = (baseline - descent + pad_y).min(y + h);
+    (top, bottom)
 }
 
 /// Live text and, while processing, a shimmer sweep — everything that only
@@ -889,10 +950,10 @@ fn draw_ribbon(
     // that does, so this closes the legibility gap exactly where it matters
     // instead of pulling the whole surface back toward opaque.
     //
-    // Vertically the band hugs the run's own ink box rather than the shape,
-    // and its top edge is held at or below the bottom of the waveform row: a
-    // shape-height band reached up into the bars and visibly darkened them
-    // along the whole length of the text.
+    // Vertically the band is the face's own line box rather than the shape or
+    // the shown substring's ink, and its top edge is held at or below the
+    // bottom of the waveform row: a shape-height band reached up into the bars
+    // and visibly darkened them along the whole length of the text.
     let text_w = atlas.measure(shown, l.text_font, 0.0);
     if text_w > 0.0 {
         let scrim_pad = l.text_pad_x * 0.4;
@@ -900,12 +961,7 @@ fn draw_ribbon(
         let band_w = (text_w + 2.0 * scrim_pad).min(w);
         let band_x = (band_right - band_w).max(x);
 
-        let (ink_top, ink_bottom) = atlas.ink_extents(shown, l.text_font);
-        let baseline = y + h * 0.5 + (ink_top + ink_bottom) * 0.5;
-        let pad_y = SCRIM_PAD_Y * l.scale;
-        let wave_bottom = y + h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
-        let band_top = (baseline - ink_top - pad_y).max(wave_bottom);
-        let band_bottom = (baseline - ink_bottom + pad_y).min(y + h);
+        let (band_top, band_bottom) = text_band(atlas, l, y, h);
         let band_h = band_bottom - band_top;
         if band_h > 0.0 {
             if let Some(path) = shapes::round_rect(band_x, band_top, band_w, band_h, band_h * 0.5) {
@@ -1011,6 +1067,7 @@ fn stroke(pixmap: &mut Pixmap, ctx: &Ctx<'_>, path: Option<Path>, colour: Rgba, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion::{EXIT_MS, INSERTED_HOLD_MS};
     use crate::state::Command;
     use crate::theme::{PORCELAIN_LIGHT, PRISM_DARK};
 
@@ -1103,8 +1160,8 @@ mod tests {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let l = Layout::new(scale);
             let mut atlas = FontAtlas::new();
-            let (ink_top, ink_bottom) = atlas.ink_extents(&printable, l.text_font);
-            let baseline = l.shape_h * 0.5 + (ink_top + ink_bottom) * 0.5;
+            let (ink_top, _) = atlas.ink_extents(&printable, l.text_font);
+            let baseline = l.shape_h * 0.5 + atlas.baseline_offset(l.text_font);
             let ink_box_top = baseline - ink_top;
             let wave_bottom = l.shape_h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
             assert!(
@@ -1117,6 +1174,162 @@ mod tests {
                 "scale {scale}: wave row starts at {wave_top}, outside the shape"
             );
         }
+    }
+
+    /// The band the live text sits in must be a function of the ribbon's
+    /// geometry and the face, and of nothing else. Anything derived from the
+    /// shown substring moves as words scroll off the left, and the text moves
+    /// with it — the whole run visibly bouncing as a descender or a tall
+    /// ascender enters or leaves the window.
+    #[test]
+    fn the_text_band_does_not_move_with_the_text() {
+        for scale in [1.0f32, 1.5, 2.0] {
+            let l = Layout::new(scale);
+            let mut atlas = FontAtlas::new();
+            let y = l.center_y - l.shape_h * 0.5;
+            let reference = text_band(&atlas, &l, y, l.shape_h);
+            // Every shape of run the marquee can leave behind: x-height only,
+            // ascenders only, descenders only, tall punctuation, and empty.
+            for text in [
+                "acemnorsu",
+                "the quarterly",
+                "jumps over pygmy",
+                "({[$#@|]})",
+                "three more charts",
+                "",
+            ] {
+                atlas.measure(text, l.text_font, 0.0);
+                assert_eq!(
+                    text_band(&atlas, &l, y, l.shape_h),
+                    reference,
+                    "scale {scale}: band moved for {text:?}"
+                );
+            }
+            let (top, bottom) = reference;
+            assert!(bottom > top, "scale {scale}: empty band {top}..{bottom}");
+        }
+    }
+
+    /// The exit that follows a successful insert: the checkmark fades out on
+    /// its own. The bug this pins had the mint core dot and the whole wave row
+    /// fading back *in* underneath it, because the state cross-fade kept
+    /// running toward `Hidden` — which draws nothing — while presence was
+    /// already carrying the exit.
+    #[test]
+    fn nothing_fades_back_in_while_the_inserted_check_leaves() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        model.apply(Command::Level(0.9));
+        model.apply(Command::Inserted { latency_ms: 142 });
+
+        let layout = Layout::new(1.0);
+        let theme = PRISM_DARK;
+        let mut t = 0u64;
+        let mut sampled = 0;
+        while t < u64::from(INSERTED_HOLD_MS) + u64::from(EXIT_MS) {
+            t += 16;
+            model.tick(t);
+            if model.state().is_visible() {
+                continue;
+            }
+            let ctx = Ctx {
+                layout: &layout,
+                theme: &theme,
+                xf: Transform::identity(),
+                alpha: model.presence(),
+                model: &model,
+            };
+            let listening = ctx.state_alpha(OverlayState::Listening);
+            let processing = ctx.state_alpha(OverlayState::Processing);
+            let inserted = ctx.state_alpha(OverlayState::Inserted);
+            assert!(
+                (inserted - 1.0).abs() < 1e-6,
+                "at {t} ms the inserted weight had already decayed to {inserted}"
+            );
+            assert!(
+                wave_alpha(listening, processing, inserted) <= 0.001,
+                "at {t} ms the wave row came back at {}",
+                wave_alpha(listening, processing, inserted)
+            );
+            assert!(
+                (1.0 - inserted) * glyph_alpha(0.0) <= 0.001,
+                "at {t} ms the live core dot came back"
+            );
+            sampled += 1;
+        }
+        assert!(sampled > 4, "only {sampled} exit frames sampled");
+    }
+
+    /// The same thing at the pixel level, and the reason it is worth two
+    /// tests: the row of bars is drawn *over* the glass, so ink reappearing
+    /// there shows up as the band getting more opaque even while the shape as
+    /// a whole is fading out.
+    #[test]
+    fn the_wave_band_only_ever_fades_during_the_exit() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        model.apply(Command::Level(1.0));
+        let mut r = Renderer::new(1.0);
+        let mut t = 0u64;
+        while t < 400 {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+        }
+        model.apply(Command::Inserted { latency_ms: 142 });
+
+        // Sampled in *shape-local* space and mapped through the same enter
+        // transform the frame was drawn with: the exit slides the shape up by
+        // 10 px and shrinks it to 90 %, so a fixed window rectangle would
+        // watch different parts of the shape drift past and prove nothing.
+        // The strip is the upper half of the bar row, which the checkmark
+        // (half a shape-height tall, centred) never reaches.
+        let band_alpha = |r: &Renderer, model: &Model| -> u64 {
+            let l = r.layout();
+            let (dy, s) = model.enter_transform(l.scale);
+            let oy = l.center_y + l.shape_h * 0.5;
+            let map = |x: f32, y: f32| -> (u32, u32) {
+                (
+                    (l.center_x + (x - l.center_x) * s).round() as u32,
+                    (oy + dy + (y - oy) * s).round() as u32,
+                )
+            };
+            let row = l.center_y - WAVE_Y_OFFSET * l.scale;
+            let (x0, y0) = map(l.center_x - l.shape_h * 0.35, row - WAVE_MAX_H * 0.5);
+            let (x1, y1) = map(l.center_x + l.shape_h * 0.35, row);
+            let mut sum = 0u64;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    sum += u64::from(r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha());
+                }
+            }
+            sum
+        };
+
+        let mut previous = None;
+        let mut exit_frames = 0;
+        let gone_by = t + u64::from(INSERTED_HOLD_MS) + u64::from(EXIT_MS) + 200;
+        while t < gone_by {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+            if model.state().is_visible() {
+                continue;
+            }
+            let now = band_alpha(&r, &model);
+            if let Some(before) = previous {
+                assert!(
+                    now <= before,
+                    "at {t} ms the wave band got denser as the pill left: {before} → {now}"
+                );
+            }
+            previous = Some(now);
+            exit_frames += 1;
+        }
+        assert!(exit_frames > 4, "only {exit_frames} exit frames sampled");
+        assert_eq!(previous, Some(0), "the pill never finished leaving");
     }
 
     #[test]

@@ -55,6 +55,17 @@ pub trait PillSink: Send {
     /// why this exists and what it does and does not authorise.
     fn set_partial_text(&mut self, _text: &str) {}
 
+    /// Turn the live-text ribbon on or off, as
+    /// [`crate::config::Config::show_live_text`] currently says.
+    ///
+    /// Pushed at startup and again on every config reload, the same way
+    /// [`Self::set_theme`] is: the toggle is the privacy escape hatch the
+    /// live-text design rests on, so it has to take effect when the user
+    /// edits it, not at the next restart. A sink that forwards partial text
+    /// anywhere **must** implement this; the default no-op is only correct
+    /// for sinks that never forward it in the first place.
+    fn set_show_live_text(&mut self, _on: bool) {}
+
     /// Engine label for the chip (e.g. `mock`, `deepgram`). Default no-op.
     fn set_engine(&mut self, _label: &str) {}
 
@@ -84,6 +95,9 @@ impl PillSink for Box<dyn PillSink> {
     }
     fn set_partial_text(&mut self, text: &str) {
         (**self).set_partial_text(text);
+    }
+    fn set_show_live_text(&mut self, on: bool) {
+        (**self).set_show_live_text(on);
     }
     fn set_engine(&mut self, label: &str) {
         (**self).set_engine(label);
@@ -132,6 +146,9 @@ impl PillSink for LogPill {
         // the width the ribbon is being asked to hold.
         iris_core::vlog!("pill: partial_text ({} chars)", text.chars().count());
     }
+    fn set_show_live_text(&mut self, on: bool) {
+        iris_core::vlog!("pill: show_live_text={on}");
+    }
     fn set_engine(&mut self, label: &str) {
         iris_core::vlog!("pill: engine={label}");
     }
@@ -178,6 +195,10 @@ impl OverlayPill {
     /// partial text is never forwarded to the overlay, which then never
     /// leaves its orb-only presentation — see
     /// [`crate::config::Config::show_live_text`] for why this exists.
+    ///
+    /// This is the value the process started with;
+    /// [`PillSink::set_show_live_text`] carries later edits to it, so a
+    /// config reload takes effect without a restart.
     #[must_use]
     pub fn new(handle: iris_overlay::OverlayHandle, show_live_text: bool) -> Self {
         Self {
@@ -205,6 +226,17 @@ impl PillSink for OverlayPill {
     fn set_partial_text(&mut self, text: &str) {
         if self.show_live_text {
             self.handle.set_partial_text(text);
+        }
+    }
+
+    fn set_show_live_text(&mut self, on: bool) {
+        self.show_live_text = on;
+        if !on {
+            // Whatever the ribbon is holding right now goes with the toggle:
+            // an empty partial collapses it back to the orb on the next
+            // frame, so turning the opt-out on never leaves transcript text
+            // on screen waiting for the next state change to clear it.
+            self.handle.set_partial_text("");
         }
     }
 
@@ -253,24 +285,47 @@ pub enum PillEvent {
     SetPartialText,
     /// [`PillSink::set_theme`].
     SetTheme(Theme),
+    /// [`PillSink::set_show_live_text`], with the value pushed.
+    SetShowLiveText(bool),
 }
 
 /// A test double that remembers the state transitions it was told about.
 ///
 /// Cloneable and shared, because the loop takes ownership of its sink and a
 /// test still has to see what the loop did with it.
+///
+/// It models [`PillSink::set_show_live_text`] the same way [`OverlayPill`]
+/// does — text arriving while the toggle is off is dropped, not recorded —
+/// because a double that recorded text the real sink would have thrown away
+/// could not be used to check the opt-out at all.
 #[derive(Debug, Clone, Default)]
 pub struct RecordingPill {
     state: std::sync::Arc<std::sync::Mutex<Recorded>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Recorded {
     events: Vec<PillEvent>,
     levels: Vec<f32>,
     engine: Option<String>,
     partial_lens: Vec<usize>,
     partial_texts: Vec<String>,
+    show_live_text: bool,
+}
+
+impl Default for Recorded {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            levels: Vec::new(),
+            engine: None,
+            partial_lens: Vec::new(),
+            partial_texts: Vec::new(),
+            // Matches `Config::show_live_text`'s default, so a sink nobody
+            // configures behaves like the shipping one.
+            show_live_text: true,
+        }
+    }
 }
 
 impl RecordingPill {
@@ -320,10 +375,17 @@ impl PillSink for RecordingPill {
     fn set_partial_text(&mut self, text: &str) {
         {
             let mut state = self.state.lock().expect("pill mutex");
+            if !state.show_live_text {
+                return;
+            }
             state.partial_lens.push(text.chars().count());
             state.partial_texts.push(text.to_string());
         }
         self.push(PillEvent::SetPartialText);
+    }
+    fn set_show_live_text(&mut self, on: bool) {
+        self.state.lock().expect("pill mutex").show_live_text = on;
+        self.push(PillEvent::SetShowLiveText(on));
     }
     fn set_engine(&mut self, label: &str) {
         self.state.lock().expect("pill mutex").engine = Some(label.to_string());

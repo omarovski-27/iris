@@ -142,7 +142,10 @@ insert the overlay holds the confirmation then exits itself — the loop does
 `set_partial_text` is what opens the overlay's live-transcript ribbon.
 `show_live_text = false` in the config makes `OverlayPill` swallow it, so the
 overlay never sees a partial and stays the quiet orb — the opt-out for anyone
-who does not want dictated words on screen.
+who does not want dictated words on screen. It is pushed through
+`PillSink::set_show_live_text` at startup and again on every "reload
+settings", the same way the theme is, so editing it takes effect without a
+restart.
 
 | Sink | When |
 |---|---|
