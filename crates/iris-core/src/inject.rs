@@ -97,13 +97,13 @@ pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    // Only a transcript long enough to be escalated ever consults the target,
-    // so the ordinary short dictation — the overwhelming common case — pays
-    // none of the OS calls `focused_target` makes.
-    let target = needs_more_than_one_batch(text)
-        .then(focused_target)
-        .flatten();
-    let effective = effective_method(text, method, target.as_ref());
+    // Asked once, here, and then handed to both things that need it. Only a
+    // transcript long enough to be escalated ever consults the target, so the
+    // ordinary short dictation — the overwhelming common case — pays none of
+    // the OS calls `focused_target` makes.
+    let needs_second_batch = needs_more_than_one_batch(text);
+    let target = needs_second_batch.then(focused_target).flatten();
+    let effective = effective_method(needs_second_batch, method, target.as_ref());
     if let (Method::SendInput, Some(target)) = (effective, &target) {
         vlog!(
             "{} ({}) does not take Ctrl+V as paste; typing this {}-character \
@@ -264,6 +264,14 @@ fn accepts_paste(target: Option<&Target>) -> bool {
 /// takes. Declining to paste injects nothing, so unlike a correction it is
 /// safe for exactly the keys the correction must not touch.
 ///
+/// "After the correction has had its chance" is a claim about the *reading*,
+/// not merely about statement order, and it is the caller's to honour:
+/// `GetAsyncKeyState` does not update synchronously for an injected key-up,
+/// so a reading taken the instant a correction was flushed can still say
+/// down and veto a paste the correction just made safe. `win::settled_reads_down`
+/// is what makes the reading honest, and it is the only thing that should
+/// produce `hotkey_down` here.
+///
 /// `win::paste` asks this twice, before and after writing the clipboard, for
 /// reasons given there; both answers come from this one rule.
 #[cfg(any(windows, test))]
@@ -309,6 +317,16 @@ const PACE_GAP: std::time::Duration = std::time::Duration::from_millis(8);
 /// Nothing at or under [`MAX_SEND_INPUT_CHARS`] is paced: that is the regime
 /// this project has evidence is already sound, and it is the overwhelmingly
 /// common one, so the ordinary dictation pays nothing for this.
+///
+/// The cost is not only wall-clock. Each gap is an open window in which the
+/// user's own keystrokes can land *inside* the transcript — most plausibly
+/// their next push-to-talk press, since back-to-back dictation is the
+/// documented common case for this product (see [`modifier_to_release`]) and
+/// a long transcript is exactly what is still injecting when it happens. A
+/// long burst was already split into several `SendInput` calls before pacing
+/// existed, so this widens that window rather than opening it; the trade is
+/// accepted deliberately, because interleaved input is visible and
+/// correctable where the silent garbling this guards against is neither.
 #[cfg(any(windows, test))]
 fn pacing(units: usize) -> Option<Pace> {
     (units > MAX_SEND_INPUT_CHARS).then_some(Pace {
@@ -397,8 +415,12 @@ const MAX_SEND_INPUT_CHARS: usize = BATCH / 2;
 /// `Method::default()`, so manufacturing the distinction by flipping the
 /// `Default` impl would break a pinned test there instead of adding the
 /// feature).
-fn effective_method(text: &str, requested: Method, target: Option<&Target>) -> Method {
-    if requested == Method::SendInput && needs_more_than_one_batch(text) && accepts_paste(target) {
+fn effective_method(
+    needs_second_batch: bool,
+    requested: Method,
+    target: Option<&Target>,
+) -> Method {
+    if requested == Method::SendInput && needs_second_batch && accepts_paste(target) {
         Method::Clipboard
     } else {
         requested
@@ -406,15 +428,17 @@ fn effective_method(text: &str, requested: Method, target: Option<&Target>) -> M
 }
 
 /// Whether `text` would need more than one `SendInput` batch — the single
-/// length question this module asks, named once so its two callers cannot
-/// drift apart.
+/// length question this module asks.
 ///
-/// [`effective_method`] asks it to decide whether to escalate; [`inject`]
-/// asks it first, to decide whether looking the target up is worth the OS
-/// calls. Were the second ever narrower than the first, `effective_method`
-/// would be handed `None` for a window it was supposed to examine and would
-/// escalate into it — silently, since the log line that explains a declined
-/// escalation only fires when there is a target to name.
+/// Asked exactly once, by [`inject`], which uses the answer for both things
+/// that depend on it: whether looking the target up is worth the OS calls,
+/// and whether to escalate. [`effective_method`] is handed that same answer
+/// rather than recomputing it, so the two cannot drift: were the lookup ever
+/// gated more narrowly than the escalation, `effective_method` would be
+/// handed `None` for a window it was supposed to examine and would escalate
+/// into it — silently, since the log line that explains a declined escalation
+/// only fires when there is a target to name. Walking [`crate::text::plan_len`]
+/// once also keeps the cost off a path measured in milliseconds.
 fn needs_more_than_one_batch(text: &str) -> bool {
     crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS
 }
@@ -484,10 +508,10 @@ fn modifier_to_release(hotkey: Key, hotkey_down: bool, genuinely_held: bool) -> 
 #[cfg(windows)]
 mod win {
     use anyhow::{bail, Context, Result};
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HWND};
+    use windows::core::{w, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Threading::{
@@ -574,7 +598,9 @@ mod win {
     }
 
     fn send_keystrokes(text: &str, hotkey: Key) -> Result<()> {
-        release_hotkey_if_stuck(hotkey)?;
+        // Nothing here reads the key's state afterwards, so whether a
+        // correction was made changes nothing about what follows.
+        let _ = release_hotkey_if_stuck(hotkey)?;
 
         let units = text::plan(text);
         let pace = super::pacing(units.len());
@@ -626,6 +652,38 @@ mod win {
     /// never on the common path where it does not.
     const SETTLE: std::time::Duration = std::time::Duration::from_millis(5);
 
+    /// Whether `release_hotkey_if_stuck` actually injected a corrective
+    /// key-up. Only the caller that goes on to *read* the key's state needs
+    /// this, and it needs it for the same reason `SETTLE` exists: the reading
+    /// and the thing that changed it update through independent paths.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Correction {
+        None,
+        Injected,
+    }
+
+    /// `reads_down`, but not poisoned by a correction this code just made.
+    ///
+    /// `GetAsyncKeyState` reflects an injected key-up no more synchronously
+    /// than a real one, so sampling immediately after `release_hotkey_if_stuck`
+    /// flushed a correction can report the very state the correction just
+    /// cleared. Anything deciding on that reading would then act on a desync
+    /// that no longer exists — `paste` would veto its own accelerator and
+    /// drop a long transcript onto the keystroke path the escalation exists
+    /// to get off, for no reason the user could see.
+    ///
+    /// So the settle is paid on exactly the readings that need it. A
+    /// correction is rare (it needs a genuine desync, and `RightAlt` and
+    /// `RightWin` never get one at all), and where none was injected there is
+    /// nothing to wait for: the common path — hotkey never down — stays free,
+    /// exactly as `SETTLE` already promises for the correction itself.
+    fn settled_reads_down(key: Key, corrected: Correction) -> bool {
+        if corrected == Correction::Injected {
+            std::thread::sleep(SETTLE);
+        }
+        reads_down(key)
+    }
+
     /// Correct the configured hotkey if Windows still thinks it is down.
     ///
     /// One dedicated `SendInput` call, issued and flushed before the burst
@@ -638,6 +696,11 @@ mod win {
     ///
     /// Scoped to `hotkey` alone, never a sweep of every standard modifier —
     /// see `super::modifier_to_release` for why that matters.
+    ///
+    /// Reports whether it injected anything. A caller that only sends a burst
+    /// afterwards can ignore that; a caller that goes on to *read* the key's
+    /// state cannot, because its own correction is the thing most likely to
+    /// make that reading stale — see `settled_reads_down`.
     ///
     /// Skips entirely when no hook is installed
     /// (`!hotkey::is_listening()`) — see that function's docs. Paths that
@@ -655,14 +718,14 @@ mod win {
     /// not, and cannot be without relaxing that constraint. This is
     /// deliberate, not an oversight: recorded here rather than papered over
     /// with a test that would only appear to cover it.
-    fn release_hotkey_if_stuck(hotkey: Key) -> Result<()> {
+    fn release_hotkey_if_stuck(hotkey: Key) -> Result<Correction> {
         if !crate::hotkey::is_listening() {
-            return Ok(());
+            return Ok(Correction::None);
         }
         let vk = hotkey.vk() as u16;
         let is_down = || reads_down(hotkey);
         if !is_down() {
-            return Ok(());
+            return Ok(Correction::None);
         }
         // The hotkey reads down: give the hook thread SETTLE to catch up
         // before trusting that against `is_held` (see SETTLE's docs), then
@@ -674,7 +737,7 @@ mod win {
         let down = is_down();
         let held = crate::hotkey::is_held();
         let Some(hotkey) = super::modifier_to_release(hotkey, down, held) else {
-            return Ok(());
+            return Ok(Correction::None);
         };
         // The root cause is unreproducible off the user's desk, so the code
         // itself is the field signal that confirms or refutes it.
@@ -685,7 +748,8 @@ mod win {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
         let mut correction = vec![key_event(vk, 0, flags)];
-        flush(&mut correction)
+        flush(&mut correction)?;
+        Ok(Correction::Injected)
     }
 
     fn key_event(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -757,6 +821,10 @@ mod win {
     /// where a user will see it — rather than trade one silent corruption bug
     /// for a subtler one.
     ///
+    /// What *is* mitigated rather than only disclosed is persistence, which
+    /// is a separate cost from the clobber: see
+    /// `decline_history_and_cloud_sync`.
+    ///
     /// Two things can still make the paste unusable after this is chosen, and
     /// neither may cost the user their words: the clipboard can be held open
     /// by another process, and the hotkey can still be down in a way that
@@ -773,12 +841,18 @@ mod win {
     /// the clipboard, and a hotkey pressed during that wait would otherwise
     /// reach the burst unnoticed.
     ///
+    /// Both readings come from `settled_reads_down`, never `reads_down`
+    /// directly. Each follows a `release_hotkey_if_stuck` that may just have
+    /// injected a key-up for this very key, and a raw reading taken then can
+    /// still report the state that correction cleared — which would veto the
+    /// paste on a desync that no longer exists.
+    ///
     /// Returning `Ok` means the four events entered the input stream. Whether
     /// the target resolved Ctrl+V as paste, and pasted correctly, is not
     /// observable from here — see the module docs.
     fn paste(text: &str, hotkey: Key) -> Result<()> {
-        release_hotkey_if_stuck(hotkey)?;
-        if !super::paste_accelerator_survives(hotkey, reads_down(hotkey)) {
+        let corrected = release_hotkey_if_stuck(hotkey)?;
+        if !super::paste_accelerator_survives(hotkey, settled_reads_down(hotkey, corrected)) {
             vlog!(
                 "the hotkey ({}) is down and would change Ctrl+V into another accelerator; \
                  typing the transcript instead, and leaving the clipboard alone",
@@ -791,7 +865,20 @@ mod win {
         // reasons that have nothing to do with the transcript. Losing a long
         // utterance to that would be the worst outcome of the whole feature.
         if let Err(e) = set_clipboard(text) {
-            vlog!("clipboard unavailable ({e:#}); typing the transcript instead");
+            if e.cleared {
+                vlog!(
+                    "the clipboard was emptied but the transcript could not be written to it \
+                     ({:#}); typing the transcript instead — the previous clipboard contents \
+                     are gone",
+                    e.source
+                );
+            } else {
+                vlog!(
+                    "clipboard unavailable ({:#}); typing the transcript instead, with the \
+                     previous clipboard contents left untouched",
+                    e.source
+                );
+            }
             return send_keystrokes(text, hotkey);
         }
         // Again, immediately before the burst: any gap between checking the
@@ -799,8 +886,8 @@ mod win {
         // state, and `set_clipboard` above is exactly such a gap. This
         // mirrors `send_keystrokes`, where the correction already immediately
         // precedes its burst.
-        release_hotkey_if_stuck(hotkey)?;
-        if !super::paste_accelerator_survives(hotkey, reads_down(hotkey)) {
+        let corrected = release_hotkey_if_stuck(hotkey)?;
+        if !super::paste_accelerator_survives(hotkey, settled_reads_down(hotkey, corrected)) {
             vlog!(
                 "the hotkey ({}) went down while the clipboard was being written; typing \
                  the transcript instead",
@@ -826,34 +913,150 @@ mod win {
         Ok(())
     }
 
-    fn set_clipboard(text: &str) -> Result<()> {
+    /// A failed clipboard write, and what it cost.
+    ///
+    /// `cleared` is the part the caller cannot infer: once `EmptyClipboard`
+    /// has succeeded the user's previous contents are gone whether or not the
+    /// replacement lands, so a failure after that point is not the free
+    /// fallback a failure before it is. `paste` says which happened rather
+    /// than reporting both as "clipboard unavailable".
+    struct ClipboardError {
+        cleared: bool,
+        source: anyhow::Error,
+    }
+
+    /// Copy `bytes` into the kind of block `SetClipboardData` accepts.
+    ///
+    /// The caller owns the returned handle until `set_clipboard_owned`
+    /// succeeds for it.
+    unsafe fn global_block(bytes: &[u8]) -> Result<HGLOBAL> {
+        unsafe {
+            let handle =
+                GlobalAlloc(GMEM_MOVEABLE, bytes.len()).context("allocating clipboard memory")?;
+            let ptr = GlobalLock(handle);
+            if ptr.is_null() {
+                let _ = GlobalFree(Some(handle));
+                bail!("locking clipboard memory failed");
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            let _ = GlobalUnlock(handle);
+            Ok(handle)
+        }
+    }
+
+    /// Hand `handle` to the clipboard under `format`.
+    ///
+    /// `SetClipboardData` takes ownership of the block only on success, so it
+    /// must not be freed there — but every failure path from the allocation
+    /// onwards must free it.
+    unsafe fn set_clipboard_owned(format: u32, handle: HGLOBAL) -> Result<()> {
+        unsafe {
+            if let Err(e) = SetClipboardData(format, Some(HANDLE(handle.0))) {
+                let _ = GlobalFree(Some(handle));
+                return Err(anyhow::Error::new(e));
+            }
+            Ok(())
+        }
+    }
+
+    /// Ask Windows to keep this clipboard item out of Clipboard History
+    /// (Win+V) and off Cloud Clipboard sync.
+    ///
+    /// Escalation put every long dictation on the clipboard automatically, so
+    /// without this a transcript does not merely clobber the clipboard — it
+    /// persists in the Win+V history after the dictation is over, and syncs
+    /// to the user's other devices when Cloud Clipboard is on. That is a
+    /// different and larger disclosure than the clobber, and Windows has a
+    /// supported way to decline it: three registered formats whose names the
+    /// system knows, documented under "Cloud Clipboard and Clipboard History
+    /// Formats" in the Win32 clipboard-formats topic.
+    /// `ExcludeClipboardContentFromMonitorProcessing` takes any data at all;
+    /// `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard` take a
+    /// serialised `DWORD` of zero to decline each individually. All three are
+    /// set: they are documented as independent, and the first is the one that
+    /// also asks clipboard monitors in general to leave the item alone.
+    ///
+    /// Deliberately best-effort and never fatal. Failing to register a
+    /// marker must not cost the user the transcript that the clipboard write
+    /// is there to deliver, and on a Windows build with no clipboard history
+    /// there is nothing to decline in the first place. It is also not a
+    /// guarantee against a third-party clipboard manager: that is a separate
+    /// program free to ignore the request, which is why
+    /// `crates/iris-app/README.md` discloses it as Windows' own history and
+    /// sync being excluded rather than as the transcript being private.
+    ///
+    /// This does not touch the live clipboard, so the documented recovery
+    /// path — the transcript still sitting there to be pasted by hand — is
+    /// unaffected.
+    unsafe fn decline_history_and_cloud_sync() {
+        unsafe {
+            for name in [
+                w!("ExcludeClipboardContentFromMonitorProcessing"),
+                w!("CanIncludeInClipboardHistory"),
+                w!("CanUploadToCloudClipboard"),
+            ] {
+                let format = RegisterClipboardFormatW(name);
+                if format == 0 {
+                    vlog!(
+                        "could not register a clipboard-history opt-out format ({})",
+                        windows::core::Error::from_thread()
+                    );
+                    continue;
+                }
+                // A serialised DWORD of zero: "no" to both of the formats
+                // that read a value, and acceptable as the "any data" the
+                // third takes.
+                let declined = global_block(&0u32.to_ne_bytes())
+                    .and_then(|block| set_clipboard_owned(format, block));
+                if let Err(e) = declined {
+                    vlog!("could not opt out of clipboard history/cloud sync ({e:#})");
+                }
+            }
+        }
+    }
+
+    fn set_clipboard(text: &str) -> std::result::Result<(), ClipboardError> {
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
         utf16.push(0);
-        let bytes = utf16.len() * std::mem::size_of::<u16>();
+        let bytes: Vec<u8> = utf16.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
 
         unsafe {
-            OpenClipboard(Some(HWND(std::ptr::null_mut())))
-                .context("another application is holding the clipboard open")?;
+            // Allocated and filled before the clipboard is even opened. Every
+            // step that can fail belongs on this side of `EmptyClipboard`:
+            // past that point the user's previous contents are already gone,
+            // and a failure there has nothing to put back.
+            let block = global_block(&bytes).map_err(|source| ClipboardError {
+                cleared: false,
+                source,
+            })?;
+
+            if let Err(source) = OpenClipboard(Some(HWND(std::ptr::null_mut())))
+                .context("another application is holding the clipboard open")
+            {
+                let _ = GlobalFree(Some(block));
+                return Err(ClipboardError {
+                    cleared: false,
+                    source,
+                });
+            }
             // From here on every path must close the clipboard.
-            let result = (|| -> Result<()> {
-                EmptyClipboard().context("emptying the clipboard")?;
-                let handle =
-                    GlobalAlloc(GMEM_MOVEABLE, bytes).context("allocating clipboard memory")?;
-                let ptr = GlobalLock(handle);
-                if ptr.is_null() {
-                    let _ = GlobalFree(Some(handle));
-                    bail!("locking clipboard memory failed");
-                }
-                std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
-                let _ = GlobalUnlock(handle);
-                // SetClipboardData takes ownership of the block only on
-                // success, so it must not be freed there — but every failure
-                // path from the allocation onwards must free it.
-                if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))) {
-                    let _ = GlobalFree(Some(handle));
-                    return Err(anyhow::Error::new(e).context("setting clipboard text"));
-                }
-                Ok(())
+            let result = (|| -> std::result::Result<(), ClipboardError> {
+                EmptyClipboard()
+                    .context("emptying the clipboard")
+                    .map_err(|source| {
+                        let _ = GlobalFree(Some(block));
+                        ClipboardError {
+                            cleared: false,
+                            source,
+                        }
+                    })?;
+                // Before the text, so the transcript is never on the
+                // clipboard for an instant without them.
+                decline_history_and_cloud_sync();
+                set_clipboard_owned(CF_UNICODETEXT, block).map_err(|source| ClipboardError {
+                    cleared: true,
+                    source: source.context("setting clipboard text"),
+                })
             })();
             let _ = CloseClipboard();
             result
@@ -898,10 +1101,17 @@ mod tests {
         }
     }
 
+    /// The method `inject` would settle on for `text`, wired the way `inject`
+    /// wires it: the length predicate asked once and handed to
+    /// `effective_method`, never recomputed inside it.
+    fn method_for(text: &str, requested: Method, target: Option<&Target>) -> Method {
+        effective_method(needs_more_than_one_batch(text), requested, target)
+    }
+
     #[test]
     fn short_text_keeps_the_requested_send_input_method() {
         assert_eq!(
-            effective_method("hello", Method::SendInput, None),
+            method_for("hello", Method::SendInput, None),
             Method::SendInput
         );
     }
@@ -913,7 +1123,7 @@ mod tests {
         // project has evidence is sound.
         let text = "a".repeat(MAX_SEND_INPUT_CHARS);
         assert_eq!(
-            effective_method(&text, Method::SendInput, None),
+            method_for(&text, Method::SendInput, None),
             Method::SendInput
         );
     }
@@ -922,22 +1132,24 @@ mod tests {
     fn text_needing_a_second_batch_is_escalated_to_clipboard() {
         let text = "a".repeat(MAX_SEND_INPUT_CHARS + 1);
         assert_eq!(
-            effective_method(&text, Method::SendInput, None),
+            method_for(&text, Method::SendInput, None),
             Method::Clipboard
         );
         assert_eq!(
-            effective_method(&text, Method::SendInput, Some(&ordinary_window())),
+            method_for(&text, Method::SendInput, Some(&ordinary_window())),
             Method::Clipboard
         );
     }
 
     #[test]
     fn the_target_lookup_and_the_escalation_share_one_length_predicate() {
-        // `inject` gates the target lookup on this predicate and
-        // `effective_method` escalates on it. If the first were ever narrower
-        // than the second, a window that should have been examined would be
-        // pasted into with no target consulted and nothing logged, which is
-        // exactly the failure the deny-list exists to prevent.
+        // `inject` gates the target lookup on this predicate and hands the
+        // same answer to `effective_method` rather than letting it ask again.
+        // Were the lookup ever gated more narrowly than the escalation, a
+        // window that should have been examined would be pasted into with no
+        // target consulted and nothing logged — exactly the failure the
+        // deny-list exists to prevent. Pinned across the boundary because the
+        // threshold is where a drift would first show.
         for units in [
             0,
             1,
@@ -949,7 +1161,7 @@ mod tests {
             let text = "a".repeat(units);
             assert_eq!(
                 needs_more_than_one_batch(&text),
-                effective_method(&text, Method::SendInput, None) == Method::Clipboard,
+                method_for(&text, Method::SendInput, None) == Method::Clipboard,
                 "{units} units"
             );
         }
@@ -961,12 +1173,12 @@ mod tests {
         // events regardless of length, so a short text must not be changed
         // any more than a long one already isn't.
         assert_eq!(
-            effective_method("hi", Method::Clipboard, None),
+            method_for("hi", Method::Clipboard, None),
             Method::Clipboard
         );
         let long = "a".repeat(MAX_SEND_INPUT_CHARS * 2);
         assert_eq!(
-            effective_method(&long, Method::Clipboard, None),
+            method_for(&long, Method::Clipboard, None),
             Method::Clipboard
         );
     }
@@ -998,7 +1210,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                effective_method(&long, Method::SendInput, Some(&target)),
+                method_for(&long, Method::SendInput, Some(&target)),
                 Method::SendInput,
                 "{target:?}"
             );
@@ -1063,7 +1275,7 @@ mod tests {
             process: "nvim-qt.exe".to_string(),
         };
         assert_eq!(
-            effective_method(&long, Method::SendInput, Some(&target)),
+            method_for(&long, Method::SendInput, Some(&target)),
             Method::SendInput
         );
     }
@@ -1102,7 +1314,7 @@ mod tests {
         let chars_needed = MAX_SEND_INPUT_CHARS / 2 + 1;
         let text = "\u{1F600}".repeat(chars_needed);
         assert_eq!(
-            effective_method(&text, Method::SendInput, None),
+            method_for(&text, Method::SendInput, None),
             Method::Clipboard
         );
     }
@@ -1128,7 +1340,7 @@ mod tests {
         );
         let text = crate::text::prepare(spoken, true);
         assert_eq!(
-            effective_method(&text, Method::SendInput, Some(&ordinary_window())),
+            method_for(&text, Method::SendInput, Some(&ordinary_window())),
             Method::Clipboard
         );
     }
@@ -1246,6 +1458,76 @@ mod tests {
         }
         steps.push(PasteStep::SendAccelerator);
         steps
+    }
+
+    /// Which of two possible `GetAsyncKeyState` answers `win::paste` actually
+    /// acts on, modelling `win::settled_reads_down`: `raw` is what the OS says
+    /// the instant `release_hotkey_if_stuck` flushed a correction — which may
+    /// still be the state that correction just cleared — and `settled` is what
+    /// it says once the settle has been paid. Reconstructed from the real
+    /// rule for the same reason `paste_steps` and `calls` are: `mod win` is
+    /// `cfg(windows)` and observing it for real would mean executing the
+    /// injection path, which this project forbids.
+    fn reading_used(corrected: bool, raw: bool, settled: bool) -> bool {
+        if corrected {
+            settled
+        } else {
+            raw
+        }
+    }
+
+    #[test]
+    fn a_hotkey_the_correction_just_released_does_not_veto_the_paste() {
+        // The race this closes: `release_hotkey_if_stuck` flushes a key-up for
+        // a genuinely stuck RightShift and returns immediately.
+        // `GetAsyncKeyState` does not update synchronously for an injected
+        // event, so a reading taken right then can still say down. Vetoing on
+        // it would decline the paste over a desync that no longer exists and
+        // drop the long transcript back onto the keystroke path the escalation
+        // exists to get off — a slower, worse delivery decided by timing the
+        // user cannot see.
+        let after_correction = reading_used(true, true, false);
+        assert!(!after_correction, "the settled reading is the honest one");
+        assert_eq!(
+            paste_steps(Key::RightShift, after_correction, after_correction),
+            vec![
+                PasteStep::Correct,
+                PasteStep::WriteClipboard,
+                PasteStep::Correct,
+                PasteStep::SendAccelerator
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hotkey_still_down_after_the_correction_settles_still_vetoes() {
+        // The other direction, and the reason this is a settle rather than
+        // "assume the correction worked": a correction that did not take
+        // leaves Ctrl+V genuinely spoiled, and the settled reading is what
+        // says so.
+        assert!(reading_used(true, true, true));
+        assert_eq!(
+            paste_steps(Key::RightShift, true, true),
+            vec![PasteStep::Correct, PasteStep::FallBackToKeystrokes]
+        );
+    }
+
+    #[test]
+    fn an_uncorrected_reading_is_never_made_to_wait() {
+        // RightAlt and RightWin are exactly the keys `modifier_to_release`
+        // refuses to correct, so nothing this code did can have staled their
+        // reading: there is no correction in flight to settle for, the veto is
+        // certain rather than racy, and the common path — a hotkey that never
+        // read down at all — pays no latency for this.
+        assert!(reading_used(false, true, false));
+        assert!(!reading_used(false, false, true));
+        for key in [Key::RightAlt, Key::RightWin] {
+            assert_eq!(
+                paste_steps(key, reading_used(false, true, false), true),
+                vec![PasteStep::Correct, PasteStep::FallBackToKeystrokes],
+                "{key}"
+            );
+        }
     }
 
     #[test]

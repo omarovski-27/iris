@@ -103,6 +103,27 @@ reasoning is in `win::paste`'s doc comment in `iris-core/src/inject.rs` (commit
 `e2aac70`). If you keep something on the clipboard you cannot lose, copy it back
 after a long dictation, or keep dictations short.
 
+**Where an escalated transcript can end up.** Clobbering is not the only cost of
+going through the clipboard: anything on it can be picked up by other software,
+and a dictation is not necessarily something you want kept. Iris asks Windows to
+keep the item out of **Clipboard History (Win+V)** and off **Cloud Clipboard
+sync**, using the three registered formats Windows documents for exactly that
+(`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`
+and `CanUploadToCloudClipboard`; see `decline_history_and_cloud_sync` in
+`iris-core/src/inject.rs`). Two limits on that, both real:
+
+- It is a request to the system, not a guarantee about other programs. **A
+  third-party clipboard manager is separate software that is free to ignore
+  it** — if you run one, assume it captures long dictations, and check its own
+  settings if that matters to you.
+- Iris cannot verify it from inside the app. This path only runs during real
+  injection, which this project does not execute unattended (see `CLAUDE.md`),
+  so the opt-out is the documented Windows mechanism applied as documented,
+  not something a test on your machine has confirmed.
+
+The transcript still sits on the live clipboard afterwards either way — that is
+deliberate, and it is the recovery path described below.
+
 That automatic escalation skips windows that do not treat Ctrl+V as paste —
 terminals (including ConEmu/Cmder, Hyper and Tabby), Remote Desktop and VM
 client windows, vim, Emacs. They keep the keystrokes, sent in smaller groups
@@ -110,6 +131,13 @@ with a short pause between them so a long transcript still arrives intact. The
 same keystroke fallback catches a clipboard that another application is holding
 open, and a hotkey still held down that would turn Ctrl+V into a different
 shortcut. All three fallbacks are logged under `--verbose`.
+
+Those pauses have a flip side worth knowing: anything *you* type during them
+lands in the middle of the transcript. Starting your next dictation while a long
+one is still being typed out is the likely way to see it. Long transcripts were
+already split into several bursts before the pauses existed, so this widens the
+window rather than creating it — and unlike the garbling it prevents, it is
+visible on screen.
 
 All of that applies to the automatic escalation only — that is, to the default
 `method = "sendinput"`. Setting `method = "clipboard"` is your own choice and is
