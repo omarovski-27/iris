@@ -70,4 +70,4 @@ pub use config::{Config, EngineChoice, Theme};
 pub use history::{DictationRecord, LatencyBreakdown, SessionLog};
 pub use inject::{Injector, RecordingInjector};
 pub use pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillEvent, PillSink, RecordingPill};
-pub use window::{NoopWindow, WindowSink};
+pub use window::{NoopWindow, RecordingWindow, WindowSink};

@@ -91,6 +91,36 @@ impl WindowSink for NoopWindow {
     fn open(&self) {}
 }
 
+/// A test double that counts [`WindowSink::open`] calls.
+///
+/// Cloneable and shared, because the loop takes ownership of its window sink
+/// and a test still has to see what the loop did with it — the same shape as
+/// [`crate::pill::RecordingPill`].
+#[derive(Debug, Clone, Default)]
+pub struct RecordingWindow {
+    opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RecordingWindow {
+    /// A sink that has not been opened.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many times [`WindowSink::open`] was called.
+    #[must_use]
+    pub fn opens(&self) -> usize {
+        self.opens.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl WindowSink for RecordingWindow {
+    fn open(&self) {
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Start the settings window on its own thread.
 ///
 /// On Windows this is a real `eframe` window, opened lazily on the first
@@ -121,5 +151,15 @@ mod tests {
         NoopWindow.open();
         let boxed: Box<dyn WindowSink> = Box::new(NoopWindow);
         boxed.open();
+    }
+
+    #[test]
+    fn recording_window_counts_opens_through_a_clone() {
+        let window = RecordingWindow::new();
+        let observer = window.clone();
+        assert_eq!(observer.opens(), 0);
+        window.open();
+        window.open();
+        assert_eq!(observer.opens(), 2);
     }
 }

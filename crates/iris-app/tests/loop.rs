@@ -19,7 +19,7 @@ use iris_app::app::Command;
 use iris_app::audio::ChannelAudio;
 use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
-use iris_app::{App, Injector, RecordingInjector, RecordingPill, SessionLog};
+use iris_app::{App, Injector, RecordingInjector, RecordingPill, RecordingWindow, SessionLog};
 use iris_core::engine::{Engine, Session, TranscriptEvent};
 use iris_core::hotkey::{HotkeyEvent, Key};
 
@@ -37,6 +37,7 @@ struct Rig {
     commands_rx: Receiver<Command>,
     injector: Arc<RecordingInjector>,
     pill: RecordingPill,
+    window: RecordingWindow,
     config_path: std::path::PathBuf,
     history_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
@@ -61,6 +62,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     let frames = audio.sender();
     let armed = audio.armed();
     let pill = RecordingPill::new();
+    let window = RecordingWindow::new();
 
     let app = App::new(
         config,
@@ -71,7 +73,8 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     )
     .expect("building the app")
     // Keep a failing test from hanging for ten seconds per dictation.
-    .with_final_timeout(Duration::from_secs(5));
+    .with_final_timeout(Duration::from_secs(5))
+    .with_window(Box::new(window.clone()));
 
     let (keys, keys_rx) = crossbeam_channel::unbounded();
     let (commands, commands_rx) = crossbeam_channel::unbounded();
@@ -86,6 +89,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
         commands_rx,
         injector,
         pill,
+        window,
         config_path,
         history_path,
         _dir: dir,
@@ -1065,6 +1069,55 @@ fn a_tray_command_changes_and_persists_the_setting() {
     // ...and it survives a restart.
     let saved = Config::load(&config_path).expect("the config was written");
     assert!(!saved.polish.enabled);
+}
+
+/// The tray's `Settings` item (`Command::OpenSettings`) must reach the
+/// window, not shell out to an editor — the whole point of this crate having
+/// a real settings window at all.
+#[test]
+fn open_settings_opens_the_window() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let window = rig.window.clone();
+
+    commands.send(Command::OpenSettings).unwrap();
+    commands.send(Command::OpenSettings).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(window.opens(), 2);
+}
+
+/// The window sends `Command`s on its own channel, distinct from the tray's,
+/// and `App::run` must drain both — this is what lets a setting changed in
+/// the window take effect without a second, window-owned copy of `App::apply`.
+#[test]
+fn a_window_command_is_applied_the_same_as_a_tray_command() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let tray_commands = rig.commands.clone();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+
+    window_commands_tx
+        .send(Command::SetTheme(Theme::Light))
+        .unwrap();
+    tray_commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app.with_window_commands(window_commands_rx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(app.config().theme, Theme::Light);
 }
 
 #[test]
