@@ -561,15 +561,30 @@ fn a_tray_save_never_persists_a_cli_override() {
 /// same treatment `theme` already gets. Before this, the flag was frozen into
 /// the overlay sink at startup and the reload said "reloaded" while the
 /// transcript kept appearing on screen until the process restarted.
+///
+/// What the loop owes the sink is the pushed value, at startup and again on
+/// every reload, and that is exactly what this asserts. The other half — the
+/// sink dropping partial text once it has been pushed `false` — belongs to
+/// `OverlayPill` and is pinned there, against the real sink, by
+/// `set_show_live_text_moves_the_real_gate_both_ways`.
 #[test]
-fn reload_turning_off_live_text_stops_text_reaching_the_overlay() {
+fn reload_pushes_the_live_text_opt_out_down_without_a_restart() {
     let mut rig = rig();
     rig.dictate().expect("first dictation");
-    let before = rig.pill.partial_texts().len();
     assert!(
-        before > 0,
+        !rig.pill.partial_texts().is_empty(),
         "the live ribbon never got any text to begin with"
     );
+    let pushed = |pill: &RecordingPill| -> Vec<bool> {
+        pill.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                PillEvent::SetShowLiveText(on) => Some(on),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(pushed(&rig.pill), [true], "startup never told the sink");
 
     // The user edits config.toml and asks for a reload — no restart.
     let mut off = Config::default();
@@ -581,16 +596,17 @@ fn reload_turning_off_live_text_stops_text_reaching_the_overlay() {
     rig.app
         .run(&rig.keys_rx, &rig.commands_rx)
         .expect("the loop should exit on Quit");
-    assert!(!rig.app.config().show_live_text, "the reload did not land");
 
-    rig.dictate().expect("second dictation");
+    assert!(!rig.app.config().show_live_text, "the reload did not land");
     assert_eq!(
-        rig.pill.partial_texts().len(),
-        before,
-        "partial text reached the overlay after the opt-out was turned on: {:?}",
-        rig.pill.partial_texts()
+        pushed(&rig.pill),
+        [true, false],
+        "the reloaded opt-out never reached the sink: {:?}",
+        rig.pill.events()
     );
+
     // ... and the dictation itself is untouched: only the display changed.
+    rig.dictate().expect("second dictation");
     assert_eq!(rig.injector.inserted().len(), 2);
 }
 

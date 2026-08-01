@@ -212,6 +212,17 @@ impl OverlayPill {
     pub fn handle(&self) -> &iris_overlay::OverlayHandle {
         &self.handle
     }
+
+    /// What [`PillSink::set_partial_text`] would hand to the overlay: the text
+    /// itself, or nothing at all while the live-text opt-out is on.
+    ///
+    /// The single place the gate is decided, so a test can exercise the real
+    /// decision rather than a double's imitation of it — the overlay end of
+    /// the handle is a command channel owned by another thread and cannot be
+    /// observed from here.
+    fn partial_for_overlay<'a>(&self, text: &'a str) -> Option<&'a str> {
+        self.show_live_text.then_some(text)
+    }
 }
 
 impl PillSink for OverlayPill {
@@ -224,7 +235,7 @@ impl PillSink for OverlayPill {
     }
 
     fn set_partial_text(&mut self, text: &str) {
-        if self.show_live_text {
+        if let Some(text) = self.partial_for_overlay(text) {
             self.handle.set_partial_text(text);
         }
     }
@@ -294,38 +305,24 @@ pub enum PillEvent {
 /// Cloneable and shared, because the loop takes ownership of its sink and a
 /// test still has to see what the loop did with it.
 ///
-/// It models [`PillSink::set_show_live_text`] the same way [`OverlayPill`]
-/// does — text arriving while the toggle is off is dropped, not recorded —
-/// because a double that recorded text the real sink would have thrown away
-/// could not be used to check the opt-out at all.
+/// It records every call and interprets none of them — including
+/// [`PillSink::set_show_live_text`], which lands as a [`PillEvent`] and does
+/// not gate anything here. Re-implementing [`OverlayPill`]'s gate in the
+/// double would mean tests passing on the double's copy of the rule while the
+/// real one drifted; what the loop owes the sink is the pushed flag, and that
+/// is what this lets a test see.
 #[derive(Debug, Clone, Default)]
 pub struct RecordingPill {
     state: std::sync::Arc<std::sync::Mutex<Recorded>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Recorded {
     events: Vec<PillEvent>,
     levels: Vec<f32>,
     engine: Option<String>,
     partial_lens: Vec<usize>,
     partial_texts: Vec<String>,
-    show_live_text: bool,
-}
-
-impl Default for Recorded {
-    fn default() -> Self {
-        Self {
-            events: Vec::new(),
-            levels: Vec::new(),
-            engine: None,
-            partial_lens: Vec::new(),
-            partial_texts: Vec::new(),
-            // Matches `Config::show_live_text`'s default, so a sink nobody
-            // configures behaves like the shipping one.
-            show_live_text: true,
-        }
-    }
 }
 
 impl RecordingPill {
@@ -375,16 +372,12 @@ impl PillSink for RecordingPill {
     fn set_partial_text(&mut self, text: &str) {
         {
             let mut state = self.state.lock().expect("pill mutex");
-            if !state.show_live_text {
-                return;
-            }
             state.partial_lens.push(text.chars().count());
             state.partial_texts.push(text.to_string());
         }
         self.push(PillEvent::SetPartialText);
     }
     fn set_show_live_text(&mut self, on: bool) {
-        self.state.lock().expect("pill mutex").show_live_text = on;
         self.push(PillEvent::SetShowLiveText(on));
     }
     fn set_engine(&mut self, label: &str) {
@@ -515,16 +508,48 @@ mod tests {
         let overlay =
             iris_overlay::spawn(iris_overlay::OverlayConfig::default()).expect("overlay starts");
         let mut pill = OverlayPill::new(overlay.handle(), false);
+        assert_eq!(pill.partial_for_overlay("this must not reach it"), None);
         pill.show_listening();
         pill.update_level(0.5);
         pill.set_partial_text("this must not reach the overlay");
         pill.processing();
         pill.inserted(90);
         overlay.shutdown();
-        // Nothing here asserts on the overlay's internal state directly —
-        // `iris_overlay::Model` is crate-private — so this is a liveness/
-        // compile-level guard: `OverlayPill::set_partial_text` gates the
-        // forward on `show_live_text`, and this test pins that the gate
-        // exists and the call sequence does not panic or block with it off.
+    }
+
+    /// The reload path pushes the current setting through
+    /// [`PillSink::set_show_live_text`], and this is the production sink's
+    /// half of that promise: the same decision `set_partial_text` forwards on
+    /// has to follow the pushed value, in both directions and with no
+    /// restart. Asserted against the real [`OverlayPill`], not a double —
+    /// the far end of an `OverlayHandle` is another thread's command queue
+    /// and cannot be read back from here.
+    #[test]
+    fn set_show_live_text_moves_the_real_gate_both_ways() {
+        let overlay =
+            iris_overlay::spawn(iris_overlay::OverlayConfig::default()).expect("overlay starts");
+        let mut pill = OverlayPill::new(overlay.handle(), true);
+        assert_eq!(
+            pill.partial_for_overlay("the quarterly"),
+            Some("the quarterly")
+        );
+
+        pill.set_show_live_text(false);
+        assert_eq!(
+            pill.partial_for_overlay("the quarterly"),
+            None,
+            "the opt-out did not reach the sink's own gate"
+        );
+        pill.show_listening();
+        pill.set_partial_text("this must not reach the overlay");
+
+        pill.set_show_live_text(true);
+        assert_eq!(
+            pill.partial_for_overlay("the quarterly"),
+            Some("the quarterly"),
+            "turning the opt-out back off left the ribbon mute"
+        );
+        pill.set_partial_text("the quarterly");
+        overlay.shutdown();
     }
 }

@@ -494,25 +494,20 @@ impl Ctx<'_> {
 
     /// How present `state` is, cross-fading with whatever we came from.
     ///
-    /// The cross-fade is frozen while the shape is *leaving*. `Hidden` draws
-    /// nothing, so once it is the current state there is nothing to cross-fade
-    /// *into*: the exit is carried entirely by [`Model::presence`], and letting
-    /// the cross run as well means every term written as `1.0 - inserted`
-    /// (the core dot) or `1.0 - inserted * 0.9` (the wave row) *inverts* over
-    /// the 90 ms after the inserted hold expires — the checkmark dissolved
-    /// into a re-emerging mint dot and a full bar row while the shape faded
-    /// out. Holding the last visible state at full weight leaves presence as
-    /// the single thing that animates an exit, which is what it was always
-    /// meant to be. Enter, and every visible-to-visible transition, are
-    /// untouched.
+    /// Reads [`shown_state`] / [`shown_cross`], so the cross-fade is frozen
+    /// while the shape is *leaving*. Letting it run there means every term
+    /// written as `1.0 - inserted` (the core dot) or `1.0 - inserted * 0.9`
+    /// (the wave row) *inverts* over the 90 ms after the inserted hold
+    /// expires — the checkmark dissolved into a re-emerging mint dot and a
+    /// full bar row while the shape faded out. Holding the last visible state
+    /// at full weight leaves presence as the single thing that animates an
+    /// exit, which is what it was always meant to be. Enter, and every
+    /// visible-to-visible transition, are untouched.
     fn state_alpha(&self, state: OverlayState) -> f32 {
-        if !self.model.state().is_visible() {
-            return f32::from(self.model.previous_state() == state);
-        }
         fade_between(
-            self.model.state() == state,
+            shown_state(self.model) == state,
             self.model.previous_state() == state,
-            self.model.cross(),
+            shown_cross(self.model),
         )
     }
 
@@ -521,6 +516,38 @@ impl Ctx<'_> {
         let mut pts = [Point::from_xy(x, y)];
         self.xf.map_points(&mut pts);
         (pts[0].x, pts[0].y)
+    }
+}
+
+/// The state whose *look* the frame is drawing.
+///
+/// [`OverlayState::Hidden`] has no look of its own: leaving is a fade of
+/// whatever was last on screen, carried entirely by [`Model::presence`]. So
+/// while the shape is on its way out this is the state it is leaving *from*,
+/// and every appearance decision in this module reads it instead of
+/// [`Model::state`] — one place, so an exit can never half-switch, with the
+/// wave row and the core dot holding while the glow, the core's colour or the
+/// processing shimmer jump to their `Hidden` answers on the first exit frame.
+///
+/// What deliberately does *not* read it: anything measuring elapsed time in
+/// the current state (the check's draw-on progress), and the ribbon's
+/// open/closed target, which is geometry — the ribbon still collapses as the
+/// shape leaves.
+fn shown_state(model: &Model) -> OverlayState {
+    if model.state().is_visible() {
+        model.state()
+    } else {
+        model.previous_state()
+    }
+}
+
+/// Progress of the cross-fade into [`shown_state`], frozen at 1.0 while the
+/// shape is leaving — there is nothing to cross-fade into.
+fn shown_cross(model: &Model) -> f32 {
+    if model.state().is_visible() {
+        model.cross()
+    } else {
+        1.0
     }
 }
 
@@ -611,13 +638,24 @@ fn fill_through(pixmap: &mut Pixmap, mask: &Mask, colour: Rgba) {
     pixmap.fill_rect(rect, &paint, Transform::identity(), Some(mask));
 }
 
+/// The state halo's colour, cross-fading between the state being left and the
+/// one being shown.
 fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
     let pick = |state: OverlayState| match state {
         OverlayState::Listening => theme.glow_listening,
         OverlayState::Inserted => theme.glow_inserted,
         _ => theme.glow_idle,
     };
-    pick(model.previous_state()).lerp(pick(model.state()), model.cross())
+    pick(model.previous_state()).lerp(pick(shown_state(model)), shown_cross(model))
+}
+
+/// The core dot's colour: sky while the engine is working, mint otherwise.
+fn core_colour(theme: &Theme, model: &Model) -> Rgba {
+    if shown_state(model) == OverlayState::Processing {
+        theme.accent
+    } else {
+        theme.rec
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -806,11 +844,7 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
         }
     }
 
-    let core_colour = if model.state() == OverlayState::Processing {
-        theme.accent
-    } else {
-        theme.rec
-    };
+    let core_colour = core_colour(theme, model);
     let mut core_r = l.shape_h * 0.15;
     if listening > 0.0 {
         let t = (model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
@@ -918,7 +952,7 @@ fn draw_ribbon(
     let l = ctx.layout;
     let theme = ctx.theme;
 
-    if ctx.model.state() == OverlayState::Processing {
+    if shown_state(ctx.model) == OverlayState::Processing {
         let phase = (ctx.model.now_ms() % u64::from(SCAN_PERIOD_MS)) as f32 / SCAN_PERIOD_MS as f32;
         let band_w = w * 0.35;
         let band_x = x - band_w + (w + band_w) * phase;
@@ -1067,7 +1101,7 @@ fn stroke(pixmap: &mut Pixmap, ctx: &Ctx<'_>, path: Option<Path>, colour: Rgba, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{EXIT_MS, INSERTED_HOLD_MS};
+    use crate::motion::{EXIT_MS, INSERTED_HOLD_MS, STATE_CROSS_MS};
     use crate::state::Command;
     use crate::theme::{PORCELAIN_LIGHT, PRISM_DARK};
 
@@ -1259,6 +1293,81 @@ mod tests {
             sampled += 1;
         }
         assert!(sampled > 4, "only {sampled} exit frames sampled");
+    }
+
+    /// Every appearance decision has to agree about what is on screen while
+    /// the shape leaves. The state weights were frozen first; the halo
+    /// colour, the core dot's colour and the processing shimmer are the
+    /// siblings that used to read the raw state and so answered `Hidden` from
+    /// the first exit frame — the halo lerping mint → sky and 0.12 → 0.08
+    /// alpha, and the core snapping sky → mint the instant a cancel from
+    /// `Processing` landed, all while the shape they belong to was still
+    /// fully drawn.
+    #[test]
+    fn colour_and_shimmer_hold_their_answers_through_the_exit() {
+        for (name, setup, hide) in [
+            (
+                "inserted",
+                vec![
+                    Command::ShowListening,
+                    Command::Inserted { latency_ms: 142 },
+                ],
+                false,
+            ),
+            (
+                "cancelled while processing",
+                vec![Command::ShowListening, Command::Processing],
+                true,
+            ),
+            (
+                "cancelled while listening",
+                vec![Command::ShowListening],
+                true,
+            ),
+        ] {
+            for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+                let mut model = Model::new(theme);
+                model.tick(0);
+                for c in &setup {
+                    model.apply(c.clone());
+                }
+                let mut t = 0u64;
+                // Settle the state cross-fade, then start leaving.
+                while t < u64::from(STATE_CROSS_MS) + 32 {
+                    t += 16;
+                    model.tick(t);
+                }
+                let last_visible = (
+                    shown_state(&model),
+                    glow_colour(&theme, &model),
+                    core_colour(&theme, &model),
+                );
+                if hide {
+                    model.apply(Command::Hide);
+                }
+
+                let mut frames = 0;
+                while !model.is_idle() {
+                    t += 16;
+                    model.tick(t);
+                    if model.state().is_visible() {
+                        continue;
+                    }
+                    assert_eq!(
+                        (
+                            shown_state(&model),
+                            glow_colour(&theme, &model),
+                            core_colour(&theme, &model)
+                        ),
+                        last_visible,
+                        "{name} on {}: the look changed at {t} ms, mid-exit",
+                        theme.name
+                    );
+                    frames += 1;
+                }
+                assert!(frames > 4, "{name}: only {frames} exit frames sampled");
+            }
+        }
     }
 
     /// The same thing at the pixel level, and the reason it is worth two
