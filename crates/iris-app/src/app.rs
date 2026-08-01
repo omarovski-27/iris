@@ -353,16 +353,22 @@ impl<A: AudioSource> App<A> {
                 self.persist();
             }
             Command::SetHotkey(key) => {
-                if key != self.config.hotkey {
-                    self.config.hotkey = key;
+                // `self.config.hotkey` is deliberately left alone: the hook
+                // was installed with the old key in `main` and stays that
+                // way until a restart, exactly like a hand-edited hotkey
+                // does through `Command::Reload`. Only `saved` — what the
+                // *next* launch will read — takes the new value.
+                if key != self.saved.hotkey {
                     self.saved.hotkey = key;
                     println!("  hotkey: {key} (restart Iris for this to take effect)");
                     self.persist();
                 }
             }
             Command::SetOverlayEnabled(enabled) => {
-                if enabled != self.config.overlay_enabled {
-                    self.config.overlay_enabled = enabled;
+                // Same reasoning as `SetHotkey`: the overlay is spawned (or
+                // not) once in `main`, so `self.config.overlay_enabled` stays
+                // as it was until a restart.
+                if enabled != self.saved.overlay_enabled {
                     self.saved.overlay_enabled = enabled;
                     println!(
                         "  overlay: {} (restart Iris for this to take effect)",

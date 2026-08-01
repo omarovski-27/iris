@@ -1071,6 +1071,41 @@ fn a_tray_command_changes_and_persists_the_setting() {
     assert!(!saved.polish.enabled);
 }
 
+/// `SetHotkey` and `SetOverlayEnabled` are the two settings this window adds
+/// beyond what the tray already exposed. Both are restart-gated (the hook
+/// and the overlay are both set up once in `main`), so the acceptance bar
+/// for them is narrower than a live setting: persisted, and the running
+/// process's in-force config deliberately left alone until restart — proven
+/// here the same way `reload_keeps_in_force_settings_that_need_a_restart`
+/// proves it for a hand-edited file.
+#[test]
+fn hotkey_and_overlay_changes_persist_but_wait_for_a_restart() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    commands.send(Command::SetHotkey(Key::F9)).unwrap();
+    commands.send(Command::SetOverlayEnabled(false)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    // In force: unchanged, because a restart is what applies these.
+    assert_eq!(app.config().hotkey, Key::RightCtrl);
+    assert!(app.config().overlay_enabled);
+
+    // On disk: changed, so the next launch picks them up.
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(saved.hotkey, Key::F9);
+    assert!(!saved.overlay_enabled);
+}
+
 /// The tray's `Settings` item (`Command::OpenSettings`) must reach the
 /// window, not shell out to an editor — the whole point of this crate having
 /// a real settings window at all.
