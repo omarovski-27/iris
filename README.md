@@ -27,7 +27,7 @@ First dictation:
 
 1. A tray icon appears (prism triangle). Right-click for engine / theme / polish.
 2. Hold **Right-Ctrl**, speak, release.
-3. The Prism pill appears bottom-centre while you talk; text is polished and injected into the focused window.
+3. The Prism pill appears bottom-centre while you talk — a quiet orb that opens into a ribbon showing your words as they are heard (set `show_live_text = false` to keep it orb-only); text is polished and injected into the focused window.
 4. Session history lands in `history.jsonl` beside the config.
 
 ### Config location
@@ -96,7 +96,7 @@ run anywhere.
 - [`crates/iris-spike/README.md`](crates/iris-spike/README.md) — running the
   spike, and how to read the latency report
 - [`crates/iris-overlay/README.md`](crates/iris-overlay/README.md) — the pill
-  overlay API, design lock, and demo
+  overlay API, the design record, and the demo
 - [`docs/spike-findings.md`](docs/spike-findings.md) — measured latency, where
   the budget goes, architecture recommendation
 - [`docs/dev-windows.md`](docs/dev-windows.md) — building for Windows from WSL2

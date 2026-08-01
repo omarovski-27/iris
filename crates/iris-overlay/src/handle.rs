@@ -35,8 +35,11 @@ impl Drop for AliveGuard {
 pub struct OverlayConfig {
     /// Palette to start in. Defaults to [`PRISM_DARK`], the locked v1 default.
     pub theme: Theme,
-    /// Initial engine label for the chip, e.g. `groq · whisper-large-v3-turbo · en`.
-    /// May be empty; the chip is simply not drawn.
+    /// Initial engine label, e.g. `groq · whisper-large-v3-turbo · en`.
+    ///
+    /// Carried on the model for continuity, but not rendered by this design —
+    /// see [`OverlayHandle::set_engine`] and [`crate::state::Command::Engine`].
+    /// May be empty.
     pub engine: String,
 }
 
@@ -151,10 +154,10 @@ pub fn spawn(config: OverlayConfig) -> Result<Overlay, OverlayError> {
 /// let pill = overlay.handle();
 ///
 /// pill.set_engine("groq · whisper-large-v3-turbo · en");
-/// pill.show_listening();          // hotkey down
-/// pill.update_level(0.62);        // ... per audio frame
-/// pill.set_partial_len(31);       // ... per partial transcript
-/// pill.processing();              // hotkey up
+/// pill.show_listening();                      // hotkey down
+/// pill.update_level(0.62);                    // ... per audio frame
+/// pill.set_partial_text("the quarterly");     // ... per partial transcript
+/// pill.processing();                          // hotkey up
 /// pill.inserted(142);             // text landed; hides itself after ~550 ms
 /// # Ok(())
 /// # }
@@ -188,17 +191,21 @@ impl OverlayHandle {
         self.send(Command::Level(level));
     }
 
-    /// Report how many characters of partial transcript exist so far.
+    /// Report the current partial-transcript text.
     ///
-    /// Drives the partial ribbon along the bottom of the pill. Deliberately a
-    /// length and not the text: the overlay never holds transcript content, so
-    /// there is nothing on screen to read over the user's shoulder and nothing
-    /// in a crash dump.
-    pub fn set_partial_len(&self, chars: usize) {
-        self.send(Command::PartialLen(chars));
+    /// The overlay holds this string for exactly as long as the ribbon showing
+    /// it is on screen, and never persists, transmits, or logs it — see
+    /// `README.md` "Design provenance" for why this direction reverses the
+    /// previous "never holds transcript content" rule, and under what
+    /// condition. Call it as often as the transcript updates; each call
+    /// replaces the previous text outright; an empty string collapses the
+    /// ribbon back to the quiet orb.
+    pub fn set_partial_text(&self, text: impl Into<String>) {
+        self.send(Command::PartialText(text.into()));
     }
 
-    /// Set the engine label shown in the chip below the pill while listening.
+    /// Set the engine label. Carried on the model for continuity, but not
+    /// rendered by this design — see [`crate::state::Command::Engine`].
     pub fn set_engine(&self, label: impl Into<String>) {
         self.send(Command::Engine(label.into()));
     }
@@ -274,7 +281,7 @@ mod tests {
         let (h, rx) = wired();
         h.show_listening();
         h.update_level(0.5);
-        h.set_partial_len(7);
+        h.set_partial_text("hi there");
         h.set_engine("groq");
         h.processing();
         h.inserted(142);
@@ -283,7 +290,7 @@ mod tests {
 
         assert!(matches!(rx.recv().unwrap(), Command::ShowListening));
         assert!(matches!(rx.recv().unwrap(), Command::Level(v) if (v - 0.5).abs() < 1e-6));
-        assert!(matches!(rx.recv().unwrap(), Command::PartialLen(7)));
+        assert!(matches!(rx.recv().unwrap(), Command::PartialText(s) if s == "hi there"));
         assert!(matches!(rx.recv().unwrap(), Command::Engine(s) if s == "groq"));
         assert!(matches!(rx.recv().unwrap(), Command::Processing));
         assert!(matches!(
@@ -427,9 +434,10 @@ mod tests {
 
         h.set_engine("deepgram · nova-3 · en");
         h.show_listening();
-        for i in 0..10 {
+        let words = ["the", "the quarterly", "the quarterly report"];
+        for (i, w) in words.iter().enumerate() {
             h.update_level(0.1 * i as f32);
-            h.set_partial_len(i * 4);
+            h.set_partial_text(*w);
         }
         h.processing();
         h.inserted(142);
@@ -443,6 +451,7 @@ mod tests {
         assert_eq!(model.state(), crate::OverlayState::Inserted);
         assert_eq!(model.latency_ms(), Some(142));
         assert_eq!(model.engine(), "deepgram · nova-3 · en");
+        assert_eq!(model.text(), "the quarterly report");
     }
 
     #[test]

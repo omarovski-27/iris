@@ -137,19 +137,29 @@ When updating this file, preserve this bar for all agents and keep entries conci
 
 - Crate: `crates/iris-overlay/`. App adapter: `iris-app::pill::OverlayPill`
   (implements `PillSink`). `OverlayHandle` is the low-level contract; see
-  `crates/iris-overlay/README.md` for rendering/WSL notes.
-- The design is **captain-locked** (2026-07-31): Prism dark default, Porcelain
-  light, listening-only telemetry chip, prism-triangle icon (tray uses the same
-  mark via `tray::icon_rgba`). Source mockups:
-  `/home/omar/firstmate/data/iris-design/`.
-- Geometry is a compact HUD chip (`168×34`, radius 17 in `layout.rs`) — desk
-  feedback tightened it from the mockup recorder bar so it does not read as a
-  digital recording strip. No solid rec-red (mint/sky live core); spectrum stays
-  on the waveform only. Motion timings in `motion.rs` stay captain criteria.
+  `crates/iris-overlay/README.md` for the full design record, rendering, and
+  WSL notes — that file is the authority on exact geometry and colour tokens,
+  not this one.
+- The design is **captain-decided** (2026-07-31, superseding the prior
+  captain-locked fixed capsule of the same date): a shape-shifting orb that
+  opens into a live-text ribbon, Prism dark default, Porcelain light,
+  prism-triangle icon unchanged (tray uses the same mark via
+  `tray::icon_rgba`). Full rationale and the two rejected alternatives:
+  `data/iris-ui-directions/report.md` in the fleet's records.
+- Geometry is one capsule whose width animates between an orb (`layout::ORB_D`)
+  and an open ribbon (`layout::RIBBON_MAX_W`) — there is no fixed pill size any
+  more. No solid rec-red (mint/sky live core). Motion timings in `motion.rs`
+  are unchanged and stay captain criteria; every one is imported by the new
+  shape, not copied.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
 - The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is
   the only `cfg(windows)` file. That is what lets `cargo run --example pill-demo
   -- --filmstrip <dir>` produce reviewable PNGs of the real frames from Linux.
-- The pill is a display: it never activates, never hit-tests, holds no
-  transcript text, and never injects input.
+- The pill is a display: it never activates, never hit-tests, and never
+  injects input. It **does** now hold the live transcript text on screen while
+  the ribbon is open — a deliberate, captain-approved reversal of the previous
+  "never holds transcript text" rule, with a config opt-out
+  (`iris-app::config::Config`) that falls back to the orb-only presentation.
+  See `crates/iris-overlay/README.md` "The contract changed, and here is why"
+  before touching this again.

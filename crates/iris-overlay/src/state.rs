@@ -5,12 +5,10 @@
 //! every transition and every easing curve is exercised deterministically by the
 //! tests rather than by staring at a screen.
 
-use crate::layout::Rect;
 use crate::motion::{
-    frame_rate_independent, one_pole, EASE_IN, EASE_OUT, ENTER_MS, EXIT_MS, INSERTED_HOLD_MS,
-    LEVEL_ATTACK_MS, LEVEL_RELEASE_MS, RIBBON_FULL_CHARS, STATE_CROSS_MS,
+    one_pole, EASE_IN, EASE_OUT, ENTER_MS, EXIT_MS, INSERTED_HOLD_MS, LEVEL_ATTACK_MS,
+    LEVEL_RELEASE_MS, STATE_CROSS_MS,
 };
-use crate::spectrum::{self, BAR_COUNT, PROCESSING_ENV, RESTING_ENV};
 use crate::theme::Theme;
 
 /// The four states of the pill.
@@ -23,13 +21,15 @@ use crate::theme::Theme;
 pub enum OverlayState {
     /// Nothing on screen. The window is hidden and the loop is asleep.
     Hidden,
-    /// The hotkey is down. Spectrum waveform tracks the microphone; the timer
-    /// and the engine chip are visible.
+    /// The hotkey is down. The orb (or open ribbon) tracks the microphone and
+    /// the live transcript.
     Listening,
-    /// The hotkey is up and the engine is finishing. Scan band sweeps.
+    /// The hotkey is up and the engine is finishing. The last text holds; a
+    /// shimmer sweeps the open ribbon (or a spinner, if nothing was captured).
     Processing,
-    /// Text has landed in the target application. Check draws, latency prints,
-    /// then the pill leaves on its own.
+    /// Text has landed in the target application. The ribbon collapses, a
+    /// check draws itself into the orb, latency prints, then the pill leaves
+    /// on its own.
     Inserted,
 }
 
@@ -38,15 +38,6 @@ impl OverlayState {
     #[must_use]
     pub fn is_visible(self) -> bool {
         !matches!(self, OverlayState::Hidden)
-    }
-
-    /// Whether the listening-only telemetry (timer + engine chip) shows here.
-    ///
-    /// The captain's locked decision: the chip is listening-only, and latency
-    /// replaces it on `inserted`.
-    #[must_use]
-    pub fn shows_chip(self) -> bool {
-        matches!(self, OverlayState::Listening | OverlayState::Processing)
     }
 }
 
@@ -62,9 +53,21 @@ pub enum Command {
     /// Report the current microphone level, 0.0–1.0. Out-of-range values are
     /// clamped rather than rejected.
     Level(f32),
-    /// Report how many characters of partial transcript exist so far.
-    PartialLen(usize),
-    /// Set the engine label shown in the chip, e.g. `groq · whisper-large-v3-turbo · en`.
+    /// Report the current partial-transcript text.
+    ///
+    /// This is the overlay's one deliberate reversal of the earlier rule that
+    /// it never holds transcript content — see `README.md` and the design
+    /// report at `data/iris-ui-directions/report.md` for why. The overlay
+    /// holds this string for exactly as long as it is on screen and never
+    /// persists, transmits, or logs it.
+    PartialText(String),
+    /// Set the engine label, e.g. `groq · whisper-large-v3-turbo · en`.
+    ///
+    /// Carried on the model for continuity with callers that already send it,
+    /// but nothing in this design renders it — the ribbon has no room for a
+    /// second line of text without competing with the transcript for
+    /// attention. Kept as live data rather than removed outright so a future
+    /// direction can pick it back up without a contract change.
     Engine(String),
     /// The hotkey is up; the engine is finishing.
     Processing,
@@ -90,6 +93,11 @@ pub enum Command {
 ///
 /// Drive it with [`Model::apply`] for commands and [`Model::tick`] once per
 /// frame. Everything the renderer needs is a getter on this type.
+///
+/// This holds no shape or text-measurement state — no font, no width, no
+/// morph progress. Those live on the `Renderer`, which owns the `FontAtlas`
+/// they depend on. `Model` is deliberately shape-agnostic, the same way it
+/// was when the pill was a fixed 168×34 capsule.
 #[derive(Clone, Debug)]
 pub struct Model {
     theme: Theme,
@@ -105,16 +113,13 @@ pub struct Model {
 
     level: f32,
     level_target: f32,
-    partial_fill: f32,
-    partial_len: usize,
 
+    text: String,
     engine: String,
     latency_ms: Option<u32>,
 
     listen_started_at: u64,
     listen_frozen_ms: Option<u64>,
-
-    bars: [f32; BAR_COUNT],
 }
 
 impl Model {
@@ -131,13 +136,11 @@ impl Model {
             presence: 0.0,
             level: 0.0,
             level_target: 0.0,
-            partial_fill: 0.0,
-            partial_len: 0,
+            text: String::new(),
             engine: String::new(),
             latency_ms: None,
             listen_started_at: 0,
             listen_frozen_ms: None,
-            bars: spectrum::resting_bars(),
         }
     }
 
@@ -167,8 +170,7 @@ impl Model {
             Command::ShowListening => {
                 if self.state != Listening {
                     self.latency_ms = None;
-                    self.partial_len = 0;
-                    self.partial_fill = 0.0;
+                    self.text.clear();
                     self.listen_started_at = self.now_ms;
                     self.listen_frozen_ms = None;
                     self.enter(Listening);
@@ -181,7 +183,7 @@ impl Model {
                     0.0
                 };
             }
-            Command::PartialLen(len) => self.partial_len = len,
+            Command::PartialText(text) => self.text = text,
             Command::Engine(label) => self.engine = label,
             Command::Processing => {
                 if matches!(self.state, Listening) {
@@ -264,30 +266,6 @@ impl Model {
             LEVEL_RELEASE_MS
         };
         self.level += (self.level_target - self.level) * one_pole(tau, dt);
-
-        // Partial ribbon.
-        let target = (self.partial_len as f32 / RIBBON_FULL_CHARS as f32).clamp(0.0, 1.0);
-        let target = if self.state == OverlayState::Listening {
-            target
-        } else if self.state.is_visible() {
-            self.partial_fill
-        } else {
-            0.0
-        };
-        self.partial_fill += (target - self.partial_fill) * frame_rate_independent(0.2, dt);
-
-        let env = match self.state {
-            OverlayState::Listening => self.level,
-            OverlayState::Processing => PROCESSING_ENV,
-            _ => RESTING_ENV,
-        };
-        spectrum::advance(
-            &mut self.bars,
-            env,
-            now_ms,
-            dt,
-            self.state == OverlayState::Listening,
-        );
     }
 
     // -- what the renderer and the run loop read ---------------------------
@@ -359,19 +337,15 @@ impl Model {
         self.level
     }
 
-    /// How far the partial-transcript ribbon extends, 0.0–1.0.
+    /// The current partial-transcript text. Empty before any has arrived, or
+    /// once cleared by a fresh [`Command::ShowListening`].
     #[must_use]
-    pub fn partial_fill(&self) -> f32 {
-        self.partial_fill
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
-    /// Characters of partial transcript reported so far.
-    #[must_use]
-    pub fn partial_len(&self) -> usize {
-        self.partial_len
-    }
-
-    /// The engine label for the chip.
+    /// The engine label. Carried but not rendered by this design — see
+    /// [`Command::Engine`].
     #[must_use]
     pub fn engine(&self) -> &str {
         &self.engine
@@ -383,31 +357,12 @@ impl Model {
         self.latency_ms
     }
 
-    /// The current bar heights, as `scaleY` factors in 0.0–1.0.
-    #[must_use]
-    pub fn bars(&self) -> &[f32; BAR_COUNT] {
-        &self.bars
-    }
-
     /// How long the user has been speaking, in milliseconds. Frozen when
     /// listening ends so the readout does not keep counting during processing.
     #[must_use]
     pub fn listening_ms(&self) -> u64 {
         self.listen_frozen_ms
             .unwrap_or_else(|| self.now_ms.saturating_sub(self.listen_started_at))
-    }
-
-    /// The telemetry readout for the current state, per the locked decision:
-    /// the timer while speaking, an ellipsis while processing, the latency on
-    /// inserted, nothing when hidden.
-    #[must_use]
-    pub fn readout(&self) -> Option<String> {
-        match self.state {
-            OverlayState::Hidden => None,
-            OverlayState::Listening => Some(format_timer(self.listening_ms())),
-            OverlayState::Processing => Some("···".to_string()),
-            OverlayState::Inserted => self.latency_ms.map(|ms| format!("{ms} ms")),
-        }
     }
 
     /// The offset and scale the whole pill is drawn with, given `presence`.
@@ -419,18 +374,13 @@ impl Model {
         let p = self.presence();
         ((1.0 - p) * 10.0 * layout_scale, 0.90 + 0.10 * p)
     }
-
-    /// The region of the ribbon that is currently lit.
-    #[must_use]
-    pub fn ribbon_rect(&self, full: Rect) -> Rect {
-        Rect {
-            w: full.w * self.partial_fill.clamp(0.0, 1.0),
-            ..full
-        }
-    }
 }
 
-/// Format elapsed milliseconds as `m:ss`, the way the mockup's timer reads.
+/// Format elapsed milliseconds as `m:ss`, the way the mockup's timer read.
+///
+/// No longer used by the pill itself (the ribbon shows words, not a timer),
+/// kept because `docs/spike-findings.md`-style latency tooling and the crate's
+/// own tests still find it useful for formatting elapsed time.
 #[must_use]
 pub fn format_timer(ms: u64) -> String {
     let total = ms / 1000;
@@ -463,7 +413,7 @@ mod tests {
         assert_eq!(m.state(), OverlayState::Hidden);
         assert!(m.is_idle());
         assert_eq!(m.presence(), 0.0);
-        assert_eq!(m.readout(), None);
+        assert_eq!(m.text(), "");
     }
 
     #[test]
@@ -551,7 +501,19 @@ mod tests {
         m.apply(Command::ShowListening);
         assert_eq!(m.state(), OverlayState::Listening);
         assert_eq!(m.latency_ms(), None, "stale latency carried over");
-        assert_eq!(m.partial_len(), 0, "stale partial carried over");
+        assert_eq!(m.text(), "", "stale transcript carried over");
+    }
+
+    #[test]
+    fn a_fresh_utterance_clears_the_previous_transcript() {
+        let mut m = model();
+        m.apply(Command::ShowListening);
+        m.apply(Command::PartialText("the quarterly report".into()));
+        m.apply(Command::Processing);
+        m.apply(Command::Inserted { latency_ms: 90 });
+
+        m.apply(Command::ShowListening);
+        assert_eq!(m.text(), "");
     }
 
     #[test]
@@ -601,7 +563,7 @@ mod tests {
         for c in [
             Command::ShowListening,
             Command::Level(0.5),
-            Command::PartialLen(4),
+            Command::PartialText("hi".into()),
             Command::Engine("groq".into()),
             Command::Processing,
             Command::Inserted { latency_ms: 1 },
@@ -658,7 +620,6 @@ mod tests {
         m.tick(60_000);
         assert!(m.presence() <= 1.0);
         assert!(m.level().is_finite());
-        assert!(m.bars().iter().all(|b| b.is_finite()));
     }
 
     #[test]
@@ -674,31 +635,6 @@ mod tests {
             frozen,
             "timer kept running while processing"
         );
-    }
-
-    #[test]
-    fn the_readout_says_the_right_thing_in_each_state() {
-        let mut m = model();
-        assert_eq!(m.readout(), None);
-
-        m.apply(Command::ShowListening);
-        run_to(&mut m, 0, 3_000);
-        assert_eq!(m.readout().as_deref(), Some("0:03"));
-
-        m.apply(Command::Processing);
-        assert_eq!(m.readout().as_deref(), Some("···"));
-
-        m.apply(Command::Inserted { latency_ms: 142 });
-        assert_eq!(m.readout().as_deref(), Some("142 ms"));
-    }
-
-    #[test]
-    fn the_chip_is_listening_only() {
-        // The locked telemetry decision, as a test.
-        assert!(OverlayState::Listening.shows_chip());
-        assert!(OverlayState::Processing.shows_chip());
-        assert!(!OverlayState::Inserted.shows_chip());
-        assert!(!OverlayState::Hidden.shows_chip());
     }
 
     #[test]
@@ -751,37 +687,13 @@ mod tests {
     }
 
     #[test]
-    fn the_partial_ribbon_fills_with_the_transcript_and_resets_between_utterances() {
+    fn text_updates_are_held_verbatim() {
         let mut m = model();
         m.apply(Command::ShowListening);
-        m.apply(Command::PartialLen(RIBBON_FULL_CHARS * 2));
-        run_to(&mut m, 0, 800);
-        assert!(
-            (m.partial_fill() - 1.0).abs() < 0.05,
-            "{}",
-            m.partial_fill()
-        );
-
-        m.apply(Command::Hide);
-        run_to(&mut m, 800, 2_000);
-        assert!(m.partial_fill() < 0.05, "{}", m.partial_fill());
-    }
-
-    #[test]
-    fn ribbon_rect_only_shortens_the_track() {
-        let mut m = model();
-        m.apply(Command::ShowListening);
-        m.apply(Command::PartialLen(RIBBON_FULL_CHARS / 2));
-        run_to(&mut m, 0, 800);
-        let full = Rect {
-            x: 10.0,
-            y: 20.0,
-            w: 100.0,
-            h: 2.0,
-        };
-        let lit = m.ribbon_rect(full);
-        assert_eq!((lit.x, lit.y, lit.h), (full.x, full.y, full.h));
-        assert!(lit.w > 0.0 && lit.w < full.w, "{}", lit.w);
+        m.apply(Command::PartialText("the quarterly".into()));
+        assert_eq!(m.text(), "the quarterly");
+        m.apply(Command::PartialText("the quarterly report".into()));
+        assert_eq!(m.text(), "the quarterly report");
     }
 
     #[test]
@@ -789,12 +701,11 @@ mod tests {
         let mut m = model();
         m.apply(Command::ShowListening);
         run_to(&mut m, 0, 500);
-        let (state, presence, bars) = (m.state(), m.presence(), *m.bars());
+        let (state, presence) = (m.state(), m.presence());
         m.apply(Command::SetTheme(Box::new(PORCELAIN_LIGHT)));
         assert_eq!(m.theme().name, PORCELAIN_LIGHT.name);
         assert_eq!(m.state(), state);
         assert_eq!(m.presence(), presence);
-        assert_eq!(*m.bars(), bars);
     }
 
     #[test]

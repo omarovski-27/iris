@@ -154,9 +154,13 @@ fn apply_overrides(config: &mut Config, args: &Args) {
 /// Build a pill sink. On Windows the resident path prefers a live overlay;
 /// elsewhere (and when the overlay fails to start) fall back to log/noop so
 /// CI and non-Windows paths stay green.
-fn pill_for(args: &Args, overlay: Option<&iris_overlay::Overlay>) -> Box<dyn PillSink> {
+fn pill_for(
+    args: &Args,
+    config: &Config,
+    overlay: Option<&iris_overlay::Overlay>,
+) -> Box<dyn PillSink> {
     if let Some(overlay) = overlay {
-        return Box::new(OverlayPill::new(overlay.handle()));
+        return Box::new(OverlayPill::new(overlay.handle(), config.show_live_text));
     }
     if args.verbose {
         Box::new(LogPill)
@@ -211,7 +215,7 @@ fn run(
 
     // Overlay owns its thread for process life; App drives it via OverlayPill.
     let overlay = try_spawn_overlay(&config);
-    let pill = pill_for(args, overlay.as_ref());
+    let pill = pill_for(args, &config, overlay.as_ref());
 
     let mut app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
@@ -276,7 +280,7 @@ fn speak_wav(
 
     // Optional real pill for offline demos; never required for correctness.
     let overlay = try_spawn_overlay(&config);
-    let pill = pill_for(args, overlay.as_ref());
+    let pill = pill_for(args, &config, overlay.as_ref());
 
     let audio = ChannelAudio::new();
     let frames_tx = audio.sender();
@@ -336,7 +340,7 @@ fn demo_dictation(mut config: Config, config_path: &std::path::Path, args: &Args
 
     let pcm = synthetic_demo_pcm();
     let overlay = try_spawn_overlay(&config);
-    let pill = pill_for(args, overlay.as_ref());
+    let pill = pill_for(args, &config, overlay.as_ref());
 
     let audio = ChannelAudio::new();
     let frames_tx = audio.sender();

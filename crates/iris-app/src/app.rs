@@ -125,6 +125,7 @@ impl<A: AudioSource> App<A> {
         // before the first hotkey press.
         pill.set_engine(engine.name());
         pill.set_theme(config.theme);
+        pill.set_show_live_text(config.show_live_text);
         Ok(Self {
             saved: config.clone(),
             config,
@@ -346,6 +347,10 @@ impl<A: AudioSource> App<A> {
                     self.polisher = polish::build(&config);
                     self.history = open_history(&config, &self.config_path);
                     self.pill.set_theme(config.theme);
+                    // Same treatment as the theme, and for a stronger reason:
+                    // this is the live transcript's opt-out, so "reloaded"
+                    // has to mean it is already in force.
+                    self.pill.set_show_live_text(config.show_live_text);
                     self.config = config;
                     self.saved = saved;
                     println!("  reloaded {}", self.config_path.display());
@@ -479,7 +484,7 @@ impl<A: AudioSource> App<A> {
                         let pill = &mut self.pill;
                         dictation.absorb_event(event, &mut |text: &str| {
                             iris_core::vlog!("~ {text}");
-                            pill.set_partial_len(text.chars().count());
+                            pill.set_partial_text(text);
                         });
                     }
                     Err(_) => {
@@ -517,7 +522,7 @@ impl<A: AudioSource> App<A> {
             let pill = &mut self.pill;
             dictation.finish(self.final_timeout, &mut |text: &str| {
                 iris_core::vlog!("~ {text}");
-                pill.set_partial_len(text.chars().count());
+                pill.set_partial_text(text);
             })?
         };
         let mut timeline = outcome.timeline;

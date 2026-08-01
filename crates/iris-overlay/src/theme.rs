@@ -141,16 +141,22 @@ pub struct Theme {
     pub dark: bool,
 
     // ---- pill shell ----
-    /// Top stop of the pill's vertical body gradient.
-    pub shell_top: Rgba,
-    /// Bottom stop of the pill's vertical body gradient.
-    pub shell_bottom: Rgba,
     /// 1 px border stroked just inside the pill outline.
     pub border: Rgba,
     /// 1 px ring stroked just outside the pill outline (`0 0 0 1px` in CSS).
     pub outer_ring: Rgba,
     /// 1 px inner highlight along the top edge (`inset 0 1px 0` in CSS).
     pub inner_highlight: Rgba,
+    /// Soft, broad highlight wash across the upper portion of the shell —
+    /// the glass "sheen" a curved translucent surface catches light with,
+    /// distinct from `inner_highlight`'s crisp 1 px line.
+    pub glass_sheen: Rgba,
+    /// Backing tint painted as a soft band behind live text only, guaranteed
+    /// to contrast with `ink`. The shell's own fill is a colour ramp in
+    /// service of looking like glass, not of legibility, so it cannot itself
+    /// promise contrast at every point along it — this is the local fix for
+    /// that, instead of pulling the whole surface back toward opaque.
+    pub text_scrim: Rgba,
     /// Colour of the ambient drop shadow.
     pub ambient_shadow: Rgba,
 
@@ -163,11 +169,7 @@ pub struct Theme {
     pub glow_inserted: Rgba,
 
     // ---- the live signal path: the only place the spectrum is allowed ----
-    /// Stops of the 1 px hairline along the pill's top edge.
-    pub hairline: &'static [Rgba],
-    /// Opacity applied to the whole hairline.
-    pub hairline_opacity: f32,
-    /// Stops of the ramp painted across the 28 waveform bars.
+    /// Stops of the ramp painted across the waveform bars.
     pub spectrum: &'static [Rgba],
     /// Stops of the processing scan band.
     pub scan: &'static [Rgba],
@@ -175,9 +177,12 @@ pub struct Theme {
     // ---- ink ----
     /// Primary text.
     pub ink: Rgba,
-    /// Secondary text — the timer.
+    /// Secondary text. Belongs to the captions this design no longer draws
+    /// (see the note beside `render::draw_ribbon`); kept as a palette token,
+    /// not painted.
     pub ink_dim: Rgba,
-    /// Tertiary text — the engine chip, and the idle capsule core.
+    /// Tertiary text, and the idle capsule core. Same caption story as
+    /// [`Self::ink_dim`].
     pub ink_faint: Rgba,
 
     // ---- capsule ----
@@ -207,34 +212,28 @@ pub struct Theme {
 
 /// Prism — the locked v1 dark default.
 ///
-/// Quiet instrument shell: spectrum lives only on the live signal path. Solid
-/// UI accents are cool mint/sky — never a red "recording" cue.
+/// Glass, not flat black — the captain's own words on the first pass of this
+/// shell: "it's now just black". Shell stops carry alpha rather than being
+/// fully opaque, so the desktop shows through exactly the way a real layered
+/// window composites (no backdrop sampling, no faked blur — see
+/// `render/mod.rs`'s `draw_shell` for what that does and does not mean).
+/// Solid UI accents stay cool mint/sky — never a red "recording" cue.
 pub const PRISM_DARK: Theme = Theme {
     name: "prism-dark",
     dark: true,
 
-    // Nearly flat dark shell — refined HUD, not glossy glass.
-    shell_top: Rgba::hex(0x12_151C),
-    shell_bottom: Rgba::hex(0x0E_1117),
-    border: Rgba::hex_a(0xFF_FFFF, 0.06),
-    outer_ring: Rgba::hex_a(0x00_0000, 0.28),
-    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.03),
-    ambient_shadow: Rgba::hex_a(0x00_0000, 0.55),
+    border: Rgba::hex_a(0xFF_FFFF, 0.10),
+    outer_ring: Rgba::hex_a(0x00_0000, 0.22),
+    inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.16),
+    glass_sheen: Rgba::hex_a(0xE4_F0_FF, 0.12),
+    text_scrim: Rgba::hex_a(0x08_0A0D, 0.55),
+    ambient_shadow: Rgba::hex_a(0x00_0000, 0.50),
 
     // Soft cool halos only — no purple blob, no crimson listening glow.
     glow_idle: Rgba::hex_a(0x6B_CBFF, 0.08),
     glow_listening: Rgba::hex_a(0x5C_E6A8, 0.10),
     glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.12),
 
-    // Refined hairline: cool mint→sky→soft periwinkle, low opacity.
-    hairline: &[
-        Rgba::TRANSPARENT,
-        Rgba::hex(0x6B_E0C0),
-        Rgba::hex(0x6B_CBFF),
-        Rgba::hex(0x8A_9B_E0),
-        Rgba::TRANSPARENT,
-    ],
-    hairline_opacity: 0.32,
     // Live waveform only: muted cool instrument spectrum (no rose/red candy).
     spectrum: &[
         Rgba::hex(0xB8_C4_A0),
@@ -274,31 +273,23 @@ pub const PRISM_DARK: Theme = Theme {
 
 /// Porcelain — the light theme, shipping day one.
 ///
-/// Same geometry and motion as Prism; soft white shell with a cool mint→sky
-/// live path. No rose/rec-red accents.
+/// Same geometry and motion as Prism; translucent white glass shell with a
+/// cool mint→sky live path. No rose/rec-red accents.
 pub const PORCELAIN_LIGHT: Theme = Theme {
     name: "porcelain-light",
     dark: false,
 
-    shell_top: Rgba::hex(0xFF_FFFF),
-    shell_bottom: Rgba::hex(0xF8_F9_FC),
-    border: Rgba::hex_a(0x1C_2430, 0.05),
-    outer_ring: Rgba::hex_a(0x1C_2430, 0.04),
+    border: Rgba::hex_a(0x1C_2430, 0.08),
+    outer_ring: Rgba::hex_a(0x1C_2430, 0.05),
     inner_highlight: Rgba::hex_a(0xFF_FFFF, 0.90),
-    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.10),
+    glass_sheen: Rgba::hex_a(0xFF_FFFF, 0.38),
+    text_scrim: Rgba::hex_a(0xFF_FFFF, 0.60),
+    ambient_shadow: Rgba::hex_a(0x1C_2430, 0.14),
 
     glow_idle: Rgba::hex_a(0x7A_A8_C8, 0.07),
     glow_listening: Rgba::hex_a(0x3D_BF8A, 0.09),
     glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.10),
 
-    hairline: &[
-        Rgba::TRANSPARENT,
-        Rgba::hex(0x8E_C5_C0),
-        Rgba::hex(0x8E_C5_E8),
-        Rgba::hex(0xA0_B0_D8),
-        Rgba::TRANSPARENT,
-    ],
-    hairline_opacity: 0.36,
     spectrum: &[
         Rgba::hex(0x9A_C8_B0),
         Rgba::hex(0x8E_C5_C8),
@@ -393,11 +384,11 @@ mod tests {
     fn every_token_alpha_is_normalised() {
         for theme in THEMES {
             let mut all = vec![
-                theme.shell_top,
-                theme.shell_bottom,
                 theme.border,
                 theme.outer_ring,
                 theme.inner_highlight,
+                theme.glass_sheen,
+                theme.text_scrim,
                 theme.ambient_shadow,
                 theme.glow_idle,
                 theme.glow_listening,
@@ -418,7 +409,6 @@ mod tests {
                 theme.latency.0,
                 theme.latency.1,
             ];
-            all.extend_from_slice(theme.hairline);
             all.extend_from_slice(theme.spectrum);
             all.extend_from_slice(theme.scan);
             for c in all {
@@ -429,39 +419,70 @@ mod tests {
                     c.a
                 );
             }
-            assert!(
-                (0.0..=1.0).contains(&theme.hairline_opacity),
-                "{}",
-                theme.name
-            );
         }
     }
 
-    /// The pill is drawn on top of an unknown desktop, so the *only* contrast
-    /// guarantee we control is ink against our own shell. The engine chip
-    /// (`ink_faint`) is the weakest text on the pill; hold it to a floor.
+    /// Source-over compositing of a translucent colour onto an opaque one,
+    /// the same arithmetic the rasteriser does per pixel.
+    fn composite(src: Rgba, dst: Rgba) -> Rgba {
+        let a = src.a.clamp(0.0, 1.0);
+        let ch = |s: u8, d: u8| (f32::from(s) * a + f32::from(d) * (1.0 - a)).round() as u8;
+        Rgba {
+            r: ch(src.r, dst.r),
+            g: ch(src.g, dst.g),
+            b: ch(src.b, dst.b),
+            a: 1.0,
+        }
+    }
+
+    /// The pill is drawn on top of an unknown desktop, and its own shell
+    /// fill is a colour ramp (`theme.spectrum`) chosen for glassy variety,
+    /// not for legibility — it does not itself promise contrast at every
+    /// point along it. `text_scrim` is the token that carries that promise
+    /// instead: a soft band painted behind live text only (see
+    /// `render::draw_ribbon`). This test protects that guarantee, the one
+    /// contrast the pill actually controls regardless of shell or desktop.
+    ///
+    /// It scores `ink` against what is *actually on screen* behind it, not
+    /// against `text_scrim`'s bare RGB: the scrim is translucent, so its own
+    /// `relative_luminance` (which ignores alpha) describes a colour that is
+    /// never painted, and a test written against it would keep passing if the
+    /// alpha were dropped to nothing. So the backing is rebuilt the way the
+    /// renderer builds it — every `spectrum` stop at `GLASS_FILL_ALPHA` over
+    /// the two extreme desktops, then `text_scrim` over that — and the worst
+    /// stop/desktop combination has to clear the floor. Only `ink` is checked
+    /// because only `ink` is ever painted on the scrim; `ink_dim` and
+    /// `ink_faint` belong to captions this design no longer draws.
     #[test]
-    fn ink_contrasts_with_its_own_shell() {
+    fn ink_contrasts_with_its_own_text_scrim() {
         for theme in THEMES {
-            let shell = theme
-                .shell_top
-                .lerp(theme.shell_bottom, 0.5)
-                .relative_luminance();
-            for (label, ink) in [
-                ("ink", theme.ink),
-                ("ink_dim", theme.ink_dim),
-                ("ink_faint", theme.ink_faint),
-            ] {
-                let l = ink.relative_luminance();
-                let (hi, lo) = if l > shell { (l, shell) } else { (shell, l) };
-                let ratio = (hi + 0.05) / (lo + 0.05);
-                assert!(
-                    ratio >= 2.5,
-                    "{} / {}: contrast ratio {ratio:.2} is too low to read",
-                    theme.name,
-                    label
-                );
+            let ink = theme.ink.relative_luminance();
+            let mut worst = f32::MAX;
+            let mut worst_where = String::new();
+            for desktop in [Rgba::hex(0x00_0000), Rgba::hex(0xFF_FFFF)] {
+                for (i, stop) in theme.spectrum.iter().enumerate() {
+                    let shell = composite(stop.fade(crate::render::GLASS_FILL_ALPHA), desktop);
+                    let backing = composite(theme.text_scrim, shell).relative_luminance();
+                    let (hi, lo) = if ink > backing {
+                        (ink, backing)
+                    } else {
+                        (backing, ink)
+                    };
+                    let ratio = (hi + 0.05) / (lo + 0.05);
+                    if ratio < worst {
+                        worst = ratio;
+                        worst_where = format!(
+                            "stop {i} over #{:02X}{:02X}{:02X}",
+                            desktop.r, desktop.g, desktop.b
+                        );
+                    }
+                }
             }
+            assert!(
+                worst >= 2.5,
+                "{}: ink contrasts only {worst:.2} against the composited text_scrim ({worst_where})",
+                theme.name
+            );
         }
     }
 
@@ -471,17 +492,9 @@ mod tests {
     fn every_theme_has_a_real_ramp() {
         for theme in THEMES {
             assert!(theme.spectrum.len() >= 2, "{}", theme.name);
-            assert!(theme.hairline.len() >= 3, "{}", theme.name);
             assert!(theme.scan.len() >= 3, "{}", theme.name);
-            // Both ends of the hairline and the scan fade out, so they never
-            // collide with the pill's rounded ends.
-            assert_eq!(theme.hairline[0].a, 0.0, "{}", theme.name);
-            assert_eq!(
-                theme.hairline[theme.hairline.len() - 1].a,
-                0.0,
-                "{}",
-                theme.name
-            );
+            // Both ends of the scan band fade out, so it never collides with
+            // the pill's rounded ends.
             assert_eq!(theme.scan[0].a, 0.0, "{}", theme.name);
             assert_eq!(theme.scan[theme.scan.len() - 1].a, 0.0, "{}", theme.name);
         }

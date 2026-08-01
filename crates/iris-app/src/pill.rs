@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!   set_engine / set_theme (anytime)
-//!   show_listening → update_level* / set_partial_len* → processing
+//!   show_listening → update_level* / set_partial_text* → processing
 //!     → inserted(latency_ms)   // success: overlay auto-exits after ~550 ms hold
 //!     → hide                   // cancel / empty / error only
 //! ```
@@ -35,7 +35,7 @@ use crate::config::Theme;
 /// Where the dictation loop reports what the user should be seeing.
 ///
 /// The happy-path sequence is fixed: `show_listening`, then any number of
-/// `update_level` / `set_partial_len`, then `processing`, then
+/// `update_level` / `set_partial_text`, then `processing`, then
 /// `inserted(latency_ms)` when text actually reached the target window.
 /// `hide` runs on every *unsuccessful* path so a sink can clean up without a
 /// timeout; after a successful insert the sink self-dismisses.
@@ -47,13 +47,29 @@ pub trait PillSink: Send {
     /// it drives an animation, so dropping one costs nothing.
     fn update_level(&mut self, level: f32);
 
-    /// How many characters of partial transcript exist so far.
+    /// The current partial-transcript text.
     ///
-    /// Drives the partial ribbon. Default is a no-op so simple sinks stay
-    /// three-line structs.
-    fn set_partial_len(&mut self, _chars: usize) {}
+    /// Drives the live-text ribbon. Default is a no-op so simple sinks stay
+    /// three-line structs. [`OverlayPill`] gates this behind
+    /// [`crate::config::Config::show_live_text`] — see its doc comment for
+    /// why this exists and what it does and does not authorise.
+    fn set_partial_text(&mut self, _text: &str) {}
 
-    /// Engine label for the chip (e.g. `mock`, `deepgram`). Default no-op.
+    /// Turn the live-text ribbon on or off, as
+    /// [`crate::config::Config::show_live_text`] currently says.
+    ///
+    /// Pushed at startup and again on every config reload, the same way
+    /// [`Self::set_theme`] is: the toggle is the privacy escape hatch the
+    /// live-text design rests on, so it has to take effect when the user
+    /// edits it, not at the next restart. A sink that forwards partial text
+    /// anywhere **must** implement this; the default no-op is only correct
+    /// for sinks that never forward it in the first place.
+    fn set_show_live_text(&mut self, _on: bool) {}
+
+    /// Engine label (e.g. `mock`, `deepgram`). Default no-op.
+    ///
+    /// Still pushed at startup and on a tray switch; the current overlay
+    /// design carries it on the model but does not draw it.
     fn set_engine(&mut self, _label: &str) {}
 
     /// Map the app theme onto the overlay palette. Default no-op.
@@ -80,8 +96,11 @@ impl PillSink for Box<dyn PillSink> {
     fn update_level(&mut self, level: f32) {
         (**self).update_level(level);
     }
-    fn set_partial_len(&mut self, chars: usize) {
-        (**self).set_partial_len(chars);
+    fn set_partial_text(&mut self, text: &str) {
+        (**self).set_partial_text(text);
+    }
+    fn set_show_live_text(&mut self, on: bool) {
+        (**self).set_show_live_text(on);
     }
     fn set_engine(&mut self, label: &str) {
         (**self).set_engine(label);
@@ -124,8 +143,14 @@ impl PillSink for LogPill {
         iris_core::vlog!("pill: listening");
     }
     fn update_level(&mut self, _level: f32) {}
-    fn set_partial_len(&mut self, chars: usize) {
-        iris_core::vlog!("pill: partial_len={chars}");
+    fn set_partial_text(&mut self, text: &str) {
+        // The loop already logged the text itself as `~ {text}` before calling
+        // this; what this line adds is that the *pill* was told about it, and
+        // the width the ribbon is being asked to hold.
+        iris_core::vlog!("pill: partial_text ({} chars)", text.chars().count());
+    }
+    fn set_show_live_text(&mut self, on: bool) {
+        iris_core::vlog!("pill: show_live_text={on}");
     }
     fn set_engine(&mut self, label: &str) {
         iris_core::vlog!("pill: engine={label}");
@@ -163,19 +188,44 @@ pub fn overlay_theme(theme: Theme) -> iris_overlay::Theme {
 #[derive(Clone, Debug)]
 pub struct OverlayPill {
     handle: iris_overlay::OverlayHandle,
+    show_live_text: bool,
 }
 
 impl OverlayPill {
     /// Drive `handle` from the dictation loop.
+    ///
+    /// `show_live_text` gates [`PillSink::set_partial_text`]: when `false`,
+    /// partial text is never forwarded to the overlay, which then never
+    /// leaves its orb-only presentation — see
+    /// [`crate::config::Config::show_live_text`] for why this exists.
+    ///
+    /// This is the value the process started with;
+    /// [`PillSink::set_show_live_text`] carries later edits to it, so a
+    /// config reload takes effect without a restart.
     #[must_use]
-    pub fn new(handle: iris_overlay::OverlayHandle) -> Self {
-        Self { handle }
+    pub fn new(handle: iris_overlay::OverlayHandle, show_live_text: bool) -> Self {
+        Self {
+            handle,
+            show_live_text,
+        }
     }
 
-    /// The underlying handle, for callers that need [`OverlayHandle::is_connected`].
+    /// The underlying handle, for callers that need
+    /// [`iris_overlay::OverlayHandle::is_connected`].
     #[must_use]
     pub fn handle(&self) -> &iris_overlay::OverlayHandle {
         &self.handle
+    }
+
+    /// What [`PillSink::set_partial_text`] would hand to the overlay: the text
+    /// itself, or nothing at all while the live-text opt-out is on.
+    ///
+    /// The single place the gate is decided, so a test can exercise the real
+    /// decision rather than a double's imitation of it — the overlay end of
+    /// the handle is a command channel owned by another thread and cannot be
+    /// observed from here.
+    fn partial_for_overlay<'a>(&self, text: &'a str) -> Option<&'a str> {
+        self.show_live_text.then_some(text)
     }
 }
 
@@ -188,8 +238,21 @@ impl PillSink for OverlayPill {
         self.handle.update_level(level);
     }
 
-    fn set_partial_len(&mut self, chars: usize) {
-        self.handle.set_partial_len(chars);
+    fn set_partial_text(&mut self, text: &str) {
+        if let Some(text) = self.partial_for_overlay(text) {
+            self.handle.set_partial_text(text);
+        }
+    }
+
+    fn set_show_live_text(&mut self, on: bool) {
+        self.show_live_text = on;
+        if !on {
+            // Whatever the ribbon is holding right now goes with the toggle:
+            // an empty partial collapses it back to the orb on the next
+            // frame, so turning the opt-out on never leaves transcript text
+            // on screen waiting for the next state change to clear it.
+            self.handle.set_partial_text("");
+        }
     }
 
     fn set_engine(&mut self, label: &str) {
@@ -230,19 +293,28 @@ pub enum PillEvent {
     Hide,
     /// [`PillSink::set_engine`].
     SetEngine,
-    /// [`PillSink::set_partial_len`].
-    SetPartialLen {
-        /// Character count.
-        chars: usize,
-    },
+    /// [`PillSink::set_partial_text`]. The text itself is not carried on this
+    /// marker — same reason [`PillSink::update_level`] does not carry its
+    /// level here — so `PillEvent` stays cheap to compare and `Copy`. See
+    /// [`RecordingPill::partial_texts`] for the actual strings.
+    SetPartialText,
     /// [`PillSink::set_theme`].
     SetTheme(Theme),
+    /// [`PillSink::set_show_live_text`], with the value pushed.
+    SetShowLiveText(bool),
 }
 
 /// A test double that remembers the state transitions it was told about.
 ///
 /// Cloneable and shared, because the loop takes ownership of its sink and a
 /// test still has to see what the loop did with it.
+///
+/// It records every call and interprets none of them — including
+/// [`PillSink::set_show_live_text`], which lands as a [`PillEvent`] and does
+/// not gate anything here. Re-implementing [`OverlayPill`]'s gate in the
+/// double would mean tests passing on the double's copy of the rule while the
+/// real one drifted; what the loop owes the sink is the pushed flag, and that
+/// is what this lets a test see.
 #[derive(Debug, Clone, Default)]
 pub struct RecordingPill {
     state: std::sync::Arc<std::sync::Mutex<Recorded>>,
@@ -254,6 +326,7 @@ struct Recorded {
     levels: Vec<f32>,
     engine: Option<String>,
     partial_lens: Vec<usize>,
+    partial_texts: Vec<String>,
 }
 
 impl RecordingPill {
@@ -277,9 +350,15 @@ impl RecordingPill {
         self.state.lock().expect("pill mutex").engine.clone()
     }
 
-    /// Every partial length reported so far.
+    /// Every partial length reported so far, derived from the text each
+    /// [`PillSink::set_partial_text`] call carried.
     pub fn partial_lens(&self) -> Vec<usize> {
         self.state.lock().expect("pill mutex").partial_lens.clone()
+    }
+
+    /// Every partial-transcript string reported so far, in order.
+    pub fn partial_texts(&self) -> Vec<String> {
+        self.state.lock().expect("pill mutex").partial_texts.clone()
     }
 
     fn push(&self, event: PillEvent) {
@@ -294,13 +373,16 @@ impl PillSink for RecordingPill {
     fn update_level(&mut self, level: f32) {
         self.state.lock().expect("pill mutex").levels.push(level);
     }
-    fn set_partial_len(&mut self, chars: usize) {
-        self.state
-            .lock()
-            .expect("pill mutex")
-            .partial_lens
-            .push(chars);
-        self.push(PillEvent::SetPartialLen { chars });
+    fn set_partial_text(&mut self, text: &str) {
+        {
+            let mut state = self.state.lock().expect("pill mutex");
+            state.partial_lens.push(text.chars().count());
+            state.partial_texts.push(text.to_string());
+        }
+        self.push(PillEvent::SetPartialText);
+    }
+    fn set_show_live_text(&mut self, on: bool) {
+        self.push(PillEvent::SetShowLiveText(on));
     }
     fn set_engine(&mut self, label: &str) {
         self.state.lock().expect("pill mutex").engine = Some(label.to_string());
@@ -332,7 +414,7 @@ mod tests {
         pill.set_theme(Theme::Dark);
         pill.show_listening();
         pill.update_level(0.25);
-        pill.set_partial_len(4);
+        pill.set_partial_text("hey");
         pill.update_level(0.75);
         pill.processing();
         pill.inserted(142);
@@ -344,14 +426,15 @@ mod tests {
                 PillEvent::SetEngine,
                 PillEvent::SetTheme(Theme::Dark),
                 PillEvent::ShowListening,
-                PillEvent::SetPartialLen { chars: 4 },
+                PillEvent::SetPartialText,
                 PillEvent::Processing,
                 PillEvent::Inserted { latency_ms: 142 },
             ]
         );
         assert_eq!(observer.levels(), [0.25, 0.75]);
         assert_eq!(observer.engine().as_deref(), Some("mock"));
-        assert_eq!(observer.partial_lens(), [4]);
+        assert_eq!(observer.partial_lens(), [3]);
+        assert_eq!(observer.partial_texts(), ["hey".to_string()]);
     }
 
     #[test]
@@ -363,7 +446,7 @@ mod tests {
         let mut noop = NoopPill;
         noop.show_listening();
         noop.update_level(1.0);
-        noop.set_partial_len(1);
+        noop.set_partial_text("hi");
         noop.set_engine("x");
         noop.set_theme(Theme::Light);
         noop.processing();
@@ -392,14 +475,14 @@ mod tests {
             engine: "mock".into(),
         })
         .expect("overlay should start");
-        let mut pill = OverlayPill::new(overlay.handle());
+        let mut pill = OverlayPill::new(overlay.handle(), true);
         assert!(pill.handle().is_connected());
 
         pill.set_engine("mock");
         pill.set_theme(Theme::Light);
         pill.show_listening();
         pill.update_level(0.6);
-        pill.set_partial_len(12);
+        pill.set_partial_text("the quarterly report");
         pill.processing();
         pill.inserted(142);
         // No hide after insert — confirmation hold is the overlay's job.
@@ -412,10 +495,65 @@ mod tests {
     fn overlay_pill_hide_is_for_cancel_paths() {
         let overlay = iris_overlay::spawn(iris_overlay::OverlayConfig::default())
             .expect("overlay should start");
-        let mut pill = OverlayPill::new(overlay.handle());
+        let mut pill = OverlayPill::new(overlay.handle(), true);
         pill.show_listening();
         pill.processing();
         pill.hide();
+        overlay.shutdown();
+    }
+
+    /// The config toggle this adapter exists to serve: with `show_live_text`
+    /// off, partial text must never reach the real overlay, so the ribbon it
+    /// would open never has anything to open with — the orb-only fallback the
+    /// design report calls "a complete and coherent design on its own", not a
+    /// degraded one.
+    #[test]
+    fn show_live_text_off_never_forwards_partial_text() {
+        let overlay =
+            iris_overlay::spawn(iris_overlay::OverlayConfig::default()).expect("overlay starts");
+        let mut pill = OverlayPill::new(overlay.handle(), false);
+        assert_eq!(pill.partial_for_overlay("this must not reach it"), None);
+        pill.show_listening();
+        pill.update_level(0.5);
+        pill.set_partial_text("this must not reach the overlay");
+        pill.processing();
+        pill.inserted(90);
+        overlay.shutdown();
+    }
+
+    /// The reload path pushes the current setting through
+    /// [`PillSink::set_show_live_text`], and this is the production sink's
+    /// half of that promise: the same decision `set_partial_text` forwards on
+    /// has to follow the pushed value, in both directions and with no
+    /// restart. Asserted against the real [`OverlayPill`], not a double —
+    /// the far end of an `OverlayHandle` is another thread's command queue
+    /// and cannot be read back from here.
+    #[test]
+    fn set_show_live_text_moves_the_real_gate_both_ways() {
+        let overlay =
+            iris_overlay::spawn(iris_overlay::OverlayConfig::default()).expect("overlay starts");
+        let mut pill = OverlayPill::new(overlay.handle(), true);
+        assert_eq!(
+            pill.partial_for_overlay("the quarterly"),
+            Some("the quarterly")
+        );
+
+        pill.set_show_live_text(false);
+        assert_eq!(
+            pill.partial_for_overlay("the quarterly"),
+            None,
+            "the opt-out did not reach the sink's own gate"
+        );
+        pill.show_listening();
+        pill.set_partial_text("this must not reach the overlay");
+
+        pill.set_show_live_text(true);
+        assert_eq!(
+            pill.partial_for_overlay("the quarterly"),
+            Some("the quarterly"),
+            "turning the opt-out back off left the ribbon mute"
+        );
+        pill.set_partial_text("the quarterly");
         overlay.shutdown();
     }
 }

@@ -1,11 +1,11 @@
-//! Text for the timer, the latency figure and the engine chip.
+//! Text for the ribbon's live transcript.
 //!
-//! All three are mono in the Prism mockup (`--mono: "Cascadia Mono"`), so the
-//! pill needs exactly one face. Cascadia Mono is the font the design spec names
-//! and it is SIL OFL 1.1, so it ships in-crate rather than being looked up in
-//! the system font stack: the overlay then rasterises identically on Windows and
-//! in the headless Linux tests, which is what makes a rendered PNG a usable
-//! review artefact.
+//! Everything the pill draws is mono in the Prism mockup
+//! (`--mono: "Cascadia Mono"`), so it needs exactly one face. Cascadia Mono is
+//! the font the design spec names and it is SIL OFL 1.1, so it ships in-crate
+//! rather than being looked up in the system font stack: the overlay then
+//! rasterises identically on Windows and in the headless Linux tests, which is
+//! what makes a rendered PNG a usable review artefact.
 //!
 //! See `assets/fonts/OFL.txt` for the licence.
 
@@ -22,23 +22,28 @@ const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-Regula
 /// How the glyph coverage is coloured.
 #[derive(Clone, Copy, Debug)]
 pub enum TextPaint {
-    /// One flat colour.
+    /// One flat colour. The only variant the shipping design currently uses
+    /// — the live ribbon text.
     Solid(Rgba),
-    /// A left-to-right ramp across the whole run — the mockup paints the
-    /// latency figure with `linear-gradient(90deg, mint, sky)` clipped to text.
+    /// A left-to-right ramp across the whole run. Unused by the product
+    /// since the latency caption that used it was removed (captain's second
+    /// visual pass: "developer information on a user surface"), kept because
+    /// it is a real capability of this general-purpose rasteriser, not
+    /// design-specific dead weight — `render::text`'s own tests exercise it
+    /// directly.
+    #[allow(dead_code)]
     Gradient(Rgba, Rgba),
 }
 
 /// Horizontal alignment of a run against the x coordinate it is drawn at.
-///
-/// Only the two the pill actually uses: the engine chip is centred under the
-/// capsule, and the telemetry readout is right-aligned so its digits do not
-/// walk as the value changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
-    /// `x` is the centre of the run.
+    /// `x` is the centre of the run. Unused by the product for the same
+    /// reason as [`TextPaint::Gradient`] — kept for the same reason.
+    #[allow(dead_code)]
     Center,
-    /// `x` is the right edge of the run.
+    /// `x` is the right edge of the run — the live ribbon text, so its
+    /// newest characters do not walk as the string grows.
     Right,
 }
 
@@ -94,22 +99,76 @@ impl FontAtlas {
         key
     }
 
+    /// Advance width of one character, rasterising it into the cache first if
+    /// it is not there yet.
+    fn advance(&mut self, c: char, px: f32) -> f32 {
+        let key = self.ensure(c, px);
+        self.glyphs[&key].metrics.advance_width
+    }
+
     /// Total advance width of `text`, including `tracking` between characters.
     pub fn measure(&mut self, text: &str, px: f32, tracking: f32) -> f32 {
+        self.measure_capped(text, px, tracking, f32::INFINITY)
+    }
+
+    /// [`Self::measure`], but stopping as soon as the running width passes
+    /// `budget` — the result is then only known to be *wider* than `budget`,
+    /// which is all any caller here does with it.
+    ///
+    /// Every measurement in this crate is of the live transcript, which grows
+    /// for as long as the user keeps speaking, and happens once or twice per
+    /// frame. Both callers clamp to a width the ribbon cannot exceed, so
+    /// measuring the part of the string past that clamp was pure waste that
+    /// scaled with utterance length; this makes the per-frame cost depend on
+    /// what is *shown* instead. Below the budget it is exactly `measure`, and
+    /// `measure` is written in terms of it so the two cannot drift.
+    pub fn measure_capped(&mut self, text: &str, px: f32, tracking: f32, budget: f32) -> f32 {
         let mut w = 0.0;
         for c in text.chars() {
             let key = self.ensure(c, px);
             w += self.glyphs[&key].metrics.advance_width + tracking;
+            if w - tracking > budget {
+                break;
+            }
         }
         (w - tracking).max(0.0)
+    }
+
+    /// The face's own ascent and descent at `px`, both measured upwards from
+    /// the baseline (so descent is negative).
+    ///
+    /// Falls back to a plausible split of the em box only if the face carries
+    /// no horizontal line metrics at all, which the embedded one does.
+    pub fn line_extents(&self, px: f32) -> (f32, f32) {
+        self.font
+            .horizontal_line_metrics(px)
+            .map_or((px * 0.8, -px * 0.2), |m| (m.ascent, m.descent))
+    }
+
+    /// How far below a run's vertical centre its baseline sits, at `px`.
+    ///
+    /// Derived from [`Self::line_extents`] — the face's metrics — and so a
+    /// function of the size alone. That is the point: the ribbon holds a live
+    /// transcript whose *shown* substring changes every time a word scrolls
+    /// off the left, and centring on that substring's own ink box (which is
+    /// what [`Self::ink_extents`] measures) moved the whole run up or down by
+    /// a pixel or three whenever a descender or a tall ascender entered or
+    /// left it. A constant ribbon height must give a constant baseline.
+    pub fn baseline_offset(&self, px: f32) -> f32 {
+        let (ascent, descent) = self.line_extents(px);
+        (ascent + descent) * 0.5
     }
 
     /// Distance from the baseline to the top and bottom of the run's inked
     /// area, both measured upwards.
     ///
-    /// Centring on the ink rather than on the font's line box is what keeps
-    /// `0:03` and `142 ms` optically centred in the pill body; line-box centring
-    /// would leave them sitting high, because the descender space is empty.
+    /// Deliberately *not* what positions the run any more — see
+    /// [`Self::baseline_offset`] for why a live transcript cannot be centred
+    /// on its own ink. It stays because measuring where a string's ink
+    /// actually lands is the only way to check the drawn result against the
+    /// geometry around it: `render`'s `the_wave_row_clears_the_live_text_ink_box`
+    /// holds the waveform clear of the real glyphs at every DPI scale with it.
+    #[allow(dead_code)]
     pub fn ink_extents(&mut self, text: &str, px: f32) -> (f32, f32) {
         let (mut top, mut bottom) = (f32::MIN, f32::MAX);
         for c in text.chars() {
@@ -128,7 +187,9 @@ impl FontAtlas {
         }
     }
 
-    /// Draw `text` with its ink box centred vertically on `center_y`.
+    /// Draw `text` with the face's line box centred vertically on `center_y`,
+    /// so the baseline lands at the same place for every string of the same
+    /// size — see [`Self::baseline_offset`].
     ///
     /// `alpha` scales the whole run, which is how every text fade in the pill is
     /// expressed.
@@ -153,8 +214,7 @@ impl FontAtlas {
             Align::Center => x - width * 0.5,
             Align::Right => x - width,
         };
-        let (ink_top, ink_bottom) = self.ink_extents(text, px);
-        let baseline = center_y + (ink_top + ink_bottom) * 0.5;
+        let baseline = center_y + self.baseline_offset(px);
 
         let mut pen = left;
         for c in text.chars() {
@@ -185,6 +245,41 @@ impl Default for FontAtlas {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The longest suffix of `text`, on a char boundary, that measures no wider
+/// than `max_w`. The overflow strategy for the live-transcript ribbon: rather
+/// than clip pixels (this atlas has no clip-mask parameter to draw through),
+/// the shown *string* is trimmed so the newest words stay against the right
+/// padding and the oldest ones drop off cleanly.
+///
+/// It walks *backwards* from the end, accumulating one advance per step, and
+/// its "does the whole thing already fit?" guard stops at `max_w` too, so the
+/// cost is `O(shown)` rather than `O(len)`. That matters: the ribbon holds the
+/// whole utterance, which grows for as long as the user keeps speaking, and
+/// this runs once per frame inside a 16 ms budget. Re-measuring each candidate
+/// suffix from the front made the cost quadratic; measuring the whole
+/// transcript just to discover it overflows kept it linear in a string that
+/// only ever gets longer.
+pub(crate) fn trailing_fit<'a>(
+    atlas: &mut FontAtlas,
+    text: &'a str,
+    px: f32,
+    max_w: f32,
+) -> &'a str {
+    if atlas.measure_capped(text, px, 0.0, max_w) <= max_w {
+        return text;
+    }
+    let mut w = 0.0;
+    let mut start = text.len();
+    for (byte_idx, c) in text.char_indices().rev() {
+        w += atlas.advance(c, px);
+        if w > max_w {
+            break;
+        }
+        start = byte_idx;
+    }
+    &text[start..]
 }
 
 /// Alpha-blend a coverage bitmap into the pixmap.
@@ -515,5 +610,129 @@ mod tests {
         );
         let lit = pm.pixels().iter().filter(|p| p.alpha() > 0).count();
         assert!(lit > 200, "chip barely rendered: {lit} px");
+    }
+
+    #[test]
+    fn trailing_fit_keeps_the_newest_words_and_fits_the_budget() {
+        let mut a = atlas();
+        let long = "the quick brown fox jumps over the lazy dog";
+        let shown = trailing_fit(&mut a, long, 15.0, 60.0);
+        assert!(shown.len() < long.len());
+        assert!(long.ends_with(shown));
+        assert!(a.measure(shown, 15.0, 0.0) <= 60.0);
+    }
+
+    /// The backwards walk must pick exactly the suffix the straightforward
+    /// (quadratic) forward scan would, including on a multi-byte string and
+    /// at a budget too small for even one character.
+    #[test]
+    fn trailing_fit_matches_a_front_to_back_reference() {
+        let mut a = atlas();
+        let reference = |a: &mut FontAtlas, text: &str, max_w: f32| -> String {
+            text.char_indices()
+                .map(|(i, _)| &text[i..])
+                .find(|c| a.measure(c, 15.0, 0.0) <= max_w)
+                .unwrap_or("")
+                .to_string()
+        };
+        for text in [
+            "the quick brown fox jumps over the lazy dog and keeps talking",
+            "naïve café — 日本語 mixed in",
+        ] {
+            for max_w in [0.0, 3.0, 17.0, 60.0, 240.0] {
+                assert_eq!(
+                    trailing_fit(&mut a, text, 15.0, max_w),
+                    reference(&mut a, text, max_w),
+                    "text {text:?} at {max_w}"
+                );
+            }
+        }
+    }
+
+    /// Below the budget the capped measure is the plain one; above it, it only
+    /// promises "wider than the budget" — and it must stop early to be worth
+    /// having, which is what the glyph-cache count checks.
+    #[test]
+    fn measuring_with_a_budget_stops_early_and_otherwise_agrees() {
+        let mut a = atlas();
+        let text = "the quick brown fox jumps over the lazy dog";
+        let full = a.measure(text, 15.0, 0.0);
+        assert_eq!(a.measure_capped(text, 15.0, 0.0, full), full);
+        assert_eq!(a.measure_capped(text, 15.0, 0.0, full + 100.0), full);
+        assert!(a.measure_capped(text, 15.0, 0.0, 40.0) > 40.0);
+        assert!(a.measure_capped(text, 15.0, 0.0, 40.0) < full);
+        assert_eq!(a.measure_capped("", 15.0, 4.0, 0.0), 0.0);
+
+        // Distinct characters, so cache growth is a direct count of how much
+        // of the string was walked.
+        let mut fresh = FontAtlas::new();
+        let distinct = "abcdefghijklmnopqrstuvwxyz";
+        let three = fresh.measure("abc", 15.0, 0.0);
+        let before = fresh.glyphs.len();
+        fresh.measure_capped(distinct, 15.0, 0.0, three);
+        assert!(
+            fresh.glyphs.len() - before < 6,
+            "walked {} extra glyphs for a three-glyph budget",
+            fresh.glyphs.len() - before
+        );
+    }
+
+    /// The live ribbon trims its text from the left as words scroll off, so a
+    /// baseline derived from the shown substring's ink moves whenever a
+    /// descender or a tall ascender enters or leaves it. The trailing glyph
+    /// must land on exactly the same rows regardless of what precedes it.
+    #[test]
+    fn the_baseline_does_not_move_with_the_characters_in_the_run() {
+        let rows = |text: &str| {
+            let mut a = FontAtlas::new();
+            let mut pm = Pixmap::new(200, 60).unwrap();
+            a.draw(
+                &mut pm,
+                text,
+                15.0,
+                0.0,
+                150.0,
+                30.0,
+                Align::Right,
+                TextPaint::Solid(Rgba::hex(0xFF_FFFF)),
+                1.0,
+            );
+            // Only the trailing glyph's column window, which right alignment
+            // pins in place no matter what comes before it.
+            let last_w = a.measure(&text.chars().last().unwrap().to_string(), 15.0, 0.0);
+            let from = (150.0 - last_w).floor() as usize;
+            let (mut top, mut bottom) = (usize::MAX, 0usize);
+            for (i, p) in pm.pixels().iter().enumerate() {
+                let (x, y) = (i % 200, i / 200);
+                if x >= from && x < 150 && p.alpha() > 0 {
+                    top = top.min(y);
+                    bottom = bottom.max(y);
+                }
+            }
+            (top, bottom)
+        };
+        let reference = rows("ax");
+        assert!(reference.0 < reference.1, "nothing drawn: {reference:?}");
+        for text in ["hx", "jx", "gpqx", "AWx", "({x", "x"] {
+            assert_eq!(
+                rows(text),
+                reference,
+                "trailing glyph moved when the run became {text:?}"
+            );
+        }
+        // ... and the offset it comes from is a function of size alone.
+        let a = atlas();
+        assert!((a.baseline_offset(15.0) - a.baseline_offset(15.0)).abs() < f32::EPSILON);
+        assert!(a.baseline_offset(30.0) > a.baseline_offset(15.0));
+        let (ascent, descent) = a.line_extents(15.0);
+        assert!(ascent > 0.0 && descent < 0.0, "{ascent} {descent}");
+    }
+
+    #[test]
+    fn trailing_fit_returns_the_whole_string_when_it_already_fits() {
+        let mut a = atlas();
+        let short = "hello";
+        let width = a.measure(short, 15.0, 0.0);
+        assert_eq!(trailing_fit(&mut a, short, 15.0, width + 5.0), short);
     }
 }

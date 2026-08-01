@@ -1,116 +1,68 @@
 //! Geometry: the pill's logical measurements, and the DPI-scaled device-pixel
 //! rectangles the renderer draws into.
 //!
-//! Every constant here is in *logical* pixels at 100 % scale. The locked Prism
-//! placement is still bottom-centre, 58 px above the work area; the body itself
-//! is a compact HUD chip (`168 × 34`, radius 17) rather than the original mockup
-//! recorder bar (`248 × 46`). [`Layout::new`] multiplies them by the monitor's
-//! scale factor, which is the whole of this crate's per-monitor-V2 DPI story:
-//! nothing is rasterised at 96 dpi and stretched, the pill is re-laid-out and
-//! re-rasterised at the monitor's real scale.
+//! Every constant here is in *logical* pixels at 100 % scale. [`Layout::new`]
+//! multiplies them by the monitor's scale factor, which is the whole of this
+//! crate's per-monitor-V2 DPI story: nothing is rasterised at 96 dpi and
+//! stretched, the pill is re-laid-out and re-rasterised at the monitor's real
+//! scale.
+//!
+//! # The shape
+//!
+//! A capsule whose corner radius is always exactly half its height, so at
+//! minimum width it is a perfect circle (the quiet "orb") and at any wider
+//! width it is a true capsule — there is no separate "orb shape" and "ribbon
+//! shape", only one shape whose width animates. Height never changes.
+//! [`ORB_D`] is both the orb's diameter and the ribbon's height.
+//!
+//! The **window is fixed-size**, sized for the *widest* state
+//! ([`RIBBON_MAX_W`]) up front — see `window/win32.rs`'s `Surface::present`,
+//! which already hands a fresh size to `UpdateLayeredWindow` every frame
+//! regardless. Only the shape drawn inside that window animates; the window
+//! itself never needs to resize or reposition more often than a DPI or
+//! monitor change already causes today. This is deliberate: it was the
+//! lower-risk of two options considered (the other being a window that
+//! resizes live with the ribbon), and the fixed transparent margin around a
+//! narrow orb costs nothing extra to composite.
 //!
 //! Geometry is deliberately *not* a theme property — see [`crate::theme`].
-
-use crate::spectrum::BAR_COUNT;
 
 // ---------------------------------------------------------------------------
 // Logical constants (100 % scale)
 // ---------------------------------------------------------------------------
 
-/// Pill width.
-pub const PILL_W: f32 = 168.0;
-/// Pill height.
-pub const PILL_H: f32 = 34.0;
-/// Pill corner radius. Exactly half the height, so the ends are true semicircles.
-pub const PILL_RADIUS: f32 = 17.0;
+/// Orb diameter, and the ribbon's constant height. Equal on purpose — see the
+/// module doc's "The shape".
+pub const ORB_D: f32 = 34.0;
+/// Widest the ribbon grows before new words start scrolling the oldest ones
+/// off the leading edge instead of growing further.
+pub const RIBBON_MAX_W: f32 = 460.0;
+/// Inner padding each side of the live-text run.
+pub const RIBBON_PAD_X: f32 = 18.0;
+/// Live-text font size.
+pub const TEXT_FONT: f32 = 15.0;
 
-/// Distance from the bottom of the pill to the bottom of the monitor's work
-/// area. Above the taskbar, below anything the user is reading.
+/// Transparent margin around the shape, every side, for the drop shadow and
+/// state glow to bleed into.
+///
+/// The glow is a Gaussian of sigma 14 (see `render/mod.rs`), whose tail is
+/// still faintly non-zero two-plus standard deviations out. This margin is
+/// intentionally sized past that so the halo never reads as a hard-edged
+/// rectangle against a dark wallpaper.
+pub const MARGIN: f32 = 34.0;
+
+/// Distance from the bottom of the shape to the bottom of the monitor's work
+/// area. Unchanged from the previous pill design on purpose: this direction
+/// changes the shape, not where the eye has to look for it.
 pub const WORK_AREA_GAP: f32 = 58.0;
 
-/// Transparent margin left and right of the pill, inside the window, for the
-/// drop shadow to bleed into.
-///
-/// The shadow is a Gaussian of sigma 11 (CSS blur-radius ~22), whose tail is
-/// still faintly non-zero two standard deviations out. Anything less than
-/// ~2.5 sigma of margin and the halo is cut off square at the window edge,
-/// which on a dark wallpaper reads as a visible rectangle around the pill.
-pub const MARGIN_X: f32 = 28.0;
-/// Transparent margin above the pill.
-pub const MARGIN_TOP: f32 = 28.0;
-/// Transparent margin below the engine chip.
-pub const MARGIN_BOTTOM: f32 = 28.0;
-
-/// Gap between the bottom of the pill and the top of the engine chip.
-pub const CHIP_GAP: f32 = 7.0;
-/// Height of the engine chip's text box.
-pub const CHIP_H: f32 = 9.0;
-
-/// Left padding inside the pill, before the capsule.
-const PAD_L: f32 = 5.0;
-/// The capsule's square box.
-const CAP_BOX: f32 = 18.0;
-/// Gap between the capsule box and the waveform.
-const CAP_GAP: f32 = 2.0;
-/// Diameter of the capsule ring.
-const CAP_RING_D: f32 = 14.0;
-/// Stroke width of the capsule ring.
-const CAP_RING_W: f32 = 1.2;
-/// Diameter of the capsule core (live indicator — not a rec-button red).
-const CAP_CORE_D: f32 = 5.0;
-
-/// Width reserved on the right for the telemetry readout, including the pill's
-/// own right padding. Fixed, so the waveform never reflows when the readout
-/// changes from `0:03` to `142 ms` — the report forbids layout thrash.
-///
-/// Holds Cascadia Mono at [`META_FONT`] through `1000 ms` (~41 px advance plus
-/// [`META_PAD_R`]) without the right-aligned run entering the waveform.
-const META_SLOT: f32 = 52.0;
-/// Distance from the pill's right edge to the right edge of the readout text.
-const META_PAD_R: f32 = 10.0;
-
-/// Height of the waveform box.
-const WAVE_H: f32 = 18.0;
-/// Inner padding at each end of the waveform box.
-const WAVE_PAD: f32 = 4.0;
-/// Width of one bar.
-const BAR_W: f32 = 1.5;
-/// Gap between bars.
-///
-/// Pitch is tight enough that all [`BAR_COUNT`] bars sit inside the waveform's
-/// padded interior at [`PILL_W`] with [`META_SLOT`] reserved for `1000 ms`.
-const BAR_GAP: f32 = 1.5;
-/// Height of a bar at `scaleY(1)`.
-const BAR_H: f32 = 16.0;
-
-/// Inset of the spectrum hairline from each end of the pill.
-const HAIRLINE_INSET: f32 = 10.0;
-/// Thickness of the spectrum hairline.
-const HAIRLINE_H: f32 = 1.0;
-
-/// Left edge of the processing scan track.
-const SCAN_L: f32 = 26.0;
-/// Distance from the pill's right edge to the right edge of the scan track.
-const SCAN_R: f32 = 46.0;
-/// Thickness of the scan band.
-const SCAN_H: f32 = 1.5;
-
-/// Distance from the pill's bottom edge to the partial-transcript ribbon.
-const RIBBON_UP: f32 = 4.0;
-/// Thickness of the partial-transcript ribbon.
-const RIBBON_H: f32 = 1.25;
-
-/// Font size of the telemetry readout.
-const META_FONT: f32 = 10.0;
-/// Font size of the engine chip.
-const CHIP_FONT: f32 = 9.0;
-/// Letter-spacing of the engine chip, in em.
-const CHIP_TRACKING_EM: f32 = 0.08;
-
-/// Overall window width in logical pixels: pill plus shadow margins.
-pub const WINDOW_W: f32 = PILL_W + 2.0 * MARGIN_X;
-/// Overall window height in logical pixels: pill, chip, and shadow margins.
-pub const WINDOW_H: f32 = MARGIN_TOP + PILL_H + CHIP_GAP + CHIP_H + MARGIN_BOTTOM;
+/// Overall window width in logical pixels: the widest ribbon state, plus
+/// shadow margins on both sides.
+pub const WINDOW_W: f32 = RIBBON_MAX_W + 2.0 * MARGIN;
+/// Overall window height in logical pixels: the shape plus shadow margins
+/// above and below. No caption row — see `render/mod.rs`'s module doc for
+/// why there is no text anywhere near the shape but inside it.
+pub const WINDOW_H: f32 = MARGIN + ORB_D + MARGIN;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -192,23 +144,25 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// Bottom-centre of `work`, with the *pill's* bottom edge exactly
+    /// Bottom-centre of `work`, with the *shape's* bottom edge exactly
     /// [`WORK_AREA_GAP`] scaled pixels above the bottom of the work area.
     ///
-    /// The window is taller than the pill (shadow margin above, chip and shadow
-    /// margin below), so this is not simply "window bottom minus 58".
+    /// The window is taller than the shape (shadow margin above and below),
+    /// so this is not simply "window bottom minus 58".
+    /// The window is fixed-size (see the module doc), so this never needs to
+    /// be recomputed more often than a DPI or monitor change already causes.
     #[must_use]
     pub fn compute(work: WorkArea, scale: f32) -> Self {
         let scale = sane_scale(scale);
         let width = (WINDOW_W * scale).round().max(1.0) as u32;
         let height = (WINDOW_H * scale).round().max(1.0) as u32;
 
-        // Everything between the window's top edge and the pill's bottom edge.
-        let above_pill_bottom = ((MARGIN_TOP + PILL_H) * scale).round() as i32;
+        // Everything between the window's top edge and the shape's bottom edge.
+        let above_shape_bottom = ((MARGIN + ORB_D) * scale).round() as i32;
         let gap = (WORK_AREA_GAP * scale).round() as i32;
 
         let x = work.left + (work.width() - width as i32) / 2;
-        let y = work.bottom - gap - above_pill_bottom;
+        let y = work.bottom - gap - above_shape_bottom;
         Self {
             x,
             y,
@@ -232,7 +186,10 @@ fn sane_scale(scale: f32) -> f32 {
 
 /// Every rectangle the renderer needs, in device pixels, for one scale factor.
 ///
-/// Recomputed on `WM_DPICHANGED`; never interpolated.
+/// Recomputed on `WM_DPICHANGED`; never interpolated. Unlike the previous
+/// pill layout, this holds no shape-specific rectangles beyond the anchor
+/// point and font sizes — the shape's actual width is animation state that
+/// lives on the `Renderer`, not geometry that lives here.
 #[derive(Clone, Debug)]
 pub struct Layout {
     /// The scale factor this layout was built for (`dpi / 96`).
@@ -241,48 +198,19 @@ pub struct Layout {
     pub window_w: u32,
     /// Window height in device pixels.
     pub window_h: u32,
-    /// The pill body.
-    pub pill: Rect,
-    /// The pill's corner radius.
-    pub radius: f32,
-    /// The capsule's square box on the left of the pill.
-    pub cap: Rect,
-    /// Diameter of the capsule ring.
-    pub cap_ring_d: f32,
-    /// Stroke width of the capsule ring.
-    pub cap_ring_w: f32,
-    /// Diameter of the capsule core.
-    pub cap_core_d: f32,
-    /// The waveform box between the capsule and the telemetry readout.
-    pub wave: Rect,
-    /// Height of a bar at full scale.
-    pub bar_h: f32,
-    /// Width of one bar.
-    pub bar_w: f32,
-    /// Pitch between bar left edges.
-    pub bar_pitch: f32,
-    /// Left edge of the first bar.
-    pub bar_x0: f32,
-    /// Right edge of the telemetry readout text.
-    pub meta_right: f32,
-    /// Vertical centre of the telemetry readout text.
-    pub meta_center_y: f32,
-    /// Font size of the telemetry readout, in device pixels.
-    pub meta_font: f32,
-    /// Vertical centre of the engine chip text.
-    pub chip_center_y: f32,
-    /// Font size of the engine chip, in device pixels.
-    pub chip_font: f32,
-    /// Letter-spacing of the engine chip, in device pixels.
-    pub chip_tracking: f32,
-    /// The 1 px spectrum hairline along the pill's top edge.
-    pub hairline: Rect,
-    /// The track the processing scan band sweeps along.
-    pub scan_track: Rect,
-    /// Thickness of the scan band.
-    pub scan_h: f32,
-    /// The partial-transcript ribbon at full extension.
-    pub ribbon: Rect,
+    /// Horizontal centre of the shape, in window-local device pixels. Every
+    /// width the shape ever takes is centred on this.
+    pub center_x: f32,
+    /// Vertical centre of the shape.
+    pub center_y: f32,
+    /// Orb diameter / ribbon height, in device pixels.
+    pub shape_h: f32,
+    /// Widest the ribbon grows, in device pixels.
+    pub ribbon_max_w: f32,
+    /// Inner padding each side of the live-text run.
+    pub text_pad_x: f32,
+    /// Live-text font size, in device pixels.
+    pub text_font: f32,
 }
 
 impl Layout {
@@ -295,107 +223,17 @@ impl Layout {
         let window_w = (WINDOW_W * s).round().max(1.0) as u32;
         let window_h = (WINDOW_H * s).round().max(1.0) as u32;
 
-        let pill = Rect {
-            x: px(MARGIN_X),
-            y: px(MARGIN_TOP),
-            w: px(PILL_W),
-            h: px(PILL_H),
-        };
-
-        let cap = Rect {
-            x: pill.x + px(PAD_L),
-            y: pill.center_y() - px(CAP_BOX) * 0.5,
-            w: px(CAP_BOX),
-            h: px(CAP_BOX),
-        };
-
-        let wave_left = pill.x + px(PAD_L + CAP_BOX + CAP_GAP);
-        let wave_right = pill.right() - px(META_SLOT);
-        let wave = Rect {
-            x: wave_left,
-            y: pill.center_y() - px(WAVE_H) * 0.5,
-            w: wave_right - wave_left,
-            h: px(WAVE_H),
-        };
-
-        // Bars are centred inside the waveform box's padded interior, matching
-        // the mockup's `justify-content: center`.
-        let bar_w = px(BAR_W);
-        let bar_pitch = px(BAR_W + BAR_GAP);
-        let bars_w = bar_pitch * (BAR_COUNT - 1) as f32 + bar_w;
-        let bar_x0 = wave.x + px(WAVE_PAD) + ((wave.w - px(2.0 * WAVE_PAD)) - bars_w) * 0.5;
-
-        let scan_l = pill.x + px(SCAN_L);
-        let scan_r = pill.right() - px(SCAN_R);
-        let scan_track = Rect {
-            x: scan_l,
-            y: pill.center_y() - px(SCAN_H) * 0.5,
-            w: scan_r - scan_l,
-            h: px(SCAN_H),
-        };
-
         Self {
             scale: s,
             window_w,
             window_h,
-            pill,
-            radius: px(PILL_RADIUS),
-            cap,
-            cap_ring_d: px(CAP_RING_D),
-            cap_ring_w: (px(CAP_RING_W)).max(1.0),
-            cap_core_d: px(CAP_CORE_D),
-            wave,
-            bar_h: px(BAR_H),
-            bar_w,
-            bar_pitch,
-            bar_x0,
-            meta_right: pill.right() - px(META_PAD_R),
-            meta_center_y: pill.center_y(),
-            meta_font: px(META_FONT),
-            chip_center_y: pill.bottom() + px(CHIP_GAP + CHIP_H * 0.5),
-            chip_font: px(CHIP_FONT),
-            chip_tracking: px(CHIP_FONT) * CHIP_TRACKING_EM,
-            hairline: Rect {
-                x: pill.x + px(HAIRLINE_INSET),
-                y: pill.y,
-                w: pill.w - px(2.0 * HAIRLINE_INSET),
-                h: (px(HAIRLINE_H)).max(1.0),
-            },
-            scan_track,
-            scan_h: (px(SCAN_H)).max(1.0),
-            ribbon: Rect {
-                x: bar_x0,
-                y: pill.bottom() - px(RIBBON_UP),
-                w: bars_w,
-                h: (px(RIBBON_H)).max(1.0),
-            },
+            center_x: window_w as f32 * 0.5,
+            center_y: px(MARGIN) + px(ORB_D) * 0.5,
+            shape_h: px(ORB_D),
+            ribbon_max_w: px(RIBBON_MAX_W),
+            text_pad_x: px(RIBBON_PAD_X),
+            text_font: px(TEXT_FONT),
         }
-    }
-
-    /// The rectangle for bar `index` at vertical scale `scale_y` (0.0–1.0).
-    ///
-    /// Bars grow from their vertical centre — `transform-origin: 50% 50%` in
-    /// the mockup — so the row stays optically centred as it moves.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index >= BAR_COUNT`.
-    #[must_use]
-    pub fn bar_rect(&self, index: usize, scale_y: f32) -> Rect {
-        assert!(index < BAR_COUNT, "bar index {index} out of range");
-        let h = (self.bar_h * scale_y.clamp(0.0, 1.0)).max(self.scale.min(1.0));
-        Rect {
-            x: self.bar_x0 + self.bar_pitch * index as f32,
-            y: self.wave.center_y() - h * 0.5,
-            w: self.bar_w,
-            h,
-        }
-    }
-
-    /// Total width the bar row occupies.
-    #[must_use]
-    pub fn bars_width(&self) -> f32 {
-        self.bar_pitch * (BAR_COUNT - 1) as f32 + self.bar_w
     }
 }
 
@@ -404,105 +242,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logical_geometry_is_the_hud_chip_spec() {
-        // Compact HUD chip: smaller than the original Prism mockup bar so the
-        // pill reads as status chrome, not a digital recorder strip.
-        assert_eq!(PILL_W, 168.0);
-        assert_eq!(PILL_H, 34.0);
-        assert_eq!(PILL_RADIUS, 17.0);
-        assert_eq!(WORK_AREA_GAP, 58.0);
-        // Radius is exactly half the height: the ends are true semicircles.
-        assert_eq!(PILL_RADIUS * 2.0, PILL_H);
-        // Stay clearly smaller than the mockup recorder proportions.
-        const { assert!(PILL_W < 180.0 && PILL_H < 40.0) };
+    fn logical_geometry_matches_the_spec() {
+        assert_eq!(ORB_D, 34.0);
+        assert_eq!(RIBBON_MAX_W, 460.0);
+        assert_eq!(WORK_AREA_GAP, 58.0, "placement anchor stays unchanged");
     }
 
     #[test]
-    fn window_is_bigger_than_the_pill_it_contains() {
+    fn window_is_bigger_than_the_widest_shape() {
         let l = Layout::new(1.0);
-        assert_eq!((l.window_w, l.window_h), (224, 106));
-        assert!(l.pill.x > 0.0 && l.pill.y > 0.0);
-        assert!(l.pill.right() < l.window_w as f32);
-        // The chip lives below the pill and inside the window.
-        assert!(l.chip_center_y > l.pill.bottom());
-        assert!(l.chip_center_y < l.window_h as f32);
+        assert_eq!((l.window_w, l.window_h), (528, 102));
+        assert!(l.center_x > 0.0 && l.center_y > 0.0);
+        assert!(l.center_x < l.window_w as f32);
+        assert!(l.ribbon_max_w + 2.0 * MARGIN <= l.window_w as f32 + 0.5);
     }
 
+    /// No caption means no reason for the shape to sit off-centre vertically
+    /// any more — unlike the previous layout (shadow above, shape, caption,
+    /// shadow below), the margin above and below the shape is now identical.
     #[test]
-    fn everything_stays_inside_the_pill() {
-        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
-            let l = Layout::new(scale);
-            let inside = |r: Rect, what: &str| {
-                assert!(r.x >= l.pill.x - 0.01, "{what} left at {scale}x");
-                assert!(
-                    r.right() <= l.pill.right() + 0.01,
-                    "{what} right at {scale}x"
-                );
-                assert!(r.y >= l.pill.y - 0.01, "{what} top at {scale}x");
-                assert!(
-                    r.bottom() <= l.pill.bottom() + 0.01,
-                    "{what} bottom at {scale}x"
-                );
-            };
-            inside(l.cap, "capsule");
-            inside(l.wave, "waveform");
-            inside(l.hairline, "hairline");
-            inside(l.scan_track, "scan track");
-            inside(l.ribbon, "ribbon");
-            inside(l.bar_rect(0, 1.0), "first bar");
-            inside(l.bar_rect(BAR_COUNT - 1, 1.0), "last bar");
-            assert!(l.meta_right <= l.pill.right(), "readout at {scale}x");
-            assert!(
-                l.meta_right > l.wave.right(),
-                "readout overlaps wave at {scale}x"
-            );
-            let budget = l.meta_right - l.wave.right();
-            assert!(
-                budget + 0.05 >= 41.0 * scale,
-                "meta budget {budget} too tight for 1000 ms at {scale}x"
-            );
-        }
-    }
-
-    #[test]
-    fn the_bar_row_fits_its_padded_box() {
-        for scale in [1.0, 1.25, 1.5, 2.0] {
-            let l = Layout::new(scale);
-            let first = l.bar_rect(0, 1.0);
-            let last = l.bar_rect(BAR_COUNT - 1, 1.0);
-            let pad = WAVE_PAD * scale;
-            let inner_l = l.wave.x + pad;
-            let inner_r = l.wave.right() - pad;
-            assert!(
-                first.x + 0.01 >= inner_l,
-                "bars overflow padded left at {scale}x: {} < {inner_l}",
-                first.x
-            );
-            assert!(
-                last.right() <= inner_r + 0.01,
-                "bars overflow padded right at {scale}x: {} > {inner_r}",
-                last.right()
-            );
-            // Centred within the outer wave box (and therefore the pad).
-            let lead = first.x - l.wave.x;
-            let trail = l.wave.right() - last.right();
-            assert!((lead - trail).abs() < 0.5, "bars off-centre at {scale}x");
-        }
-    }
-
-    #[test]
-    fn bars_grow_from_their_centre() {
+    fn the_shape_is_vertically_centred_in_the_window_with_no_caption_left_over() {
         let l = Layout::new(1.0);
-        let center = l.wave.center_y();
-        for sy in [0.07, 0.5, 1.0] {
-            let r = l.bar_rect(4, sy);
-            assert!((r.center_y() - center).abs() < 0.01, "sy={sy}");
-        }
-        // Taller scaleY means a taller bar, monotonically.
-        assert!(l.bar_rect(4, 1.0).h > l.bar_rect(4, 0.5).h);
-        assert!(l.bar_rect(4, 0.5).h > l.bar_rect(4, 0.07).h);
-        // Never zero-height: a bar that vanishes reads as a rendering bug.
-        assert!(l.bar_rect(4, 0.0).h > 0.0);
+        let above = l.center_y - l.shape_h * 0.5;
+        let below = l.window_h as f32 - (l.center_y + l.shape_h * 0.5);
+        assert!((above - below).abs() < 0.01, "above {above}, below {below}");
     }
 
     #[test]
@@ -511,19 +274,9 @@ mod tests {
         let two = Layout::new(2.0);
         assert_eq!(two.window_w, one.window_w * 2);
         assert_eq!(two.window_h, one.window_h * 2);
-        assert!((two.pill.w - one.pill.w * 2.0).abs() < 0.01);
-        assert!((two.radius - one.radius * 2.0).abs() < 0.01);
-        assert!((two.bar_pitch - one.bar_pitch * 2.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn hairline_and_bars_never_disappear_at_low_scale() {
-        // Sub-pixel strokes would round to nothing; they are floored at 1 px.
-        let l = Layout::new(0.5);
-        assert!(l.hairline.h >= 1.0);
-        assert!(l.scan_h >= 1.0);
-        assert!(l.ribbon.h >= 1.0);
-        assert!(l.cap_ring_w >= 1.0);
+        assert!((two.shape_h - one.shape_h * 2.0).abs() < 0.01);
+        assert!((two.ribbon_max_w - one.ribbon_max_w * 2.0).abs() < 0.01);
+        assert!((two.text_font - one.text_font * 2.0).abs() < 0.01);
     }
 
     #[test]
@@ -536,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_puts_the_pill_58_logical_px_above_the_work_area() {
+    fn placement_puts_the_shape_58_logical_px_above_the_work_area() {
         let work = WorkArea {
             left: 0,
             top: 0,
@@ -546,8 +299,8 @@ mod tests {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let p = Placement::compute(work, scale);
             let l = Layout::new(scale);
-            let pill_bottom = p.y as f32 + l.pill.bottom();
-            let gap = work.bottom as f32 - pill_bottom;
+            let shape_bottom = p.y as f32 + l.center_y + l.shape_h * 0.5;
+            let gap = work.bottom as f32 - shape_bottom;
             assert!(
                 (gap - WORK_AREA_GAP * scale).abs() <= 1.0,
                 "scale {scale}: gap {gap}, want {}",
@@ -587,7 +340,7 @@ mod tests {
         assert!(p.x >= work.left && p.x + p.width as i32 <= work.right);
         assert!(p.y > work.top && p.y < work.bottom);
         let l = Layout::new(1.0);
-        let gap = work.bottom as f32 - (p.y as f32 + l.pill.bottom());
+        let gap = work.bottom as f32 - (p.y as f32 + l.center_y + l.shape_h * 0.5);
         assert!((gap - WORK_AREA_GAP).abs() <= 1.0, "gap {gap}");
     }
 

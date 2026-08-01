@@ -1,4 +1,5 @@
-//! Drive the pill through its full state cycle with synthetic audio.
+//! Drive the pill through its full state cycle with synthetic audio and a
+//! scripted utterance.
 //!
 //! ```bash
 //! # On Windows (or from WSL, against the cross-compiled exe) — the real pill:
@@ -19,13 +20,21 @@ use iris_overlay::{
     PRISM_DARK,
 };
 
-/// One pass through hidden → listening → processing → inserted → hidden.
-const CYCLE: Cycle = Cycle {
-    listen_ms: 3_400,
-    process_ms: 180,
-    latency_ms: 142,
-    settle_ms: 900,
-};
+/// A short utterance that fits comfortably inside the ribbon's max width —
+/// the common case, no scrolling.
+const SHORT_UTTERANCE: &str = "set a reminder for tomorrow";
+/// A long utterance, chosen specifically to overflow the ribbon and exercise
+/// the marquee-tail scroll (oldest words drop off the left, newest stay
+/// pinned against the right padding).
+const LONG_UTTERANCE: &str =
+    "the quarterly report needs three more charts before it goes to the board on friday morning";
+
+/// Word-by-word reveal cadence, modelling perceived speech rate (~150 wpm).
+const WORD_MS: u64 = 380;
+/// Silence before the first partial arrives, matching `docs/spike-findings.md`'s
+/// modelled "first audio -> first partial" cost (~340 ms) with a little air so
+/// the low/high-level orb-only frames read clearly before words start.
+const FIRST_WORD_AT_MS: u64 = 950;
 
 struct Cycle {
     listen_ms: u64,
@@ -35,6 +44,18 @@ struct Cycle {
 }
 
 impl Cycle {
+    /// Long enough to reveal every word of `utterance` at [`WORD_MS`] plus a
+    /// trailing buffer, whichever utterance was chosen.
+    fn for_utterance(utterance: &str) -> Self {
+        let words = utterance.split(' ').count() as u64;
+        Self {
+            listen_ms: FIRST_WORD_AT_MS + WORD_MS * words + 500,
+            process_ms: 220,
+            latency_ms: 142,
+            settle_ms: 900,
+        }
+    }
+
     /// Total wall time of one pass.
     fn total_ms(&self) -> u64 {
         self.listen_ms + self.process_ms + self.settle_ms
@@ -56,9 +77,22 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     cycles: u32,
 
-    /// Engine label for the chip.
+    /// Engine label. Carried on the model but not rendered by this design —
+    /// see `state::Command::Engine`.
     #[arg(long, default_value = "groq · whisper-large-v3-turbo · en")]
     engine: String,
+
+    /// Which scripted utterance to speak.
+    #[arg(long, value_parser = ["short", "long"], default_value = "long")]
+    utterance: String,
+
+    /// Whether the live transcript reaches the overlay at all.
+    ///
+    /// `off` sends no partial text, which is exactly what `iris-app`'s
+    /// `Config::show_live_text = false` opt-out does to this crate: the orb
+    /// never opens into a ribbon. Use it to review that presentation.
+    #[arg(long, value_parser = ["on", "off"], default_value = "on")]
+    live_text: String,
 
     /// Monitor scale to render at in filmstrip mode (1.0 = 100 %, 1.5 = 150 %).
     #[arg(long, default_value_t = 1.0)]
@@ -81,15 +115,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "porcelain" => PORCELAIN_LIGHT,
         _ => PRISM_DARK,
     };
+    let utterance = match args.utterance.as_str() {
+        "short" => SHORT_UTTERANCE,
+        _ => LONG_UTTERANCE,
+    };
+    let cycle = Cycle::for_utterance(utterance);
+
+    let live_text = args.live_text == "on";
 
     match &args.filmstrip {
-        Some(dir) => filmstrip(&args, theme, dir.clone()),
-        None => live(&args, theme),
+        Some(dir) => filmstrip(&args, theme, utterance, live_text, &cycle, dir.clone()),
+        None => live(&args, theme, utterance, live_text, &cycle),
     }
 }
 
 /// The real overlay: spawn a window and drive it in real time.
-fn live(args: &Args, theme: Theme) -> Result<(), Box<dyn std::error::Error>> {
+fn live(
+    args: &Args,
+    theme: Theme,
+    utterance: &str,
+    live_text: bool,
+    cycle: &Cycle,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !cfg!(windows) {
         eprintln!(
             "This is not Windows, so there is no overlay window to show.\n\
@@ -107,31 +154,33 @@ fn live(args: &Args, theme: Theme) -> Result<(), Box<dyn std::error::Error>> {
     println!("theme: {}", theme.name);
     println!(
         "cycle: listen {} ms -> processing {} ms -> inserted (latency {} ms) -> hidden",
-        CYCLE.listen_ms, CYCLE.process_ms, CYCLE.latency_ms
+        cycle.listen_ms, cycle.process_ms, cycle.latency_ms
     );
 
-    let mut cycle = 0u32;
-    while args.cycles == 0 || cycle < args.cycles {
-        cycle += 1;
-        println!("[{cycle}] listening");
+    let mut cycle_no = 0u32;
+    while args.cycles == 0 || cycle_no < args.cycles {
+        cycle_no += 1;
+        println!("[{cycle_no}] listening");
         pill.show_listening();
 
         let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(CYCLE.listen_ms) {
+        while start.elapsed() < Duration::from_millis(cycle.listen_ms) {
             let t = start.elapsed().as_millis() as u64;
             pill.update_level(synthetic_level(t));
-            pill.set_partial_len(spoken_chars(t));
+            if live_text {
+                pill.set_partial_text(words_said_by(t, utterance));
+            }
             std::thread::sleep(Duration::from_millis(16));
         }
 
-        println!("[{cycle}] processing");
+        println!("[{cycle_no}] processing");
         pill.processing();
-        std::thread::sleep(Duration::from_millis(CYCLE.process_ms));
+        std::thread::sleep(Duration::from_millis(cycle.process_ms));
 
-        println!("[{cycle}] inserted ({} ms)", CYCLE.latency_ms);
-        pill.inserted(CYCLE.latency_ms);
+        println!("[{cycle_no}] inserted ({} ms)", cycle.latency_ms);
+        pill.inserted(cycle.latency_ms);
         // The pill hides itself; wait long enough to watch it go.
-        std::thread::sleep(Duration::from_millis(CYCLE.settle_ms));
+        std::thread::sleep(Duration::from_millis(cycle.settle_ms));
 
         // The overlay thread gives up if the surface stops accepting frames.
         // Without this the demo would print a happy transcript of a cycle
@@ -147,7 +196,14 @@ fn live(args: &Args, theme: Theme) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The same cycle, rendered to PNGs with no window.
-fn filmstrip(args: &Args, theme: Theme, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn filmstrip(
+    args: &Args,
+    theme: Theme,
+    utterance: &str,
+    live_text: bool,
+    cycle: &Cycle,
+    dir: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
 
     let mut pill = HeadlessOverlay::new(args.scale, theme);
@@ -160,7 +216,7 @@ fn filmstrip(args: &Args, theme: Theme, dir: PathBuf) -> Result<(), Box<dyn std:
     let mut frame = 0u32;
     let mut written = 0u32;
 
-    for cycle in 0..cycles {
+    for cycle_no in 0..cycles {
         let base = now;
         pill.apply(Command::ShowListening);
         // Thresholds rather than equalities: the frame step will not land
@@ -168,17 +224,19 @@ fn filmstrip(args: &Args, theme: Theme, dir: PathBuf) -> Result<(), Box<dyn std:
         let (mut said_processing, mut said_inserted) = (false, false);
         loop {
             let elapsed = now - base;
-            if elapsed >= CYCLE.listen_ms + CYCLE.process_ms && !said_inserted {
+            if elapsed >= cycle.listen_ms + cycle.process_ms && !said_inserted {
                 said_inserted = true;
                 pill.apply(Command::Inserted {
-                    latency_ms: CYCLE.latency_ms,
+                    latency_ms: cycle.latency_ms,
                 });
-            } else if elapsed >= CYCLE.listen_ms && !said_processing {
+            } else if elapsed >= cycle.listen_ms && !said_processing {
                 said_processing = true;
                 pill.apply(Command::Processing);
-            } else if elapsed < CYCLE.listen_ms {
+            } else if elapsed < cycle.listen_ms {
                 pill.apply(Command::Level(synthetic_level(elapsed)));
-                pill.apply(Command::PartialLen(spoken_chars(elapsed)));
+                if live_text {
+                    pill.apply(Command::PartialText(words_said_by(elapsed, utterance)));
+                }
             }
             pill.tick(now);
             pill.render();
@@ -189,22 +247,23 @@ fn filmstrip(args: &Args, theme: Theme, dir: PathBuf) -> Result<(), Box<dyn std:
             frame += 1;
 
             now += step;
-            if now - base >= CYCLE.total_ms() {
+            if now - base >= cycle.total_ms() {
                 break;
             }
         }
-        if cycle + 1 < cycles {
+        if cycle_no + 1 < cycles {
             pill.apply(Command::Hide);
         }
     }
 
     println!(
-        "{written} frames -> {} ({} x {} px, {} @ {:.0} %)",
+        "{written} frames -> {} ({} x {} px, {} @ {:.0} %, {} utterance)",
         dir.display(),
         pill.frame().width,
         pill.frame().height,
         theme.name,
-        args.scale * 100.0
+        args.scale * 100.0,
+        args.utterance,
     );
     println!("Open them in order; each filename carries the state it was in.");
     Ok(())
@@ -222,8 +281,8 @@ fn label(state: OverlayState) -> &'static str {
 /// A speech-shaped envelope: syllables riding on a phrase-length swell, with a
 /// short fade-in so the waveform does not slam open on the first frame.
 ///
-/// This is the mockup's `envelope()` function, transcribed. It exists so the
-/// demo looks like someone talking rather than like a test tone.
+/// This is the mockup's original `envelope()` function, transcribed. It
+/// exists so the demo looks like someone talking rather than a test tone.
 fn synthetic_level(ms: u64) -> f32 {
     let s = ms as f32 / 1000.0;
     let syllables = 0.54 + 0.44 * (s * 6.4).sin() + 0.17 * (s * 12.1 + 1.4).sin();
@@ -232,7 +291,17 @@ fn synthetic_level(ms: u64) -> f32 {
     (syllables * phrase).clamp(0.10, 1.0) * attack
 }
 
-/// Roughly how many characters a person has said by `ms`, at ~13 chars/second.
-fn spoken_chars(ms: u64) -> usize {
-    (ms / 75) as usize
+/// How much of `utterance` has been "said" by `ms`, one word at a time.
+///
+/// Empty until [`FIRST_WORD_AT_MS`], modelling the real first-partial latency
+/// so the orb has a moment of quiet before any text arrives — the state the
+/// design falls back to for non-streaming engines, and the state that should
+/// read as complete on its own, not as "waiting for a bug fix".
+fn words_said_by(ms: u64, utterance: &str) -> String {
+    if ms < FIRST_WORD_AT_MS {
+        return String::new();
+    }
+    let words: Vec<&str> = utterance.split(' ').collect();
+    let said = (((ms - FIRST_WORD_AT_MS) / WORD_MS) as usize + 1).min(words.len());
+    words[..said].join(" ")
 }
