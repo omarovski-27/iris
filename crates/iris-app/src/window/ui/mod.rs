@@ -126,7 +126,10 @@ fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overl
     // hook was installed with — not the saved one. After a rebind those
     // differ until a restart, and a footer that quietly switched to the new
     // key would be telling the user to hold something inert.
-    let pending = (state.config.hotkey != env.in_force_hotkey).then(|| state.config.hotkey);
+    let pending = env
+        .restart_pending(&state.config)
+        .hotkey
+        .then(|| state.config.hotkey);
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
         ui.add_space(4.0);
         if let Some(saved) = pending {

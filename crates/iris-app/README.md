@@ -323,9 +323,12 @@ priority order:
   hotkey rebinding, all written through `Config`. Never renders an API key;
   "Open config file" hands `config.toml` to the user's editor instead, which
   is still where the keys are set. `hotkey` and `overlay_enabled` are read
-  once at startup, so the window is given the *running* values too and marks
-  either one "until restart" the moment the saved value diverges — including
-  in the sidebar, which always names the key that works right now.
+  once at startup, so the window is given the *running* values too — the
+  sidebar always names the key that works right now — and marks either one
+  "until restart" once the file has moved since launch. Moved since launch,
+  not merely different from what is running: `--hotkey` is a run-only
+  override that never reaches the file, and it is already in force, so it is
+  not something a restart would apply.
 - **Insights** — most repeated words/phrases (stopwords and filler stripped),
   dictations today/all-time, total words, average/median perceived latency,
   success-vs-failure rate — all computed from the session log on the window's

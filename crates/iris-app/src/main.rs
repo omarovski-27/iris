@@ -276,16 +276,20 @@ fn start_resident(
     // (App::run selects on both), so a window write can never race a tray
     // write to persist() — see `iris_app::window::state`'s module docs.
     //
-    // `InForce` is the snapshot of what this process is *actually* doing:
-    // the hook above was installed with `config.hotkey` and the overlay was
-    // spawned (or not) just now, and neither changes again without a restart,
-    // so the window can show a rebind as pending instead of live.
-    let in_force = iris_app::window::InForce {
+    // `Startup` is what this process is *actually* doing — the hook above was
+    // installed with `config.hotkey` and the overlay was spawned (or not)
+    // just now, neither changing again without a restart — paired with what
+    // the file said before `apply_overrides` ran. `file_config` is the
+    // pre-override copy, so a run-only `--hotkey` reads as already in force
+    // rather than as an edit waiting to be restarted into.
+    let startup = iris_app::window::Startup {
         hotkey: config.hotkey,
         overlay_enabled: config.overlay_enabled,
+        saved_hotkey: file_config.hotkey,
+        saved_overlay_enabled: file_config.overlay_enabled,
     };
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
-    let window = iris_app::window::spawn(config_path.to_path_buf(), window_commands_tx, in_force)?;
+    let window = iris_app::window::spawn(config_path.to_path_buf(), window_commands_tx, startup)?;
 
     let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
@@ -504,9 +508,11 @@ fn demo_window() -> Result<()> {
     let handle = window::spawn(
         config_path.clone(),
         commands_tx,
-        window::InForce {
+        window::Startup {
             hotkey: config.hotkey,
             overlay_enabled: config.overlay_enabled,
+            saved_hotkey: config.hotkey,
+            saved_overlay_enabled: config.overlay_enabled,
         },
     )?;
     handle.open();

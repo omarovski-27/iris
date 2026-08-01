@@ -95,6 +95,40 @@ pub struct Env<'a> {
     /// Whether the overlay was actually spawned this run, on the same
     /// snapshot-vs-saved footing as [`Env::in_force_hotkey`].
     pub in_force_overlay_enabled: bool,
+    /// What `config.toml` held for `hotkey` when the process launched. See
+    /// [`Env::restart_pending`] for why the pending check needs this rather
+    /// than [`Env::in_force_hotkey`].
+    pub saved_hotkey_at_startup: Key,
+    /// The same launch-time file value for `overlay_enabled`.
+    pub saved_overlay_enabled_at_startup: bool,
+}
+
+impl Env<'_> {
+    /// Whether the *file* has moved since launch — i.e. whether restarting
+    /// would actually change how Iris behaves.
+    ///
+    /// Deliberately not "saved differs from running": a run-only CLI override
+    /// (`iris --hotkey f9` over a `hotkey = "right-ctrl"` file) makes those
+    /// two differ for the whole session by design, and marking it pending
+    /// would nag about an edit nobody made. A real rebind moves the file, so
+    /// it shows up here; the override never touches it, so it does not.
+    #[must_use]
+    pub fn restart_pending(&self, saved: &Config) -> RestartPending {
+        RestartPending {
+            hotkey: saved.hotkey != self.saved_hotkey_at_startup,
+            overlay_enabled: saved.overlay_enabled != self.saved_overlay_enabled_at_startup,
+        }
+    }
+}
+
+/// Which restart-gated settings have been changed since launch, for the view
+/// to mark. See [`Env::restart_pending`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartPending {
+    /// `hotkey` has been rebound and is waiting on a restart.
+    pub hotkey: bool,
+    /// `overlay_enabled` has been toggled and is waiting on a restart.
+    pub overlay_enabled: bool,
 }
 
 /// The window's in-memory state. Built fresh each time the window opens.
@@ -297,6 +331,8 @@ mod tests {
             utc_offset_seconds: 0,
             in_force_hotkey: Key::default(),
             in_force_overlay_enabled: true,
+            saved_hotkey_at_startup: Key::default(),
+            saved_overlay_enabled_at_startup: true,
         }
     }
 
@@ -470,9 +506,51 @@ mod tests {
         let mut state = WindowState::new(&env);
 
         assert_eq!(state.config.hotkey, env.in_force_hotkey);
+        assert!(!env.restart_pending(&state.config).hotkey);
         state.set_hotkey(&env, Key::F9);
         assert_eq!(state.config.hotkey, Key::F9);
         assert_ne!(state.config.hotkey, env.in_force_hotkey);
+        assert!(env.restart_pending(&state.config).hotkey);
+    }
+
+    /// `iris --hotkey f9` over a `hotkey = "right-ctrl"` file: `main` never
+    /// writes the override back, so the running key and the saved one differ
+    /// for the whole session with nothing pending. Marking that as a restart
+    /// away from taking effect would nag about an edit nobody made.
+    #[test]
+    fn a_run_only_cli_override_is_not_a_pending_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let mut env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        // What `--hotkey f9` and `--overlay`-style overrides leave behind:
+        // in force differs from the file, and the file never moves.
+        env.in_force_hotkey = Key::F9;
+        env.in_force_overlay_enabled = false;
+
+        let saved = Config::default();
+        assert_eq!(saved.hotkey, env.saved_hotkey_at_startup);
+        let pending = env.restart_pending(&saved);
+        assert!(!pending.hotkey);
+        assert!(!pending.overlay_enabled);
+    }
+
+    #[test]
+    fn toggling_the_overlay_is_pending_independently_of_the_hotkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.set_overlay_enabled(&env, false);
+        let pending = env.restart_pending(&state.config);
+        assert!(pending.overlay_enabled);
+        assert!(!pending.hotkey);
     }
 
     #[test]

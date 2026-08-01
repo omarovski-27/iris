@@ -68,7 +68,7 @@ pub mod ui;
 mod shell;
 
 pub use insights::{DayWindow, Insights, Ranked};
-pub use state::{Env, Tab, WindowState};
+pub use state::{Env, RestartPending, Tab, WindowState};
 
 /// What the dictation loop asks the settings window to do.
 ///
@@ -121,21 +121,31 @@ impl WindowSink for RecordingWindow {
     }
 }
 
-/// What the running process is actually doing, as opposed to what
-/// `config.toml` says it should.
+/// The two settings that cannot change without a restart, as `main` saw them
+/// at launch — both what the process actually runs on and what the file said.
 ///
-/// The two settings here are read exactly once, in `main`, before this window
-/// can exist: the hotkey when the hook is installed, `overlay_enabled` when
-/// the overlay is (or is not) spawned. Changing either saves immediately but
-/// only takes effect on the next launch, so the window is handed the running
-/// values and shows a restart-pending qualifier wherever they have drifted —
-/// without it the sidebar would confidently name a key that does nothing.
+/// Each is read exactly once, before this window can exist: the hotkey when
+/// the hook is installed, `overlay_enabled` when the overlay is (or is not)
+/// spawned. So the window is handed the running values, and names those
+/// rather than the saved ones — without that the sidebar would confidently
+/// name a key that does nothing.
+///
+/// The file values are here because "running ≠ saved" alone does not mean a
+/// change is pending. A run-only CLI override (`iris --hotkey f9`) diverges
+/// from the file by design and never converges, and flagging that as pending
+/// would nag about an edit the user never made. What *is* pending is the file
+/// having moved since launch, which is `saved_*` against the current
+/// [`WindowState::config`](state::WindowState::config).
 #[derive(Debug, Clone, Copy)]
-pub struct InForce {
+pub struct Startup {
     /// The key the installed hook listens for.
     pub hotkey: iris_core::hotkey::Key,
     /// Whether `iris-overlay` was spawned this run.
     pub overlay_enabled: bool,
+    /// `hotkey` as `config.toml` held it at launch, before any CLI override.
+    pub saved_hotkey: iris_core::hotkey::Key,
+    /// `overlay_enabled` as `config.toml` held it at launch, likewise.
+    pub saved_overlay_enabled: bool,
 }
 
 /// Start the settings window on its own thread.
@@ -147,15 +157,15 @@ pub struct InForce {
 pub fn spawn(
     config_path: std::path::PathBuf,
     commands: crossbeam_channel::Sender<crate::app::Command>,
-    in_force: InForce,
+    startup: Startup,
 ) -> anyhow::Result<Box<dyn WindowSink>> {
     #[cfg(windows)]
     {
-        shell::spawn(config_path, commands, in_force)
+        shell::spawn(config_path, commands, startup)
     }
     #[cfg(not(windows))]
     {
-        let _ = (config_path, commands, in_force);
+        let _ = (config_path, commands, startup);
         Ok(Box::new(NoopWindow))
     }
 }

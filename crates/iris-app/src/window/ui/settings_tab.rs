@@ -62,7 +62,7 @@ fn dictation_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &ir
                 });
         });
 
-        let hotkey_pending = state.config.hotkey != env.in_force_hotkey;
+        let hotkey_pending = env.restart_pending(&state.config).hotkey;
         labeled_row(ui, theme, "Hotkey", |ui| {
             egui::ComboBox::from_id_salt("iris_settings_hotkey")
                 .selected_text(state.config.hotkey.label())
@@ -171,7 +171,7 @@ fn overlay_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris
             {
                 state.set_overlay_enabled(env, enabled);
             }
-            if state.config.overlay_enabled != env.in_force_overlay_enabled {
+            if env.restart_pending(&state.config).overlay_enabled {
                 let running = if env.in_force_overlay_enabled {
                     "shown"
                 } else {

@@ -408,9 +408,11 @@ When updating this file, preserve this bar for all agents and keep entries conci
   module docs for why a second writer would race it.
 - `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
   like `hotkey`, changing it needs a restart (both are read once at startup).
-  `main` therefore hands `window::spawn` an `InForce` snapshot of what the
-  process is really doing, and the view marks either setting "until restart"
-  wherever the saved value has outrun it.
+  `main` therefore hands `window::spawn` a `Startup` snapshot: what the
+  process is really running on *and* what the file held before CLI overrides.
+  The view names the running value, and marks a setting "until restart" only
+  when the file has moved since launch — `--hotkey` diverges from the file by
+  design and must not read as an unsaved edit.
 - Anything the window cannot reach the OS for crosses through `Env` as a
   callback or a plain value (`list_devices`, `open_config_file`, the local UTC
   offset from `GetTimeZoneInformation`), so `window::ui` stays `egui`-only.

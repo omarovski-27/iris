@@ -22,7 +22,7 @@ use crate::app::Command;
 use crate::config::Config;
 
 use super::state::{Env, WindowState};
-use super::{ui, InForce, WindowSink};
+use super::{ui, Startup, WindowSink};
 
 /// Sends the `open` signal [`spawn`]'s thread waits on.
 pub struct WindowHandle {
@@ -43,7 +43,7 @@ impl WindowSink for WindowHandle {
 pub fn spawn(
     config_path: PathBuf,
     commands: Sender<Command>,
-    in_force: InForce,
+    startup: Startup,
 ) -> Result<Box<dyn WindowSink>> {
     let (open_tx, open_rx) = crossbeam_channel::unbounded::<()>();
 
@@ -55,7 +55,7 @@ pub fn spawn(
                     open_rx.clone(),
                     config_path.clone(),
                     commands.clone(),
-                    in_force,
+                    startup,
                 );
             }
         })
@@ -69,7 +69,7 @@ fn run_window(
     reopen_signal: Receiver<()>,
     config_path: PathBuf,
     commands: Sender<Command>,
-    in_force: InForce,
+    startup: Startup,
 ) {
     // Best-effort: a config that fails to load just draws the default-theme
     // icon rather than blocking the window from opening at all.
@@ -103,7 +103,7 @@ fn run_window(
         config_path,
         commands,
         reopen_signal,
-        in_force,
+        startup,
         // Asked once per window, not once per frame: a timezone change while
         // the window happens to be open is not worth a syscall every 16 ms,
         // and reopening the window picks up the new one.
@@ -126,7 +126,7 @@ struct SettingsApp {
     config_path: PathBuf,
     commands: Sender<Command>,
     reopen_signal: Receiver<()>,
-    in_force: InForce,
+    startup: Startup,
     utc_offset_seconds: i32,
     /// Built lazily on the first frame — `Env` borrows the fields above, so
     /// it cannot be constructed until `self` exists.
@@ -142,8 +142,10 @@ impl eframe::App for SettingsApp {
             open_config_file: &open_config_file,
             reopen_signal: &self.reopen_signal,
             utc_offset_seconds: self.utc_offset_seconds,
-            in_force_hotkey: self.in_force.hotkey,
-            in_force_overlay_enabled: self.in_force.overlay_enabled,
+            in_force_hotkey: self.startup.hotkey,
+            in_force_overlay_enabled: self.startup.overlay_enabled,
+            saved_hotkey_at_startup: self.startup.saved_hotkey,
+            saved_overlay_enabled_at_startup: self.startup.saved_overlay_enabled,
         };
         let state = self.state.get_or_insert_with(|| WindowState::new(&env));
         ui::draw_root(ctx, state, &env);
@@ -185,15 +187,17 @@ fn open_config_file(path: &Path) -> Result<()> {
 /// `crate::history` stamps every record in UTC. This process is many threads
 /// deep by the time a window opens, so the offset comes from the OS instead —
 /// `GetTimeZoneInformation` reports it as a *bias* in minutes to add to local
-/// time to reach UTC, plus a seasonal bias whose value depends on which
-/// season the call says we are in. Falls back to UTC on the documented
-/// `TIME_ZONE_ID_INVALID`, which only degrades the "Dictations today" tile.
+/// time to reach UTC, plus a seasonal bias picked by the season the call says
+/// we are in. Falls back to UTC on the documented `TIME_ZONE_ID_INVALID`,
+/// which only degrades the "Dictations today" tile.
 // `GetTimeZoneInformation` has no safe wrapper. The call fills a struct we
 // own and outlives nothing, so the opt-in is one function wide.
 #[allow(unsafe_code)]
 fn local_utc_offset_seconds() -> i32 {
     use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 
+    /// `TIME_ZONE_ID_UNKNOWN` — a real zone, with no seasonal rule in force.
+    const UNKNOWN: u32 = 0;
     /// `TIME_ZONE_ID_STANDARD` — standard time is in effect.
     const STANDARD: u32 = 1;
     /// `TIME_ZONE_ID_DAYLIGHT` — daylight saving is in effect.
@@ -201,12 +205,14 @@ fn local_utc_offset_seconds() -> i32 {
 
     let mut info = TIME_ZONE_INFORMATION::default();
     let seasonal = match unsafe { GetTimeZoneInformation(&mut info) } {
-        STANDARD => info.StandardBias,
+        // `UNKNOWN` is still standard time — the zone simply has no
+        // daylight-saving transition — so it carries `StandardBias` like
+        // `STANDARD` does, not a bias of zero.
+        UNKNOWN | STANDARD => info.StandardBias,
         DAYLIGHT => info.DaylightBias,
-        // TIME_ZONE_ID_UNKNOWN (no seasonal rule) or TIME_ZONE_ID_INVALID
-        // (the call failed, and `info` is still the zeroed default — i.e.
-        // UTC).
-        _ => 0,
+        // TIME_ZONE_ID_INVALID: the call failed. Nothing says what it left in
+        // `info`, so read none of it and answer UTC.
+        _ => return 0,
     };
     -(info.Bias.saturating_add(seasonal)).saturating_mul(60)
 }
