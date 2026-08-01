@@ -85,22 +85,26 @@ paste while still held, because Ctrl+V becomes Ctrl+Alt+V or Ctrl+Win+V; Iris
 types the transcript instead when that happens.
 
 **Injection method — what `method` decides.** `method` is a request, not a
-guarantee, and only one thing about delivery actually turns on which value you
-set. A transcript longer than 256 characters (roughly 30 seconds of speech) is
-delivered as a **clipboard paste even under `sendinput`**, because a keystroke
-burst that long arrives garbled in some apps — a reported 313-character
-dictation reached Notepad as a handful of correct characters followed by one
-repeated key and a run of spaces, while the same text typed into a terminal
-fine. That automatic escalation is skipped for windows that do not treat Ctrl+V
-as paste — terminals (including ConEmu/Cmder, Hyper and Tabby), Remote Desktop
-and VM client windows, vim, Emacs — which keep the keystrokes instead.
+guarantee. Under the default `sendinput`, two things must *both* be true before
+Iris pastes anything. The first is length: a transcript longer than 256
+characters (roughly 30 seconds of speech) is delivered as a **clipboard paste
+even under `sendinput`**, because a keystroke burst that long arrives garbled in
+some apps — a reported 313-character dictation reached Notepad as a handful of
+correct characters followed by one repeated key and a run of spaces, while the
+same text typed into a terminal fine. The second is the window: that escalation
+is skipped for targets that do not treat Ctrl+V as paste — terminals (including
+ConEmu/Cmder, Hyper and Tabby), Remote Desktop and VM client windows, vim,
+Emacs — which keep the keystrokes instead. Anything under the threshold, or
+aimed at one of those windows, is typed, and your clipboard is never touched.
 
-**That skip is the only thing `method = "clipboard"` changes.** Setting it is
-your own choice and is honoured as one: Iris pastes at any length, into whatever
-window has focus, including the paste-hostile ones above, and never filters your
-choice through that list. Everything in the two sections below applies to you
-exactly as it applies to an automatically escalated dictation — it all lives in
-the paste itself, not in the decision to paste.
+**`method = "clipboard"` drops both of those gates, not just the window list.**
+Setting it is your own choice and is honoured as one, but it is a larger change
+than "also paste into terminals": *every* dictation is pasted, at any length,
+into whatever window has focus. A five-word dictation that the default would
+have typed without going near your clipboard now clobbers it, and so does the
+next one. Everything in the two sections below then applies to you exactly as it
+applies to an automatically escalated dictation — it all lives in the paste
+itself, not in the decision to paste.
 
 **What every paste does, however Iris got there.** A paste **overwrites whatever
 was on your clipboard, and the previous contents are not restored.** This is a
@@ -111,7 +115,10 @@ silently pastes your *old* clipboard, which looks like it worked) or needs a
 delay long enough to cost the sub-second latency this app exists for and to race
 the next dictation. The full reasoning is in `win::paste`'s doc comment in
 `iris-core/src/inject.rs` (commit `e2aac70`). If you keep something on the
-clipboard you cannot lose, copy it back afterwards, or keep dictations short.
+clipboard you cannot lose, copy it back afterwards. Keeping dictations under the
+threshold avoids the paste altogether, but only under the default — with
+`method = "clipboard"` there is no length short enough to stay off the
+clipboard.
 
 A paste can also decline itself and type the transcript instead. Two things
 cause that, and neither depends on how the paste was chosen: a hotkey still
