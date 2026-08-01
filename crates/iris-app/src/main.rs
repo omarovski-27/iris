@@ -275,21 +275,8 @@ fn start_resident(
     // Its commands travel on a channel separate from the tray's `commands`
     // (App::run selects on both), so a window write can never race a tray
     // write to persist() — see `iris_app::window::state`'s module docs.
-    //
-    // `Startup` is what this process is *actually* doing — the hook above was
-    // installed with `config.hotkey` and the overlay was spawned (or not)
-    // just now, neither changing again without a restart — paired with what
-    // the file said before `apply_overrides` ran. `file_config` is the
-    // pre-override copy, so a run-only `--hotkey` reads as already in force
-    // rather than as an edit waiting to be restarted into.
-    let startup = iris_app::window::Startup {
-        hotkey: config.hotkey,
-        overlay_enabled: overlay.is_some(),
-        saved_hotkey: file_config.hotkey,
-        saved_overlay_enabled: file_config.overlay_enabled,
-    };
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
-    let window = iris_app::window::spawn(config_path.to_path_buf(), window_commands_tx, startup)?;
+    let window = iris_app::window::spawn(config_path.to_path_buf(), window_commands_tx)?;
 
     let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
@@ -487,45 +474,27 @@ fn demo_window() -> Result<()> {
     let config_path = dir.join("config.toml");
     let history_path = dir.join("history.jsonl");
 
-    let config = Config::default();
-    config
+    Config::default()
         .save(&config_path)
         .with_context(|| format!("writing {}", config_path.display()))?;
 
-    // The path is fixed, so without this the ten demo records append to the
-    // ten from the last run and the Insights figures — and any screenshot of
-    // them — drift a little further every time.
-    if history_path.exists() {
-        std::fs::remove_file(&history_path)
-            .with_context(|| format!("clearing {}", history_path.display()))?;
-    }
     let mut log = SessionLog::open(&history_path, 500);
     for record in demo_records() {
         log.append(&record)?;
     }
 
     let (commands_tx, _commands_rx) = crossbeam_channel::unbounded();
-    let handle = window::spawn(
-        config_path.clone(),
-        commands_tx,
-        window::Startup {
-            hotkey: config.hotkey,
-            // No overlay process in the demo, whatever the seeded file says.
-            overlay_enabled: false,
-            saved_hotkey: config.hotkey,
-            saved_overlay_enabled: config.overlay_enabled,
-        },
-    )?;
+    let handle = window::spawn(config_path.clone(), commands_tx)?;
     handle.open();
 
     println!("iris --demo-window");
     println!("  config   {}", config_path.display());
     println!("  history  {}", history_path.display());
-    if !cfg!(windows) {
+    if cfg!(windows) {
+        println!("  Settings window opened; exiting in 120s (Ctrl+C to stop sooner).");
+    } else {
         println!("  no window on this platform (Windows-only); the seeded files above are real.");
-        return Ok(());
     }
-    println!("  Settings window opened; exiting in 120s (Ctrl+C to stop sooner).");
     std::thread::sleep(std::time::Duration::from_secs(120));
     Ok(())
 }

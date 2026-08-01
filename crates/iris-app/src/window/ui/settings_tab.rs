@@ -6,11 +6,7 @@
 //! Deliberately absent: API keys. `config.rs`'s redaction discipline is
 //! load-bearing, and the product brief only asks for engine, device, theme,
 //! polish, the overlay toggle and hotkey rebinding — so this tab has no
-//! control that could ever put a key value in a text widget. What it does
-//! offer is "Open config file", which hands the file itself to the user's
-//! editor: the keys stay hand-edited, exactly as they were when the tray's
-//! `Settings` item opened the file directly, and nothing in this process
-//! ever reads one back to render it.
+//! control that could ever put a key value in a text widget.
 
 use egui::{RichText, Ui};
 use iris_core::hotkey::Key;
@@ -39,8 +35,6 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
             cleanup_section(ui, state, env, theme);
             ui.add_space(12.0);
             overlay_section(ui, state, env, theme);
-            ui.add_space(12.0);
-            config_file_section(ui, state, env, theme);
         });
 }
 
@@ -62,7 +56,6 @@ fn dictation_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &ir
                 });
         });
 
-        let hotkey_pending = env.restart_pending(&state.config).hotkey;
         labeled_row(ui, theme, "Hotkey", |ui| {
             egui::ComboBox::from_id_salt("iris_settings_hotkey")
                 .selected_text(state.config.hotkey.label())
@@ -74,9 +67,6 @@ fn dictation_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &ir
                         }
                     }
                 });
-            if hotkey_pending {
-                restart_pending(ui, theme, &format!("{} until restart", env.in_force_hotkey));
-            }
         });
         ui.add_space(2.0);
         caption(
@@ -164,72 +154,11 @@ fn overlay_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris
         chrome::section_label(ui, theme, "Overlay");
         ui.add_space(8.0);
         let mut enabled = state.config.overlay_enabled;
-        ui.horizontal(|ui| {
-            if ui
-                .checkbox(&mut enabled, "Show the live-text pill while dictating")
-                .changed()
-            {
-                state.set_overlay_enabled(env, enabled);
-            }
-            if env.restart_pending(&state.config).overlay_enabled {
-                let running = if env.in_force_overlay_enabled {
-                    "shown"
-                } else {
-                    "hidden"
-                };
-                restart_pending(ui, theme, &format!("{running} until restart"));
-            }
-        });
+        if ui.checkbox(&mut enabled, "Show the live-text pill while dictating").changed() {
+            state.set_overlay_enabled(env, enabled);
+        }
         caption(ui, theme, "The small on-screen indicator that appears while you hold the hotkey. Changing this needs a restart of Iris.");
     });
-}
-
-/// The one place this window points at `config.toml` itself.
-///
-/// A direct OS action rather than a [`crate::app::Command`]: nothing is read
-/// back and no state changes here, so there is nothing for `App` — the sole
-/// config writer — to arbitrate. The next refresh picks up whatever the user
-/// saved, the same way it picks up an edit made outside Iris entirely.
-fn config_file_section(
-    ui: &mut Ui,
-    state: &mut WindowState,
-    env: &Env,
-    theme: &iris_overlay::Theme,
-) {
-    chrome::card(theme).show(ui, |ui| {
-        chrome::section_label(ui, theme, "Config file");
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Open config file").clicked() {
-                state.open_config_file(env);
-            }
-            ui.label(
-                RichText::new(env.config_path.display().to_string())
-                    .size(11.0)
-                    .color(chrome::ink_faint(theme)),
-            );
-        });
-        ui.add_space(2.0);
-        caption(
-            ui,
-            theme,
-            "Everything above, plus the settings this window does not show — API keys most of \
-             all, which Iris never displays. Edited by hand; changes are picked up here within \
-             a couple of seconds.",
-        );
-    });
-}
-
-/// A short, always-visible "this is not live yet" marker beside a control
-/// whose saved value has outrun the running one. Not a tooltip: the whole
-/// problem it exists to fix is a difference the user cannot see.
-fn restart_pending(ui: &mut Ui, theme: &iris_overlay::Theme, text: &str) {
-    ui.label(
-        RichText::new(text)
-            .size(11.0)
-            .strong()
-            .color(chrome::warn(theme)),
-    );
 }
 
 fn labeled_row(

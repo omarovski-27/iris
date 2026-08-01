@@ -1,6 +1,6 @@
 //! The window's view: plain `egui`, no `eframe`, no OS calls — see the
 //! module docs on [`crate::window`] for why that split exists. Everything
-//! here type-checks on every platform; `crate::window::shell` is the only
+//! here type-checks on every platform; [`crate::window::shell`] is the only
 //! `cfg(windows)` piece, and it does nothing but bootstrap `eframe` and call
 //! [`draw_root`] once a frame.
 
@@ -13,7 +13,7 @@ use egui::{Align, CentralPanel, Color32, Frame, Layout, RichText};
 
 use crate::pill::overlay_theme;
 
-use super::{egui_theme, Env, StatusLevel, Tab, WindowState};
+use super::{egui_theme, Env, Tab, WindowState};
 
 /// Draw one frame of the whole window.
 ///
@@ -41,7 +41,7 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
         .resizable(false)
         .exact_width(176.0)
         .frame(Frame::new().inner_margin(egui::Margin::symmetric(12, 16)))
-        .show(ctx, |ui| nav(ui, state, env, &theme));
+        .show(ctx, |ui| nav(ui, state, &theme));
 
     egui::SidePanel::left("iris_window_divider")
         .resizable(false)
@@ -50,28 +50,6 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
         .show(ctx, |ui| {
             chrome::spectrum_bar(ui.painter(), &theme, ui.max_rect());
         });
-
-    // Before the `CentralPanel`, not after: egui lays panels out in the order
-    // they are added and the central panel claims whatever is left, so a
-    // bottom panel added afterwards paints over the last history card instead
-    // of reserving a strip under it.
-    if let Some((status, level)) = state
-        .status_flash()
-        .map(|(message, level)| (message.to_string(), level))
-    {
-        // A failure — a change the loop never received — is the one status
-        // the user has to act on, so it does not read like "Saved" in grey.
-        let color = match level {
-            StatusLevel::Info => chrome::ink_dim(&theme),
-            StatusLevel::Warn => chrome::warn(&theme),
-        };
-        egui::TopBottomPanel::bottom("iris_window_status")
-            .frame(Frame::new().inner_margin(egui::Margin::symmetric(24, 8)))
-            .show_separator_line(false)
-            .show(ctx, |ui| {
-                ui.label(RichText::new(status).color(color).size(12.0));
-            });
-    }
 
     CentralPanel::default()
         .frame(
@@ -84,10 +62,23 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
             Tab::Settings => settings_tab::draw(ui, state, env, &theme),
             Tab::Insights => insights_tab::draw(ui, state, &theme),
         });
+
+    if let Some(status) = state.status_text().map(str::to_string) {
+        egui::TopBottomPanel::bottom("iris_window_status")
+            .frame(Frame::new().inner_margin(egui::Margin::symmetric(24, 8)))
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(status)
+                        .color(chrome::ink_dim(&theme))
+                        .size(12.0),
+                );
+            });
+    }
 }
 
 /// The left-hand section picker: History, Settings, Insights.
-fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overlay::Theme) {
+fn nav(ui: &mut egui::Ui, state: &mut WindowState, theme: &iris_overlay::Theme) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("Iris")
@@ -127,25 +118,10 @@ fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overl
         ui.add_space(4.0);
     }
 
-    // The hint names the key that works *right now*, which is the one the
-    // hook was installed with — not the saved one. After a rebind those
-    // differ until a restart, and a footer that quietly switched to the new
-    // key would be telling the user to hold something inert.
-    let pending = env
-        .restart_pending(&state.config)
-        .hotkey
-        .then_some(state.config.hotkey);
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
         ui.add_space(4.0);
-        if let Some(saved) = pending {
-            ui.label(
-                RichText::new(format!("{saved} after restart"))
-                    .size(11.0)
-                    .color(chrome::warn(theme)),
-            );
-        }
         ui.label(
-            RichText::new(format!("hold {} to dictate", env.in_force_hotkey))
+            RichText::new(format!("hold {} to dictate", state.config.hotkey))
                 .size(11.0)
                 .color(chrome::ink_faint(theme)),
         );
