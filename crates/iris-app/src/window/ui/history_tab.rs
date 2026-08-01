@@ -5,7 +5,7 @@
 use egui::{Color32, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::history::DictationRecord;
-use crate::window::{search, Env, WindowState};
+use crate::window::{Env, WindowState};
 
 use super::chrome;
 
@@ -37,19 +37,15 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
     });
     ui.add_space(12.0);
 
-    let filtered = search::filter(&state.history, &state.search);
+    // Matching lowercases every record it looks at, so it runs only when the
+    // query or the log has actually moved — not on every repaint, which is
+    // what typing in the box above causes.
+    state.sync_filter();
+    let matched = state.filtered().len();
     let count_label = if state.search.is_empty() {
-        format!(
-            "{} dictation{}",
-            filtered.len(),
-            if filtered.len() == 1 { "" } else { "s" }
-        )
+        format!("{matched} dictation{}", if matched == 1 { "" } else { "s" })
     } else {
-        format!(
-            "{} match{}",
-            filtered.len(),
-            if filtered.len() == 1 { "" } else { "es" }
-        )
+        format!("{matched} match{}", if matched == 1 { "" } else { "es" })
     };
     ui.label(
         RichText::new(count_label)
@@ -59,7 +55,7 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
     ui.add_space(6.0);
 
     let mut copy_action = None;
-    if filtered.is_empty() {
+    if matched == 0 {
         chrome::card(theme).show(ui, |ui| {
             ui.label(
                 RichText::new(if state.history.is_empty() {
@@ -71,10 +67,12 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
             );
         });
     } else {
+        let history = &state.history;
+        let filtered = state.filtered();
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for record in &filtered {
+                for record in filtered.iter().filter_map(|&i| history.get(i)) {
                     card(ui, theme, record, &mut copy_action);
                     ui.add_space(8.0);
                 }

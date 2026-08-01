@@ -68,7 +68,7 @@ pub mod ui;
 mod shell;
 
 pub use insights::{DayWindow, Insights, Ranked};
-pub use state::{Env, RestartPending, Tab, WindowState};
+pub use state::{Env, RestartPending, Status, StatusLevel, Tab, WindowState};
 
 /// What the dictation loop asks the settings window to do.
 ///

@@ -284,7 +284,7 @@ fn start_resident(
     // rather than as an edit waiting to be restarted into.
     let startup = iris_app::window::Startup {
         hotkey: config.hotkey,
-        overlay_enabled: config.overlay_enabled,
+        overlay_enabled: overlay.is_some(),
         saved_hotkey: file_config.hotkey,
         saved_overlay_enabled: file_config.overlay_enabled,
     };
@@ -510,7 +510,8 @@ fn demo_window() -> Result<()> {
         commands_tx,
         window::Startup {
             hotkey: config.hotkey,
-            overlay_enabled: config.overlay_enabled,
+            // No overlay process in the demo, whatever the seeded file says.
+            overlay_enabled: false,
             saved_hotkey: config.hotkey,
             saved_overlay_enabled: config.overlay_enabled,
         },

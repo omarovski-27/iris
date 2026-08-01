@@ -27,6 +27,7 @@ use crate::history::{DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
 
 use super::insights::{DayWindow, Insights};
+use super::search;
 
 /// How often the window re-reads `config.toml` and the session log while it
 /// is open and visible.
@@ -131,6 +132,28 @@ pub struct RestartPending {
     pub overlay_enabled: bool,
 }
 
+/// How a flashed [`Status`] reads: ordinary feedback, or a failure the user
+/// has to notice because the change did *not* happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLevel {
+    /// "Saved", "Copied" — the thing worked.
+    Info,
+    /// The thing did not work; the view paints this in the warning colour.
+    Warn,
+}
+
+/// A transient message (e.g. "Copied", "Saved") and when it was set, so the
+/// view can drop it after [`STATUS_HOLD`].
+#[derive(Debug, Clone)]
+pub struct Status {
+    /// What to show.
+    pub message: String,
+    /// How to show it.
+    pub level: StatusLevel,
+    /// When [`WindowState::flash`] set it.
+    pub at: Instant,
+}
+
 /// The window's in-memory state. Built fresh each time the window opens.
 pub struct WindowState {
     /// The active section.
@@ -147,10 +170,15 @@ pub struct WindowState {
     pub insights: Insights,
     /// Input device names for the Settings picker.
     pub devices: Vec<String>,
-    /// A transient message (e.g. "Copied", "Saved") and when it was set, so
-    /// the view can fade it out after [`STATUS_HOLD`].
-    pub status: Option<(String, Instant)>,
+    /// The current status line, if any. See [`WindowState::status_flash`].
+    pub status: Option<Status>,
     last_refresh: Instant,
+    /// Positions in `history` matching `search`, as of `filtered_for`. See
+    /// [`WindowState::sync_filter`].
+    filtered: Vec<usize>,
+    /// The query `filtered` was computed for; `None` while it is stale, which
+    /// is how a reloaded `history` invalidates it.
+    filtered_for: Option<String>,
 }
 
 impl WindowState {
@@ -170,6 +198,8 @@ impl WindowState {
             devices,
             status: None,
             last_refresh: Instant::now(),
+            filtered: Vec::new(),
+            filtered_for: None,
         }
     }
 
@@ -188,7 +218,31 @@ impl WindowState {
         }
         self.history = load_history(&self.config, env.config_path);
         self.insights = Insights::compute(&self.history, &local_day(env.utc_offset_seconds));
+        self.filtered_for = None;
         self.last_refresh = Instant::now();
+    }
+
+    /// Bring [`WindowState::filtered`] up to date with `search` and `history`,
+    /// recomputing only when one of them has actually moved.
+    ///
+    /// The History tab calls this once per frame, and matching is not free:
+    /// it lowercases every record it looks at, over a log whose cap
+    /// (`history.max_entries`) the user sets. Recomputing that on every
+    /// repaint made the window heavier the longer the log got — worst while
+    /// typing in the search box, which is when it repaints continuously.
+    pub fn sync_filter(&mut self) {
+        if self.filtered_for.as_deref() == Some(self.search.as_str()) {
+            return;
+        }
+        self.filtered = search::filter_indices(&self.history, &self.search);
+        self.filtered_for = Some(self.search.clone());
+    }
+
+    /// Positions in [`WindowState::history`] matching the search box, as of
+    /// the last [`WindowState::sync_filter`].
+    #[must_use]
+    pub fn filtered(&self) -> &[usize] {
+        &self.filtered
     }
 
     /// Re-enumerate input devices (a manual "refresh" next to the picker).
@@ -203,69 +257,117 @@ impl WindowState {
     pub fn open_config_file(&mut self, env: &Env) {
         match (env.open_config_file)(env.config_path) {
             Ok(()) => self.flash("Opened config.toml"),
-            Err(e) => self.flash(format!("Could not open config.toml: {e}")),
+            Err(e) => self.flash_failure(format!("Could not open config.toml: {e}")),
         }
     }
 
     /// Show `message` in the status line for [`STATUS_HOLD`].
     pub fn flash(&mut self, message: impl Into<String>) {
-        self.status = Some((message.into(), Instant::now()));
+        self.set_status(message, StatusLevel::Info);
+    }
+
+    /// Like [`WindowState::flash`], for something that did not work.
+    pub fn flash_failure(&mut self, message: impl Into<String>) {
+        self.set_status(message, StatusLevel::Warn);
+    }
+
+    fn set_status(&mut self, message: impl Into<String>, level: StatusLevel) {
+        self.status = Some(Status {
+            message: message.into(),
+            level,
+            at: Instant::now(),
+        });
+    }
+
+    /// The status message and how to paint it, if it has not yet expired.
+    #[must_use]
+    pub fn status_flash(&self) -> Option<(&str, StatusLevel)> {
+        self.status
+            .as_ref()
+            .filter(|status| status.at.elapsed() < STATUS_HOLD)
+            .map(|status| (status.message.as_str(), status.level))
     }
 
     /// The status message, if it has not yet expired.
     #[must_use]
     pub fn status_text(&self) -> Option<&str> {
-        self.status
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < STATUS_HOLD)
-            .map(|(text, _)| text.as_str())
+        self.status_flash().map(|(message, _)| message)
     }
 
     /// Switch the transcription engine. Takes effect immediately; rolled
     /// back by the loop (and self-corrected here on the next refresh) if the
     /// engine cannot be built, e.g. no API key.
     pub fn set_engine(&mut self, env: &Env, choice: EngineChoice) {
-        self.config.engine = choice;
-        let _ = env.commands.send(Command::SetEngine(choice));
-        self.flash("Saved");
+        if self.dispatch(env, Command::SetEngine(choice), "Saved") {
+            self.config.engine = choice;
+        }
     }
 
     /// Switch the input device. Takes effect immediately.
     pub fn set_device(&mut self, env: &Env, device: Option<String>) {
-        self.config.audio.device = device.clone();
-        let _ = env.commands.send(Command::SetDevice(device));
-        self.flash("Saved");
+        if self.dispatch(env, Command::SetDevice(device.clone()), "Saved") {
+            self.config.audio.device = device;
+        }
     }
 
     /// Switch dark/light. Takes effect immediately, on this window too.
     pub fn set_theme(&mut self, env: &Env, theme: Theme) {
-        self.config.theme = theme;
-        let _ = env.commands.send(Command::SetTheme(theme));
-        self.flash("Saved");
+        if self.dispatch(env, Command::SetTheme(theme), "Saved") {
+            self.config.theme = theme;
+        }
     }
 
     /// Turn transcript cleanup on or off. Takes effect immediately.
     pub fn set_polish(&mut self, env: &Env, enabled: bool) {
-        self.config.polish.enabled = enabled;
-        let _ = env.commands.send(Command::SetPolish(enabled));
-        self.flash("Saved");
+        if self.dispatch(env, Command::SetPolish(enabled), "Saved") {
+            self.config.polish.enabled = enabled;
+        }
     }
 
     /// Rebind the push-to-talk key. Saved now; needs a restart to take
     /// effect, because the hook is installed once in `main` before this
     /// window exists — the same restart the tray's own hotkey change needs.
     pub fn set_hotkey(&mut self, env: &Env, key: Key) {
-        self.config.hotkey = key;
-        let _ = env.commands.send(Command::SetHotkey(key));
-        self.flash("Saved — restart Iris to use the new key");
+        if self.dispatch(
+            env,
+            Command::SetHotkey(key),
+            "Saved — restart Iris to use the new key",
+        ) {
+            self.config.hotkey = key;
+        }
     }
 
     /// Show or hide the live-text pill overlay. Saved now; needs a restart —
     /// the overlay is spawned once in `main` before this window exists.
     pub fn set_overlay_enabled(&mut self, env: &Env, enabled: bool) {
-        self.config.overlay_enabled = enabled;
-        let _ = env.commands.send(Command::SetOverlayEnabled(enabled));
-        self.flash("Saved — restart Iris for this to take effect");
+        if self.dispatch(
+            env,
+            Command::SetOverlayEnabled(enabled),
+            "Saved — restart Iris for this to take effect",
+        ) {
+            self.config.overlay_enabled = enabled;
+        }
+    }
+
+    /// Hand `command` to the loop, and report what happened.
+    ///
+    /// Returns whether the loop took it, which is the only case where the
+    /// local [`WindowState::config`] may move: [`crate::App`] writes the file,
+    /// so if the receiver is gone (the loop has already returned, and this
+    /// window is outliving it by a moment) nothing is saved. Mutating anyway
+    /// would leave the form showing a value no file holds, until the next
+    /// [`WindowState::refresh`] silently put it back with no explanation.
+    fn dispatch(&mut self, env: &Env, command: Command, saved: &str) -> bool {
+        match env.commands.send(command) {
+            Ok(()) => {
+                self.flash(saved);
+                true
+            }
+            Err(_) => {
+                self.flash_failure("Not saved — Iris is no longer running. Restart Iris.");
+                false
+            }
+        }
     }
 }
 
@@ -462,8 +564,87 @@ mod tests {
 
         state.flash("hello");
         assert_eq!(state.status_text(), Some("hello"));
-        state.status.as_mut().unwrap().1 = Instant::now() - STATUS_HOLD - Duration::from_secs(1);
+        state.status.as_mut().unwrap().at = Instant::now() - STATUS_HOLD - Duration::from_secs(1);
         assert_eq!(state.status_text(), None);
+    }
+
+    /// The loop is the only writer of `config.toml`, so a send that never
+    /// arrives means nothing was saved. Claiming "Saved" and moving the form
+    /// anyway would show a value no file holds until the next refresh quietly
+    /// put it back.
+    #[test]
+    fn a_setting_change_the_loop_can_no_longer_receive_is_reported_as_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        let before = state.config.clone();
+        drop(rx); // the dictation loop has returned
+
+        state.set_engine(&env, EngineChoice::Groq);
+        state.set_theme(&env, Theme::Light);
+        state.set_polish(&env, !before.polish.enabled);
+        state.set_device(&env, Some("Some Mic".into()));
+        state.set_hotkey(&env, Key::F9);
+        state.set_overlay_enabled(&env, !before.overlay_enabled);
+
+        assert_eq!(state.config, before, "nothing may move without the loop");
+        let (message, level) = state.status_flash().unwrap();
+        assert!(message.contains("Not saved"), "{message}");
+        assert_eq!(level, StatusLevel::Warn);
+    }
+
+    #[test]
+    fn a_successful_change_flashes_at_info_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.set_theme(&env, Theme::Light);
+        assert_eq!(state.config.theme, Theme::Light);
+        assert_eq!(state.status_flash(), Some(("Saved", StatusLevel::Info)));
+    }
+
+    #[test]
+    fn sync_filter_recomputes_only_when_the_query_or_the_history_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        Config::default().save(&config_path).unwrap();
+        let mut log = SessionLog::open(dir.path().join("history.jsonl"), 10);
+        log.append(&DictationRecord::now("mock", "apples")).unwrap();
+        log.append(&DictationRecord::now("mock", "bananas"))
+            .unwrap();
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.sync_filter();
+        assert_eq!(state.filtered(), [0, 1]);
+
+        state.search = "apple".into();
+        state.sync_filter();
+        assert_eq!(state.filtered(), [1], "newest first, so 'apples' is last");
+
+        // Cached: the same query over the same history costs nothing. Only
+        // `refresh` replaces `history`, and it invalidates the cache.
+        state.sync_filter();
+        assert_eq!(state.filtered(), [1], "no recompute without a change");
+
+        log.append(&DictationRecord::now("mock", "more apples"))
+            .unwrap();
+        state.refresh(&env, true);
+        state.sync_filter();
+        assert_eq!(state.filtered(), [0, 2]);
     }
 
     #[test]

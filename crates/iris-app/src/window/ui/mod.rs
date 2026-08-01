@@ -13,7 +13,7 @@ use egui::{Align, CentralPanel, Color32, Frame, Layout, RichText};
 
 use crate::pill::overlay_theme;
 
-use super::{egui_theme, Env, Tab, WindowState};
+use super::{egui_theme, Env, StatusLevel, Tab, WindowState};
 
 /// Draw one frame of the whole window.
 ///
@@ -55,16 +55,21 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
     // they are added and the central panel claims whatever is left, so a
     // bottom panel added afterwards paints over the last history card instead
     // of reserving a strip under it.
-    if let Some(status) = state.status_text().map(str::to_string) {
+    if let Some((status, level)) = state
+        .status_flash()
+        .map(|(message, level)| (message.to_string(), level))
+    {
+        // A failure — a change the loop never received — is the one status
+        // the user has to act on, so it does not read like "Saved" in grey.
+        let color = match level {
+            StatusLevel::Info => chrome::ink_dim(&theme),
+            StatusLevel::Warn => chrome::warn(&theme),
+        };
         egui::TopBottomPanel::bottom("iris_window_status")
             .frame(Frame::new().inner_margin(egui::Margin::symmetric(24, 8)))
             .show_separator_line(false)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(status)
-                        .color(chrome::ink_dim(&theme))
-                        .size(12.0),
-                );
+                ui.label(RichText::new(status).color(color).size(12.0));
             });
     }
 
@@ -129,7 +134,7 @@ fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overl
     let pending = env
         .restart_pending(&state.config)
         .hotkey
-        .then(|| state.config.hotkey);
+        .then_some(state.config.hotkey);
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
         ui.add_space(4.0);
         if let Some(saved) = pending {
