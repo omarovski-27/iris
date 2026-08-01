@@ -8,8 +8,10 @@
 //! this project builds from WSL, and it does not drag in a windowing framework.
 //! The alternatives were `systray` (unmaintained since 2021), `trayicon`
 //! (Windows-only and thinner, no submenus) and pulling in `tao`/`winit` purely
-//! for their event loop, which would be a UI framework in a crate whose brief
-//! says the tray is the only UI.
+//! for their event loop, which is a whole windowing framework for something
+//! that never needs a window. The crate does now carry one — the settings
+//! window's `eframe` shell — but it is confined to `window::shell` and its own
+//! thread, and the tray does not depend on it.
 //!
 //! # Threading
 //!

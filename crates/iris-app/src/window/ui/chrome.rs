@@ -125,7 +125,7 @@ pub fn ok(theme: &PillTheme) -> Color32 {
     color32(theme.ok)
 }
 
-/// The warm failure tone — see [`warn_color`] for why it is amber rather
+/// The warm failure tone — see `warn_color` for why it is amber rather
 /// than a red, and why it is a token of its own rather than a spectrum stop.
 #[must_use]
 pub fn warn(theme: &PillTheme) -> Color32 {

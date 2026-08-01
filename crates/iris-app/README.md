@@ -43,8 +43,10 @@ is written *after* the text has been injected.
 
 Threads: the hotkey hook and the tray each own one and do nothing on it but pump
 Windows messages (a low-level hook whose callback takes >300 ms is silently
-uninstalled); WASAPI owns the audio callback; the main thread owns the engine
-session, injection and the log. Nothing is shared behind a lock.
+uninstalled); the settings window owns one more; WASAPI owns the audio callback;
+the main thread owns the engine session, injection and the log. Nothing is
+shared behind a lock. The full inventory, with each thread's rule, is the table
+in `lib.rs`'s crate docs.
 
 ## Configuration
 
@@ -219,14 +221,12 @@ contains no `[keys]` section at all.
 
 ## Tray
 
-`tray-icon` 0.24 (+ `muda` for the menu). Chosen because it is the maintained
-extraction of Tauri's tray, it is pure Rust over Win32 — no C toolchain — so it
-cross-compiles to `x86_64-pc-windows-gnu`, which is how this project builds from
-WSL, and it drags in no windowing framework. `systray` is unmaintained (2021),
-`trayicon` has no submenus, and pulling in `tao`/`winit` for their event loop
-would put a UI framework in a crate whose only UI is meant to be the tray. On
-Linux `tray-icon` needs GTK, so the dependency is `[target.'cfg(windows)']` and
-the tray is simply absent elsewhere.
+`tray-icon` 0.24 (+ `muda` for the menu): the maintained extraction of Tauri's
+tray, pure Rust over Win32 — no C toolchain — so it cross-compiles to
+`x86_64-pc-windows-gnu`, which is how this project builds from WSL, and it needs
+no windowing framework of its own. The alternatives weighed against it are in
+`tray.rs`'s module docs. On Linux `tray-icon` needs GTK, so the dependency is
+`[target.'cfg(windows)']` and the tray is simply absent elsewhere.
 
 Menu: engine picker, microphone picker, theme, polish toggle, open settings,
 reload settings, quit. "Open settings" opens the settings window (below) —

@@ -33,6 +33,7 @@
 //! | audio | WASAPI via cpal | never blocks; hands 16 kHz frames to a channel |
 //! | tray | [`tray`] | pumps messages, sends [`Command`]s |
 //! | overlay | [`iris_overlay`] via [`pill::OverlayPill`] | paints the pill; never blocks the loop |
+//! | settings window | [`window`] | `eframe`; sends [`Command`]s, never writes the config itself |
 //! | main | [`App`] | owns the engine, the timeline, injection and the log |
 //!
 //! Nothing is shared behind a lock, so no part of the latency budget is spent

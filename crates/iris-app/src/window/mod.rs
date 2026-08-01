@@ -17,9 +17,9 @@
 //!   (`TextEdit`, `ScrollArea`, `ComboBox`, clipboard) plus a `Painter`
 //!   escape hatch for porting `iris-overlay`'s `Rgba` tokens directly. `egui`
 //!   itself (not `eframe`) has no OS dependency at all, so the entire view —
-//!   [`ui`], [`state`], [`insights`], [`search`], [`egui_theme`] — is a plain
+//!   [`ui`], `state`, `insights`, `search`, `egui_theme` — is a plain
 //!   dependency (see `Cargo.toml`) that type-checks and unit-tests on Linux;
-//!   only [`shell`] (the native window/GL bootstrap) needs `eframe`, and it
+//!   only `shell` (the native window/GL bootstrap) needs `eframe`, and it
 //!   is `[target.'cfg(windows)'.dependencies]`-gated the same way
 //!   `tray-icon` already is, so nothing GUI-shaped compiles on a non-Windows
 //!   `cargo check --workspace`.
@@ -44,7 +44,7 @@
 //!
 //! # Design
 //!
-//! [`egui_theme`] maps `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT`
+//! `egui_theme` maps `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT`
 //! tokens onto egui, and [`ui::chrome`] paints the background wash and the
 //! spectrum accent bar from the same tokens — the window and the pill are
 //! meant to read as one product, not two.

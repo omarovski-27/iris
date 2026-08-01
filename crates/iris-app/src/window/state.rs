@@ -143,7 +143,7 @@ pub enum StatusLevel {
 }
 
 /// A transient message (e.g. "Copied", "Saved") and when it was set, so the
-/// view can drop it after [`STATUS_HOLD`].
+/// view can drop it after `STATUS_HOLD`.
 #[derive(Debug, Clone)]
 pub struct Status {
     /// What to show.
@@ -203,7 +203,7 @@ impl WindowState {
         }
     }
 
-    /// Re-read `config.toml` and the session log if [`REFRESH_INTERVAL`] has
+    /// Re-read `config.toml` and the session log if `REFRESH_INTERVAL` has
     /// elapsed since the last read, or unconditionally when `force` (a
     /// manual refresh).
     pub fn refresh(&mut self, env: &Env, force: bool) {
@@ -261,7 +261,7 @@ impl WindowState {
         }
     }
 
-    /// Show `message` in the status line for [`STATUS_HOLD`].
+    /// Show `message` in the status line for `STATUS_HOLD`.
     pub fn flash(&mut self, message: impl Into<String>) {
         self.set_status(message, StatusLevel::Info);
     }

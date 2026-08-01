@@ -1,6 +1,6 @@
 //! The window's view: plain `egui`, no `eframe`, no OS calls — see the
 //! module docs on [`crate::window`] for why that split exists. Everything
-//! here type-checks on every platform; [`crate::window::shell`] is the only
+//! here type-checks on every platform; `crate::window::shell` is the only
 //! `cfg(windows)` piece, and it does nothing but bootstrap `eframe` and call
 //! [`draw_root`] once a frame.
 
