@@ -137,15 +137,27 @@ in practice.
   reaches the injector via `SystemInjector::new` (wired in `main.rs`), not
   via `app.rs`.
 - A transcript needing more than one `SendInput` batch (`inject::BATCH`, 512
-  events / 256 characters) is silently rerouted to `Method::Clipboard` by
+  events / 256 characters) is rerouted to `Method::Clipboard` by
   `inject::effective_method`, regardless of the configured method. Evidence:
   a long dictation can desync keystroke up/down pairing in a slow-consuming
   target (a classic Win32 edit control) even though `SendInput` reports full
   success, while the identical bytes land fine in a terminal built to absorb
-  bursts — so a `sendinput`-configured build can still end up pasting for a
-  long transcript. Read `effective_method`'s doc comment before changing the
-  threshold; it explains why the line is drawn exactly at `BATCH` and not a
-  rounder number.
+  bursts — so a `sendinput`-configured build can still end up pasting, and
+  clobbering the clipboard, for a long transcript. That is disclosed to users
+  in `crates/iris-app/README.md`; keep it there. Read `effective_method`'s
+  doc comment before changing the threshold; it explains why the line is
+  drawn exactly at `BATCH` and not a rounder number.
+- Three things veto that paste, and each falls back to keystrokes rather than
+  failing: a target whose Ctrl+V is not paste (`inject::accepts_paste`, a
+  documented default-allow deny-list of terminals/RDP/vim), a hotkey still
+  down that would turn Ctrl+V into another accelerator
+  (`inject::paste_accelerator_survives`), and a clipboard held open by
+  another process. The fallback is only safe because `inject::pacing` splits
+  a burst past the threshold into smaller `SendInput` calls with a gap
+  between them, so nothing lands on the unpaced burst the escalation exists
+  to avoid. `paste_accelerator_survives` is the *only* sanctioned way to
+  cover `RightAlt`/`RightWin`: it declines to paste instead of widening the
+  correction, because it injects nothing.
 - Deepgram closes an idle websocket connection (no audio sent) in roughly
   12-15s, live-measured. Relevant to any future connection-reuse idea: it
   only pays off within that window of the last dictation, not across the

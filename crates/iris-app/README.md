@@ -67,7 +67,7 @@ device = "Yeti"           # substring of the device name; omit for the default
 warm = true               # keep the mic stream open (opening it costs ~30 ms)
 
 [inject]
-method = "sendinput"      # sendinput | clipboard
+method = "sendinput"      # sendinput | clipboard; long transcripts paste anyway
 trailing_space = true
 
 [history]
@@ -80,7 +80,35 @@ groq = "gsk_..."
 
 **Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
 `inject.rs` applies before every injection burst for the other choices, so they
-behave differently there.
+behave differently there. They are also the two that cannot receive a clipboard
+paste while still held, because Ctrl+V becomes Ctrl+Alt+V or Ctrl+Win+V; Iris
+types the transcript instead when that happens.
+
+**Injection method — and your clipboard.** `method` is a request, not a
+guarantee. A transcript longer than 256 characters (roughly 30 seconds of
+speech) is delivered as a **clipboard paste even under `sendinput`**, because a
+keystroke burst that long arrives garbled in some apps — a reported 313-character
+dictation reached Notepad as a handful of correct characters followed by one
+repeated key and a run of spaces, while the same text typed into a terminal
+fine.
+
+That paste **overwrites whatever was on your clipboard, and the previous
+contents are not restored.** This is a deliberate trade, not an oversight:
+restoring the old contents is unsound rather than merely awkward — Windows
+offers no signal for "the target has finished reading the clipboard", so any
+restore either races the paste (and the app silently pastes your *old*
+clipboard, which looks like it worked) or needs a delay long enough to cost the
+sub-second latency this app exists for and to race the next dictation. The full
+reasoning is in `win::paste`'s doc comment in `iris-core/src/inject.rs` (commit
+`e2aac70`). If you keep something on the clipboard you cannot lose, copy it back
+after a long dictation, or keep dictations short.
+
+Windows that do not treat Ctrl+V as paste — terminals, Remote Desktop and VM
+client windows, vim — never get the paste; they receive keystrokes, sent in
+smaller groups with a short pause between them so a long transcript still
+arrives intact. The same keystroke fallback catches a clipboard that another
+application is holding open, so a long dictation degrades instead of being lost.
+`--verbose` logs whenever a fallback fires.
 
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at

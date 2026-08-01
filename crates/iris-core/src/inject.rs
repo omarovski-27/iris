@@ -16,6 +16,20 @@
 //! opt-in. The failure it exists to avoid is silent: `SendInput` reports full
 //! success even when a slow-consuming target garbles what it received.
 //!
+//! Neither strategy is safe everywhere, so nothing here is unconditional:
+//!
+//! * A window that does not treat Ctrl+V as paste — a terminal, an RDP
+//!   client, vim — never receives the escape hatch ([`accepts_paste`]).
+//! * A hotkey still reading down would spoil the paste chord, and is not
+//!   always correctable ([`paste_accelerator_survives`]).
+//! * The clipboard can simply be unavailable, held open by another process.
+//!
+//! Every one of those routes back to keystrokes, and a keystroke burst past
+//! [`MAX_SEND_INPUT_CHARS`] is *paced* ([`pacing`]) rather than sent flat out,
+//! so the fallback is not the same sustained burst the escalation exists to
+//! avoid. No transcript is left on a path this project has evidence corrupts
+//! it.
+//!
 //! Both are measured; see `docs/spike-findings.md`.
 
 use anyhow::{bail, Result};
@@ -62,13 +76,181 @@ impl std::fmt::Display for Method {
 /// injector can correct it if it still reads as down and is eligible for
 /// correction — see [`modifier_to_release`] and [`Key::is_correctable_modifier`].
 ///
-/// `method` is a request, not a guarantee: see [`effective_method`] for the
-/// one case where a long transcript overrides it.
+/// `method` is a request, not a guarantee: see [`effective_method`] for when
+/// a long transcript overrides it, and [`pacing`] for what happens to a long
+/// transcript that stays on keystrokes anyway.
 pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    imp(text, effective_method(text, method), hotkey)
+    let target = focused_target();
+    imp(text, effective_method(text, method, target.as_ref()), hotkey)
+}
+
+/// The window that will receive the text, as far as [`accepts_paste`] needs
+/// to know it: two strings, so the decision that reads them stays portable
+/// and testable off Windows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Target {
+    /// `GetClassNameW` of the foreground window, e.g. `ConsoleWindowClass`.
+    class: String,
+    /// The owning executable's file name, e.g. `nvim.exe`.
+    process: String,
+}
+
+#[cfg(windows)]
+fn focused_target() -> Option<Target> {
+    win::foreground_target()
+}
+
+/// Off Windows nothing is ever injected (see [`imp`]), so there is nothing to
+/// identify.
+#[cfg(not(windows))]
+fn focused_target() -> Option<Target> {
+    None
+}
+
+/// Window classes that do not treat Ctrl+V as paste, or bind it to their own
+/// meaning. Matched case-insensitively against [`Target::class`].
+const PASTE_HOSTILE_CLASSES: &[&str] = &[
+    "consolewindowclass",           // conhost: cmd, powershell, ssh sessions
+    "cascadia_hosting_window_class", // Windows Terminal
+    "putty",
+    "mintty",
+    "tscshellcontainerclass", // mstsc, the Remote Desktop client
+    "vmplayerframewindow",    // VMware Workstation Player
+    "vmuiframe",              // VMware Workstation
+    "vim",                    // gvim
+];
+
+/// The same, by executable name — the class name of a window is up to its
+/// author and several of these apps host themselves in a generic one.
+const PASTE_HOSTILE_PROCESSES: &[&str] = &[
+    "vim.exe",
+    "gvim.exe",
+    "nvim.exe",
+    "nvim-qt.exe",
+    "neovide.exe",
+    "conhost.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "windowsterminal.exe",
+    "mintty.exe",
+    "putty.exe",
+    "kitty.exe",
+    "alacritty.exe",
+    "wezterm-gui.exe",
+    "mstsc.exe",
+    "vmconnect.exe",
+];
+
+/// Whether Ctrl+V would actually paste into `target`.
+///
+/// [`Method::Clipboard`] gives up `SendInput`'s defining advantage — it
+/// "works in essentially every control, including ones that refuse paste" —
+/// in exchange for delivering any length in four events. That trade is only
+/// worth making where the accelerator means paste. Where it does not, sending
+/// it is not a slower delivery, it is a *different* corruption: vim in insert
+/// mode takes Ctrl+V as literal-next-character and inserts a control
+/// sequence; conhost, PuTTY and most RDP/VM client windows either bind it
+/// elsewhere or forward it to the guest.
+///
+/// Terminals are the sharpest case, and also the reassuring one: they are the
+/// targets that never reproduced the burst corruption in the first place (see
+/// [`effective_method`]), so declining to paste into them costs nothing — the
+/// keystroke path is exactly where the evidence says they are safe.
+///
+/// This is a deny-list, and therefore a heuristic: it cannot enumerate every
+/// paste-hostile app, and it cannot see a *mode* (vim run inside a terminal
+/// is caught by the terminal, but an embedded terminal inside an editor is
+/// not). It is default-*allow* on purpose, so its two failure directions are
+/// asymmetric and both bounded: a hostile app this list misses pastes, which
+/// is the behaviour that existed before it; a harmless app wrongly listed
+/// gets a paced keystroke burst, which is correct, just slower. An
+/// unidentifiable window (`None` — no foreground window, or a process this
+/// one may not query) is treated the same as an unlisted one, which is what
+/// keeps the originally reported failure — a plain edit control — fixed.
+fn accepts_paste(target: Option<&Target>) -> bool {
+    let Some(target) = target else {
+        return true;
+    };
+    let class = target.class.to_ascii_lowercase();
+    let process = target.process.to_ascii_lowercase();
+    !PASTE_HOSTILE_CLASSES.contains(&class.as_str())
+        && !PASTE_HOSTILE_PROCESSES.contains(&process.as_str())
+}
+
+/// Whether Ctrl+V still means paste with `hotkey` reading down.
+///
+/// The paste accelerator is input surface the automatic escalation
+/// introduced, and it needs the same protection `release_hotkey_if_stuck`
+/// gives a keystroke burst — but it cannot get all of it from there.
+/// [`modifier_to_release`] deliberately declines to correct `RightAlt` and
+/// `RightWin` at all, and declines to correct anything during a genuine
+/// repress; both exclusions are load-bearing (see
+/// [`Key::is_correctable_modifier`]) and neither may be widened for this.
+/// Yet a `ralt`-configured user dictating 300 characters would otherwise send
+/// Ctrl+Alt+V, and a user starting their next push-to-talk on `rshift` while
+/// the previous transcript injects would send Ctrl+Shift+V — back-to-back
+/// dictation being the documented common case, not an edge.
+///
+/// So this extends the protection the only way that does not touch those
+/// exclusions: it is sampled *after* the correction has had its chance, and
+/// a hotkey still down that would spoil the chord ([`Key::alters_paste_chord`])
+/// makes the paste unusable rather than the correction broader. The caller
+/// then types the transcript instead — the same fallback a held clipboard
+/// takes. Declining to paste injects nothing, so unlike a correction it is
+/// safe for exactly the keys the correction must not touch.
+#[cfg(any(windows, test))]
+fn paste_accelerator_survives(hotkey: Key, hotkey_down: bool) -> bool {
+    !(hotkey_down && hotkey.alters_paste_chord())
+}
+
+/// How a keystroke burst is split, when it must be.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pace {
+    /// Planned units per `SendInput` call.
+    units: usize,
+    /// How long to wait between calls.
+    gap: std::time::Duration,
+}
+
+/// Units per `SendInput` call once a burst needs pacing, and the pause
+/// between calls. Both are heuristics — the mechanism they answer to is a
+/// target's message loop falling behind, which this project cannot measure
+/// without the live injection `CLAUDE.md` forbids — chosen to be obviously
+/// on the safe side of the numbers it does have: a quarter of the batch the
+/// reported failure exceeded, with a gap several times an ordinary
+/// message-dispatch interval. The whole cost lands only on transcripts that
+/// already opted out of pasting: the reported 313-character one becomes five
+/// calls and four gaps, some 32 ms against a sub-second budget.
+#[cfg(any(windows, test))]
+const PACED_UNITS: usize = 64;
+#[cfg(any(windows, test))]
+const PACE_GAP: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// How to deliver a `units`-long keystroke burst; `None` for one flat burst.
+///
+/// Pacing is what makes the keystroke path a legitimate fallback rather than
+/// a return to the reported bug. Everything that declines to paste — a
+/// paste-hostile target, a spoiled accelerator, an unavailable clipboard —
+/// lands here with a transcript that may be arbitrarily long, and the failure
+/// [`effective_method`] describes is a property of *sustained* burst length
+/// against a slow consumer. Splitting the burst and yielding between the
+/// pieces gives that consumer's message loop room to drain, which one
+/// uninterrupted `SendInput` array never does.
+///
+/// Nothing at or under [`MAX_SEND_INPUT_CHARS`] is paced: that is the regime
+/// this project has evidence is already sound, and it is the overwhelmingly
+/// common one, so the ordinary dictation pays nothing for this.
+#[cfg(any(windows, test))]
+fn pacing(units: usize) -> Option<Pace> {
+    (units > MAX_SEND_INPUT_CHARS).then_some(Pace {
+        units: PACED_UNITS,
+        gap: PACE_GAP,
+    })
 }
 
 /// How many keystroke events `win::send_keystrokes` fits in one `SendInput`
@@ -128,11 +310,18 @@ const MAX_SEND_INPUT_CHARS: usize = BATCH / 2;
 /// clobbering the clipboard; see `win::paste`'s doc comment for why that
 /// trade is accepted as-is rather than mitigated with a restore.
 ///
+/// Not unconditional on the target: a window that does not take Ctrl+V as
+/// paste keeps the keystroke path, where [`pacing`] handles the same burst
+/// problem a different way. See [`accepts_paste`].
+///
 /// Never downgrades: a caller that already asked for `Clipboard` is
 /// unaffected, and a text that fits in one batch keeps whatever the caller
 /// requested.
-fn effective_method(text: &str, requested: Method) -> Method {
-    if requested == Method::SendInput && crate::text::plan(text).len() > MAX_SEND_INPUT_CHARS {
+fn effective_method(text: &str, requested: Method, target: Option<&Target>) -> Method {
+    if requested == Method::SendInput
+        && crate::text::plan_len(text) > MAX_SEND_INPUT_CHARS
+        && accepts_paste(target)
+    {
         Method::Clipboard
     } else {
         requested
@@ -204,20 +393,28 @@ fn modifier_to_release(hotkey: Key, hotkey_down: bool, genuinely_held: bool) -> 
 #[cfg(windows)]
 mod win {
     use anyhow::{bail, Context, Result};
-    use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HWND};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
     };
 
     use crate::text::{self, KeyUnit};
     use crate::vlog;
 
-    use super::{Key, Method, BATCH};
+    use super::{Key, Method, Target, MAX_SEND_INPUT_CHARS};
 
     const CF_UNICODETEXT: u32 = 13;
     const VK_CONTROL: u16 = 0x11;
@@ -225,8 +422,9 @@ mod win {
 
     // `SendInput` takes an array; sending one call per keystroke would cost a
     // syscall each and let other input interleave. Batches keep a transcript
-    // atomic from the target app's point of view. `BATCH` is defined outside
-    // this module — see `super::effective_method` for why.
+    // atomic from the target app's point of view. The batch size — and,
+    // above it, whether to pace the calls apart at all — is decided outside
+    // this module; see `super::effective_method` and `super::pacing` for why.
 
     pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
         if text.is_empty() {
@@ -238,20 +436,78 @@ mod win {
         }
     }
 
+    /// Identify the window that will receive the text.
+    ///
+    /// Best-effort by design: every step here can fail for reasons that say
+    /// nothing about the target (no foreground window during a focus change,
+    /// a higher-integrity process this one may not open), and `None` is a
+    /// sound answer to all of them — `super::accepts_paste` treats an
+    /// unidentified window as an ordinary one.
+    pub fn foreground_target() -> Option<Target> {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut buf);
+            let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let process = process_name(pid).unwrap_or_default();
+
+            Some(Target { class, process })
+        }
+    }
+
+    /// The file name of `pid`'s executable. `PROCESS_QUERY_LIMITED_INFORMATION`
+    /// is the right of the two: it is granted for processes at a higher
+    /// integrity level, which the focused window's often is.
+    fn process_name(pid: u32) -> Option<String> {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 512];
+            let mut len = buf.len() as u32;
+            let queried = QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            );
+            let _ = CloseHandle(process);
+            queried.ok()?;
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            Some(path.rsplit(['\\', '/']).next()?.to_string())
+        }
+    }
+
     fn send_keystrokes(text: &str, hotkey: Key) -> Result<()> {
         release_hotkey_if_stuck(hotkey)?;
 
-        let mut inputs = Vec::with_capacity(BATCH);
-        for unit in text::plan(text) {
+        let units = text::plan(text);
+        let pace = super::pacing(units.len());
+        // Unpaced, this is the single batch every short transcript has always
+        // been sent as; paced, it is one of several deliberately smaller ones.
+        let per_call = pace.map_or(MAX_SEND_INPUT_CHARS, |p| p.units) * 2;
+
+        let mut inputs = Vec::with_capacity(per_call);
+        let last = units.len().saturating_sub(1);
+        for (i, unit) in units.iter().enumerate() {
             let (scan, vk, extra) = match unit {
-                KeyUnit::Unicode(u) => (u, 0u16, KEYEVENTF_UNICODE),
-                KeyUnit::Virtual(vk) => (0u16, vk, KEYBD_EVENT_FLAGS(0)),
+                KeyUnit::Unicode(u) => (*u, 0u16, KEYEVENTF_UNICODE),
+                KeyUnit::Virtual(vk) => (0u16, *vk, KEYBD_EVENT_FLAGS(0)),
             };
             inputs.push(key_event(vk, scan, extra));
             inputs.push(key_event(vk, scan, extra | KEYEVENTF_KEYUP));
 
-            if inputs.len() >= BATCH && unit.may_end_batch() {
+            if inputs.len() >= per_call && unit.may_end_batch() && i < last {
                 flush(&mut inputs)?;
+                if let Some(pace) = pace {
+                    // The point of pacing: hand the target's message loop
+                    // time to drain what it has before sending more.
+                    std::thread::sleep(pace.gap);
+                }
             }
         }
         flush(&mut inputs)
@@ -297,12 +553,19 @@ mod win {
     /// not, and cannot be without relaxing that constraint. This is
     /// deliberate, not an oversight: recorded here rather than papered over
     /// with a test that would only appear to cover it.
+    /// `GetAsyncKeyState`'s answer for `key`, the reading
+    /// `super::modifier_to_release` and `super::paste_accelerator_survives`
+    /// are both handed.
+    fn reads_down(key: Key) -> bool {
+        unsafe { GetAsyncKeyState(key.vk() as i32) as u16 & 0x8000 != 0 }
+    }
+
     fn release_hotkey_if_stuck(hotkey: Key) -> Result<()> {
         if !crate::hotkey::is_listening() {
             return Ok(());
         }
         let vk = hotkey.vk() as u16;
-        let is_down = || unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+        let is_down = || reads_down(hotkey);
         if !is_down() {
             return Ok(());
         }
@@ -395,16 +658,43 @@ mod win {
     ///   edge a timer could afford to ignore.
     ///
     /// So this clobbers the clipboard and says so — plainly, in the change
-    /// that made escalation automatic — rather than trade one silent
-    /// corruption bug for a subtler one.
+    /// that made escalation automatic, and in `crates/iris-app/README.md`
+    /// where a user will see it — rather than trade one silent corruption bug
+    /// for a subtler one.
+    ///
+    /// Two things can still make the paste unusable after this is chosen, and
+    /// neither may cost the user their words: the clipboard can be held open
+    /// by another process, and the hotkey can still be down in a way that
+    /// spoils the accelerator. Both fall back to `send_keystrokes`, which
+    /// `super::pacing` makes a safe landing for a long transcript rather than
+    /// a return to the reported bug.
     fn paste(text: &str, hotkey: Key) -> Result<()> {
-        set_clipboard(text)?;
+        // Clipboard managers, Office and RDP redirection all open the
+        // clipboard briefly and routinely, so this fails transiently for
+        // reasons that have nothing to do with the transcript. Losing a long
+        // utterance to that would be the worst outcome of the whole feature.
+        if let Err(e) = set_clipboard(text) {
+            vlog!("clipboard unavailable ({e:#}); typing the transcript instead");
+            return send_keystrokes(text, hotkey);
+        }
         // After the clipboard work, not before it: `set_clipboard` can block
         // on another application holding the clipboard, and any gap between
         // checking the hotkey and sending the burst is a window for the
         // hotkey to change state again. This mirrors `send_keystrokes`,
         // where the correction already immediately precedes its burst.
         release_hotkey_if_stuck(hotkey)?;
+        // Sampled after the correction has had its chance, so this only
+        // fires for a hotkey the correction is not allowed to touch — see
+        // `super::paste_accelerator_survives`. The clipboard is already
+        // clobbered by this point, which is the disclosed cost either way.
+        if !super::paste_accelerator_survives(hotkey, reads_down(hotkey)) {
+            vlog!(
+                "the hotkey ({}) is still down and would change Ctrl+V into another \
+                 accelerator; typing the transcript instead",
+                hotkey.label()
+            );
+            return send_keystrokes(text, hotkey);
+        }
 
         let inputs = [
             key_event(VK_CONTROL, 0, KEYBD_EVENT_FLAGS(0)),
@@ -482,10 +772,20 @@ mod tests {
         assert!(inject("", Method::SendInput, Key::default()).is_ok());
     }
 
+    /// A window nothing knows anything special about — the regime the
+    /// reported failure was found in (Notepad is a plain edit control) and
+    /// the one most targets fall into.
+    fn ordinary_window() -> Target {
+        Target {
+            class: "Notepad".to_string(),
+            process: "notepad.exe".to_string(),
+        }
+    }
+
     #[test]
     fn short_text_keeps_the_requested_send_input_method() {
         assert_eq!(
-            effective_method("hello", Method::SendInput),
+            effective_method("hello", Method::SendInput, None),
             Method::SendInput
         );
     }
@@ -496,13 +796,23 @@ mod tests {
         // can still deliver in a single flush, which is the regime this
         // project has evidence is sound.
         let text = "a".repeat(MAX_SEND_INPUT_CHARS);
-        assert_eq!(effective_method(&text, Method::SendInput), Method::SendInput);
+        assert_eq!(
+            effective_method(&text, Method::SendInput, None),
+            Method::SendInput
+        );
     }
 
     #[test]
     fn text_needing_a_second_batch_is_escalated_to_clipboard() {
         let text = "a".repeat(MAX_SEND_INPUT_CHARS + 1);
-        assert_eq!(effective_method(&text, Method::SendInput), Method::Clipboard);
+        assert_eq!(
+            effective_method(&text, Method::SendInput, None),
+            Method::Clipboard
+        );
+        assert_eq!(
+            effective_method(&text, Method::SendInput, Some(&ordinary_window())),
+            Method::Clipboard
+        );
     }
 
     #[test]
@@ -510,9 +820,93 @@ mod tests {
         // Nothing to protect either way: Clipboard already delivers in four
         // events regardless of length, so a short text must not be changed
         // any more than a long one already isn't.
-        assert_eq!(effective_method("hi", Method::Clipboard), Method::Clipboard);
+        assert_eq!(
+            effective_method("hi", Method::Clipboard, None),
+            Method::Clipboard
+        );
         let long = "a".repeat(MAX_SEND_INPUT_CHARS * 2);
-        assert_eq!(effective_method(&long, Method::Clipboard), Method::Clipboard);
+        assert_eq!(
+            effective_method(&long, Method::Clipboard, None),
+            Method::Clipboard
+        );
+    }
+
+    #[test]
+    fn a_paste_hostile_target_keeps_the_keystroke_path_however_long_the_text() {
+        // Ctrl+V is not paste in any of these: vim in insert mode takes it
+        // as literal-next-character, and a terminal or RDP client either
+        // binds it elsewhere or forwards it. Pasting here would swap one
+        // corruption for another, so escalation must decline — and `pacing`
+        // is what keeps declining safe.
+        let long = "a".repeat(MAX_SEND_INPUT_CHARS * 4);
+        for target in [
+            Target {
+                class: "ConsoleWindowClass".to_string(),
+                process: "cmd.exe".to_string(),
+            },
+            Target {
+                class: "CASCADIA_HOSTING_WINDOW_CLASS".to_string(),
+                process: "WindowsTerminal.exe".to_string(),
+            },
+            Target {
+                class: "TscShellContainerClass".to_string(),
+                process: "mstsc.exe".to_string(),
+            },
+            Target {
+                class: "Vim".to_string(),
+                process: "gvim.exe".to_string(),
+            },
+        ] {
+            assert_eq!(
+                effective_method(&long, Method::SendInput, Some(&target)),
+                Method::SendInput,
+                "{target:?}"
+            );
+            assert!(
+                pacing(crate::text::plan_len(&long)).is_some(),
+                "{target:?} must not be left on an unpaced burst"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostile_process_is_caught_even_in_an_anonymous_window_class() {
+        // Window class names are up to the app; several terminals host
+        // themselves in a generic one, so the executable is checked too.
+        let long = "a".repeat(MAX_SEND_INPUT_CHARS + 1);
+        let target = Target {
+            class: "Window".to_string(),
+            process: "nvim-qt.exe".to_string(),
+        };
+        assert_eq!(
+            effective_method(&long, Method::SendInput, Some(&target)),
+            Method::SendInput
+        );
+    }
+
+    #[test]
+    fn target_matching_ignores_case() {
+        // `GetClassNameW` and the image name report whatever casing the app
+        // and the filesystem happen to use.
+        assert!(!accepts_paste(Some(&Target {
+            class: "consolewindowclass".to_string(),
+            process: "CMD.EXE".to_string(),
+        })));
+        assert!(!accepts_paste(Some(&Target {
+            class: "PUTTY".to_string(),
+            process: String::new(),
+        })));
+    }
+
+    #[test]
+    fn an_unidentifiable_window_is_treated_as_an_ordinary_one() {
+        // Default-allow, deliberately: the reported failure was a plain edit
+        // control, and identification can fail for reasons that say nothing
+        // about the target. Treating unknown as hostile would leave the
+        // reported bug unfixed exactly where it was reported.
+        assert!(accepts_paste(None));
+        assert!(accepts_paste(Some(&ordinary_window())));
+        assert!(accepts_paste(Some(&Target::default())));
     }
 
     #[test]
@@ -523,7 +917,10 @@ mod tests {
         // rather than counting `chars()`.
         let chars_needed = MAX_SEND_INPUT_CHARS / 2 + 1;
         let text = "\u{1F600}".repeat(chars_needed);
-        assert_eq!(effective_method(&text, Method::SendInput), Method::Clipboard);
+        assert_eq!(
+            effective_method(&text, Method::SendInput, None),
+            Method::Clipboard
+        );
     }
 
     #[test]
@@ -546,7 +943,135 @@ mod tests {
             "the reported transcript must span more than one batch"
         );
         let text = crate::text::prepare(spoken, true);
-        assert_eq!(effective_method(&text, Method::SendInput), Method::Clipboard);
+        assert_eq!(
+            effective_method(&text, Method::SendInput, Some(&ordinary_window())),
+            Method::Clipboard
+        );
+    }
+
+    #[test]
+    fn the_reported_long_dictation_is_paced_when_it_cannot_be_pasted() {
+        // The other half of the same repro: the identical transcript into a
+        // terminal, or with the clipboard unavailable, stays on keystrokes.
+        // It must not go out as the one sustained burst that corrupted it —
+        // that is what would leave a target on the known-bad path.
+        let spoken = "Test one, test two, test three. Although this is working fine. I'm currently testing it. And I was testing it on the terminal. It was working good. I'm now testing it because I want to see the bar Can I notice something that the waves and the coloring do not reach the end So, like, kind of gets cut off about 75%?";
+        let text = crate::text::prepare(spoken, true);
+        let pace = pacing(crate::text::plan_len(&text)).expect("a burst this long must be paced");
+        assert!(pace.units < MAX_SEND_INPUT_CHARS);
+        assert!(!pace.gap.is_zero());
+    }
+
+    #[test]
+    fn an_ordinary_dictation_is_never_paced() {
+        // Pacing costs wall-clock, and the single-batch regime is the one
+        // this project has evidence is already sound. Nothing at or under
+        // the threshold may pay for the fallback path.
+        assert_eq!(pacing(0), None);
+        assert_eq!(pacing(crate::text::plan_len("hello there ")), None);
+        assert_eq!(pacing(MAX_SEND_INPUT_CHARS), None);
+        assert!(pacing(MAX_SEND_INPUT_CHARS + 1).is_some());
+    }
+
+    /// The events of one `SendInput` call, as `win::send_keystrokes` would
+    /// fill it: reconstructed from the same portable `pacing` decision the
+    /// real loop calls, for the same reason `burst` below is (see its docs).
+    fn calls(text: &str) -> Vec<Vec<crate::text::KeyUnit>> {
+        let units = crate::text::plan(text);
+        let pace = pacing(units.len());
+        let per_call = pace.map_or(MAX_SEND_INPUT_CHARS, |p| p.units);
+        let last = units.len().saturating_sub(1);
+
+        let mut out = vec![Vec::new()];
+        for (i, unit) in units.iter().enumerate() {
+            out.last_mut().expect("one call is always open").push(*unit);
+            let full = out.last().expect("one call is always open").len() >= per_call;
+            if full && unit.may_end_batch() && i < last {
+                out.push(Vec::new());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pacing_splits_a_long_burst_without_ever_splitting_a_surrogate_pair() {
+        // Windows only reassembles an astral character when both halves
+        // arrive in one call, so the extra flushes pacing introduces must
+        // obey exactly the rule the single batch boundary already did.
+        let text = format!("{}{}", "😀".repeat(200), "a".repeat(200));
+        let calls = calls(&text);
+
+        assert!(calls.len() > 1, "this must be long enough to be split");
+        let rejoined: Vec<_> = calls.iter().flatten().copied().collect();
+        assert_eq!(rejoined, crate::text::plan(&text), "no unit may be lost");
+        for call in &calls {
+            assert!(
+                call.last().expect("no empty call").may_end_batch(),
+                "a call may not end on a high surrogate"
+            );
+            assert!(call.len() <= PACED_UNITS + 1, "{} units", call.len());
+        }
+    }
+
+    #[test]
+    fn a_short_burst_is_still_exactly_one_send_input_call() {
+        assert_eq!(calls("hello ").len(), 1);
+        assert_eq!(calls(&"a".repeat(MAX_SEND_INPUT_CHARS)).len(), 1);
+    }
+
+    #[test]
+    fn a_hotkey_that_would_spoil_the_paste_chord_blocks_the_accelerator() {
+        // Ctrl+Shift+V, Ctrl+Alt+V and Ctrl+Win+V are not paste. With the
+        // hotkey down, pasting is not a slower delivery, it is a failed one.
+        for key in [Key::RightShift, Key::RightAlt, Key::RightWin] {
+            assert!(!paste_accelerator_survives(key, true), "{key}");
+        }
+        // Ctrl is the one modifier the chord itself already presses and
+        // releases, so a stuck Ctrl leaves paste meaning paste.
+        for key in [Key::RightCtrl, Key::LeftCtrl, Key::F8, Key::CapsLock] {
+            assert!(paste_accelerator_survives(key, true), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_hotkey_reading_up_never_blocks_the_accelerator() {
+        for key in [
+            Key::RightShift,
+            Key::RightAlt,
+            Key::RightWin,
+            Key::RightCtrl,
+        ] {
+            assert!(paste_accelerator_survives(key, false), "{key}");
+        }
+    }
+
+    #[test]
+    fn protecting_the_accelerator_does_not_widen_pr_9s_exclusions() {
+        // The regression guard for the delicate part: the paste chord is new
+        // input surface and needs protecting, but the correction that
+        // protects a keystroke burst must not grow to cover it. For every
+        // key PR #9 deliberately refuses to correct — RightAlt and RightWin
+        // on a *genuine desync*, the case the correction is otherwise for —
+        // the answer stays None, and the accelerator is declined instead.
+        for key in [Key::RightAlt, Key::RightWin] {
+            assert_eq!(modifier_to_release(key, true, false), None, "{key}");
+            assert!(!paste_accelerator_survives(key, true), "{key}");
+        }
+        // And a genuine repress is still left alone for every hotkey,
+        // whichever path it is on: correcting it would inject an orphan
+        // key-up for a press the user is still making.
+        for key in [Key::RightCtrl, Key::LeftCtrl, Key::RightShift] {
+            assert_eq!(modifier_to_release(key, true, true), None, "{key}");
+        }
+        // RightShift is the one that is correctable *and* spoils the chord.
+        // It is still corrected exactly when PR #9 said it should be — the
+        // accelerator check is sampled afterwards and changes nothing about
+        // that decision.
+        assert_eq!(
+            modifier_to_release(Key::RightShift, true, false),
+            Some(Key::RightShift)
+        );
+        assert_eq!(modifier_to_release(Key::RightShift, false, false), None);
     }
 
     #[test]

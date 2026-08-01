@@ -69,9 +69,42 @@ pub fn plan(text: &str) -> Vec<KeyUnit> {
     units
 }
 
+/// How many units [`plan`] would produce, without producing them.
+///
+/// [`crate::inject::inject`] needs the length before it knows whether it will
+/// send keystrokes at all, and the transcript is planned again inside the
+/// keystroke path itself; counting here keeps that decision off the
+/// allocator on a path with a sub-second latency budget. Must agree with
+/// `plan(text).len()` exactly — the test below pins that.
+pub fn plan_len(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch {
+            '\r' => 0,
+            '\n' | '\t' => 1,
+            _ => ch.len_utf16(),
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_len_agrees_with_plan_on_everything_plan_special_cases() {
+        for text in [
+            "",
+            "hello",
+            "ü→日本",
+            "😀 emoji 😀",
+            "line\nbreak\ttab",
+            "crlf\r\nkept as one",
+            "\r\r\r",
+            &"a".repeat(300),
+        ] {
+            assert_eq!(plan_len(text), plan(text).len(), "{text:?}");
+        }
+    }
 
     #[test]
     fn ascii_becomes_one_unicode_event_per_character() {
