@@ -173,9 +173,15 @@ been captured before the failure — it is not proof that none was.
 | `engine` | Needs | Notes |
 |---|---|---|
 | `mock` | nothing | deterministic, offline, instant; the default |
-| `deepgram` | `IRIS_DEEPGRAM_KEY` | streaming; hides its latency behind speech |
+| `deepgram` | `IRIS_DEEPGRAM_KEY` | streaming; hides its latency behind speech, except for a hold too short to get a first result back (see below) |
 | `groq` | `IRIS_GROQ_KEY` | batch on key-release; cannot hide latency |
 | `local` | `--features local-native` | on-device; see below |
+
+A hold shorter than Deepgram's connect-plus-first-result latency (~1-3 s) has
+nothing streamed back by key-release, so its whole transcript rides on the
+finalisation flush the engine waits for before closing the socket. That
+invariant, and the measurements behind it, live in `AGENTS.md` and the
+`iris-core::engine::deepgram` module doc.
 
 `local` wraps `iris-engine-local` through `engines::LocalAdapter`, the one-file
 mapping that crate's README predicts (`start`/`open`, `feed`/`push`,
