@@ -162,7 +162,12 @@ In priority order:
    uncertain item in the budget. Needs a person at the keyboard.
 2. **Deepgram flush latency with a key.** `iris-harness --engine deepgram
    --runs 20`. The target holds if p95 of `key-release → final transcript` is
-   under ~280 ms. Everything else is already proven.
+   under ~280 ms. Everything else is already proven. Informal signal, not a
+   benchmark: live protocol verification of the `from_finalize` wait (see
+   `AGENTS.md`) saw acks arrive in roughly 200-550 ms across a handful of hold
+   shapes — which straddles the ~280 ms bar in section 3, so it is not safe to
+   assume that bar holds for every hold. Ad-hoc observations on a few holds are
+   not a p95; run the harness above to settle it.
 3. **Real microphone end-to-end**, via the checklist in the spike README.
 
 *Resolved since:* **connection reuse.** A pre-warmed spare connection was built
