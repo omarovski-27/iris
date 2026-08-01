@@ -86,6 +86,30 @@ overlay UI hangs off.
 Measured latency numbers, the budget breakdown, and open risks:
 `docs/spike-findings.md`.
 
+**A short hold can end before Deepgram says anything at all.** Connect + first
+result is ~1-3 s; a hold shorter than that has nothing streamed back when the
+key comes up, so the entire transcript depends on one post-`Finalize` flush,
+and sending `CloseStream` immediately after `Finalize` can pull the socket out
+from under that flush before Deepgram gets to it. `deepgram.rs`'s `pump` waits
+for `from_finalize` — a boolean Deepgram itself sets on the Results message
+that answers a `Finalize`, live-verified to arrive for any session that was
+sent real audio, including holds under 0.5s and holds containing only silence
+— before sending `CloseStream`; `FINALIZE_ACK_TIMEOUT` is a bounded safety net
+under that for protocol failure only. The ack decides when `CloseStream` goes
+out and nothing else: reporting `Final` on it too was built and reverted,
+because the ack proves the flush *started*, not that it fit in one frame, and a
+live cadence measurement found inter-message gaps too wide for any quiet window
+to both cover them and fit the perceived-latency budget — so `Final` is gated on
+the session close instead. Three earlier designs (unbounded coverage-catch-up, a
+fixed ceiling, a stall detector) were tried and rejected first. The measured
+figures and the full reasoning — including why an inferred "Deepgram is probably
+done" always loses to this authoritative signal — live in the module doc of
+`crates/iris-core/src/engine/deepgram.rs`, beside the constants they set. Session
+prewarming was also tried and dropped: a live idle probe found Deepgram closes
+an unused connection in roughly 12-15s (see Sharp edges), far short of real
+gaps between dictations, so it protected against a race that barely occurred
+in practice.
+
 ## Sharp edges
 
 - API keys come from the environment only (`IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY`).
@@ -112,6 +136,10 @@ Measured latency numbers, the budget breakdown, and open risks:
   before touching this; none of it is dead code. The configured hotkey
   reaches the injector via `SystemInjector::new` (wired in `main.rs`), not
   via `app.rs`.
+- Deepgram closes an idle websocket connection (no audio sent) in roughly
+  12-15s, live-measured. Relevant to any future connection-reuse idea: it
+  only pays off within that window of the last dictation, not across the
+  minutes-apart gaps typical of real desktop use.
 
 ## Maintaining this file
 

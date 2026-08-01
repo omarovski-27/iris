@@ -172,14 +172,25 @@ at `max_entries`:
 that record is the user's only way to recover words that never made it onto the
 screen. `iris --history` prints the tail of it.
 
+A record with an `error` carries a zeroed `latency` block (`App::dictate`'s
+`Err` arm builds a fresh record rather than the timeline it was tracking), so
+`"audio_secs":0.0` on an errored row is consistent with *some* audio having
+been captured before the failure — it is not proof that none was.
+
 ## Engines
 
 | `engine` | Needs | Notes |
 |---|---|---|
 | `mock` | nothing | deterministic, offline, instant; the default |
-| `deepgram` | `IRIS_DEEPGRAM_KEY` | streaming; hides its latency behind speech |
+| `deepgram` | `IRIS_DEEPGRAM_KEY` | streaming; hides its latency behind speech, except for a hold too short to get a first result back (see below) |
 | `groq` | `IRIS_GROQ_KEY` | batch on key-release; cannot hide latency |
 | `local` | `--features local-native` | on-device; see below |
+
+A hold shorter than Deepgram's connect-plus-first-result latency (~1-3 s) has
+nothing streamed back by key-release, so its whole transcript rides on the
+finalisation flush the engine waits for before closing the socket. That
+invariant, and the measurements behind it, live in `AGENTS.md` and the
+`iris-core::engine::deepgram` module doc.
 
 `local` wraps `iris-engine-local` through `engines::LocalAdapter`, the one-file
 mapping that crate's README predicts (`start`/`open`, `feed`/`push`,
@@ -216,3 +227,7 @@ network, and a `RecordingInjector` instead of `SendInput`.
 `--demo-dictation` and `--speak-wav <file>` run one full dictation — engine,
 polish, session log, latency report, pill adapter — with dry-run injection, on
 any platform. They are the portable way to see the loop work end to end.
+`--speak-wav` feeds the file at real-time speed (one frame per frame-length,
+like a live microphone), so the run takes about as long as the WAV: bursting it
+would finish the utterance before the key came up and hide the finalisation
+race a held key is meant to exercise.

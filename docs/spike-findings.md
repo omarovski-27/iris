@@ -67,8 +67,17 @@ exactly, since our overhead is ~1.5 ms:
 | 160 ms | 163 ms | ✓ comfortable |
 | 400 ms | 419 ms | ✗ misses |
 
-So the target holds **iff Deepgram's flush-after-`CloseStream` is under roughly
-280 ms.** That is the single number to measure the moment a key exists.
+So the target holds **iff Deepgram's finalisation flush is under roughly
+280 ms.** That is the single number to measure the moment a key exists. (That
+flush is now awaited explicitly: `finish()` waits for Deepgram's own
+`from_finalize` acknowledgement before `CloseStream` rather than closing
+immediately — see `AGENTS.md` and `crates/iris-core/src/engine/deepgram.rs`.
+The final transcript is reported once the session closes, so the `CloseStream`
++ Metadata sign-off round trip is *inside* the number above. Reporting it one
+round trip earlier, on the ack, was built and reverted: covering a flush split
+across frames needs a quiet window after the ack, and measured inter-message
+gaps are too wide for any window that still fits this budget. See the module
+doc for the measurements.)
 
 ## 4. Injection is the unexpected risk
 
@@ -159,12 +168,22 @@ In priority order:
    uncertain item in the budget. Needs a person at the keyboard.
 2. **Deepgram flush latency with a key.** `iris-harness --engine deepgram
    --runs 20`. The target holds if p95 of `key-release → final transcript` is
-   under ~280 ms. Everything else is already proven.
+   under ~280 ms. Everything else is already proven. Informal signal, not a
+   benchmark: live protocol verification of the `from_finalize` wait (see
+   `AGENTS.md`) saw acks arrive in roughly 200-550 ms across a handful of hold
+   shapes — which straddles the ~280 ms bar in section 3, so it is not safe to
+   assume that bar holds for every hold. The ack is not the whole number: per
+   section 3, the `CloseStream` + Metadata sign-off round trip sits on top of
+   that ack latency, since the final transcript is reported on the session
+   close. Ad-hoc observations on a few holds are not a p95; run the harness
+   above to settle it.
 3. **Real microphone end-to-end**, via the checklist in the spike README.
-4. **Connection reuse.** For very short utterances ("yes", "delete that") the
-   120 ms handshake stops being free. A pre-warmed spare connection would fix
-   it; Deepgram closes idle sockets after ~10 s, so it needs a keepalive.
-   Deferred: it does not affect the 5-second case the target is defined on.
+
+*Resolved since:* **connection reuse.** A pre-warmed spare connection was built
+and then measured out — Deepgram closes an idle socket far short of the gaps
+between real dictations; see `AGENTS.md` (Sharp edges) for the measured window.
+The short-utterance case it was meant to help is covered instead by the
+`from_finalize` wait.
 
 ## 7. Architecture recommendation
 
