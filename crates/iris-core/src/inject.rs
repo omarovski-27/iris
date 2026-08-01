@@ -88,11 +88,12 @@ impl std::fmt::Display for Method {
 ///
 /// `hotkey` is the configured push-to-talk key. It is passed through so the
 /// injector can correct it if it still reads as down and is eligible for
-/// correction — see [`modifier_to_release`] and [`Key::is_correctable_modifier`].
+/// correction — see `modifier_to_release` and `Key::is_correctable_modifier`
+/// (both crate-private, so they are named rather than linked here).
 ///
-/// `method` is a request, not a guarantee: see [`effective_method`] for when
-/// a long transcript overrides it, and [`pacing`] for what happens to a long
-/// transcript that stays on keystrokes anyway.
+/// `method` is a request, not a guarantee: see `effective_method` for when
+/// a long transcript overrides it, and `pacing` for what happens to a long
+/// transcript that stays on keystrokes anyway (both crate-private too).
 pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     if text.is_empty() {
         return Ok(());
