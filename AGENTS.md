@@ -130,11 +130,6 @@ in practice.
   before touching this; none of it is dead code. The configured hotkey
   reaches the injector via `SystemInjector::new` (wired in `main.rs`), not
   via `app.rs`.
-- A failed dictation's `DictationRecord` in `history.jsonl` gets a fresh,
-  zeroed `Timeline` (`App::dictate`'s `Err` arm), not the one `capture` was
-  actually tracking. `"audio_secs":0.0` on an errored record is consistent
-  with *some* audio having been captured before the failure, not proof that
-  literally none was — don't over-read that field on error rows.
 - Deepgram closes an idle websocket connection (no audio sent) in roughly
   12-15s, live-measured. Relevant to any future connection-reuse idea: it
   only pays off within that window of the last dictation, not across the

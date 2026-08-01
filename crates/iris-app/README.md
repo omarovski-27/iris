@@ -163,6 +163,11 @@ at `max_entries`:
 that record is the user's only way to recover words that never made it onto the
 screen. `iris --history` prints the tail of it.
 
+A record with an `error` carries a zeroed `latency` block (`App::dictate`'s
+`Err` arm builds a fresh record rather than the timeline it was tracking), so
+`"audio_secs":0.0` on an errored row is consistent with *some* audio having
+been captured before the failure — it is not proof that none was.
+
 ## Engines
 
 | `engine` | Needs | Notes |
@@ -207,3 +212,7 @@ network, and a `RecordingInjector` instead of `SendInput`.
 `--demo-dictation` and `--speak-wav <file>` run one full dictation — engine,
 polish, session log, latency report, pill adapter — with dry-run injection, on
 any platform. They are the portable way to see the loop work end to end.
+`--speak-wav` feeds the file at real-time speed (one frame per frame-length,
+like a live microphone), so the run takes about as long as the WAV: bursting it
+would finish the utterance before the key came up and hide the finalisation
+race a held key is meant to exercise.

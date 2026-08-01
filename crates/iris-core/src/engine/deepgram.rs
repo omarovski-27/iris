@@ -791,9 +791,8 @@ mod tests {
         metadata_duration: f64,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let metadata =
-                serde_json::json!({ "type": "Metadata", "duration": metadata_duration })
-                    .to_string();
+            let metadata = serde_json::json!({ "type": "Metadata", "duration": metadata_duration })
+                .to_string();
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
 

@@ -67,8 +67,11 @@ exactly, since our overhead is ~1.5 ms:
 | 160 ms | 163 ms | ✓ comfortable |
 | 400 ms | 419 ms | ✗ misses |
 
-So the target holds **iff Deepgram's flush-after-`CloseStream` is under roughly
-280 ms.** That is the single number to measure the moment a key exists.
+So the target holds **iff Deepgram's finalisation flush is under roughly
+280 ms.** That is the single number to measure the moment a key exists. (That
+flush is now awaited explicitly: `finish()` waits for Deepgram's own
+`from_finalize` acknowledgement before `CloseStream` rather than closing
+immediately — see `AGENTS.md` and `crates/iris-core/src/engine/deepgram.rs`.)
 
 ## 4. Injection is the unexpected risk
 
@@ -161,10 +164,12 @@ In priority order:
    --runs 20`. The target holds if p95 of `key-release → final transcript` is
    under ~280 ms. Everything else is already proven.
 3. **Real microphone end-to-end**, via the checklist in the spike README.
-4. **Connection reuse.** For very short utterances ("yes", "delete that") the
-   120 ms handshake stops being free. A pre-warmed spare connection would fix
-   it; Deepgram closes idle sockets after ~10 s, so it needs a keepalive.
-   Deferred: it does not affect the 5-second case the target is defined on.
+
+*Resolved since:* **connection reuse.** A pre-warmed spare connection was built
+and then measured out — Deepgram closes an idle socket in roughly 12-15 s,
+far short of the gaps between real dictations. The short-utterance case it was
+meant to help is covered instead by the `from_finalize` wait. See `AGENTS.md`
+(Sharp edges) for the measurement.
 
 ## 7. Architecture recommendation
 
