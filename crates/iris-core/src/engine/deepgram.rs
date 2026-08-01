@@ -47,10 +47,31 @@
 //! this for protocol failure only — a missing or malformed signal — and
 //! should never be reached in normal operation.
 //!
-//! Because the ack is authoritative, it is also what `TranscriptEvent::Final`
-//! fires on: `CloseStream` and the Metadata sign-off that follow are teardown
-//! and no longer sit between the user and their text, which would otherwise
-//! have added a whole round trip to every dictation.
+//! # The flush may arrive in more than one message: `FINALIZE_QUIET_WINDOW`
+//!
+//! What the ack proves is that Deepgram *started* answering the `Finalize`,
+//! not that the answer fit in one frame. Deepgram does not document a
+//! one-tagged-result-per-`Finalize` guarantee, and concluding on the first
+//! tagged message would leave any continuation absorbed but unreportable —
+//! silently re-creating the mid-utterance truncation this module exists to
+//! fix. So the first ack arms [`FINALIZE_QUIET_WINDOW`] instead of concluding
+//! outright: another *freshly* tagged result restarts the window, and only
+//! the window elapsing concludes the session.
+//!
+//! This is not the rejected guessing above wearing a shorter timeout. Those
+//! designs inferred the unbounded, unanswerable question "is Deepgram done
+//! with this utterance?" from silence, and so had to be either slow or wrong.
+//! This one asks only "has the flush Deepgram has *already told us* it is
+//! sending finished arriving?" — a bounded question about one response
+//! already in flight, never about the utterance.
+//!
+//! Because the ack plus that short window is authoritative, it is what
+//! `TranscriptEvent::Final` fires on: `CloseStream` and the Metadata sign-off
+//! that follow are teardown and no longer sit between the user and their
+//! text, which would otherwise have added a whole round trip to every
+//! dictation. Anything that still arrives after the terminal event has gone
+//! out is logged rather than dropped in silence, so a protocol change that
+//! outgrows the window shows up in a session log instead of as a missing word.
 
 use std::time::{Duration, Instant};
 
@@ -82,6 +103,21 @@ const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 /// was consistently 200-550ms; this leaves a wide margin without adding
 /// meaningful latency to any real session, and it should never be reached.
 const FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long after a `from_finalize`-tagged result to keep listening for
+/// another one before treating the flush as complete. Restarted by each
+/// freshly tagged result, so a split flush is collected whole.
+///
+/// Grounded in the same live measurements as [`FINALIZE_ACK_TIMEOUT`]: the
+/// 200-550 ms observed there is a full round trip — our `Finalize` travelling
+/// to Deepgram, Deepgram deciding to respond, and a first response coming
+/// back. A continuation of that same flush needs none of that: no new
+/// command, no new decision, no new round trip, only the next frame of a
+/// response already being written. It therefore has to arrive well inside the
+/// 200 ms floor of a first-time round trip, and this sits clearly below that
+/// floor rather than near it. Small enough to stay off the perceived-latency
+/// budget in `docs/spike-findings.md`; large enough that a continuation
+/// already on the wire cannot be missed.
+const FINALIZE_QUIET_WINDOW: Duration = Duration::from_millis(150);
 /// Below this, [`conclude`]'s empty-transcript error names the hold as the
 /// cause rather than silence. Wording only — a user who released this fast
 /// should be told they released too early, not that Deepgram heard them and
@@ -265,26 +301,37 @@ async fn pump_inner(
     // Finalize goes out) from being misread as the close sign-off before
     // `CloseStream` was ever sent.
     let mut closed_stream = false;
-    // Some(deadline) while waiting specifically for `from_finalize` — see the
-    // module doc. Absolute, not renewed by intervening messages: it is a
-    // safety net for protocol failure, not a progress heuristic.
+    // Some(deadline) while waiting specifically for the *first*
+    // `from_finalize` — see the module doc. Absolute, not renewed by
+    // intervening messages: it is a safety net for protocol failure, not a
+    // progress heuristic.
     let mut finalize_ack_deadline: Option<Instant> = None;
+    // Some(deadline) once that first ack has landed and we are only checking
+    // whether the same flush has more to say. Unlike the one above this *is*
+    // renewed — but only by another freshly `from_finalize`-tagged result,
+    // never by an unrelated frame, so it cannot be stretched by traffic that
+    // is not part of the flush.
+    let mut finalize_quiet_deadline: Option<Instant> = None;
     // A socket failure mid-session ends the loop rather than the function:
     // the segments already finalised are the user's words, and `conclude`
     // still gets to return them.
     let mut failure: Option<anyhow::Error> = None;
-    // Whether the one terminal event has already gone out. `from_finalize` is
-    // authoritative that the transcript is complete, so the application is
-    // told the moment it lands and `CloseStream` + the Metadata sign-off run
-    // afterwards as pure teardown — off the user's perceived latency. Set
-    // there and checked at the bottom so the terminal event is sent exactly
-    // once, whichever way the loop ends.
+    // Whether the one terminal event has already gone out. `from_finalize`
+    // plus a quiet window is authoritative that the transcript is complete, so
+    // the application is told as soon as the flush has finished arriving and
+    // `CloseStream` + the Metadata sign-off run afterwards as pure teardown —
+    // off the user's perceived latency. Set there and checked at the bottom so
+    // the terminal event is sent exactly once, whichever way the loop ends.
     let mut concluded = false;
 
     loop {
-        let poll_timeout = match finalize_ack_deadline {
-            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-            None => FINALIZE_TIMEOUT,
+        // The quiet window outranks the ack wait: it is only ever armed once
+        // the ack has landed, which clears the wait it replaces.
+        let poll_timeout = match (finalize_quiet_deadline, finalize_ack_deadline) {
+            (Some(deadline), _) | (None, Some(deadline)) => {
+                deadline.saturating_duration_since(Instant::now())
+            }
+            (None, None) => FINALIZE_TIMEOUT,
         };
 
         tokio::select! {
@@ -312,20 +359,30 @@ async fn pump_inner(
                             .context("finalising the Deepgram stream");
                         match fin {
                             Err(e) => Err(e),
-                            // Exactly zero, not a smaller version of
-                            // NEGLIGIBLE_AUDIO_SECS: sent_secs only ever
-                            // grows from real byte counts, so this is exact
-                            // and safe, and it is the only duration
-                            // live-verified not to produce a from_finalize
-                            // ack. Anything above it — even the 50 ms this
-                            // module's tests hold it to — can carry real
-                            // speech and must wait.
-                            Ok(()) if sent_secs == 0.0 => {
-                                send_close_stream(&mut socket, &mut closed_stream).await
-                            }
                             Ok(()) => {
-                                finalize_ack_deadline = Some(Instant::now() + finalize_ack_timeout);
-                                Ok(())
+                                // Only a tag absorbed strictly after the
+                                // Finalize is on the wire can be *this*
+                                // Finalize's ack. Anything counted before it
+                                // (Deepgram should never send one, but the
+                                // whole design rests on this signal being
+                                // authoritative) is discarded here rather than
+                                // left to satisfy the wait armed just below.
+                                acc.finalize_acks = 0;
+                                // Exactly zero, not a smaller version of
+                                // NEGLIGIBLE_AUDIO_SECS: sent_secs only ever
+                                // grows from real byte counts, so this is
+                                // exact and safe, and it is the only duration
+                                // live-verified not to produce a from_finalize
+                                // ack. Anything above it — even the 50 ms this
+                                // module's tests hold it to — can carry real
+                                // speech and must wait.
+                                if sent_secs == 0.0 {
+                                    send_close_stream(&mut socket, &mut closed_stream).await
+                                } else {
+                                    finalize_ack_deadline =
+                                        Some(Instant::now() + finalize_ack_timeout);
+                                    Ok(())
+                                }
                             }
                         }
                     }
@@ -339,6 +396,20 @@ async fn pump_inner(
             msg = tokio::time::timeout(poll_timeout, socket.next()) => {
                 let msg = match msg {
                     Ok(m) => m,
+                    Err(_) if finalize_quiet_deadline.is_some() => {
+                        // The flush Deepgram acknowledged has stopped
+                        // arriving, so everything it produced is in `acc`.
+                        // This — not the first tagged frame — is the finish
+                        // line; teardown follows off the critical path.
+                        finalize_quiet_deadline = None;
+                        let _ = events.send(conclude(&acc, sent_secs, None));
+                        concluded = true;
+                        if let Err(e) = send_close_stream(&mut socket, &mut closed_stream).await {
+                            failure = Some(e);
+                            break;
+                        }
+                        continue;
+                    }
                     Err(_) if finalize_ack_deadline.is_some() => {
                         // Safety net only: Deepgram never confirmed the flush
                         // within a generous margin over its measured typical
@@ -368,26 +439,39 @@ async fn pump_inner(
                         // that closing, and must never be read back as its
                         // own sign-off.
                         let was_closed_stream = closed_stream;
-                        if let Some(update) = acc.absorb(&text) {
+                        // Counted rather than latched so a *second* tagged
+                        // result is still recognisable as fresh evidence, not
+                        // mistaken for the first one still reading true.
+                        let acks_before = acc.finalize_acks;
+                        let update = acc.absorb(&text);
+                        let fresh_ack = acc.finalize_acks > acks_before;
+                        if let Some(update) = update {
                             // Nothing may follow the terminal event, so a
                             // straggler arriving during teardown is dropped
-                            // rather than surfaced as a Partial after Final.
-                            if !concluded {
+                            // rather than surfaced as a Partial after Final —
+                            // but never in silence: this is the one thing that
+                            // would mean words the user said went nowhere.
+                            if concluded {
+                                vlog!(
+                                    "deepgram: transcript grew after Final; dropping {update:?}"
+                                );
+                            } else {
                                 let _ = events.send(TranscriptEvent::Partial(update));
                             }
                         }
-                        if finalize_ack_deadline.is_some() && acc.finalize_acked {
+                        if fresh_ack && concluded {
+                            vlog!("deepgram: from_finalize result arrived after Final");
+                        }
+                        // Deepgram is answering the Finalize. Wait out
+                        // FINALIZE_QUIET_WINDOW in case the answer continues
+                        // in another frame; each continuation restarts it.
+                        if fresh_ack
+                            && !concluded
+                            && (finalize_ack_deadline.is_some()
+                                || finalize_quiet_deadline.is_some())
+                        {
                             finalize_ack_deadline = None;
-                            // Deepgram has confirmed the flush, so the
-                            // transcript is complete: report it now instead of
-                            // spending another round trip on CloseStream and
-                            // the Metadata sign-off first.
-                            let _ = events.send(conclude(&acc, sent_secs, None));
-                            concluded = true;
-                            if let Err(e) = send_close_stream(&mut socket, &mut closed_stream).await {
-                                failure = Some(e);
-                                break;
-                            }
+                            finalize_quiet_deadline = Some(Instant::now() + FINALIZE_QUIET_WINDOW);
                         }
                         // Deepgram may send a Metadata frame at open *and* as
                         // the post-CloseStream sign-off. Only the latter ends
@@ -414,7 +498,7 @@ async fn pump_inner(
     if let Some(e) = &failure {
         vlog!("deepgram session failed; salvaging the transcript: {e:#}");
     }
-    // Already told the application on the `from_finalize` ack; a failure that
+    // Already told the application when the flush finished arriving; a failure that
     // happened during teardown afterwards is not the user's problem, which is
     // the same precedence `conclude` gives text over a socket error.
     if !concluded {
@@ -463,7 +547,7 @@ fn conclude(acc: &Transcript, sent_secs: f64, failure: Option<String>) -> Transc
              before recording could start; try holding it a little longer"
                 .into(),
         ),
-        (true, None) if !acc.finalize_acked => TranscriptEvent::Error(
+        (true, None) if !acc.finalize_acked() => TranscriptEvent::Error(
             "the transcription engine never confirmed receiving the audio in time, so nothing \
              came back; please try again"
                 .into(),
@@ -485,13 +569,23 @@ struct Transcript {
     finals: Vec<String>,
     interim: String,
     done: bool,
-    /// Set once a Results message arrives tagged `"from_finalize": true` —
-    /// Deepgram's own authoritative confirmation that it produced this
-    /// result in response to our `Finalize`. See the module doc.
-    finalize_acked: bool,
+    /// How many Results messages have arrived tagged `"from_finalize": true`
+    /// — Deepgram's own authoritative confirmation that it produced a result
+    /// in response to our `Finalize`. A count rather than a flag so the pump
+    /// can tell a genuine continuation of the flush apart from a flag that has
+    /// merely been true since the first one, and so it can be zeroed when
+    /// `Finalize` actually goes out. See the module doc.
+    finalize_acks: u32,
 }
 
 impl Transcript {
+    /// Whether Deepgram has confirmed the flush at all. The pump zeroes the
+    /// count when it sends `Finalize`, so this only ever answers for the
+    /// `Finalize` of this session.
+    fn finalize_acked(&self) -> bool {
+        self.finalize_acks > 0
+    }
+
     /// Feed one JSON message. Returns the updated running transcript when the
     /// message changed it.
     fn absorb(&mut self, json: &str) -> Option<String> {
@@ -513,7 +607,7 @@ impl Transcript {
         }
 
         if value.get("from_finalize").and_then(|v| v.as_bool()) == Some(true) {
-            self.finalize_acked = true;
+            self.finalize_acks = self.finalize_acks.saturating_add(1);
         }
 
         let text = value
@@ -683,14 +777,32 @@ mod tests {
     #[test]
     fn from_finalize_flag_is_tracked() {
         let mut t = Transcript::default();
-        assert!(!t.finalize_acked);
+        assert!(!t.finalize_acked());
         t.absorb(&results("hello", false));
         assert!(
-            !t.finalize_acked,
+            !t.finalize_acked(),
             "an ordinary interim must not look like a finalize ack"
         );
         t.absorb(&results_from_finalize("hello there.", true));
-        assert!(t.finalize_acked);
+        assert!(t.finalize_acked());
+    }
+
+    #[test]
+    fn each_from_finalize_result_is_counted_separately() {
+        // The pump distinguishes "the flush has more to say" from "the flag
+        // has been true since the first frame" purely by this count moving,
+        // so a latch would silently defeat the quiet window.
+        let mut t = Transcript::default();
+        t.absorb(&results_from_finalize("Part one.", true));
+        assert_eq!(t.finalize_acks, 1);
+        t.absorb(&results("an unrelated interim", false));
+        assert_eq!(
+            t.finalize_acks, 1,
+            "an untagged message must not look like a continuation of the flush"
+        );
+        t.absorb(&results_from_finalize("Part two.", true));
+        assert_eq!(t.finalize_acks, 2);
+        assert_eq!(t.finished_text(), "Part one. Part two.");
     }
 
     #[test]
@@ -699,7 +811,7 @@ mod tests {
         // from_finalize-tagged result, just with no text in it.
         let mut t = Transcript::default();
         t.absorb(&results_from_finalize("", true));
-        assert!(t.finalize_acked);
+        assert!(t.finalize_acked());
         assert_eq!(t.finished_text(), "");
     }
 
@@ -758,7 +870,7 @@ mod tests {
         // zero-audio case.
         let mut t = Transcript::default();
         t.absorb(&results_from_finalize("", true));
-        assert!(t.finalize_acked);
+        assert!(t.finalize_acked());
         match conclude(&t, 2.5, None) {
             TranscriptEvent::Error(msg) => {
                 assert!(msg.contains("silence"), "{msg}");
@@ -818,11 +930,21 @@ mod tests {
         .unwrap();
     }
 
-    fn final_transcript(events: &Receiver<TranscriptEvent>) -> Option<String> {
-        events.try_iter().find_map(|e| match e {
-            TranscriptEvent::Final(t) => Some(t),
-            _ => None,
-        })
+    /// The fake servers' socket type — spelled out once so [`wait_for`] can
+    /// borrow it without every server body naming it.
+    type FakeSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    /// Read frames until one contains `needle`, ignoring anything else (audio
+    /// binaries, pings). Returns false if the socket ended first, which every
+    /// caller treats as "the client went away, stop scripting".
+    async fn wait_for(ws: &mut FakeSocket, needle: &str) -> bool {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(t))) if t.contains(needle) => return true,
+                Some(Ok(_)) => continue,
+                _ => return false,
+            }
+        }
     }
 
     /// How long the fake server watches for a rushed `CloseStream` after
@@ -855,12 +977,8 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
 
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
+            if !wait_for(&mut ws, "Finalize").await {
+                return;
             }
 
             if quirk == Quirk::LateOpenMetadata {
@@ -887,6 +1005,16 @@ mod tests {
             .await
             .unwrap();
 
+            if let Quirk::SplitFlush { gap, rest } = quirk {
+                // The same flush continuing in a second tagged frame: no new
+                // command from the client, so it follows the first one after
+                // only a processing gap.
+                tokio::time::sleep(gap).await;
+                ws.send(Message::Text(results_from_finalize(rest, true).into()))
+                    .await
+                    .unwrap();
+            }
+
             if quirk == Quirk::GarbageAfterFlush {
                 // A well-formed text frame (FIN, opcode 1, 2 unmasked bytes)
                 // whose payload is not UTF-8 — a genuine, deterministic socket
@@ -901,12 +1029,8 @@ mod tests {
                 return;
             }
 
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
+            if !wait_for(&mut ws, "CloseStream").await {
+                return;
             }
             if let Quirk::DelayedSignOff(delay) = quirk {
                 // Stall the sign-off so a test can tell whether Final was
@@ -928,6 +1052,12 @@ mod tests {
         DelayedSignOff(Duration),
         /// Break the socket right after the flush.
         GarbageAfterFlush,
+        /// Answer the `Finalize` in two `from_finalize`-tagged frames `gap`
+        /// apart, the second carrying `rest`.
+        SplitFlush {
+            gap: Duration,
+            rest: &'static str,
+        },
     }
 
     /// A fake Deepgram that answers `Finalize` with nothing at all — no
@@ -942,19 +1072,11 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
 
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
+            if !wait_for(&mut ws, "Finalize").await {
+                return;
             }
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) if t.contains("CloseStream") => break,
-                    Some(Ok(_)) => continue,
-                    _ => return,
-                }
+            if !wait_for(&mut ws, "CloseStream").await {
+                return;
             }
             let _ = ws
                 .send(Message::Text(
@@ -1002,9 +1124,11 @@ mod tests {
         run_pump(audio_rx, event_tx.clone(), addr, FINALIZE_ACK_TIMEOUT).await;
         server.await.unwrap();
 
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
         assert_eq!(
-            final_transcript(&event_rx).as_deref(),
-            Some("It's not working correctly. I've been having trouble."),
+            finals(&seen),
+            ["It's not working correctly. I've been having trouble."],
             "CloseStream must wait for from_finalize, not race ahead of it"
         );
     }
@@ -1034,9 +1158,11 @@ mod tests {
         run_pump(audio_rx, event_tx.clone(), addr, FINALIZE_ACK_TIMEOUT).await;
         server.await.unwrap();
 
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
         assert_eq!(
-            final_transcript(&event_rx).as_deref(),
-            Some("No."),
+            finals(&seen),
+            ["No."],
             "a hold under 0.5s must still wait for the from_finalize flush, not skip waiting"
         );
     }
@@ -1069,10 +1195,57 @@ mod tests {
         run_pump(audio_rx, event_tx.clone(), addr, FINALIZE_ACK_TIMEOUT).await;
         server.await.unwrap();
 
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
         assert_eq!(
-            final_transcript(&event_rx).as_deref(),
-            Some("Hi."),
+            finals(&seen),
+            ["Hi."],
             "50ms of real audio is not zero audio and must still wait for from_finalize"
+        );
+    }
+
+    /// `single-from-finalize-ack-assumed`: Deepgram never promised the flush
+    /// fits in one frame, and a client that concludes on the first tagged
+    /// result absorbs any continuation into the accumulator where it can
+    /// never reach the application — the same mid-utterance truncation this
+    /// module exists to fix, and one the safety-net timeout cannot see.
+    /// `FINALIZE_QUIET_WINDOW` is what makes the split whole again, so this
+    /// drives a genuinely split flush and requires both halves, in order.
+    #[tokio::test]
+    async fn a_flush_split_across_two_messages_is_delivered_whole() {
+        // Comfortably inside FINALIZE_QUIET_WINDOW, with enough headroom that
+        // a loaded CI box cannot turn a real continuation into a late one.
+        const GAP: Duration = Duration::from_millis(30);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_withhold_then_flush_server(
+            listener,
+            "The first half of it,",
+            2.0,
+            Quirk::SplitFlush {
+                gap: GAP,
+                rest: "and the second half.",
+            },
+        );
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let two_seconds = vec![0u8; crate::audio::SAMPLE_RATE as usize * 2 * 2];
+        audio_tx.send(Command::Audio(two_seconds)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        run_pump(audio_rx, event_tx, addr, FINALIZE_ACK_TIMEOUT).await;
+        server.await.unwrap();
+
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        assert_eq!(
+            finals(&seen),
+            ["The first half of it, and the second half."],
+            "a flush split across two from_finalize results must be reported whole"
         );
     }
 
@@ -1207,7 +1380,10 @@ mod tests {
     /// possibly arrive before the stall is over.
     #[tokio::test]
     async fn final_fires_on_the_flush_not_on_the_sign_off() {
-        const SIGN_OFF_DELAY: Duration = Duration::from_millis(600);
+        // Must stay well clear of RUSH_WINDOW + FINALIZE_QUIET_WINDOW (the
+        // time before Final can legitimately fire), or this measures the
+        // quiet window rather than the sign-off it means to rule out.
+        const SIGN_OFF_DELAY: Duration = Duration::from_millis(800);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

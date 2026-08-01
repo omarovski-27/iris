@@ -72,9 +72,12 @@ So the target holds **iff Deepgram's finalisation flush is under roughly
 flush is now awaited explicitly: `finish()` waits for Deepgram's own
 `from_finalize` acknowledgement before `CloseStream` rather than closing
 immediately — see `AGENTS.md` and `crates/iris-core/src/engine/deepgram.rs`.
-The ack *is* the finish line: the final transcript is reported the moment it
-lands, so `CloseStream` and the Metadata sign-off are teardown and add no
-round trip to the number above.)
+The ack plus a 150 ms quiet window for a flush split across frames *is* the
+finish line: the final transcript is reported then, so `CloseStream` and the
+Metadata sign-off are teardown and add no round trip to the number above. That
+window is the one deliberate addition to the number, and it is inside the
+budget headroom only while the flush latency itself stays well under the
+280 ms bar.)
 
 ## 4. Injection is the unexpected risk
 
