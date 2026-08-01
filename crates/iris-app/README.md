@@ -84,54 +84,48 @@ behave differently there. They are also the two that cannot receive a clipboard
 paste while still held, because Ctrl+V becomes Ctrl+Alt+V or Ctrl+Win+V; Iris
 types the transcript instead when that happens.
 
-**Injection method — and your clipboard.** `method` is a request, not a
-guarantee. A transcript longer than 256 characters (roughly 30 seconds of
-speech) is delivered as a **clipboard paste even under `sendinput`**, because a
-keystroke burst that long arrives garbled in some apps — a reported 313-character
+**Injection method — what `method` decides.** `method` is a request, not a
+guarantee, and only one thing about delivery actually turns on which value you
+set. A transcript longer than 256 characters (roughly 30 seconds of speech) is
+delivered as a **clipboard paste even under `sendinput`**, because a keystroke
+burst that long arrives garbled in some apps — a reported 313-character
 dictation reached Notepad as a handful of correct characters followed by one
 repeated key and a run of spaces, while the same text typed into a terminal
-fine.
+fine. That automatic escalation is skipped for windows that do not treat Ctrl+V
+as paste — terminals (including ConEmu/Cmder, Hyper and Tabby), Remote Desktop
+and VM client windows, vim, Emacs — which keep the keystrokes instead.
 
-That paste **overwrites whatever was on your clipboard, and the previous
-contents are not restored.** This is a deliberate trade, not an oversight:
-restoring the old contents is unsound rather than merely awkward — Windows
-offers no signal for "the target has finished reading the clipboard", so any
-restore either races the paste (and the app silently pastes your *old*
-clipboard, which looks like it worked) or needs a delay long enough to cost the
-sub-second latency this app exists for and to race the next dictation. The full
-reasoning is in `win::paste`'s doc comment in `iris-core/src/inject.rs` (commit
-`e2aac70`). If you keep something on the clipboard you cannot lose, copy it back
-after a long dictation, or keep dictations short.
+**That skip is the only thing `method = "clipboard"` changes.** Setting it is
+your own choice and is honoured as one: Iris pastes at any length, into whatever
+window has focus, including the paste-hostile ones above, and never filters your
+choice through that list. Everything in the two sections below applies to you
+exactly as it applies to an automatically escalated dictation — it all lives in
+the paste itself, not in the decision to paste.
 
-That automatic escalation skips windows that do not treat Ctrl+V as paste —
-terminals (including ConEmu/Cmder, Hyper and Tabby), Remote Desktop and VM
-client windows, vim, Emacs. They keep the keystrokes, sent in smaller groups
-with a short pause between them so a long transcript still arrives intact. The
-same keystroke fallback catches a clipboard that another application is holding
-open, and a hotkey still held down that would turn Ctrl+V into a different
-shortcut. All three fallbacks are logged under `--verbose`.
+**What every paste does, however Iris got there.** A paste **overwrites whatever
+was on your clipboard, and the previous contents are not restored.** This is a
+deliberate trade, not an oversight: restoring the old contents is unsound rather
+than merely awkward — Windows offers no signal for "the target has finished
+reading the clipboard", so any restore either races the paste (and the app
+silently pastes your *old* clipboard, which looks like it worked) or needs a
+delay long enough to cost the sub-second latency this app exists for and to race
+the next dictation. The full reasoning is in `win::paste`'s doc comment in
+`iris-core/src/inject.rs` (commit `e2aac70`). If you keep something on the
+clipboard you cannot lose, copy it back afterwards, or keep dictations short.
 
-Those pauses have a flip side worth knowing: anything *you* type during them
-lands in the middle of the transcript. Starting your next dictation while a long
-one is still being typed out is the likely way to see it. Long transcripts were
-already split into several bursts before the pauses existed, so this widens the
-window rather than creating it — and unlike the garbling it prevents, it is
-visible on screen.
+A paste can also decline itself and type the transcript instead. Two things
+cause that, and neither depends on how the paste was chosen: a hotkey still
+reading down that would turn Ctrl+V into a different shortcut (checked both
+before and after the clipboard is written — the early check spares your
+clipboard, the late one catches a key pressed while Iris was waiting for it),
+and a clipboard another application is holding open. Both are logged under
+`--verbose`, as is the paste-hostile skip above.
 
-All of that applies to the automatic escalation only — that is, to the default
-`method = "sendinput"`. Setting `method = "clipboard"` is your own choice and is
-honoured as one: every dictation is pasted, at any length, into whatever window
-has focus, including the paste-hostile ones above. Iris never overrides an
-explicit method in either direction, so a `clipboard` config is not filtered
-through that list.
-
-**Where a pasted transcript can end up.** This one is not escalation-specific:
-it applies to *every* paste Iris makes, whether you were escalated into it or
-chose `method = "clipboard"` yourself. Clobbering is not the only cost of going
-through the clipboard — anything on it can be picked up by other software, and a
-dictation is not necessarily something you want kept. So Iris asks Windows to
-keep the item out of **Clipboard History (Win+V)** and off **Cloud Clipboard
-sync**, using the three registered formats Windows documents for exactly that
+Clobbering is not the only cost of going through the clipboard: anything on it
+can be picked up by other software, and a dictation is not necessarily something
+you want kept. So Iris asks Windows to keep the item out of **Clipboard History
+(Win+V)** and off **Cloud Clipboard sync**, using the three registered formats
+Windows documents for exactly that
 (`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`
 and `CanUploadToCloudClipboard`; see `decline_history_and_cloud_sync` in
 `iris-core/src/inject.rs`). If you were relying on Win+V to get a dictation
@@ -148,13 +142,26 @@ real:
   not something a test on your machine has confirmed.
 
 The transcript still sits on the live clipboard afterwards either way — that is
-deliberate, and it is the recovery path described next.
+deliberate, and it is the recovery path described further down.
+
+**What every long keystroke burst does.** Whenever a transcript is typed rather
+than pasted *and* it is long enough to need it, the keystrokes go out in smaller
+groups with a short pause between them, so a slow app has room to keep up. This
+covers every route onto the keystroke path — a paste-hostile window, either
+hotkey veto, an unavailable clipboard — and is not specific to any of them.
+
+Those pauses have a flip side worth knowing: anything *you* type during them
+lands in the middle of the transcript. Starting your next dictation while a long
+one is still being typed out is the likely way to see it. Long transcripts were
+already split into several bursts before the pauses existed, so this widens the
+window rather than creating it — and unlike the garbling it prevents, it is
+visible on screen.
 
 **If a long dictation does not appear, it is not lost.** That list of
 paste-hostile apps is best-effort and always will be — it can only name
 application families that are actually identifiable, and no list can cover
-every app that binds Ctrl+V to something of its own. So the escalated paste is
-built to fail recoverably rather than silently:
+every app that binds Ctrl+V to something of its own. So a paste is built to fail
+recoverably rather than silently:
 
 - **The text is still on your clipboard.** Iris does not restore the previous
   contents (see above), which means the transcript is sitting there — press
