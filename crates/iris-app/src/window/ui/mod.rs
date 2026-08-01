@@ -41,7 +41,7 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
         .resizable(false)
         .exact_width(176.0)
         .frame(Frame::new().inner_margin(egui::Margin::symmetric(12, 16)))
-        .show(ctx, |ui| nav(ui, state, &theme));
+        .show(ctx, |ui| nav(ui, state, env, &theme));
 
     egui::SidePanel::left("iris_window_divider")
         .resizable(false)
@@ -51,18 +51,10 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
             chrome::spectrum_bar(ui.painter(), &theme, ui.max_rect());
         });
 
-    CentralPanel::default()
-        .frame(
-            Frame::new()
-                .inner_margin(egui::Margin::symmetric(24, 20))
-                .fill(Color32::TRANSPARENT),
-        )
-        .show(ctx, |ui| match state.tab {
-            Tab::History => history_tab::draw(ui, state, env, &theme),
-            Tab::Settings => settings_tab::draw(ui, state, env, &theme),
-            Tab::Insights => insights_tab::draw(ui, state, &theme),
-        });
-
+    // Before the `CentralPanel`, not after: egui lays panels out in the order
+    // they are added and the central panel claims whatever is left, so a
+    // bottom panel added afterwards paints over the last history card instead
+    // of reserving a strip under it.
     if let Some(status) = state.status_text().map(str::to_string) {
         egui::TopBottomPanel::bottom("iris_window_status")
             .frame(Frame::new().inner_margin(egui::Margin::symmetric(24, 8)))
@@ -75,10 +67,22 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
                 );
             });
     }
+
+    CentralPanel::default()
+        .frame(
+            Frame::new()
+                .inner_margin(egui::Margin::symmetric(24, 20))
+                .fill(Color32::TRANSPARENT),
+        )
+        .show(ctx, |ui| match state.tab {
+            Tab::History => history_tab::draw(ui, state, env, &theme),
+            Tab::Settings => settings_tab::draw(ui, state, env, &theme),
+            Tab::Insights => insights_tab::draw(ui, state, &theme),
+        });
 }
 
 /// The left-hand section picker: History, Settings, Insights.
-fn nav(ui: &mut egui::Ui, state: &mut WindowState, theme: &iris_overlay::Theme) {
+fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overlay::Theme) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("Iris")
@@ -118,10 +122,22 @@ fn nav(ui: &mut egui::Ui, state: &mut WindowState, theme: &iris_overlay::Theme) 
         ui.add_space(4.0);
     }
 
+    // The hint names the key that works *right now*, which is the one the
+    // hook was installed with — not the saved one. After a rebind those
+    // differ until a restart, and a footer that quietly switched to the new
+    // key would be telling the user to hold something inert.
+    let pending = (state.config.hotkey != env.in_force_hotkey).then(|| state.config.hotkey);
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
         ui.add_space(4.0);
+        if let Some(saved) = pending {
+            ui.label(
+                RichText::new(format!("{saved} after restart"))
+                    .size(11.0)
+                    .color(chrome::warn(theme)),
+            );
+        }
         ui.label(
-            RichText::new(format!("hold {} to dictate", state.config.hotkey))
+            RichText::new(format!("hold {} to dictate", env.in_force_hotkey))
                 .size(11.0)
                 .color(chrome::ink_faint(theme)),
         );

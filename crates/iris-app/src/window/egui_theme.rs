@@ -79,7 +79,7 @@ pub fn visuals(theme: &iris_overlay::Theme) -> egui::Visuals {
     v.extreme_bg_color = color32(raised_surface(theme));
     v.faint_bg_color = color32(raised_surface(theme));
     v.code_bg_color = color32(raised_surface(theme));
-    v.warn_fg_color = color32(theme.accent);
+    v.warn_fg_color = warn_color(theme);
     v.error_fg_color = warn_color(theme);
     v.window_stroke = Stroke::new(1.0_f32, color32(theme.border));
     v.window_shadow.color = color32(theme.ambient_shadow);
@@ -117,13 +117,15 @@ pub fn visuals(theme: &iris_overlay::Theme) -> egui::Visuals {
     v
 }
 
-/// A warm accent for destructive/error text. Neither palette defines a red —
-/// "no rec-red" is a locked rule for the pill's live states — so this reuses
-/// the warmest stop in the spectrum ramp rather than inventing an off-brand
-/// red. `pub(crate)` so `ui::chrome::warn` can share it rather than
-/// re-deriving the same colour.
+/// The failure accent, for error text and the History tab's "failed" chip.
+///
+/// Single-sourced from [`iris_overlay::Theme::warn`] like every other colour
+/// here, rather than picked off the spectrum ramp: the ramp is cool from end
+/// to end in both palettes, so a failure drawn from it sat a few percent away
+/// from the mint `ok` beside it. `pub(crate)` so `ui::chrome::warn` can share
+/// it rather than re-deriving the same colour.
 pub(crate) fn warn_color(theme: &iris_overlay::Theme) -> Color32 {
-    color32(theme.spectrum[0])
+    color32(theme.warn)
 }
 
 #[cfg(test)]
@@ -156,6 +158,20 @@ mod tests {
     fn dark_mode_flag_follows_the_theme() {
         assert!(visuals(&PRISM_DARK).dark_mode);
         assert!(!visuals(&PORCELAIN_LIGHT).dark_mode);
+    }
+
+    /// The History tab paints "failed" and "injected" a few pixels apart, so
+    /// the two colours have to be nothing like each other in either palette.
+    #[test]
+    fn warn_is_visibly_different_from_ok_in_both_themes() {
+        for theme in [&PRISM_DARK, &PORCELAIN_LIGHT] {
+            let warn = warn_color(theme);
+            let ok = color32(theme.ok);
+            let distance = warn.r().abs_diff(ok.r()) as u32
+                + warn.g().abs_diff(ok.g()) as u32
+                + warn.b().abs_diff(ok.b()) as u32;
+            assert!(distance > 120, "{}: {distance}", theme.name);
+        }
     }
 
     #[test]

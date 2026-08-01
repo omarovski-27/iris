@@ -37,8 +37,7 @@ const HEADER: &str = "\
 # setting from the tray, which drops any comments you added below this header.
 #
 #   engine   mock | deepgram | groq | local
-#   hotkey   rctrl, lctrl, rshift, ralt, rwin, capslock, scrolllock, pause,
-#            f1-f12 (also pickable from the Settings window)
+#   hotkey   rctrl, lctrl, rshift, ralt, rwin, capslock, scrolllock, pause, f8, f9, f10
 #   theme    dark | light
 #
 # engine, hotkey, input device, theme, polish and overlay_enabled can all be

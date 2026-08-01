@@ -26,7 +26,7 @@ use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
 
-use super::insights::Insights;
+use super::insights::{DayWindow, Insights};
 
 /// How often the window re-reads `config.toml` and the session log while it
 /// is open and visible.
@@ -64,9 +64,10 @@ impl Tab {
 
 /// Everything the window needs from outside itself.
 ///
-/// `list_devices` arrives as a callback rather than a direct call because
-/// enumerating input devices is a Windows-only (WASAPI) operation and this
-/// module has to stay portable; see `crate::window::shell` for the real one.
+/// `list_devices`, `open_config_file` and `utc_offset_seconds` arrive as
+/// callbacks/values rather than direct calls because each is a Windows-only
+/// operation (WASAPI, `cmd /C start`, `GetTimeZoneInformation`) and this
+/// module has to stay portable; see `crate::window::shell` for the real ones.
 pub struct Env<'a> {
     /// Where `config.toml` lives.
     pub config_path: &'a Path,
@@ -74,10 +75,26 @@ pub struct Env<'a> {
     pub commands: &'a Sender<Command>,
     /// Enumerate input devices. Empty on a platform/build with no capture.
     pub list_devices: &'a dyn Fn() -> Vec<String>,
+    /// Hand `config.toml` to whatever the desktop opens `.toml` with. The one
+    /// route to the API keys, which this window deliberately never renders —
+    /// see `crate::window::ui::settings_tab`'s module docs.
+    pub open_config_file: &'a dyn Fn(&Path) -> anyhow::Result<()>,
     /// Fires when [`crate::window::WindowSink::open`] is called again while
     /// this window is already showing — `ui::draw_root` drains it and asks
     /// the OS to focus the window instead of opening a second one.
     pub reopen_signal: &'a Receiver<()>,
+    /// The local UTC offset, for [`DayWindow`]. Zero (i.e. UTC) wherever the
+    /// OS cannot be asked.
+    pub utc_offset_seconds: i32,
+    /// The hotkey the running process actually listens for — a snapshot taken
+    /// in `main`, not the saved setting. The two differ after a rebind, and
+    /// the window has to say so: `App` deliberately leaves the installed hook
+    /// alone until a restart, so `config.hotkey` alone would tell the user to
+    /// hold a key that does nothing.
+    pub in_force_hotkey: Key,
+    /// Whether the overlay was actually spawned this run, on the same
+    /// snapshot-vs-saved footing as [`Env::in_force_hotkey`].
+    pub in_force_overlay_enabled: bool,
 }
 
 /// The window's in-memory state. Built fresh each time the window opens.
@@ -108,7 +125,7 @@ impl WindowState {
     pub fn new(env: &Env) -> Self {
         let config = Config::load(env.config_path).unwrap_or_default();
         let history = load_history(&config, env.config_path);
-        let insights = Insights::compute(&history, &today_utc());
+        let insights = Insights::compute(&history, &local_day(env.utc_offset_seconds));
         let devices = (env.list_devices)();
         Self {
             tab: Tab::History,
@@ -136,13 +153,24 @@ impl WindowState {
             self.config = config;
         }
         self.history = load_history(&self.config, env.config_path);
-        self.insights = Insights::compute(&self.history, &today_utc());
+        self.insights = Insights::compute(&self.history, &local_day(env.utc_offset_seconds));
         self.last_refresh = Instant::now();
     }
 
     /// Re-enumerate input devices (a manual "refresh" next to the picker).
     pub fn refresh_devices(&mut self, env: &Env) {
         self.devices = (env.list_devices)();
+    }
+
+    /// Open `config.toml` in whatever the desktop uses for it — the only
+    /// route this window offers to the API keys, which it never renders. A
+    /// pure OS action: nothing is read back, so no [`Command`] is sent and
+    /// the next [`WindowState::refresh`] picks up a hand edit like any other.
+    pub fn open_config_file(&mut self, env: &Env) {
+        match (env.open_config_file)(env.config_path) {
+            Ok(()) => self.flash("Opened config.toml"),
+            Err(e) => self.flash(format!("Could not open config.toml: {e}")),
+        }
     }
 
     /// Show `message` in the status line for [`STATUS_HOLD`].
@@ -214,13 +242,31 @@ fn load_history(config: &Config, config_path: &Path) -> Vec<DictationRecord> {
     records
 }
 
-/// Today's UTC date as `"YYYY-MM-DD"` — a prefix of the RFC 3339 timestamps
-/// `crate::history` stamps records with.
-fn today_utc() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
+/// The UTC range covering the *local* calendar day that is current now, given
+/// a fixed offset east of UTC in seconds.
+///
+/// Pure arithmetic on a supplied offset, never a timezone lookup: reading the
+/// current local offset from a multi-threaded process is unsound, which is why
+/// `crate::history` stamps in UTC in the first place. The offset comes from
+/// `crate::window::shell`, which asks Windows once; everything after it is
+/// this function.
+fn local_day(utc_offset_seconds: i32) -> DayWindow {
+    let offset = time::Duration::seconds(i64::from(utc_offset_seconds));
+    let local_midnight =
+        (time::OffsetDateTime::now_utc() + offset).replace_time(time::Time::MIDNIGHT);
+    let start = local_midnight - offset;
+    DayWindow::new(
+        utc_seconds(start),
+        utc_seconds(start + time::Duration::days(1)),
+    )
+}
+
+/// An instant as `"YYYY-MM-DDTHH:MM:SS"` — RFC 3339 without the zone or any
+/// fractional part, the form [`DayWindow`] compares.
+fn utc_seconds(at: time::OffsetDateTime) -> String {
+    at.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
-        .get(..10)
+        .get(..19)
         .unwrap_or_default()
         .to_string()
 }
@@ -229,6 +275,12 @@ fn today_utc() -> String {
 mod tests {
     use super::*;
     use crate::history::DictationRecord;
+
+    /// Never actually launches anything: no test may spawn a process onto the
+    /// user's desktop, the same rule injection lives under.
+    fn refuse_to_open(_path: &Path) -> anyhow::Result<()> {
+        anyhow::bail!("no desktop in a test")
+    }
 
     fn env_with<'a>(
         config_path: &'a Path,
@@ -240,7 +292,11 @@ mod tests {
             config_path,
             commands,
             list_devices: devices,
+            open_config_file: &refuse_to_open,
             reopen_signal,
+            utc_offset_seconds: 0,
+            in_force_hotkey: Key::default(),
+            in_force_overlay_enabled: true,
         }
     }
 
@@ -375,9 +431,61 @@ mod tests {
     }
 
     #[test]
-    fn today_utc_looks_like_a_date() {
-        let today = today_utc();
-        assert_eq!(today.len(), 10, "{today}");
-        assert_eq!(today.matches('-').count(), 2, "{today}");
+    fn local_day_is_exactly_24_hours_wide_and_shifts_with_the_offset() {
+        let utc = local_day(0);
+        assert!(utc.contains(&utc_seconds(time::OffsetDateTime::now_utc())));
+        // Every offset still covers *now*, and the window it covers moves.
+        for hours in [-11, -8, 5, 13] {
+            let day = local_day(hours * 3600);
+            assert!(
+                day.contains(&utc_seconds(time::OffsetDateTime::now_utc())),
+                "offset {hours} lost the present moment"
+            );
+        }
+        // A whole-hour offset shifts the boundary by that many hours, so the
+        // two windows can only agree when the offset is zero.
+        assert_ne!(utc, local_day(9 * 3600));
+    }
+
+    #[test]
+    fn utc_seconds_drops_the_zone_and_any_fraction() {
+        let at = time::OffsetDateTime::from_unix_timestamp(1_784_000_000).unwrap();
+        let formatted = utc_seconds(at);
+        assert_eq!(formatted.len(), 19, "{formatted}");
+        assert!(!formatted.ends_with('Z'), "{formatted}");
+        assert_eq!(formatted.matches(':').count(), 2, "{formatted}");
+    }
+
+    /// `set_hotkey` saves but must not pretend the change is live: the hook
+    /// stays on the key `main` installed until a restart, and the view keys
+    /// its restart-pending marker off exactly this divergence.
+    #[test]
+    fn a_saved_hotkey_diverges_from_the_in_force_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        assert_eq!(state.config.hotkey, env.in_force_hotkey);
+        state.set_hotkey(&env, Key::F9);
+        assert_eq!(state.config.hotkey, Key::F9);
+        assert_ne!(state.config.hotkey, env.in_force_hotkey);
+    }
+
+    #[test]
+    fn open_config_file_reports_a_failure_rather_than_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.open_config_file(&env);
+        assert!(state.status_text().unwrap().contains("Could not open"));
     }
 }

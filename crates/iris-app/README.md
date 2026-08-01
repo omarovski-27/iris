@@ -232,6 +232,8 @@ Menu: engine picker, microphone picker, theme, polish toggle, open settings,
 reload settings, quit. "Open settings" opens the settings window (below) —
 opening it twice focuses the existing window rather than making a second one,
 and closing it never stops dictation, which owns its own thread throughout.
+The config file is still one click away, from that window's Settings tab, so
+"Reload settings" keeps meaning what it always did.
 
 While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,
@@ -318,7 +320,12 @@ priority order:
   one-click copy per entry; a failed injection shows its reason in place, not
   buried, because this is the recovery path.
 - **Settings** — engine, input device, theme, polish, the overlay toggle and
-  hotkey rebinding, all written through `Config`. Never renders an API key.
+  hotkey rebinding, all written through `Config`. Never renders an API key;
+  "Open config file" hands `config.toml` to the user's editor instead, which
+  is still where the keys are set. `hotkey` and `overlay_enabled` are read
+  once at startup, so the window is given the *running* values too and marks
+  either one "until restart" the moment the saved value diverges — including
+  in the sidebar, which always names the key that works right now.
 - **Insights** — most repeated words/phrases (stopwords and filler stripped),
   dictations today/all-time, total words, average/median perceived latency,
   success-vs-failure rate — all computed from the session log on the window's
@@ -351,7 +358,15 @@ inherited rather than solved differently.
 Colour is `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT` tokens,
 mapped onto `egui::Visuals` by `egui_theme` and painted directly for the
 background wash and the spectrum accent bar — the window and the pill are
-meant to read as one product.
+meant to read as one product. A failed injection is the one warm thing on
+screen (`theme.warn`, amber — not the banned rec-red), and History gives it a
+square marker and bold label as well as the colour, so "failed" and
+"injected" stay a pair of glances apart without relying on colour vision.
+
+"Dictations today" counts the user's *local* calendar day even though records
+are stamped in UTC. The offset comes from `GetTimeZoneInformation` in
+`window::shell`, not from `time`'s local-offset lookup, which is unsound in a
+multi-threaded process — the same reason `history.rs` stamps in UTC at all.
 
 `cargo run -p iris-app -- --demo-window` opens a real window against a
 seeded config and session log under the system temp directory — no hotkey, no

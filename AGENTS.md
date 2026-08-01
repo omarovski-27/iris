@@ -408,6 +408,15 @@ When updating this file, preserve this bar for all agents and keep entries conci
   module docs for why a second writer would race it.
 - `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
   like `hotkey`, changing it needs a restart (both are read once at startup).
+  `main` therefore hands `window::spawn` an `InForce` snapshot of what the
+  process is really doing, and the view marks either setting "until restart"
+  wherever the saved value has outrun it.
+- Anything the window cannot reach the OS for crosses through `Env` as a
+  callback or a plain value (`list_devices`, `open_config_file`, the local UTC
+  offset from `GetTimeZoneInformation`), so `window::ui` stays `egui`-only.
+  Note the offset: `time`'s `current_local_offset` is unsound in a
+  multi-threaded process — that is why `history.rs` stamps UTC — so
+  `window::shell` asks Windows and `insights::DayWindow` does the arithmetic.
 - `cargo run -p iris-app -- --demo-window` opens the real window against a
   seeded config/session log under the system temp dir — no hotkey, no
   microphone, no injector — the manual verification and screenshot path.

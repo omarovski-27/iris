@@ -149,20 +149,36 @@ fn engine_chip(ui: &mut Ui, theme: &iris_overlay::Theme, engine: &str) {
         });
 }
 
-/// A small coloured dot plus a label — painted rather than a text glyph, so
-/// it never depends on the active font covering a checkmark/cross, and reads
-/// as the same "coloured halo" language the pill's own state rings use.
+/// A small marker plus a label — painted rather than a text glyph, so it
+/// never depends on the active font covering a checkmark/cross, and reads as
+/// the same "coloured halo" language the pill's own state rings use.
+///
+/// Failure gets a filled *square* and bold text where the other two states
+/// get a dot in regular weight. Colour alone would not carry it: this is the
+/// recovery path, and the difference between "injected" and "failed" has to
+/// survive a colour-blind reader and a bad monitor, not just the amber/mint
+/// split.
 fn status_chip(ui: &mut Ui, theme: &iris_overlay::Theme, record: &DictationRecord) {
-    let (label, color): (&str, Color32) = if record.text.is_empty() && record.error.is_none() {
-        ("idle", chrome::ink_faint(theme))
-    } else if record.injected {
-        ("injected", chrome::ok(theme))
+    let (label, color, failed): (&str, Color32, bool) =
+        if record.text.is_empty() && record.error.is_none() {
+            ("idle", chrome::ink_faint(theme), false)
+        } else if record.injected {
+            ("injected", chrome::ok(theme), false)
+        } else {
+            ("failed", chrome::warn(theme), true)
+        };
+    let (marker, _response) = ui.allocate_exact_size(egui::vec2(9.0, 11.0), egui::Sense::hover());
+    if failed {
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(marker.center(), egui::vec2(7.0, 7.0)),
+            egui::CornerRadius::same(1),
+            color,
+        );
     } else {
-        ("failed", chrome::warn(theme))
-    };
-    let (dot, _response) = ui.allocate_exact_size(egui::vec2(8.0, 11.0), egui::Sense::hover());
-    ui.painter().circle_filled(dot.center(), 3.0, color);
-    ui.label(RichText::new(label).size(11.0).color(color));
+        ui.painter().circle_filled(marker.center(), 3.0, color);
+    }
+    let text = RichText::new(label).size(11.0).color(color);
+    ui.label(if failed { text.strong() } else { text });
 }
 
 /// `"2026-07-31T06:27:17Z"` -> `"2026-07-31 06:27:17 UTC"`.

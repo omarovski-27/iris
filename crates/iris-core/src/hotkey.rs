@@ -25,6 +25,19 @@ use anyhow::{bail, Result};
 /// Modifier keys are the good choices: they are on every keyboard, they are
 /// comfortable to hold, and the right-hand ones are nearly unused as bare
 /// keypresses. Right-Ctrl is the default for that reason.
+///
+/// # The bar for adding a key
+///
+/// This list is curated, not merely short. `suppress_hotkey` (on by default)
+/// makes the hook swallow the configured key *globally and unconditionally* —
+/// `is_hotkey_event` matches the virtual-key alone, with no modifier check —
+/// for as long as Iris runs. So a key only belongs here if losing it
+/// system-wide is harmless: bare modifiers and the handful of function keys
+/// with no standing shell, browser or editor binding. "It is a function key"
+/// is not the criterion. F1 (help), F4 (Alt+F4 closes a window), F5
+/// (refresh), F11 (fullscreen) and F12 (devtools) are all deliberately absent
+/// for that reason — binding one of them would silently break it everywhere,
+/// with nothing on screen to connect the breakage to Iris.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Key {
     /// The default: on every keyboard, comfortable to hold, and almost never
@@ -38,24 +51,15 @@ pub enum Key {
     CapsLock,
     ScrollLock,
     Pause,
-    F1,
-    F2,
-    F3,
-    F4,
-    F5,
-    F6,
-    F7,
     F8,
     F9,
     F10,
-    F11,
-    F12,
 }
 
 impl Key {
     /// Every supported hotkey, in the order offered to the user (a settings
     /// picker, `--help` text). Mirrors [`Key::NAMES`] one-to-one; a test pins
-    /// that down.
+    /// that down. See the type's docs before adding to it.
     pub const ALL: &'static [Key] = &[
         Key::RightCtrl,
         Key::LeftCtrl,
@@ -65,18 +69,9 @@ impl Key {
         Key::CapsLock,
         Key::ScrollLock,
         Key::Pause,
-        Key::F1,
-        Key::F2,
-        Key::F3,
-        Key::F4,
-        Key::F5,
-        Key::F6,
-        Key::F7,
         Key::F8,
         Key::F9,
         Key::F10,
-        Key::F11,
-        Key::F12,
     ];
 
     /// The Win32 virtual-key code. A low-level hook reports the *specific*
@@ -92,18 +87,9 @@ impl Key {
             Key::CapsLock => 0x14,   // VK_CAPITAL
             Key::ScrollLock => 0x91, // VK_SCROLL
             Key::Pause => 0x13,      // VK_PAUSE
-            Key::F1 => 0x70,
-            Key::F2 => 0x71,
-            Key::F3 => 0x72,
-            Key::F4 => 0x73,
-            Key::F5 => 0x74,
-            Key::F6 => 0x75,
-            Key::F7 => 0x76,
             Key::F8 => 0x77,
             Key::F9 => 0x78,
             Key::F10 => 0x79,
-            Key::F11 => 0x7A,
-            Key::F12 => 0x7B,
         }
     }
 
@@ -117,18 +103,9 @@ impl Key {
             Key::CapsLock => "caps-lock",
             Key::ScrollLock => "scroll-lock",
             Key::Pause => "pause",
-            Key::F1 => "f1",
-            Key::F2 => "f2",
-            Key::F3 => "f3",
-            Key::F4 => "f4",
-            Key::F5 => "f5",
-            Key::F6 => "f6",
-            Key::F7 => "f7",
             Key::F8 => "f8",
             Key::F9 => "f9",
             Key::F10 => "f10",
-            Key::F11 => "f11",
-            Key::F12 => "f12",
         }
     }
 
@@ -142,18 +119,9 @@ impl Key {
         "capslock",
         "scrolllock",
         "pause",
-        "f1",
-        "f2",
-        "f3",
-        "f4",
-        "f5",
-        "f6",
-        "f7",
         "f8",
         "f9",
         "f10",
-        "f11",
-        "f12",
     ];
 
     /// Whether `inject.rs` may synthesise a corrective key-up for this hotkey
@@ -240,18 +208,9 @@ impl std::str::FromStr for Key {
             "capslock" | "caps" => Key::CapsLock,
             "scrolllock" | "scroll" => Key::ScrollLock,
             "pause" | "break" => Key::Pause,
-            "f1" => Key::F1,
-            "f2" => Key::F2,
-            "f3" => Key::F3,
-            "f4" => Key::F4,
-            "f5" => Key::F5,
-            "f6" => Key::F6,
-            "f7" => Key::F7,
             "f8" => Key::F8,
             "f9" => Key::F9,
             "f10" => Key::F10,
-            "f11" => Key::F11,
-            "f12" => Key::F12,
             _ => bail!(
                 "unknown hotkey {s:?} (expected one of: {})",
                 Key::NAMES.join(", ")

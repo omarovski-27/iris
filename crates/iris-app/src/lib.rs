@@ -47,9 +47,10 @@
 //! project's `CLAUDE.md`), so [`inject::SystemInjector`] is constructed by
 //! `main` and nowhere else.
 
-// Deny rather than forbid: the tray has to pump a Win32 message loop, which is
-// `unsafe` by construction. That one module opts back in explicitly; nothing
-// else in the crate may.
+// Deny rather than forbid: a couple of Win32 calls have no safe wrapper — the
+// tray's message pump, and `window::shell`'s one timezone query. Each opts
+// back in explicitly, at the smallest scope that compiles, with the reason
+// written above it; nothing else in the crate may.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]

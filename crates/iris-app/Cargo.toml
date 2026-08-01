@@ -61,6 +61,10 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
+    # GetTimeZoneInformation: the settings window's "Dictations today" needs
+    # the local calendar day, and `time`'s own local-offset lookup is unsound
+    # in a multi-threaded process. See `window::shell`.
+    "Win32_System_Time",
 ] }
 # Settings window: immediate-mode, pure Rust over WGL (the `glow` backend) —
 # no MSVC, no WebView2 runtime to bundle. Proved to cross-compile+link on

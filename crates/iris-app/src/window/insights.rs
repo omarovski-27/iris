@@ -15,6 +15,53 @@ use crate::history::DictationRecord;
 /// How many entries [`Insights::top_words`] and [`Insights::top_phrases`] keep.
 const TOP_N: usize = 8;
 
+/// The stretch of UTC time one *local* calendar day covers, as the half-open
+/// range `[start, end)`.
+///
+/// A range rather than a date prefix because the two calendars do not line
+/// up: [`crate::history`] stamps every record in UTC (deliberately — reading
+/// the local offset from a multi-threaded process is unsound, see that
+/// module), while "Dictations today" is only meaningful on the user's own
+/// clock. Converting the *day* once and comparing instants keeps the
+/// conversion at the edge, so this module stays pure arithmetic; see
+/// `crate::window::shell` for where the offset comes from.
+///
+/// Both bounds are `"YYYY-MM-DDTHH:MM:SS"` — RFC 3339 in UTC, truncated to
+/// whole seconds, which is exactly the prefix [`DayWindow::contains`]
+/// compares so a record's optional fractional seconds cannot skew it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DayWindow {
+    start: String,
+    end: String,
+}
+
+/// How many characters of an RFC 3339 UTC timestamp are compared: the
+/// `"YYYY-MM-DDTHH:MM:SS"` prefix, which is fixed-width and therefore orders
+/// lexicographically.
+const SECOND_PRECISION: usize = 19;
+
+impl DayWindow {
+    /// A window from two UTC `"YYYY-MM-DDTHH:MM:SS"` bounds, `start`
+    /// inclusive and `end` exclusive.
+    #[must_use]
+    pub fn new(start: impl Into<String>, end: impl Into<String>) -> Self {
+        Self {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    /// Whether an RFC 3339 UTC `timestamp` falls inside this window. A
+    /// timestamp too short to carry a whole second is never inside one.
+    #[must_use]
+    pub fn contains(&self, timestamp: &str) -> bool {
+        let Some(at) = timestamp.get(..SECOND_PRECISION) else {
+            return false;
+        };
+        at >= self.start.as_str() && at < self.end.as_str()
+    }
+}
+
 /// A word or phrase and how many dictations it appeared in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ranked {
@@ -29,7 +76,8 @@ pub struct Ranked {
 pub struct Insights {
     /// Every entry in the log, successful or not.
     pub total_dictations: usize,
-    /// Entries whose timestamp falls on today's UTC date.
+    /// Entries that fall on today's *local* calendar day — see [`DayWindow`]
+    /// for why that is not the same as today's UTC date.
     pub dictations_today: usize,
     /// Words across every transcript (`text.split_whitespace().count()`).
     pub total_words: usize,
@@ -54,17 +102,17 @@ pub struct Insights {
 
 impl Default for Insights {
     fn default() -> Self {
-        Self::compute(&[], "")
+        Self::compute(&[], &DayWindow::default())
     }
 }
 
 impl Insights {
     /// Roll `records` up into [`Insights`].
     ///
-    /// `today` is the caller's current UTC date as `"YYYY-MM-DD"` (a prefix of
-    /// [`crate::history::DictationRecord::timestamp`]'s RFC 3339 rendering) —
-    /// passed in rather than read from the clock so this stays a pure,
-    /// deterministic function to test.
+    /// `today` is the caller's current *local* calendar day, expressed as the
+    /// UTC range it covers — passed in rather than read from the clock so
+    /// this stays a pure, deterministic function to test, and so the one
+    /// place that has to ask the OS for a timezone stays in the native shell.
     ///
     /// # Success vs failure
     ///
@@ -75,11 +123,11 @@ impl Insights {
     /// said, or that the engine tried and failed on, counts as an attempt;
     /// [`crate::history::DictationRecord::injected`] decides success.
     #[must_use]
-    pub fn compute(records: &[DictationRecord], today: &str) -> Self {
+    pub fn compute(records: &[DictationRecord], today: &DayWindow) -> Self {
         let total_dictations = records.len();
         let dictations_today = records
             .iter()
-            .filter(|r| r.timestamp.get(..today.len()) == Some(today))
+            .filter(|r| today.contains(&r.timestamp))
             .count();
         let total_words = records
             .iter()
@@ -361,9 +409,15 @@ mod tests {
         record_at(text, timestamp, true, None)
     }
 
+    /// 2026-08-01 for a user on UTC — the day every fixture below is stamped
+    /// in. `local_day` is what builds the real one.
+    fn today() -> DayWindow {
+        DayWindow::new("2026-08-01T00:00:00", "2026-08-02T00:00:00")
+    }
+
     #[test]
     fn empty_history_is_all_zeroes_and_none() {
-        let insights = Insights::compute(&[], "2026-08-01");
+        let insights = Insights::compute(&[], &today());
         assert_eq!(insights.total_dictations, 0);
         assert_eq!(insights.dictations_today, 0);
         assert_eq!(insights.total_words, 0);
@@ -383,16 +437,45 @@ mod tests {
             ok("three word phrase", "2026-08-01T10:00:00Z"),
             ok("yesterday's words here", "2026-07-31T10:00:00Z"),
         ];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         assert_eq!(insights.total_dictations, 3);
         assert_eq!(insights.dictations_today, 2);
         assert_eq!(insights.total_words, 2 + 3 + 3);
     }
 
+    /// The whole point of the range: for a user on UTC-8, a dictation at
+    /// 22:00 local is stamped in the *next* UTC day, and one made at 09:00
+    /// UTC is still yesterday evening to them. A UTC-date prefix gets both
+    /// backwards.
+    #[test]
+    fn a_local_day_is_not_the_utc_day() {
+        // 2026-08-01 in UTC-8 runs 08:00Z on the 1st to 08:00Z on the 2nd.
+        let local = DayWindow::new("2026-08-01T08:00:00", "2026-08-02T08:00:00");
+        let records = vec![
+            ok("last night, their time", "2026-08-01T05:00:00Z"),
+            ok("this morning", "2026-08-01T17:00:00Z"),
+            ok("tonight", "2026-08-02T06:00:00Z"),
+            ok("tomorrow morning", "2026-08-02T17:00:00Z"),
+        ];
+        assert_eq!(Insights::compute(&records, &local).dictations_today, 2);
+    }
+
+    #[test]
+    fn a_day_window_is_half_open_and_ignores_fractional_seconds() {
+        let day = today();
+        assert!(day.contains("2026-08-01T00:00:00Z"));
+        assert!(day.contains("2026-08-01T00:00:00.482913Z"));
+        assert!(day.contains("2026-08-01T23:59:59.999Z"));
+        assert!(!day.contains("2026-08-02T00:00:00Z"));
+        assert!(!day.contains("2026-07-31T23:59:59Z"));
+        assert!(!day.contains("2026-08-01"), "not a whole second");
+        assert!(!DayWindow::default().contains("2026-08-01T09:00:00Z"));
+    }
+
     #[test]
     fn a_silent_tap_counts_toward_neither_success_nor_failure() {
         let silent = record_at("", "2026-08-01T09:00:00Z", false, None);
-        let insights = Insights::compute(&[silent], "2026-08-01");
+        let insights = Insights::compute(&[silent], &today());
         assert_eq!(insights.successes, 0);
         assert_eq!(insights.failures, 0);
         assert_eq!(insights.success_rate(), None);
@@ -401,7 +484,7 @@ mod tests {
     #[test]
     fn an_engine_failure_with_no_text_still_counts_as_a_failure() {
         let failed = record_at("", "2026-08-01T09:00:00Z", false, Some("engine timed out"));
-        let insights = Insights::compute(&[failed], "2026-08-01");
+        let insights = Insights::compute(&[failed], &today());
         assert_eq!(insights.successes, 0);
         assert_eq!(insights.failures, 1);
         assert_eq!(insights.success_rate(), Some(0.0));
@@ -415,7 +498,7 @@ mod tests {
             false,
             Some("injection failed: SendInput delivered 0 of 42 events"),
         );
-        let insights = Insights::compute(&[failed], "2026-08-01");
+        let insights = Insights::compute(&[failed], &today());
         assert_eq!(insights.failures, 1);
         // The words are still counted — this record is why the feature exists.
         assert_eq!(insights.total_words, 6);
@@ -429,7 +512,7 @@ mod tests {
             record_at("three", "2026-08-01T09:00:00Z", false, Some("boom")),
             record_at("", "2026-08-01T09:00:00Z", false, None), // excluded
         ];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         assert_eq!(insights.successes, 2);
         assert_eq!(insights.failures, 1);
         assert!((insights.success_rate().unwrap() - 2.0 / 3.0).abs() < 1e-9);
@@ -445,7 +528,7 @@ mod tests {
         c.latency.perceived_ms = Some(300.0);
         let untimed = ok("d", "2026-08-01T09:00:00Z"); // perceived_ms: None
 
-        let insights = Insights::compute(&[a, b, c, untimed], "2026-08-01");
+        let insights = Insights::compute(&[a, b, c, untimed], &today());
         assert_eq!(insights.avg_latency_ms, Some(200.0));
         assert_eq!(insights.median_latency_ms, Some(200.0));
     }
@@ -456,7 +539,7 @@ mod tests {
         a.latency.perceived_ms = Some(100.0);
         let mut b = ok("b", "2026-08-01T09:00:00Z");
         b.latency.perceived_ms = Some(200.0);
-        let insights = Insights::compute(&[a, b], "2026-08-01");
+        let insights = Insights::compute(&[a, b], &today());
         assert_eq!(insights.median_latency_ms, Some(150.0));
     }
 
@@ -469,7 +552,7 @@ mod tests {
                 "2026-08-01T09:00:00Z",
             ),
         ];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         let words: Vec<&str> = insights.top_words.iter().map(|r| r.text.as_str()).collect();
         assert!(!words.contains(&"the"), "{words:?}");
         assert!(!words.contains(&"um"), "{words:?}");
@@ -481,7 +564,7 @@ mod tests {
     #[test]
     fn a_word_said_only_once_still_appears() {
         let records = vec![ok("unique", "2026-08-01T09:00:00Z")];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         assert_eq!(
             insights.top_words[0],
             Ranked {
@@ -495,7 +578,7 @@ mod tests {
     fn top_words_are_capped_and_ordered_by_count_then_alphabetically() {
         let text =
             "zebra zebra zebra yak yak xray xray wolf viper unicorn tiger snake rabbit quail";
-        let insights = Insights::compute(&[ok(text, "2026-08-01T09:00:00Z")], "2026-08-01");
+        let insights = Insights::compute(&[ok(text, "2026-08-01T09:00:00Z")], &today());
         assert_eq!(insights.top_words.len(), TOP_N);
         assert_eq!(insights.top_words[0].text, "zebra");
         assert_eq!(insights.top_words[1].text, "xray"); // count 2, ties broken alphabetically before "yak"
@@ -508,7 +591,7 @@ mod tests {
             ok("thank you so much", "2026-08-01T09:00:00Z"),
             ok("thank you again", "2026-08-01T09:00:00Z"),
         ];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         assert_eq!(insights.top_phrases[0].text, "thank you");
         assert_eq!(insights.top_phrases[0].count, 2);
     }
@@ -516,7 +599,7 @@ mod tests {
     #[test]
     fn a_phrase_seen_only_once_is_not_repeated_so_it_is_dropped() {
         let records = vec![ok("a completely unique sentence", "2026-08-01T09:00:00Z")];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         assert!(
             insights.top_phrases.is_empty(),
             "{:?}",
@@ -530,7 +613,7 @@ mod tests {
             ok("this is of the it", "2026-08-01T09:00:00Z"),
             ok("of the it is this", "2026-08-01T09:00:00Z"),
         ];
-        let insights = Insights::compute(&records, "2026-08-01");
+        let insights = Insights::compute(&records, &today());
         for phrase in &insights.top_phrases {
             let all_stopwords = phrase.text.split(' ').all(is_stopword);
             assert!(!all_stopwords, "{phrase:?} should have been dropped");
