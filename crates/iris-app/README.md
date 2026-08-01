@@ -7,7 +7,8 @@ This crate owns no algorithms. Capture, transcription, injection and latency
 instrumentation are [`iris-core`](../iris-core); transcript cleanup is
 [`iris-polish`](../iris-polish); offline ASR is
 [`iris-engine-local`](../iris-engine-local). What lives here is the product:
-the loop that holds them together, the settings, the tray, the session log.
+the loop that holds them together, the settings, the tray, the settings
+window, the session log.
 
 ```bash
 # Windows (the real thing — tray, hotkey, mic, Prism pill, inject)
@@ -18,6 +19,7 @@ cargo build --release --target x86_64-pc-windows-gnu -p iris-app
 cargo run -p iris-app -- --demo-dictation
 cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
 cargo run -p iris-app -- --history
+cargo run -p iris-app -- --demo-window
 ```
 
 ## The loop
@@ -56,6 +58,7 @@ hotkey = "right-ctrl"     # rctrl, lctrl, rshift, ralt, rwin, capslock, ...
 suppress_hotkey = true    # stop the hotkey reaching the focused app
 theme = "dark"            # dark | light
 show_live_text = false    # true opens a live-text ribbon showing dictated words
+overlay_enabled = true    # false suppresses the overlay entirely
 
 [polish]
 enabled = true
@@ -92,9 +95,11 @@ in `src/config.rs` is the implementation and carries the full reasoning.
 
 **Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
 `inject.rs` applies before every injection burst for the other choices, so they
-behave differently there. They are also the two that cannot receive a clipboard
+behave differently there: they are also the two that cannot receive a clipboard
 paste while still held, because Ctrl+V becomes Ctrl+Alt+V or Ctrl+Win+V; Iris
-types the transcript instead when that happens.
+types the transcript instead when that happens. Rebinding the hotkey — from the
+settings window or by hand — needs a restart: the hook is installed once in
+`main`.
 
 **Injection method — what `method` decides.** `method` is a request, not a
 guarantee. Under the default `sendinput`, two things must *both* be true before
@@ -191,9 +196,8 @@ recoverably rather than silently:
   worked — which matters here, because a paste into a misidentified app *is*
   reported as delivered. Run `iris --history` to print the last ten dictations,
   or `iris --history 50` for more; it ends with the log file's own path, so it
-  is also how you find the file to copy from. A Settings window with a History
-  tab that lists them with one-click copy is in development; until it lands,
-  `--history` is the way in.
+  is also how you find the file to copy from. The Settings window's History
+  tab (below) lists them with one-click copy and a search box.
 
 Note that "delivered" here only ever means the keystrokes or the paste
 shortcut reached Windows' input queue. Neither Windows nor Iris can confirm
@@ -201,6 +205,9 @@ that the app on the other end rendered them correctly — that gap is exactly
 what the original bug was — so the latency Iris records for a dictation is a
 delivery time, not a receipt. (The overlay shows no latency figure; its
 readout is the elapsed recording time — see `crates/iris-overlay/README.md`.)
+
+**Overlay.** `overlay_enabled` also needs a restart to take effect; `main`
+spawns (or skips) `iris-overlay` once, before the loop exists.
 
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at
@@ -222,9 +229,9 @@ Linux `tray-icon` needs GTK, so the dependency is `[target.'cfg(windows)']` and
 the tray is simply absent elsewhere.
 
 Menu: engine picker, microphone picker, theme, polish toggle, open settings,
-reload settings, quit. "Open settings" opens `config.toml` in the user's editor
-— the file is already the source of truth and is commented; a bespoke settings
-window would be the same thing built twice.
+reload settings, quit. "Open settings" opens the settings window (below) —
+opening it twice focuses the existing window rather than making a second one,
+and closing it never stops dictation, which owns its own thread throughout.
 
 While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,
@@ -301,6 +308,55 @@ restart.
 `--demo-dictation` forces the mock engine, dry-run inject, synthetic levels, and
 the real pill adapter (visible on Windows; headless state machine elsewhere).
 **Never** constructs `SystemInjector`.
+
+## Settings window
+
+`crate::window`, opened from the tray's `Settings` item. Three sections, in
+priority order:
+
+- **History** — the session log below, newest first, with a search box and a
+  one-click copy per entry; a failed injection shows its reason in place, not
+  buried, because this is the recovery path.
+- **Settings** — engine, input device, theme, polish, the overlay toggle and
+  hotkey rebinding, all written through `Config`. Never renders an API key.
+- **Insights** — most repeated words/phrases (stopwords and filler stripped),
+  dictations today/all-time, total words, average/median perceived latency,
+  success-vs-failure rate — all computed from the session log on the window's
+  own thread, off the dictation critical path. Not the AI speech analyzer
+  (`iris-ai-analyzer`, personality/speaking-style) — that is separate and later.
+
+**Toolkit: `egui` + `eframe`.** Chosen over a WebView shell (needs the
+WebView2 runtime + a loader DLL, and HTML/CSS in an all-Rust codebase), a
+retained Win32-controls toolkit (fights the glassy look without owner-drawing
+everything), and extending `iris-overlay`'s renderer (no input handling to
+build on — the pill "never activates, never hit-tests"). Full evidence and
+the cross-compile proof are in `window/mod.rs`'s module docs.
+
+**Portable view, thin native shell.** `window::ui` (and `state`/`insights`/
+`search`/`egui_theme`) depend on plain `egui` only, so they type-check on
+every platform, the same discipline the rest of this README describes for the
+loop. Only `window::shell` — the `eframe`/`winit` bootstrap and the OS thread
+— is `[target.'cfg(windows)']`, mirroring how `tray-icon` is gated.
+
+**The window never writes `config.toml`.** A change sends a `Command` on a
+channel `App::run` selects on alongside the tray's — the same commands the
+tray sends for engine/device/theme/polish, plus two new ones (`SetHotkey`,
+`SetOverlayEnabled`) that follow the same shape. `App` stays the one writer,
+so a window change and a tray change can never race to overwrite each other.
+`WindowState::refresh` re-reads the file and the log every couple of seconds,
+so external changes (the tray, a hand edit, a rejected switch rolled back by
+the loop) show up here too — the tray's own known-limitations trade-off,
+inherited rather than solved differently.
+
+Colour is `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT` tokens,
+mapped onto `egui::Visuals` by `egui_theme` and painted directly for the
+background wash and the spectrum accent bar — the window and the pill are
+meant to read as one product.
+
+`cargo run -p iris-app -- --demo-window` opens a real window against a
+seeded config and session log under the system temp directory — no hotkey, no
+microphone, no injector — the manual verification and screenshot path, the
+window's counterpart to `--demo-dictation`.
 
 ## Session log
 
@@ -403,3 +459,5 @@ same as the resident loop, and diagnostics behind `--verbose`.
 like a live microphone), so the run takes about as long as the WAV: bursting it
 would finish the utterance before the key came up and hide the finalisation
 race a held key is meant to exercise.
+`--demo-window` is the equivalent for the settings window: a real window
+against seeded, isolated demo data, no hotkey or microphone involved.

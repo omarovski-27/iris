@@ -63,9 +63,11 @@ pub mod inject;
 pub mod pill;
 pub mod polish;
 pub mod tray;
+pub mod window;
 
 pub use app::{App, Command, Dictated};
 pub use config::{Config, EngineChoice, Theme};
 pub use history::{DictationRecord, LatencyBreakdown, SessionLog};
 pub use inject::{Injector, RecordingInjector};
 pub use pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillEvent, PillSink, RecordingPill};
+pub use window::{NoopWindow, WindowSink};

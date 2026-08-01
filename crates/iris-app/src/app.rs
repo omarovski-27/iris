@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver};
 use iris_core::dictation::{Dictation, DictationOutcome};
 use iris_core::engine::Engine;
-use iris_core::hotkey::HotkeyEvent;
+use iris_core::hotkey::{HotkeyEvent, Key};
 use iris_core::latency::{ms, Mark, Timeline};
 use iris_core::text;
 use iris_polish::{PolishRequest, Polisher};
@@ -43,6 +43,7 @@ use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, LatencyBreakdown, PolishInfo, SessionLog};
 use crate::inject::Injector;
 use crate::pill::PillSink;
+use crate::window::{NoopWindow, WindowSink};
 use crate::{engines, polish};
 
 /// Something the tray (or any other UI) asks the loop to do.
@@ -61,7 +62,13 @@ pub enum Command {
     SetPolish(bool),
     /// Switch theme (Dark → Prism, Light → Porcelain on the overlay).
     SetTheme(Theme),
-    /// Open `config.toml` in the user's editor.
+    /// Rebind the push-to-talk key. Persisted immediately; needs a restart to
+    /// take effect, because the hook is installed once in `main`.
+    SetHotkey(Key),
+    /// Show or hide the live-text pill overlay. Persisted immediately; needs
+    /// a restart, because the overlay is spawned once in `main`.
+    SetOverlayEnabled(bool),
+    /// Open the settings window, or focus it if already open.
     OpenSettings,
     /// Re-read the config file, applying anything edited by hand.
     Reload,
@@ -95,6 +102,14 @@ pub struct App<A: AudioSource> {
     polisher: Option<Arc<dyn Polisher>>,
     injector: Arc<dyn Injector>,
     pill: Box<dyn PillSink>,
+    /// Opens/focuses the settings window on [`Command::OpenSettings`].
+    /// [`NoopWindow`] by default — only the real resident loop wires a live
+    /// one; see [`App::with_window`].
+    window: Box<dyn WindowSink>,
+    /// A second command source the window sends on directly, so its changes
+    /// reach [`App::apply`] the same way tray commands do. `never()` by
+    /// default, which simply never becomes ready; see [`App::with_window_commands`].
+    window_commands: Receiver<Command>,
     history: SessionLog,
     audio: A,
     count: usize,
@@ -145,12 +160,29 @@ impl<A: AudioSource> App<A> {
             polisher,
             injector,
             pill,
+            window: Box::new(NoopWindow),
+            window_commands: crossbeam_channel::never(),
             history,
             audio,
             count: 0,
             report: false,
             final_timeout: None,
         })
+    }
+
+    /// Give the loop a live settings window to open on [`Command::OpenSettings`].
+    #[must_use]
+    pub fn with_window(mut self, window: Box<dyn WindowSink>) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Drain [`Command`]s the settings window sends directly, alongside the
+    /// tray's `control` channel passed to [`App::run`].
+    #[must_use]
+    pub fn with_window_commands(mut self, commands: Receiver<Command>) -> Self {
+        self.window_commands = commands;
+        self
     }
 
     /// Print a latency breakdown after every dictation.
@@ -224,6 +256,14 @@ impl<A: AudioSource> App<A> {
     /// the process and the loop never has to borrow `self` while dictating.
     pub fn run(&mut self, keys: &Receiver<HotkeyEvent>, control: &Receiver<Command>) -> Result<()> {
         let frames = self.audio.frames().clone();
+        // A clone, not `&self.window_commands`, for the same reason `frames`
+        // is cloned out above: `select!` would otherwise need to hold a
+        // borrow of `self` for the arm body's `self.apply(..)` call too.
+        // Swapped for a never-ready receiver on disconnect (mirroring
+        // `capture`'s `engine_events_open`) so a window that has gone away
+        // cannot turn this into a busy loop — unlike `control`, losing the
+        // window must not end the whole dictation loop.
+        let mut window_commands = self.window_commands.clone();
         loop {
             let pressed_at = select! {
                 recv(keys) -> event => match event {
@@ -240,6 +280,18 @@ impl<A: AudioSource> App<A> {
                         continue;
                     }
                     Err(_) => return Ok(()),
+                },
+                recv(window_commands) -> command => match command {
+                    Ok(command) => {
+                        if self.apply(command)?.is_break() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        window_commands = crossbeam_channel::never();
+                        continue;
+                    }
                 },
                 // Idle audio from a warm microphone. Dropped on purpose.
                 recv(frames) -> _ => continue,
@@ -300,11 +352,26 @@ impl<A: AudioSource> App<A> {
                 self.pill.set_theme(theme);
                 self.persist();
             }
-            Command::OpenSettings => {
-                if let Err(e) = open_in_editor(&self.config_path) {
-                    eprintln!("  cannot open {}: {e:#}", self.config_path.display());
+            Command::SetHotkey(key) => {
+                if key != self.config.hotkey {
+                    self.config.hotkey = key;
+                    self.saved.hotkey = key;
+                    println!("  hotkey: {key} (restart Iris for this to take effect)");
+                    self.persist();
                 }
             }
+            Command::SetOverlayEnabled(enabled) => {
+                if enabled != self.config.overlay_enabled {
+                    self.config.overlay_enabled = enabled;
+                    self.saved.overlay_enabled = enabled;
+                    println!(
+                        "  overlay: {} (restart Iris for this to take effect)",
+                        if enabled { "on" } else { "off" }
+                    );
+                    self.persist();
+                }
+            }
+            Command::OpenSettings => self.window.open(),
             Command::Reload => match Config::load(&self.config_path) {
                 Ok(loaded) => {
                     // The hotkey hook was installed in `main` and the audio
@@ -321,6 +388,9 @@ impl<A: AudioSource> App<A> {
                     }
                     if loaded.suppress_hotkey != self.config.suppress_hotkey {
                         needs_restart.push("suppress_hotkey");
+                    }
+                    if loaded.overlay_enabled != self.config.overlay_enabled {
+                        needs_restart.push("overlay_enabled");
                     }
                     if loaded.audio.device != self.config.audio.device {
                         needs_restart.push("audio.device");
@@ -344,6 +414,7 @@ impl<A: AudioSource> App<A> {
                     let mut config = loaded;
                     config.hotkey = self.config.hotkey;
                     config.suppress_hotkey = self.config.suppress_hotkey;
+                    config.overlay_enabled = self.config.overlay_enabled;
                     config.audio = self.config.audio.clone();
                     config.keys = self.config.keys.clone();
                     config.inject.method = self.config.inject.method;
@@ -836,31 +907,4 @@ fn open_history(config: &Config, config_path: &std::path::Path) -> SessionLog {
     } else {
         SessionLog::disabled()
     }
-}
-
-/// Hand a path to whatever the desktop uses to open it.
-///
-/// v1's "settings window" is the config file in the user's editor: the file is
-/// already the source of truth, it is commented, and a bespoke settings UI in a
-/// crate whose brief says "no UI beyond the tray" would be the wrong thing to
-/// build twice.
-fn open_in_editor(path: &std::path::Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        // `start` is a cmd builtin, hence `cmd /C`. The empty argument is the
-        // window title, which `start` otherwise steals from the path.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(path)
-            .spawn()
-            .context("launching the editor")?;
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn()
-            .context("launching xdg-open")?;
-    }
-    Ok(())
 }

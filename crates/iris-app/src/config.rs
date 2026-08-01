@@ -40,6 +40,9 @@ const HEADER: &str = "\
 #   hotkey   rctrl, lctrl, rshift, ralt, rwin, capslock, scrolllock, pause, f8, f9, f10
 #   theme    dark | light
 #
+# engine, hotkey, input device, theme, polish and overlay_enabled can all be
+# changed from the Settings window (tray icon -> Settings) as well as by hand.
+#
 # Iris starts on the mock engine (offline, no key needed) until you configure
 # a real one. To use Deepgram:
 #
@@ -414,6 +417,11 @@ pub struct Config {
     /// Flipping this default is the one thing [`CURRENT_VERSION`] exists for;
     /// see [`Config::migrate`].
     pub show_live_text: bool,
+    /// Show the live-text pill overlay while dictating.
+    ///
+    /// Read once at startup (`main` spawns the overlay before [`App`](crate::App)
+    /// exists), so like `hotkey` a change here needs a restart to take effect.
+    pub overlay_enabled: bool,
     /// Transcript cleanup.
     pub polish: PolishConfig,
     /// Microphone.
@@ -439,6 +447,7 @@ impl Default for Config {
             suppress_hotkey: true,
             theme: Theme::default(),
             show_live_text: false,
+            overlay_enabled: true,
             polish: PolishConfig::default(),
             audio: AudioConfig::default(),
             inject: InjectConfig::default(),
@@ -724,8 +733,20 @@ mod tests {
             !config.show_live_text,
             "live text is off by default per captain feedback round 3"
         );
+        assert!(config.overlay_enabled);
         assert!(config.polish.enabled);
         assert_eq!(config.inject.method, Method::SendInput);
+    }
+
+    #[test]
+    fn overlay_enabled_round_trips_and_defaults_on() {
+        assert!(Config::from_toml("").unwrap().overlay_enabled);
+        let config = Config::from_toml("overlay_enabled = false\n").unwrap();
+        assert!(!config.overlay_enabled);
+        assert!(config
+            .to_toml()
+            .unwrap()
+            .contains("overlay_enabled = false"));
     }
 
     #[test]

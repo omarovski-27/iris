@@ -58,7 +58,7 @@ executed here; only compiled, cross-compiled, and been reviewed.
 
 `crates/iris-app/` is the product — the resident tray app that wires the other
 crates into a working dictation loop. Its README is the map: the loop, the
-config file, the tray, the overlay, the session log.
+config file, the tray, the overlay, the settings window, the session log.
 
 Load-bearing beyond that crate:
 
@@ -85,10 +85,13 @@ Load-bearing beyond that crate:
   injection-failure path in `App::capture`, `app.rs`, which points at the
   session log or echoes the text back when the log is off).
   `crates/iris-app/tests/console.rs` drives the real binary and holds this.
+- **The settings window** (`iris-app::window`) is the History/Settings/Insights
+  UI opened from the tray's `Settings` item. See "Settings window" below.
 
 ```bash
 cargo run -p iris-app -- --demo-dictation                 # mock + dry-run + pill
 cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
+cargo run -p iris-app -- --demo-window                    # seeded Settings window, isolated temp config
 ```
 
 ## iris-polish layout
@@ -281,6 +284,13 @@ the hold collected, but never typed.
   and nasm to cross-compile.
 - The hotkey thread must only pump messages: Windows silently uninstalls a
   low-level hook whose callback exceeds ~300 ms.
+- `winit` (via `eframe`) panics if its event loop is built off the main
+  thread — a deliberate cross-platform guard, not a bug. The settings window
+  runs on its own thread like the tray and the overlay, so `window::shell`
+  opts out with `NativeOptions.event_loop_builder` +
+  `EventLoopBuilderExtWindows::with_any_thread(true)`. Sound here specifically
+  because this process only ever runs one `eframe` window at a time; a second
+  window on a second thread would need more thought.
 - `inject.rs` corrects the configured hotkey — and *only* the configured
   hotkey, never a broader modifier sweep — before every `SendInput` burst,
   per `SendInput`'s own warning that an already-pressed key can corrupt the
@@ -376,3 +386,28 @@ When updating this file, preserve this bar for all agents and keep entries conci
   original "never holds transcript text" rule. See
   `crates/iris-overlay/README.md` "The contract changed, and here is why"
   before touching this again.
+
+## Settings window (`iris-app::window`)
+
+- Opened from the tray's `Settings` item (`Command::OpenSettings`); one
+  `iris-window` thread for process life, mirroring `tray`/`iris-overlay`. The
+  toolkit choice (`egui`/`eframe` over a WebView shell, a retained Win32
+  toolkit, or extending `iris-overlay`'s renderer) and the evidence for it are
+  in `window/mod.rs`'s module docs — read that before reconsidering it.
+- **Portable view, `cfg(windows)` shell.** `window::ui` and everything it
+  calls (`state`, `insights`, `search`, `egui_theme`) depend on plain `egui`
+  only and type-check on Linux; only `window::shell` depends on `eframe` and
+  is Windows-only, so `eframe`/`winit`/`glow` never enter a non-Windows build.
+  Keep new window code on the `egui`-only side unless it genuinely needs a
+  native window/GL call.
+- **The window never writes `config.toml`.** Every setting change sends a
+  `Command` — the same ones the tray sends (`SetEngine`/`SetDevice`/
+  `SetTheme`/`SetPolish`) plus two new ones this window introduced
+  (`SetHotkey`, `SetOverlayEnabled`) — on a channel `App::run` selects on
+  alongside the tray's. `App` stays the sole writer; see `window::state`'s
+  module docs for why a second writer would race it.
+- `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
+  like `hotkey`, changing it needs a restart (both are read once at startup).
+- `cargo run -p iris-app -- --demo-window` opens the real window against a
+  seeded config/session log under the system temp dir — no hotkey, no
+  microphone, no injector — the manual verification and screenshot path.

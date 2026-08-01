@@ -25,7 +25,7 @@ use anyhow::{bail, Result};
 /// Modifier keys are the good choices: they are on every keyboard, they are
 /// comfortable to hold, and the right-hand ones are nearly unused as bare
 /// keypresses. Right-Ctrl is the default for that reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Key {
     /// The default: on every keyboard, comfortable to hold, and almost never
     /// used as a bare keypress.
@@ -44,6 +44,23 @@ pub enum Key {
 }
 
 impl Key {
+    /// Every supported hotkey, in the order offered to the user (a settings
+    /// picker, `--help` text). Mirrors [`Key::NAMES`] one-to-one; a test pins
+    /// that down.
+    pub const ALL: &'static [Key] = &[
+        Key::RightCtrl,
+        Key::LeftCtrl,
+        Key::RightShift,
+        Key::RightAlt,
+        Key::RightWin,
+        Key::CapsLock,
+        Key::ScrollLock,
+        Key::Pause,
+        Key::F8,
+        Key::F9,
+        Key::F10,
+    ];
+
     /// The Win32 virtual-key code. A low-level hook reports the *specific*
     /// side (`VK_RCONTROL`, not `VK_CONTROL`), which is what makes
     /// right-modifier hotkeys possible.
@@ -469,6 +486,16 @@ mod tests {
     fn default_is_right_ctrl() {
         assert_eq!(Key::default(), Key::RightCtrl);
         assert_eq!(Key::default().vk(), 0xA3);
+    }
+
+    #[test]
+    fn all_lists_every_key_exactly_once_matching_names() {
+        assert_eq!(Key::ALL.len(), Key::NAMES.len());
+        for key in Key::ALL {
+            assert_eq!(key.to_string().parse::<Key>().unwrap(), *key);
+        }
+        let unique: std::collections::HashSet<_> = Key::ALL.iter().collect();
+        assert_eq!(unique.len(), Key::ALL.len(), "Key::ALL has a duplicate");
     }
 
     #[test]

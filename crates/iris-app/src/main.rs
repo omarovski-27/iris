@@ -18,7 +18,7 @@ use iris_app::audio::AudioSource;
 use iris_app::config::{self, Config, EngineChoice};
 use iris_app::inject::{DryRunInjector, Injector};
 use iris_app::pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillSink};
-use iris_app::{App, SessionLog};
+use iris_app::{App, DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
 use iris_core::inject::Method;
 
@@ -93,6 +93,14 @@ struct Args {
     /// inject so the session log records a mock insert safely.
     #[arg(long)]
     demo_dictation: bool,
+
+    /// Open the Settings window against a seeded demo config and session
+    /// log, isolated under the system temp directory, then keep running
+    /// long enough to inspect or screenshot it. Never touches the hotkey,
+    /// the microphone or injection — the manual verification path for the
+    /// window, the same role `--demo-dictation` plays for the loop.
+    #[arg(long)]
+    demo_window: bool,
 }
 
 fn main() -> Result<()> {
@@ -126,6 +134,9 @@ fn main() -> Result<()> {
     }
     if args.demo_dictation {
         return demo_dictation(config, &config_path, &args);
+    }
+    if args.demo_window {
+        return demo_window();
     }
     if let Some(wav) = args.speak_wav.clone() {
         return speak_wav(config, &config_path, &args, &wav);
@@ -253,12 +264,25 @@ fn start_resident(
         .context("installing the push-to-talk hook")?;
 
     // Overlay owns its thread for process life; App drives it via OverlayPill.
-    let overlay = try_spawn_overlay(&config);
+    let overlay = if config.overlay_enabled {
+        try_spawn_overlay(&config)
+    } else {
+        None
+    };
     let pill = pill_for(args, &config, overlay.as_ref());
+
+    // The settings window's own thread, mirroring the tray and the overlay.
+    // Its commands travel on a channel separate from the tray's `commands`
+    // (App::run selects on both), so a window write can never race a tray
+    // write to persist() — see `iris_app::window::state`'s module docs.
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let window = iris_app::window::spawn(config_path.to_path_buf(), window_commands_tx)?;
 
     let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
-        .with_file_config(file_config);
+        .with_file_config(file_config)
+        .with_window(window)
+        .with_window_commands(window_commands_rx);
 
     Ok(Resident {
         app,
@@ -436,6 +460,144 @@ fn demo_dictation(mut config: Config, config_path: &std::path::Path, args: &Args
         overlay.shutdown();
     }
     Ok(())
+}
+
+/// Open the Settings window against a seeded, isolated demo config and
+/// session log. Never constructs a hotkey listener, an audio source or an
+/// injector — this is a window-only demo, the counterpart `--demo-dictation`
+/// is for the loop.
+fn demo_window() -> Result<()> {
+    use iris_app::window;
+
+    let dir = std::env::temp_dir().join("iris-window-demo");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let config_path = dir.join("config.toml");
+    let history_path = dir.join("history.jsonl");
+
+    Config::default()
+        .save(&config_path)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
+    let mut log = SessionLog::open(&history_path, 500);
+    for record in demo_records() {
+        log.append(&record)?;
+    }
+
+    let (commands_tx, _commands_rx) = crossbeam_channel::unbounded();
+    let handle = window::spawn(config_path.clone(), commands_tx)?;
+    handle.open();
+
+    println!("iris --demo-window");
+    println!("  config   {}", config_path.display());
+    println!("  history  {}", history_path.display());
+    if cfg!(windows) {
+        println!("  Settings window opened; exiting in 120s (Ctrl+C to stop sooner).");
+    } else {
+        println!("  no window on this platform (Windows-only); the seeded files above are real.");
+    }
+    std::thread::sleep(std::time::Duration::from_secs(120));
+    Ok(())
+}
+
+/// A handful of realistic-looking dictations spanning today and yesterday,
+/// several engines, a failed injection and a silent tap, with enough
+/// repeated words and phrases for the Insights tab to have something to show.
+fn demo_records() -> Vec<DictationRecord> {
+    let now = time::OffsetDateTime::now_utc();
+    let stamp = |offset_hours: i64| {
+        (now - time::Duration::hours(offset_hours))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    };
+    let record = |engine: &str,
+                  hours_ago: i64,
+                  text: &str,
+                  injected: bool,
+                  error: Option<&str>,
+                  ms: Option<f64>| {
+        let mut r = DictationRecord::now(engine, text);
+        r.timestamp = stamp(hours_ago);
+        r.injected = injected;
+        r.error = error.map(str::to_string);
+        r.latency.perceived_ms = ms;
+        r
+    };
+
+    vec![
+        record(
+            "deepgram",
+            0,
+            "let me know if the deploy looks good on your end",
+            true,
+            None,
+            Some(210.0),
+        ),
+        record(
+            "deepgram",
+            1,
+            "thanks so much for the quick review",
+            true,
+            None,
+            Some(180.0),
+        ),
+        record(
+            "groq",
+            2,
+            "the project timeline moved up a week, let me know if that works for the team",
+            false,
+            Some("injection failed: SendInput delivered 0 of 42 events"),
+            None,
+        ),
+        record("deepgram", 3, "", false, None, None),
+        record(
+            "mock",
+            5,
+            "quick note to self, follow up on the deploy tomorrow",
+            true,
+            None,
+            Some(90.0),
+        ),
+        record(
+            "deepgram",
+            20,
+            "thanks so much, talk soon",
+            true,
+            None,
+            Some(240.0),
+        ),
+        record(
+            "groq",
+            22,
+            "let me know when the project is ready for review",
+            true,
+            None,
+            Some(310.0),
+        ),
+        record(
+            "deepgram",
+            25,
+            "the deploy went out clean, no rollbacks needed",
+            false,
+            Some("injection failed: the focused window rejected input"),
+            None,
+        ),
+        record(
+            "mock",
+            30,
+            "let me know if you need anything else from me",
+            true,
+            None,
+            Some(120.0),
+        ),
+        record(
+            "deepgram",
+            48,
+            "thanks so much for covering the project this week",
+            true,
+            None,
+            Some(200.0),
+        ),
+    ]
 }
 
 /// About one second of a 220 Hz tone — enough for the mock engine to stream
