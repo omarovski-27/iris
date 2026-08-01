@@ -527,13 +527,14 @@ mod win {
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+        CreateWindowExW, DestroyWindow, GetClassNameW, GetForegroundWindow,
+        GetWindowThreadProcessId, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
     };
 
     use crate::text::{self, KeyUnit};
     use crate::vlog;
 
-    use super::{Key, Method, Target, MAX_SEND_INPUT_CHARS};
+    use super::{Key, Method, Target, BATCH};
 
     const CF_UNICODETEXT: u32 = 13;
     const VK_CONTROL: u16 = 0x11;
@@ -610,7 +611,7 @@ mod win {
         let pace = super::pacing(units.len());
         // Unpaced, this is the single batch every short transcript has always
         // been sent as; paced, it is one of several deliberately smaller ones.
-        let per_call = pace.map_or(MAX_SEND_INPUT_CHARS, |p| p.units) * 2;
+        let per_call = pace.map_or(BATCH, |p| p.units * 2);
 
         let mut inputs = Vec::with_capacity(per_call);
         let last = units.len().saturating_sub(1);
@@ -680,7 +681,10 @@ mod win {
     /// correction is rare (it needs a genuine desync, and `RightAlt` and
     /// `RightWin` never get one at all), and where none was injected there is
     /// nothing to wait for: the common path — hotkey never down — stays free,
-    /// exactly as `SETTLE` already promises for the correction itself.
+    /// exactly as `SETTLE` already promises for the correction itself. Per
+    /// *reading*, not per call into `inject`: `paste` reads twice and can then
+    /// fall back to `send_keystrokes`, which corrects again — see `paste` for
+    /// why that repetition is left alone.
     fn settled_reads_down(key: Key, corrected: Correction) -> bool {
         if corrected == Correction::Injected {
             std::thread::sleep(SETTLE);
@@ -831,10 +835,21 @@ mod win {
     ///
     /// Two things can still make the paste unusable after this is chosen, and
     /// neither may cost the user their words: the clipboard can be held open
-    /// by another process, and the hotkey can still be down in a way that
-    /// spoils the accelerator. Both fall back to `send_keystrokes`, which
+    /// by another process — briefly retried before it counts, see
+    /// `CLIPBOARD_OPEN_ATTEMPTS` — and the hotkey can still be down in a way
+    /// that spoils the accelerator. Both fall back to `send_keystrokes`, which
     /// `super::pacing` makes a safe landing for a long transcript rather than
     /// a return to the reported bug.
+    ///
+    /// That fallback corrects the hotkey again before its own burst, so a
+    /// genuinely stuck, correctable hotkey can be sent more than one
+    /// corrective key-up — and pay more than one `SETTLE` — within a single
+    /// call here. Accepted rather than threaded through: a duplicate key-up
+    /// for a key the user is not holding is the harmless orphan release
+    /// `super::modifier_to_release` already reasons about, `RightAlt` and
+    /// `RightWin` never get one at all, and carrying a `Correction` across
+    /// into the fallback would mean reusing a reading taken before the
+    /// clipboard work that sits between them.
     ///
     /// The accelerator is therefore checked twice, and both are load-bearing.
     /// The early one is what keeps a `ralt`/`rwin` user — the hotkeys
@@ -1019,6 +1034,93 @@ mod win {
         }
     }
 
+    /// A window to own the clipboard for the length of one `set_clipboard`
+    /// call.
+    ///
+    /// Win32 requires one, and requires it of *every* write here rather than
+    /// only of a delayed-rendering one. `SetClipboardData`'s summary opens
+    /// with "The window must be the current clipboard owner", and its
+    /// Remarks, `OpenClipboard`'s and `EmptyClipboard`'s each carry the same
+    /// unqualified sentence: if an application calls `OpenClipboard` with
+    /// `hwnd` set to `NULL`, `EmptyClipboard` sets the clipboard owner to
+    /// `NULL`, and "this causes `SetClipboardData` to fail". Nothing in that
+    /// is scoped to `hMem` = `NULL` — delayed rendering is a separate
+    /// paragraph, on the parameter, and neither the transcript nor any marker
+    /// in `decline_history_and_cloud_sync` uses it. Failing there is the one
+    /// failure this code cannot make cheap: it lands past `EmptyClipboard`,
+    /// so it costs the user their previous clipboard contents *and* the
+    /// paste.
+    ///
+    /// Message-only (`HWND_MESSAGE`) and short-lived. Such a window is
+    /// invisible, has no z-order, cannot be enumerated and — the part that
+    /// matters on an injection thread that pumps nothing — "does not receive
+    /// broadcast messages", so no other process can block on a message it
+    /// will never answer. `STATIC` is the class so there is neither a class
+    /// to register nor a window procedure to write.
+    ///
+    /// Destroying it as soon as the clipboard is closed does not take the
+    /// transcript with it. `WM_RENDERALLFORMATS` — the message that makes a
+    /// clipboard owner's destruction matter — is sent "if the clipboard owner
+    /// has delayed rendering one or more clipboard formats", and every format
+    /// written here handed over its data immediately, which the system owns
+    /// from that point on.
+    unsafe fn clipboard_owner() -> Result<HWND> {
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("iris clipboard owner"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .context("creating a window to own the clipboard")
+        }
+    }
+
+    /// How many times `set_clipboard` asks for the clipboard, and how long it
+    /// waits between asks.
+    ///
+    /// `OpenClipboard` fails while another process has it open, and that is
+    /// normally somebody else's brief, routine open — a clipboard manager,
+    /// Office, RDP redirection — rather than a lasting condition. Treating the
+    /// first refusal as final would drop an already-escalated transcript onto
+    /// the keystroke path the escalation exists to get off, for a collision
+    /// that was over before the fallback finished its first paced gap.
+    ///
+    /// Bounded, not a wait-until-free loop: a clipboard held open indefinitely
+    /// must still end in that fallback rather than in `inject` never
+    /// returning, and the whole retry window costs less than the pacing the
+    /// fallback would pay anyway.
+    const CLIPBOARD_OPEN_ATTEMPTS: u32 = 3;
+    const CLIPBOARD_OPEN_GAP: std::time::Duration = std::time::Duration::from_millis(10);
+
+    fn open_clipboard(owner: HWND) -> Result<()> {
+        let mut attempt = 1;
+        loop {
+            match unsafe { OpenClipboard(Some(owner)) } {
+                Ok(()) => {
+                    if attempt > 1 {
+                        vlog!("the clipboard opened on attempt {attempt}");
+                    }
+                    return Ok(());
+                }
+                Err(e) if attempt == CLIPBOARD_OPEN_ATTEMPTS => {
+                    return Err(e).context("another application is holding the clipboard open");
+                }
+                Err(_) => {}
+            }
+            attempt += 1;
+            std::thread::sleep(CLIPBOARD_OPEN_GAP);
+        }
+    }
+
     fn set_clipboard(text: &str) -> std::result::Result<(), ClipboardError> {
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
         utf16.push(0);
@@ -1028,22 +1130,34 @@ mod win {
             // Allocated and filled before the clipboard is even opened. Every
             // step that can fail belongs on this side of `EmptyClipboard`:
             // past that point the user's previous contents are already gone,
-            // and a failure there has nothing to put back.
+            // and a failure there has nothing to put back. The owner window
+            // is on this side for the same reason.
             let block = global_block(&bytes).map_err(|source| ClipboardError {
                 cleared: false,
                 source,
             })?;
 
-            if let Err(source) = OpenClipboard(Some(HWND(std::ptr::null_mut())))
-                .context("another application is holding the clipboard open")
-            {
+            let owner = match clipboard_owner() {
+                Ok(owner) => owner,
+                Err(source) => {
+                    let _ = GlobalFree(Some(block));
+                    return Err(ClipboardError {
+                        cleared: false,
+                        source,
+                    });
+                }
+            };
+
+            if let Err(source) = open_clipboard(owner) {
                 let _ = GlobalFree(Some(block));
+                let _ = DestroyWindow(owner);
                 return Err(ClipboardError {
                     cleared: false,
                     source,
                 });
             }
-            // From here on every path must close the clipboard.
+            // From here on every path must close the clipboard and destroy
+            // the owner window.
             let result = (|| -> std::result::Result<(), ClipboardError> {
                 EmptyClipboard()
                     .context("emptying the clipboard")
@@ -1063,6 +1177,7 @@ mod win {
                 })
             })();
             let _ = CloseClipboard();
+            let _ = DestroyWindow(owner);
             result
         }
     }

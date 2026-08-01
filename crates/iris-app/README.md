@@ -114,7 +114,7 @@ reading the clipboard", so any restore either races the paste (and the app
 silently pastes your *old* clipboard, which looks like it worked) or needs a
 delay long enough to cost the sub-second latency this app exists for and to race
 the next dictation. The full reasoning is in `win::paste`'s doc comment in
-`iris-core/src/inject.rs` (commit `e2aac70`). If you keep something on the
+`iris-core/src/inject.rs`. If you keep something on the
 clipboard you cannot lose, copy it back afterwards. Keeping dictations under the
 threshold avoids the paste altogether, but only under the default — with
 `method = "clipboard"` there is no length short enough to stay off the
@@ -125,8 +125,10 @@ cause that, and neither depends on how the paste was chosen: a hotkey still
 reading down that would turn Ctrl+V into a different shortcut (checked both
 before and after the clipboard is written — the early check spares your
 clipboard, the late one catches a key pressed while Iris was waiting for it),
-and a clipboard another application is holding open. Both are logged under
-`--verbose`, as is the paste-hostile skip above.
+and a clipboard another application is holding open — a collision that is
+usually momentary, so Iris asks a few times over a few tens of milliseconds
+before giving up and typing instead. Both are logged under `--verbose`, as is
+the paste-hostile skip above.
 
 Clobbering is not the only cost of going through the clipboard: anything on it
 can be picked up by other software, and a dictation is not necessarily something
