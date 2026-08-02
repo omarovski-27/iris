@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver};
-use iris_core::dictation::{Dictation, DEFAULT_FINAL_TIMEOUT};
+use iris_core::dictation::{Dictation, DictationOutcome};
 use iris_core::engine::Engine;
 use iris_core::hotkey::HotkeyEvent;
 use iris_core::latency::{ms, Mark, Timeline};
@@ -99,7 +99,11 @@ pub struct App<A: AudioSource> {
     audio: A,
     count: usize,
     report: bool,
-    final_timeout: Duration,
+    /// Set only by [`App::with_final_timeout`]. Left `None`, every dictation
+    /// asks the engine in force for its own bound, so switching engines at
+    /// runtime switches the wait with it instead of keeping the one the app
+    /// started with.
+    final_timeout: Option<Duration>,
 }
 
 impl<A: AudioSource> App<A> {
@@ -138,7 +142,7 @@ impl<A: AudioSource> App<A> {
             audio,
             count: 0,
             report: false,
-            final_timeout: DEFAULT_FINAL_TIMEOUT,
+            final_timeout: None,
         })
     }
 
@@ -149,11 +153,18 @@ impl<A: AudioSource> App<A> {
         self
     }
 
-    /// How long to wait for the final transcript after the key comes up.
+    /// Override how long to wait for the final transcript after the key comes
+    /// up, in place of the bound the engine asks for.
     #[must_use]
     pub fn with_final_timeout(mut self, timeout: Duration) -> Self {
-        self.final_timeout = timeout;
+        self.final_timeout = Some(timeout);
         self
+    }
+
+    /// The wait in force for the engine currently selected.
+    fn final_timeout(&self) -> Duration {
+        self.final_timeout
+            .unwrap_or_else(|| self.engine.final_timeout())
     }
 
     /// The configuration as it stands on disk, when CLI flags overrode parts
@@ -555,8 +566,9 @@ impl<A: AudioSource> App<A> {
         self.pill.processing();
 
         let finished = {
+            let timeout = self.final_timeout();
             let pill = &mut self.pill;
-            dictation.finish(self.final_timeout, &mut |text: &str| {
+            dictation.finish(timeout, &mut |text: &str| {
                 iris_core::vlog!("~ {text}");
                 pill.set_partial_text(text);
             })
@@ -573,6 +585,16 @@ impl<A: AudioSource> App<A> {
                 return Ok(self.failed(e.timeline, message));
             }
         };
+        Ok(self.deliver(outcome))
+    }
+
+    /// Polish the transcript, put it on screen, and record what happened.
+    ///
+    /// Shared by every path that ends with words in hand — a clean `finish`, a
+    /// partial salvaged from an engine that died, a partial salvaged from a
+    /// hold [`App::abandoned`] before `finish` could run. What the user gets
+    /// does not depend on which of those produced the text.
+    fn deliver(&mut self, outcome: DictationOutcome) -> Dictated {
         let mut timeline = outcome.timeline;
         let raw = outcome.text.trim().to_string();
 
@@ -581,7 +603,7 @@ impl<A: AudioSource> App<A> {
             // Silence, or a key tapped by accident. Injecting nothing is right;
             // so is not pretending to the overlay that text appeared.
             record.latency = LatencyBreakdown::from_timeline(&timeline);
-            return Ok(Dictated { record, timeline });
+            return Dictated { record, timeline };
         }
 
         let (text, polished_info, polish_ms) = self.polish(&raw);
@@ -620,7 +642,7 @@ impl<A: AudioSource> App<A> {
 
         record.latency = LatencyBreakdown::from_timeline(&timeline);
         record.latency.polish_ms = polish_ms;
-        Ok(Dictated { record, timeline })
+        Dictated { record, timeline }
     }
 
     /// A hold that produced no transcript, recorded against the timeline as it
@@ -635,13 +657,32 @@ impl<A: AudioSource> App<A> {
         Dictated { record, timeline }
     }
 
-    /// As [`App::failed`], for a hold abandoned before the engine was ever
-    /// asked to finalise — the audio or hotkey thread stopped, or a frame
-    /// could not be fed. [`Dictation::abandon`] hands over what the hold had
-    /// captured up to that point, which is the whole reason these paths do not
-    /// simply `?` out to [`App::dictate`]'s blank-timeline fallback.
-    fn abandoned(&self, dictation: Dictation, error: anyhow::Error) -> Dictated {
-        self.failed(dictation.abandon(), format!("{error:#}"))
+    /// A hold that ended before the engine was ever asked to finalise — the
+    /// audio or hotkey thread stopped, or a frame could not be fed.
+    ///
+    /// [`Dictation::abandon`] hands over what the hold had captured up to that
+    /// point, and words already on the overlay are delivered exactly as a
+    /// clean dictation's would be: the failure that ended the hold does not get
+    /// to throw away text the user watched appear. Only a hold that never
+    /// transcribed anything is recorded as a failure — with its real timeline,
+    /// not [`App::dictate`]'s blank-timeline fallback.
+    fn abandoned(&mut self, dictation: Dictation, error: anyhow::Error) -> Dictated {
+        let outcome = {
+            let pill = &mut self.pill;
+            dictation.abandon(&mut |text: &str| {
+                iris_core::vlog!("~ {text}");
+                pill.set_partial_text(text);
+            })
+        };
+        if outcome.text.trim().is_empty() {
+            return self.failed(outcome.timeline, format!("{error:#}"));
+        }
+        iris_core::vlog!(
+            "hold ended by {error:#}; salvaging {} chars already transcribed",
+            outcome.text.trim().chars().count()
+        );
+        self.pill.processing();
+        self.deliver(outcome)
     }
 
     /// Clean up the transcript, falling back to the raw text on any failure.

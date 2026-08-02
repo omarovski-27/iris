@@ -86,6 +86,25 @@ pub trait Engine: Send + Sync {
         true
     }
 
+    /// How long a caller should wait after [`Session::finish`] before giving
+    /// up on this engine's transcript.
+    ///
+    /// **Choose this consciously.** The default,
+    /// [`crate::dictation::DEFAULT_FINAL_TIMEOUT`], is a *streaming* figure:
+    /// it assumes the transcript is nearly complete by key-up and only a
+    /// finalisation round-trip remains. An engine that does its real work in
+    /// `finish` — upload and inference after the key comes up, as [`groq`]
+    /// does — has a completely different distribution, and inheriting the
+    /// streaming bound means cutting the user's words off mid-upload. Where
+    /// [`Engine::streams_partials`] is `false` that loss is total, because
+    /// there is no partial to salvage.
+    ///
+    /// The bound is per engine, asked for per dictation, so switching engines
+    /// at runtime switches the wait with it.
+    fn final_timeout(&self) -> std::time::Duration {
+        crate::dictation::DEFAULT_FINAL_TIMEOUT
+    }
+
     /// Open a streaming session. Must return without waiting on the network.
     fn open(&self) -> Result<Box<dyn Session>>;
 }

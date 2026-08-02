@@ -21,6 +21,10 @@ use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
 const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
 const DEFAULT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 
+/// See [`GroqEngine::final_timeout`]. `transcribe()` sets no request timeout of
+/// its own, so this is the only bound on the whole round trip.
+const FINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct GroqEngine {
     key: String,
     model: String,
@@ -66,6 +70,18 @@ impl Engine for GroqEngine {
     /// audio is complete.
     fn streams_partials(&self) -> bool {
         false
+    }
+
+    /// Provisional, and deliberately generous: WAV encode, upload of the whole
+    /// utterance and Whisper inference all happen after key-up, and none of it
+    /// has ever been live-measured in this project (`docs/spike-findings.md`
+    /// lists this engine as compile + unit-tested, not run). A minute of speech
+    /// is a ~1.9 MB upload, which a weak uplink alone can spend the streaming
+    /// budget on, and `streams_partials` is `false` here — expiry loses the
+    /// whole transcript, not a tail of it. Tighten this only against real
+    /// measured Groq latency, never by analogy with the streaming default.
+    fn final_timeout(&self) -> std::time::Duration {
+        FINAL_TIMEOUT
     }
 
     fn open(&self) -> Result<Box<dyn Session>> {
@@ -203,6 +219,25 @@ mod tests {
             language: None,
         };
         assert!(!engine.streams_partials());
+    }
+
+    #[test]
+    fn groq_does_not_inherit_the_streaming_wait() {
+        // Upload and inference both happen after key-up here, and with no
+        // partials there is nothing to salvage when the wait runs out — an
+        // expiry costs the user the whole utterance. The streaming default is
+        // the wrong budget for that, and inheriting it silently is the bug.
+        let engine = GroqEngine {
+            key: "x".into(),
+            model: DEFAULT_MODEL.into(),
+            url: DEFAULT_URL.into(),
+            language: None,
+        };
+        assert!(
+            engine.final_timeout() > crate::dictation::DEFAULT_FINAL_TIMEOUT,
+            "a batch engine needs more room than the streaming default, not less: {:?}",
+            engine.final_timeout()
+        );
     }
 
     #[test]

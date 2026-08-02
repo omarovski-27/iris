@@ -145,23 +145,31 @@ regression (perceived latency up to ~10s during a network blip) traced to
 exactly this: a stalled Deepgram session kept trickling messages just often
 enough to keep re-arming `FINALIZE_TIMEOUT` without ever sending the close
 sign-off, so only the outer bound ended the wait. Diagnosing a hang from its
-milliseconds: check `DEFAULT_FINAL_TIMEOUT` before assuming a Deepgram-side
-constant is misbehaving. The layering also has one hard rule: **an
-engine-internal timeout must stay strictly shorter than
-`DEFAULT_FINAL_TIMEOUT`**, or it never fires and its specific, diagnosable
-error is replaced by the generic "did not return a transcript". Deepgram's
-`CONNECT_TIMEOUT` is the sharp case — it runs from key-down while the outer
-deadline runs from key-up, so a short hold leaves it no slack; it is 5s for
-that reason, and a unit test in `deepgram.rs` holds the invariant.
-`FINALIZE_TIMEOUT` is exempt only because it is re-armed and so bounds nothing
-absolutely. Relatedly, a dictation that fails carries its real `Timeline` out
-to the caller — `Dictation::finish`'s error type (`DictationError`) for an
-engine that gave up, `Dictation::abandon` for a hold that never got that far
-(dead microphone or hotkey thread, a rejected frame) — so `iris-app`'s session
-log shows the real `audio_secs` and marks instead of an all-zero record. In
-`App::capture` every no-transcript path goes through `App::failed`; the blank
-`Timeline` in `App::dictate` covers only failures before any audio exists. Do
-not widen it back.
+milliseconds: check the engine's bound before assuming a Deepgram-side constant
+is misbehaving. **The outer bound is per engine, not global**:
+`DEFAULT_FINAL_TIMEOUT` is only the default behind `Engine::final_timeout`, and
+its 6s is streaming evidence. An engine that works after key-up — Groq's upload
++ inference, the local Whisper finalizer — overrides it with a deliberately
+generous, provisional value, because there the expiry costs the whole
+utterance (`streams_partials` is false, so nothing can be salvaged). Every
+caller of `Dictation::finish` asks the engine; `App` re-asks per dictation, so
+switching engines switches the wait. Ranking the inner timeouts against the
+outer one was tried and reverted: `CONNECT_TIMEOUT` runs from key-down and the
+outer deadline from key-up, so no hold length makes the order stable. When the
+outer bound wins that race, `Dictation::finish` says the session never
+connected (from `Mark::StreamReady`, engine-agnostically) instead of the
+generic wording.
+
+**A failed dictation keeps its words and its timeline.** `Dictation::finish`
+and `Dictation::abandon` — the latter for a hold that never reached `finish`
+(dead microphone or hotkey thread, a rejected frame) — share one salvage rule:
+a non-empty `latest_partial` becomes the transcript, and the timeline carries
+the real `audio_secs` and marks. So a socket dying while the tail is fed costs
+no more than the same socket dying one statement later: `App::capture` sends
+salvaged text through `App::deliver` — polish, injection, a normal record — and
+only a hold that transcribed nothing becomes an `App::failed` error record. The
+blank `Timeline` in `App::dictate` covers only failures before any audio
+exists. Do not widen it back, and do not let the two exits drift apart.
 
 ## Sharp edges
 

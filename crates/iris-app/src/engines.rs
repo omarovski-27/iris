@@ -125,6 +125,17 @@ impl Engine for LocalAdapter {
         self.inner.streams_partials()
     }
 
+    /// Provisional, and deliberately generous for the same reason as Groq's:
+    /// the Whisper finalizer runs entirely after key-up, here on the user's own
+    /// CPU, and no local finalise latency has been measured on real hardware in
+    /// this project. Streaming partials mean an expiry costs the tail rather
+    /// than the whole utterance, but cutting a batch pass off at a bound
+    /// measured from a streaming engine would still throw away words that were
+    /// seconds from arriving.
+    fn final_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
     fn open(&self) -> Result<Box<dyn iris_core::engine::Session>> {
         let session = self.inner.start().context("starting the local engine")?;
         let (tx, rx) = crossbeam_channel::unbounded();

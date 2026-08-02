@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver, Sender};
 use iris_core::audio;
 use iris_core::capture::{self, Capture};
-use iris_core::dictation::{Dictation, DEFAULT_FINAL_TIMEOUT};
+use iris_core::dictation::Dictation;
 use iris_core::engine::{self, Engine};
 use iris_core::hotkey::{self, HotkeyEvent};
 use iris_core::latency::Mark;
@@ -172,7 +172,7 @@ fn dictate(ctx: Dictating<'_>, pressed_at: std::time::Instant) -> Result<()> {
     }
 
     dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
-    let outcome = dictation.finish(DEFAULT_FINAL_TIMEOUT, &mut on_partial)?;
+    let outcome = dictation.finish(engine.final_timeout(), &mut on_partial)?;
     let mut timeline = outcome.timeline;
 
     let payload = text::prepare(&outcome.text, args.trailing_space);

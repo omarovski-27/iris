@@ -426,13 +426,121 @@ fn a_stalled_dictation_still_logs_the_real_audio_captured() {
 }
 
 #[test]
+fn the_wait_for_the_final_transcript_comes_from_the_engine() {
+    // The 6s default was measured against a streaming engine. An engine whose
+    // work happens after key-up gets to say how long that takes, and the app
+    // must ask it rather than applying one architecture's budget to another —
+    // built without `with_final_timeout`, so only the engine's own bound can
+    // end this wait.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.polish.llm = false;
+    let audio = ChannelAudio::new();
+    let frames = audio.sender();
+    let armed = audio.armed();
+    let injector = Arc::new(RecordingInjector::new());
+    let pill = RecordingPill::new();
+    let mut app = App::new(
+        config,
+        &config_path,
+        audio,
+        injector as Arc<dyn Injector>,
+        Box::new(pill),
+    )
+    .expect("app");
+    app.set_engine(Arc::new(ImpatientEngine));
+
+    let (keys_tx, keys_rx) = crossbeam_channel::unbounded();
+    let app_frames = app.frames();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("arm");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        while !frames.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        keys_tx
+            .send(HotkeyEvent::Up(Instant::now()))
+            .expect("key up");
+    });
+
+    let started = Instant::now();
+    let err = app
+        .dictate(Instant::now(), &app_frames, &keys_rx)
+        .expect_err("the engine never concludes");
+    let waited = started.elapsed();
+    speaker.join().expect("speaker");
+
+    assert!(
+        err.to_string().contains("did not return a transcript"),
+        "{err}"
+    );
+    assert!(
+        waited < Duration::from_secs(3),
+        "the app waited out its own default instead of the engine's bound: {waited:?}"
+    );
+}
+
+#[test]
+fn a_mid_hold_failure_still_injects_the_words_already_transcribed() {
+    // The user watched these words appear on the overlay. A socket dying while
+    // the hold is still running must not cost them: the same socket dying one
+    // statement later, inside `finish()`, salvages the partial and injects it,
+    // and there is no version of "the frame feed failed" that makes the text
+    // the engine already produced less real.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(PartialThenPushFailsEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("a salvaged transcript is a dictation, not a failure");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(
+        dictated.record.text.to_ascii_lowercase().contains("hello"),
+        "the streamed partial must survive the failure that ended the hold: {:?}",
+        dictated.record.text
+    );
+    assert!(dictated.record.injected);
+    assert!(
+        dictated.record.error.is_none(),
+        "salvaged words are not an error: {:?}",
+        dictated.record.error
+    );
+    assert_eq!(rig.injector.inserted().len(), 1);
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].injected);
+    assert!(
+        records[0].latency.audio_secs > 0.4,
+        "the log must still show the audio that was captured: {:.2}s",
+        records[0].latency.audio_secs
+    );
+}
+
+#[test]
 fn a_mid_hold_failure_still_logs_the_real_audio_captured() {
     // The sibling of the test above, for the failures that never reach
     // `finish()` at all: the audio thread stopping, the hotkey thread
     // stopping, or a frame the engine refuses. Those used to `?` straight out
     // of `capture` into `dictate`'s blank-timeline fallback, logging
     // `audio_secs: 0.0` for a hold that had captured half a second of speech —
-    // the same misleading record, on a different path.
+    // the same misleading record, on a different path. With nothing ever
+    // transcribed there is nothing to salvage, so this stays a failure.
     let mut rig = rig();
     rig.app.set_engine(Arc::new(PushFailsMidHoldEngine));
 
@@ -959,6 +1067,72 @@ impl Session for PushFailsMidHoldSession {
     fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
         self.samples += pcm.len();
         // 8000 samples at 16 kHz: half a second of very real speech.
+        if self.samples >= 8_000 {
+            anyhow::bail!("the websocket died mid-hold");
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Never concludes, and asks for a much shorter wait than the streaming
+/// default — the shape of an engine that knows its own finalise cost.
+struct ImpatientEngine;
+
+impl Engine for ImpatientEngine {
+    fn name(&self) -> &'static str {
+        "impatient"
+    }
+    fn final_timeout(&self) -> Duration {
+        Duration::from_millis(200)
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(NeverConcludesSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+/// As [`PushFailsMidHoldEngine`], but it streams a partial first — so the hold
+/// dies with words already on the user's screen.
+struct PartialThenPushFailsEngine;
+
+struct PartialThenPushFailsSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Sender<TranscriptEvent>,
+    samples: usize,
+}
+
+impl Engine for PartialThenPushFailsEngine {
+    fn name(&self) -> &'static str {
+        "partial-then-push-fails"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PartialThenPushFailsSession {
+            events: rx,
+            tx,
+            samples: 0,
+        }))
+    }
+}
+
+impl Session for PartialThenPushFailsSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        let before = self.samples;
+        self.samples += pcm.len();
+        if before < 4_000 && self.samples >= 4_000 {
+            let _ = self.tx.send(TranscriptEvent::Partial("hello there".into()));
+        }
         if self.samples >= 8_000 {
             anyhow::bail!("the websocket died mid-hold");
         }

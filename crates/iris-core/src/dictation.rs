@@ -23,7 +23,8 @@ use crate::engine::{Engine, Session, TranscriptEvent};
 use crate::latency::{Mark, Timeline};
 use crate::vlog;
 
-/// How long to wait for the final transcript after `finish()` before giving up.
+/// The default wait for the final transcript after `finish()`, for an engine
+/// that has not chosen its own (see [`Engine::final_timeout`]).
 ///
 /// Deliberately well under the engine-internal worst case a protocol failure
 /// can take (for Deepgram, `FINALIZE_ACK_TIMEOUT` + `FINALIZE_TIMEOUT` ≈ 8s,
@@ -35,14 +36,14 @@ use crate::vlog;
 /// never concluded at all, so only this outer bound ended the wait — at,
 /// essentially, its full old value.
 ///
-/// **Every engine-internal timeout must stay strictly shorter than this.**
-/// This bound is what the user actually waits out, so an inner timeout that
-/// outranks it never gets to fire: its specific, diagnosable error is replaced
-/// by the generic "did not return a transcript" below, and the session log
-/// loses the real cause. Deepgram's `CONNECT_TIMEOUT` is the sharp case — it
-/// runs from key-down while this deadline starts at key-up, so a short hold
-/// leaves it almost no room, and it is held at 5s for exactly that reason.
-/// Lowering this constant means checking `engine/deepgram.rs` again.
+/// Both the value and that evidence are *streaming* evidence, so this is the
+/// default rather than the rule: an engine whose work happens after key-up
+/// overrides [`Engine::final_timeout`] instead of inheriting a budget measured
+/// from a different architecture. This bound also does not rank engine-internal
+/// timeouts. One of those can outrank it — Deepgram's `CONNECT_TIMEOUT` runs
+/// from key-down while this deadline runs from key-up, so on a short hold it
+/// simply loses the race — and the answer is not to squeeze the inner value
+/// but for the timeout arm below to name what the engine was still waiting on.
 pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A completed dictation.
@@ -175,16 +176,45 @@ impl Dictation {
     }
 
     /// Give up on this dictation without asking the engine to finalise, and
-    /// take the timeline as it stands — audio fed and marks stamped so far.
+    /// take everything it can still show for itself.
     ///
-    /// The counterpart to [`DictationError`] for a hold that never reaches
-    /// [`Dictation::finish`] at all (the microphone or the hotkey thread died,
-    /// or [`Dictation::feed`] failed). `audio_secs` is stamped here for the
-    /// same reason `finish` stamps it: a caller logging the failure must see
-    /// what was actually captured, not a timeline that reads as an empty hold.
-    pub fn abandon(mut self) -> Timeline {
+    /// The counterpart to [`Dictation::finish`] for a hold that never reaches
+    /// it at all (the microphone or the hotkey thread died, or
+    /// [`Dictation::feed`] failed). It ends the utterance on the same terms:
+    /// queued events are absorbed first, a non-empty `latest_partial` is
+    /// salvaged as the transcript, and the timeline carries the audio and marks
+    /// that really happened. An empty [`DictationOutcome::text`] means nothing
+    /// was ever transcribed — that, and only that, is a dictation with no words
+    /// in it.
+    ///
+    /// Words the user already watched appear on the overlay outlive the failure
+    /// that ended the hold: a socket dying while the tail is fed must not cost
+    /// more than the same socket dying one statement later, inside `finish`.
+    pub fn abandon(mut self, on_partial: &mut dyn FnMut(&str)) -> DictationOutcome {
+        self.poll(on_partial);
+        self.timeline.mark(Mark::KeyUp);
         self.timeline.audio_secs = self.audio_secs();
-        self.timeline
+        let text = self.salvage_partial().unwrap_or_default();
+        self.timeline.transcript = text.clone();
+        DictationOutcome {
+            text,
+            timeline: self.timeline,
+        }
+    }
+
+    /// The best transcript still available without a `Final`: whatever the
+    /// overlay last showed. Stamps [`Mark::FinalTranscript`] when there is one,
+    /// because for the user that partial *is* where the words landed.
+    ///
+    /// Shared by [`Dictation::finish`] and [`Dictation::abandon`] so the two
+    /// exits cannot drift apart on what a failed dictation is allowed to lose.
+    fn salvage_partial(&mut self) -> Option<String> {
+        if self.latest_partial.trim().is_empty() {
+            return None;
+        }
+        let text = self.latest_partial.clone();
+        self.timeline.mark(Mark::FinalTranscript);
+        Some(text)
     }
 
     /// A handle on the engine's event stream, for callers that want to `select!`
@@ -304,11 +334,7 @@ impl Dictation {
 
         // Prefer a real Final; otherwise salvage the best partial rather than
         // discarding words the user already saw on the overlay.
-        let salvaged = (!self.latest_partial.trim().is_empty()).then(|| {
-            let text = self.latest_partial.clone();
-            self.timeline.mark(Mark::FinalTranscript);
-            text
-        });
+        let salvaged = self.salvage_partial();
 
         match self.ended {
             Some(Ending::Final(text)) => {
@@ -349,11 +375,27 @@ impl Dictation {
                     );
                     Err(DictationError::fail(self.timeline, text, None))
                 } else {
-                    let text = format!(
-                        "{} engine did not return a transcript within {:.1}s",
-                        self.timeline.engine,
-                        timeout.as_secs_f64()
-                    );
+                    // An engine still opening its session at the deadline is a
+                    // connection failure, and it reads as one in the log rather
+                    // than as a silent engine. `Connected` — and so
+                    // `Mark::StreamReady` — is the only signal needed for that,
+                    // which keeps the diagnosis engine-agnostic: an inner
+                    // connect timeout that loses the race to this one no longer
+                    // takes the real cause down with it.
+                    let text = if self.timeline.at(Mark::StreamReady).is_some() {
+                        format!(
+                            "{} engine did not return a transcript within {:.1}s",
+                            self.timeline.engine,
+                            timeout.as_secs_f64()
+                        )
+                    } else {
+                        format!(
+                            "{} engine did not return a transcript within {:.1}s: it never \
+                             connected — the session was still opening when the wait ran out",
+                            self.timeline.engine,
+                            timeout.as_secs_f64()
+                        )
+                    };
                     Err(DictationError::fail(self.timeline, text, None))
                 }
             }
@@ -407,7 +449,7 @@ pub fn run_offline(
         dictation.poll(on_partial);
     }
 
-    Ok(dictation.finish(DEFAULT_FINAL_TIMEOUT, on_partial)?)
+    Ok(dictation.finish(engine.final_timeout(), on_partial)?)
 }
 
 /// How [`run_offline`] feeds audio.
@@ -557,6 +599,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("did not return a transcript"), "{err}");
+        // An engine that never reported Connected was still opening its
+        // session, and the log has to say so: an engine-internal connect
+        // timeout longer than this wait never gets to name the cause itself.
+        assert!(err.contains("never connected"), "{err}");
     }
 
     #[test]
@@ -573,6 +619,61 @@ mod tests {
             DEFAULT_FINAL_TIMEOUT <= Duration::from_secs(6),
             "DEFAULT_FINAL_TIMEOUT crept back toward the old, unbounded-feeling \
              10s ceiling: {DEFAULT_FINAL_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn the_wait_after_finish_is_the_engine_s_own() {
+        // Every caller of `finish` asks the engine, so an engine that does its
+        // work after key-up is never held to a bound measured from one that
+        // does not.
+        struct Patient;
+        impl Engine for Patient {
+            fn name(&self) -> &'static str {
+                "patient"
+            }
+            fn final_timeout(&self) -> Duration {
+                Duration::from_millis(30)
+            }
+            fn open(&self) -> Result<Box<dyn Session>> {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                Ok(Box::new(SilentForever {
+                    events: rx,
+                    _keep: tx,
+                }))
+            }
+        }
+        struct SilentForever {
+            events: crossbeam_channel::Receiver<TranscriptEvent>,
+            _keep: crossbeam_channel::Sender<TranscriptEvent>,
+        }
+        impl Session for SilentForever {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.events
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            Duration::from_millis(30) < DEFAULT_FINAL_TIMEOUT,
+            "the engine's bound has to differ from the default for this to prove anything"
+        );
+        let started = Instant::now();
+        let err = run_offline(&Patient, &tone(0.1), Pace::Fast, &mut |_| {}).unwrap_err();
+        let waited = started.elapsed();
+
+        assert!(
+            err.to_string().contains("did not return a transcript"),
+            "{err}"
+        );
+        assert!(
+            waited < DEFAULT_FINAL_TIMEOUT,
+            "the default was applied over the engine's own bound: {waited:?}"
         );
     }
 
@@ -629,6 +730,10 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("did not return a transcript"));
+        assert!(
+            !err.to_string().contains("never connected"),
+            "this engine did connect; the timeout must not blame the connection: {err}"
+        );
         assert!(
             (err.timeline.audio_secs - 1.5).abs() < 0.05,
             "the timeline on error must keep the real captured audio, not read as zero: {}",
@@ -698,13 +803,72 @@ mod tests {
         let mut dictation = Dictation::start(&engine).unwrap();
         dictation.feed(&tone(1.2)).unwrap();
 
-        let timeline = dictation.abandon();
+        let outcome = dictation.abandon(&mut |_| {});
+        let timeline = outcome.timeline;
         assert!(
             (timeline.audio_secs - 1.2).abs() < 0.05,
             "{}",
             timeline.audio_secs
         );
         assert!(timeline.at(Mark::CaptureStart).is_some());
+        assert!(
+            timeline.at(Mark::KeyUp).is_some(),
+            "the hold is over either way; the log needs an end for it"
+        );
+    }
+
+    #[test]
+    fn abandoning_a_hold_salvages_the_words_already_transcribed() {
+        // The module's standing promise — "on timeout, close, or error, a
+        // non-empty latest_partial is salvaged" — has to hold for the exit
+        // that skips finish() too. A socket dying while the tail is fed must
+        // not cost more than the same socket dying one statement later.
+        let engine = MockEngine::new(MockConfig::default());
+        let mut dictation = Dictation::start(&engine).unwrap();
+        let mut seen = Vec::new();
+        dictation.feed(&tone(1.5)).unwrap();
+        dictation.poll(&mut |p| seen.push(p.to_string()));
+        assert!(!seen.is_empty(), "the mock should have streamed partials");
+
+        let outcome = dictation.abandon(&mut |_| {});
+        assert_eq!(outcome.text, *seen.last().unwrap());
+        assert_eq!(outcome.timeline.transcript, outcome.text);
+        assert!(
+            outcome.timeline.at(Mark::FinalTranscript).is_some(),
+            "the salvaged partial is where the words landed for the user"
+        );
+    }
+
+    #[test]
+    fn abandoning_absorbs_events_still_queued_before_giving_up() {
+        // Whatever arrived while the caller was failing is as real as anything
+        // it had already polled; dropping it under-reports the transcript and
+        // the partial count both.
+        let engine = MockEngine::new(MockConfig::default());
+        let mut dictation = Dictation::start(&engine).unwrap();
+        dictation.feed(&tone(1.5)).unwrap();
+
+        let mut late = Vec::new();
+        let outcome = dictation.abandon(&mut |p| late.push(p.to_string()));
+        assert!(
+            !late.is_empty(),
+            "queued partials must still reach the caller"
+        );
+        assert!(
+            !outcome.text.is_empty(),
+            "and be salvaged as the transcript"
+        );
+        assert!(outcome.timeline.partials > 0);
+    }
+
+    #[test]
+    fn abandoning_a_hold_that_transcribed_nothing_has_no_words_to_show() {
+        let engine = MockEngine::new(MockConfig::default());
+        let dictation = Dictation::start(&engine).unwrap();
+
+        let outcome = dictation.abandon(&mut |_| {});
+        assert!(outcome.text.is_empty());
+        assert!(outcome.timeline.at(Mark::FinalTranscript).is_none());
     }
 
     /// Engine that emits a terminal Final after the first half-second of audio
