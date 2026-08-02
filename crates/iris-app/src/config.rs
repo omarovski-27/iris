@@ -539,7 +539,8 @@ impl Config {
     }
 
     /// Load from `path`, writing a documented default file first if it is
-    /// missing, so that "open settings" always has something to open.
+    /// missing, so that the settings window's "Open config file" always has
+    /// something to open.
     ///
     /// This is also where a [`Config::migrate`] result is persisted: the stamp
     /// has to reach the disk or the reset repeats on every start and a user

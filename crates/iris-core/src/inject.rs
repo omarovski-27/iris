@@ -12,26 +12,26 @@
 //!   on the target app's paste shortcut.
 //!
 //! [`inject`] reaches for that escape hatch itself for anything long enough to
-//! need it — see [`effective_method`] — rather than leaving it a manual
+//! need it — see `effective_method` — rather than leaving it a manual
 //! opt-in. The failure it exists to avoid is silent: `SendInput` reports full
 //! success even when a slow-consuming target garbles what it received.
 //!
 //! Neither strategy is safe everywhere, so nothing here is unconditional:
 //!
 //! * A window that does not treat Ctrl+V as paste — a terminal, an RDP
-//!   client, vim — never receives the escape hatch ([`accepts_paste`]).
+//!   client, vim — never receives the escape hatch (`accepts_paste`).
 //! * A hotkey still reading down would spoil the paste chord, and is not
-//!   always correctable ([`paste_accelerator_survives`]).
+//!   always correctable (`paste_accelerator_survives`).
 //! * The clipboard can simply be unavailable, held open by another process.
 //!
 //! Every one of those routes back to keystrokes, and a keystroke burst past
-//! [`MAX_SEND_INPUT_CHARS`] is *paced* ([`pacing`]) rather than sent flat out.
+//! `MAX_SEND_INPUT_CHARS` is *paced* (`pacing`) rather than sent flat out.
 //! What that is worth differs by route, and the difference matters: declining
 //! to paste into a terminal puts the text where this project's evidence says
 //! it already arrives intact, while a clipboard failure puts an *ordinary*
 //! target — the kind the corruption was reported in — on a burst that is
 //! merely paced, and the pacing constants are a reasoned guess, not a
-//! measurement (see [`pacing`]). So nothing here is left on the *unpaced*
+//! measurement (see `pacing`). So nothing here is left on the *unpaced*
 //! burst the escalation exists to avoid; that is the claim this module can
 //! actually support.
 //!

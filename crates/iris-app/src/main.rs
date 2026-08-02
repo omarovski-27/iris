@@ -552,7 +552,8 @@ fn demo_window() -> Result<()> {
 /// setting change to the seeded config file.
 ///
 /// Only the settings the window can change are handled. The rest of
-/// [`Command`] belongs to the dictation loop, which this demo deliberately
+/// [`Command`](iris_app::app::Command) belongs to the dictation loop, which
+/// this demo deliberately
 /// does not run — there is no engine to switch, no microphone to reopen and
 /// nothing to quit.
 fn apply_demo_command(

@@ -437,7 +437,8 @@ mod hook {
     /// `HELD` stops being driven by real key transitions the moment the hook
     /// goes away, so "was a hook ever installed" is the wrong question: it
     /// would keep vouching for a frozen value. Reading a dedicated flag that
-    /// [`Listener::shutdown`] clears covers the case Iris controls — a
+    /// `Listener::shutdown` (private, so named rather than linked) clears
+    /// covers the case Iris controls — a
     /// deliberate stop, including the implicit one when a `Listener` is
     /// dropped.
     ///
