@@ -28,9 +28,21 @@ on the machine you're actually going to use Iris on.
       on many machines — if it refuses, confirm the `-ExecutionPolicy Bypass`
       fallback in the README's Install section works and reads clearly to
       someone who has never used PowerShell.
+- [ ] First launch of `iris.exe` from a downloaded (not locally built) zip
+      shows SmartScreen's "Windows protected your PC" box. Confirm **More
+      info → Run anyway** actually gets Iris running, and that the README's
+      "Windows protected your PC" section reads clearly to someone who has
+      never seen that dialog before. `iris.exe` is unsigned by design (no
+      certificate) — this is expected, not a build defect.
 - [ ] The installer's closing output is still readable after it finishes —
       it pauses on "Press Enter to close" rather than vanishing with the
       window.
+- [ ] Run it redirected instead — `powershell -File .\install.ps1 >
+      install.log` or with `-NonInteractive` — and confirm it does *not*
+      hang on that same pause; both should exit on their own and leave the
+      transcript in `install.log`. `Test-Interactive`'s job is telling these
+      two cases apart, and getting it wrong either way is bad: hanging
+      forever, or losing the failure message on a real double-click.
 - [ ] Running it a second time while Iris is running says "Iris is running.
       Quit it first" instead of a raw file-in-use error.
 - [ ] The Start Menu shortcut appears and launches Iris, with its console
