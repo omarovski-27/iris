@@ -33,7 +33,7 @@ const LONG_UTTERANCE: &str =
 const WORD_MS: u64 = 380;
 /// Silence before the first partial arrives, matching `docs/spike-findings.md`'s
 /// modelled "first audio -> first partial" cost (~340 ms) with a little air so
-/// the low/high-level orb-only frames read clearly before words start.
+/// the low/high-level resting-capsule frames read clearly before words start.
 const FIRST_WORD_AT_MS: u64 = 950;
 
 struct Cycle {
@@ -295,9 +295,10 @@ fn synthetic_level(ms: u64) -> f32 {
 /// How much of `utterance` has been "said" by `ms`, one word at a time.
 ///
 /// Empty until [`FIRST_WORD_AT_MS`], modelling the real first-partial latency
-/// so the orb has a moment of quiet before any text arrives — the state the
-/// design falls back to for non-streaming engines, and the state that should
-/// read as complete on its own, not as "waiting for a bug fix".
+/// so the resting capsule has a moment of quiet before any text arrives — the
+/// state a non-streaming engine leaves on screen throughout, and the shipped
+/// default presentation, so it has to read as complete on its own, not as
+/// "waiting for a bug fix".
 fn words_said_by(ms: u64, utterance: &str) -> String {
     if ms < FIRST_WORD_AT_MS {
         return String::new();

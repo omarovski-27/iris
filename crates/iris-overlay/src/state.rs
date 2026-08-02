@@ -21,15 +21,15 @@ use crate::theme::Theme;
 pub enum OverlayState {
     /// Nothing on screen. The window is hidden and the loop is asleep.
     Hidden,
-    /// The hotkey is down. The orb (or open ribbon) tracks the microphone and
-    /// the live transcript.
+    /// The hotkey is down. The resting capsule (or open ribbon) tracks the
+    /// microphone, the elapsed time, and the live transcript.
     Listening,
     /// The hotkey is up and the engine is finishing. The last text holds; a
     /// shimmer sweeps the open ribbon (or a spinner, if nothing was captured).
     Processing,
-    /// Text has landed in the target application. The ribbon collapses, a
-    /// check draws itself into the orb, latency prints, then the pill leaves
-    /// on its own.
+    /// Text has landed in the target application. The shape collapses back to
+    /// its resting width, a check draws itself into it, latency prints, then
+    /// the pill leaves on its own.
     Inserted,
 }
 

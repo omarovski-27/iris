@@ -88,8 +88,8 @@ const GLOW_SPREAD: f32 = 3.0;
 // Bar count and pitch are recomputed from the shape's *current* width every
 // frame — the same reasoning as the mask cache above: a fixed bar count
 // would either be sparse and thin at the wide-open ribbon or crowded past
-// legibility at the orb's 34px, so density targets a constant pitch instead
-// and the bar count follows.
+// legibility at the narrow resting capsule, so density targets a constant
+// pitch instead and the bar count follows.
 const WAVE_INSET: f32 = 7.0;
 const WAVE_TARGET_PITCH: f32 = 12.0;
 const WAVE_MIN_BARS: usize = 7;
@@ -278,7 +278,7 @@ impl std::fmt::Debug for Masks {
 
 /// A linear ramp through an easing curve, evaluated exactly like
 /// [`Model::presence`] is — same shape of code, a different target and
-/// duration. Drives the orb-to-ribbon width morph.
+/// duration. Drives the rest-capsule-to-ribbon width morph.
 #[derive(Clone, Copy, Debug)]
 struct Tween {
     linear: f32,
@@ -848,9 +848,9 @@ fn fill_glass_shell(
 /// **On legibility.** Live text sits directly on this surface once the ribbon
 /// opens, and it has to read over an arbitrary desktop, light or dark. The
 /// shell does *not* answer that: its fill stays at [`GLASS_FILL_ALPHA`], its
-/// most transparent, whether the ribbon is a closed orb or wide open with
-/// text. Pulling the whole surface back toward opaque whenever there is text
-/// would trade the glass away at exactly the moment it is most visible, so
+/// most transparent, whether the shape is at its resting width or wide open
+/// with text. Pulling the whole surface back toward opaque whenever there is
+/// text would trade the glass away at exactly the moment it is most visible, so
 /// contrast is solved locally instead — `theme.text_scrim`, a soft band
 /// painted behind the run only in [`draw_ribbon`], is the sole mechanism, and
 /// `theme::tests` holds it to a measured ratio against the composited fill.

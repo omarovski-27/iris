@@ -13,10 +13,10 @@ click, and **never types**: text injection lives in `iris-core` and is not
 reachable from here.
 
 ```
-listening, default              listening, opt-in text open       inserted
-╭────────╮               ─────▶ ╭──────────────────────────╮ ──▶     ⓥ
-│ ⬤   0:07│                     │  ...the report needs three │
-╰────────╯                      ╰──────────────────────────╯
+listening, default          listening, opt-in text open        inserted
+ ╭────────╮                 ╭────────────────────────────╮
+ │ ⬤  0:07│  ──────▶        │ ...the report needs three  │  ──▶   ⓥ
+ ╰────────╯                 ╰────────────────────────────╯
 ```
 
 ## Using it
@@ -82,10 +82,11 @@ different, weaker direction than the one that was actually chosen.
   persisting, transmitting, or logging it anywhere — nothing in this crate
   writes the transcript to disk, and that stays true.
 - **Ship it with an opt-out.** `iris-app` gates `set_partial_text` behind a
-  config setting (default on) that, when off, leaves the orb-only
-  presentation running with no ribbon and no text ever reaching this crate —
-  a complete, coherent design on its own, not a degraded fallback. See
-  `iris-app/src/config.rs` and `pill.rs`.
+  config setting that, when off, leaves the resting presentation running with
+  no ribbon and no text ever reaching this crate — a complete, coherent design
+  on its own, not a degraded fallback. See `iris-app/src/config.rs` and
+  `pill.rs`. Round 3 flipped that setting's default to off, so this is now the
+  shipped presentation rather than the opt-out — see "Round 3", below.
 
 If you are extending this crate: the bar for adding to `OverlayHandle` is
 still "the smallest honest change", the same as before. This one addition
@@ -121,7 +122,8 @@ timing are unchanged from before.
 ## Design provenance
 
 The captain's decision, recorded 2026-07-31: orb → live-text ribbon, "make it
-exceptionally beautiful", live text on by default with a config opt-out. It
+exceptionally beautiful", live text on by default with a config opt-out (round
+3 kept the feature and flipped that default to off — see "Round 3", below). It
 supersedes the earlier captain-locked pill geometry (168×34 fixed capsule,
 28-bar spectrum, listening-only telemetry chip) recorded in `CLAUDE.md`'s
 history — that geometry is gone from this crate; the Prism/Porcelain palettes
@@ -131,7 +133,7 @@ and the motion budget are not.
 
 | | Then | Now |
 |---|---|---|
-| Geometry | Fixed 168×34 capsule | One shape, width animates 34→460 |
+| Geometry | Fixed 168×34 capsule | One shape, width animates 128→460 (the rest width was 34 until round 3) |
 | Motion | `motion.rs` timings and curves | **Identical** — every constant is imported, none copied |
 | Colour | Prism dark / Porcelain light | Same two palettes, same tokens, no new colours needed |
 | Waveform | 28-bar spectrum (`spectrum.rs`) | A new, independently-tuned bar row in `render/mod.rs`'s `draw_wave` — see "Glass, and the wave came back", below. `spectrum.rs` itself is gone; nothing shares code with it. |

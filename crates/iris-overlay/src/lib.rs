@@ -1,11 +1,12 @@
 //! The Iris pill overlay — the hero UI surface.
 //!
 //! A small always-on-top shape that appears bottom-centre while you hold the
-//! dictation hotkey: a quiet orb while it waits for speech, opening into a
-//! capsule that shows the live transcript as words arrive, then collapsing
-//! back to a checkmark on insert before it takes itself off screen. It never
-//! takes focus, never accepts a click, and never types: text injection lives
-//! elsewhere in Iris and deliberately not here.
+//! dictation hotkey: by default a quiet glass capsule holding a wave row and
+//! an elapsed-recording timer, widening into a live-transcript ribbon only
+//! when the consumer opts in (`iris-app`'s `show_live_text`, off by default),
+//! then collapsing back to a checkmark on insert before it takes itself off
+//! screen. It never takes focus, never accepts a click, and never types: text
+//! injection lives elsewhere in Iris and deliberately not here.
 //!
 //! # Using it
 //!
@@ -37,9 +38,11 @@
 //!
 //! # Design provenance
 //!
-//! This direction — orb → live-text ribbon — replaced an earlier fixed-size
-//! capsule design; see `README.md` "Design provenance" for the full record and
-//! why the overlay now holds transcript text when it previously never did.
+//! This direction — one shape whose width animates, up to a live-text
+//! ribbon — replaced an earlier fixed-size capsule design; see `README.md`
+//! "Design provenance" for the full record and why the overlay may now hold
+//! transcript text when it previously never did, and "Round 3" for why that
+//! ribbon is opt-in.
 //! Geometry and motion stay single-sourced and a theme swaps colours only, so
 //! switching skins cannot move a pixel — that discipline carried over from the
 //! previous design intact. The numbers in [`motion`] and [`layout`] are

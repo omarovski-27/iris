@@ -194,9 +194,9 @@ pub struct OverlayPill {
 impl OverlayPill {
     /// Drive `handle` from the dictation loop.
     ///
-    /// `show_live_text` gates [`PillSink::set_partial_text`]: when `false`,
-    /// partial text is never forwarded to the overlay, which then never
-    /// leaves its orb-only presentation — see
+    /// `show_live_text` gates [`PillSink::set_partial_text`]: when `false`
+    /// (the default), partial text is never forwarded to the overlay, which
+    /// then never leaves its resting-capsule presentation — see
     /// [`crate::config::Config::show_live_text`] for why this exists.
     ///
     /// This is the value the process started with;
@@ -248,9 +248,10 @@ impl PillSink for OverlayPill {
         self.show_live_text = on;
         if !on {
             // Whatever the ribbon is holding right now goes with the toggle:
-            // an empty partial collapses it back to the orb on the next
-            // frame, so turning the opt-out on never leaves transcript text
-            // on screen waiting for the next state change to clear it.
+            // an empty partial collapses it back to the resting capsule on
+            // the next frame, so turning live text off never leaves
+            // transcript text on screen waiting for the next state change to
+            // clear it.
             self.handle.set_partial_text("");
         }
     }
@@ -503,10 +504,10 @@ mod tests {
     }
 
     /// The config toggle this adapter exists to serve: with `show_live_text`
-    /// off, partial text must never reach the real overlay, so the ribbon it
-    /// would open never has anything to open with — the orb-only fallback the
-    /// design report calls "a complete and coherent design on its own", not a
-    /// degraded one.
+    /// off (the shipped default), partial text must never reach the real
+    /// overlay, so the ribbon it would open never has anything to open with —
+    /// the resting-capsule presentation the design report calls "a complete
+    /// and coherent design on its own", not a degraded one.
     #[test]
     fn show_live_text_off_never_forwards_partial_text() {
         let overlay =
