@@ -324,6 +324,11 @@ The whole state machine is exercised on Linux: `tests/loop.rs` drives the real
 `App` with a channel instead of a microphone, a mock engine instead of a
 network, and a `RecordingInjector` instead of `SendInput`.
 
+`tests/console.rs` runs the real binary under `--demo-dictation` and asserts
+what the terminal shows: the result line and nothing else — no latency table, no
+millisecond figures, an empty stderr — unless `--report` or `--verbose` asks for
+more.
+
 > **Injection is never executed by a test, in CI, or in a loop.** Windows
 > delivers synthetic keystrokes to the *input desktop* — the one the user is
 > looking at. There is no sandbox: an automated injection test types into
@@ -336,8 +341,8 @@ network, and a `RecordingInjector` instead of `SendInput`.
 polish, session log, pill adapter — with dry-run injection, on any platform.
 They are the portable way to see the loop work end to end. Each still prints its
 own result line — the transcript for `--speak-wav`, the demo summary for
-`--demo-dictation` — but the per-span latency table is now behind `--report`,
-same as the resident loop, and diagnostics are behind `--verbose`.
+`--demo-dictation` — but the per-span latency table sits behind `--report`,
+same as the resident loop, and diagnostics behind `--verbose`.
 `--speak-wav` feeds the file at real-time speed (one frame per frame-length,
 like a live microphone), so the run takes about as long as the WAV: bursting it
 would finish the utterance before the key came up and hide the finalisation

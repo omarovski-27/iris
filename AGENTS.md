@@ -49,6 +49,7 @@ Load-bearing beyond that crate:
   failures are the exception and must stay visible unconditionally (see the
   injection-failure path in `App::capture`, `app.rs`, which points at the
   session log or echoes the text back when the log is off).
+  `crates/iris-app/tests/console.rs` drives the real binary and holds this.
 
 ```bash
 cargo run -p iris-app -- --demo-dictation                 # mock + dry-run + pill
