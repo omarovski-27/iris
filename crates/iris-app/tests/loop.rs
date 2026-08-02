@@ -385,6 +385,39 @@ fn an_engine_failure_is_reported_and_recorded() {
 }
 
 #[test]
+fn a_stalled_dictation_still_logs_the_real_audio_captured() {
+    // Regression: the captain's session log on 2026-08-02 showed two
+    // consecutive dictations with `audio_secs: 0.0` right after a pathological
+    // 10-second one, which read as if capture itself had broken. The real
+    // errors on those two entries were a Deepgram connect timeout and a DNS
+    // failure — the audio_secs: 0.0 was an artifact of `App::capture`
+    // building a blank Timeline for the log whenever `finish()` errored,
+    // discarding whatever real audio and marks it had already stamped. This
+    // drives a dictation through the real `App::dictate` path with an engine
+    // that connects and captures normally but then never concludes, and
+    // checks the logged record still shows the audio that was actually
+    // captured instead of reading as an empty hold.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(NeverConcludesEngine));
+
+    let err = rig.dictate().expect_err("the engine never concludes");
+    assert!(
+        err.to_string().contains("did not return a transcript"),
+        "{err}"
+    );
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].injected);
+    assert!(
+        records[0].latency.audio_secs > 0.5,
+        "the log must show the real captured audio, not read as an empty \
+         hold: {:.2}s",
+        records[0].latency.audio_secs
+    );
+}
+
+#[test]
 fn back_to_back_dictations_do_not_leak_audio_into_each_other() {
     let mut rig = rig();
     rig.dictate().expect("first");
@@ -806,6 +839,42 @@ impl Engine for FailingEngine {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(TranscriptEvent::Error("no key".into())).unwrap();
         Ok(Box::new(FixedSession { text: "", tx, rx }))
+    }
+}
+
+/// Connects normally but never sends a terminal event, no matter how long
+/// `finish()` waits — models a Deepgram session stalled by a network failure
+/// (the 2026-08-02 regression) rather than a connection that fails outright.
+struct NeverConcludesEngine;
+
+struct NeverConcludesSession {
+    events: Receiver<TranscriptEvent>,
+    _keep: Sender<TranscriptEvent>,
+}
+
+impl Engine for NeverConcludesEngine {
+    fn name(&self) -> &'static str {
+        "never-concludes"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(NeverConcludesSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+impl Session for NeverConcludesSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

@@ -527,12 +527,29 @@ impl<A: AudioSource> App<A> {
         dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
         self.pill.processing();
 
-        let outcome = {
+        let finished = {
             let pill = &mut self.pill;
             dictation.finish(self.final_timeout, &mut |text: &str| {
                 iris_core::vlog!("~ {text}");
                 pill.set_partial_text(text);
-            })?
+            })
+        };
+        let outcome = match finished {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The engine never produced a transcript, but real audio may
+                // have been captured and marks stamped before it gave up —
+                // `e.timeline` carries that, so the record below reports what
+                // actually happened instead of reading as if the hold never
+                // captured anything.
+                let mut record = DictationRecord::now(self.engine.name(), "");
+                record.error = Some(format!("{e:#}"));
+                record.latency = LatencyBreakdown::from_timeline(&e.timeline);
+                return Ok(Dictated {
+                    record,
+                    timeline: e.timeline,
+                });
+            }
         };
         let mut timeline = outcome.timeline;
         let raw = outcome.text.trim().to_string();

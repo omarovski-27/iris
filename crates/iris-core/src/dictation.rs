@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::audio;
 use crate::engine::{Engine, Session, TranscriptEvent};
@@ -24,7 +24,17 @@ use crate::latency::{Mark, Timeline};
 use crate::vlog;
 
 /// How long to wait for the final transcript after `finish()` before giving up.
-pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Deliberately well under the engine-internal worst case a protocol failure
+/// can take (for Deepgram, `FINALIZE_ACK_TIMEOUT` + `FINALIZE_TIMEOUT` ≈ 8s,
+/// see `engine/deepgram.rs`) rather than padded above it: this bound exists to
+/// cap how long a *stalled* engine can hold the user's screen empty, and every
+/// final-transcript span actually observed in production on a healthy
+/// connection has stayed under 2.5s. Was 10s until the 2026-08-02 regression
+/// investigation found a degraded-network dictation whose engine session
+/// never concluded at all, so only this outer bound ended the wait — at,
+/// essentially, its full old value.
+pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A completed dictation.
 #[derive(Debug, Clone)]
@@ -32,6 +42,25 @@ pub struct DictationOutcome {
     pub text: String,
     pub timeline: Timeline,
 }
+
+/// [`Dictation::finish`] failed to produce a transcript, but real capture may
+/// have happened before the engine gave up — the timeline it stamped along
+/// the way (audio fed, marks up to key-up) travels with the error instead of
+/// being lost, so a caller logging diagnostics does not have to report a
+/// failed dictation as if nothing had been captured at all.
+#[derive(Debug)]
+pub struct DictationError {
+    message: String,
+    pub timeline: Timeline,
+}
+
+impl std::fmt::Display for DictationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DictationError {}
 
 /// Owns one engine session for the duration of one dictation.
 pub struct Dictation {
@@ -188,7 +217,7 @@ impl Dictation {
         mut self,
         timeout: Duration,
         on_partial: &mut dyn FnMut(&str),
-    ) -> Result<DictationOutcome> {
+    ) -> Result<DictationOutcome, Box<DictationError>> {
         self.timeline.mark(Mark::KeyUp);
         // Drop any premature terminal Final so we wait for the post-finish one.
         // Errors stay: the engine already failed and finish cannot un-fail it.
@@ -200,7 +229,13 @@ impl Dictation {
         // than short-circuiting the wait below before session.finish() runs.
         self.poll(on_partial);
         self.finishing = true;
-        self.session.finish()?;
+        if let Err(e) = self.session.finish() {
+            self.timeline.audio_secs = self.audio_secs();
+            return Err(Box::new(DictationError {
+                message: format!("{e:#}"),
+                timeline: self.timeline,
+            }));
+        }
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
         let deadline = Instant::now() + timeout;
@@ -249,7 +284,10 @@ impl Dictation {
                         timeline: self.timeline,
                     })
                 } else {
-                    Err(anyhow!("{} engine: {message}", self.timeline.engine))
+                    Err(Box::new(DictationError {
+                        message: format!("{} engine: {message}", self.timeline.engine),
+                        timeline: self.timeline,
+                    }))
                 }
             }
             Some(Ending::Closed) | None => {
@@ -260,16 +298,22 @@ impl Dictation {
                         timeline: self.timeline,
                     })
                 } else if matches!(self.ended, Some(Ending::Closed)) {
-                    Err(anyhow!(
-                        "{} engine closed without returning a transcript",
-                        self.timeline.engine
-                    ))
+                    Err(Box::new(DictationError {
+                        message: format!(
+                            "{} engine closed without returning a transcript",
+                            self.timeline.engine
+                        ),
+                        timeline: self.timeline,
+                    }))
                 } else {
-                    Err(anyhow!(
-                        "{} engine did not return a transcript within {:.1}s",
-                        self.timeline.engine,
-                        timeout.as_secs_f64()
-                    ))
+                    Err(Box::new(DictationError {
+                        message: format!(
+                            "{} engine did not return a transcript within {:.1}s",
+                            self.timeline.engine,
+                            timeout.as_secs_f64()
+                        ),
+                        timeline: self.timeline,
+                    }))
                 }
             }
         }
@@ -322,7 +366,7 @@ pub fn run_offline(
         dictation.poll(on_partial);
     }
 
-    dictation.finish(DEFAULT_FINAL_TIMEOUT, on_partial)
+    Ok(dictation.finish(DEFAULT_FINAL_TIMEOUT, on_partial)?)
 }
 
 /// How [`run_offline`] feeds audio.
@@ -472,6 +516,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("did not return a transcript"), "{err}");
+    }
+
+    #[test]
+    fn default_final_timeout_is_capped_well_below_the_old_ten_seconds() {
+        // Regression guard for the 2026-08-02 latency investigation: this is
+        // the bound that actually ended the captain's pathological 10015ms
+        // dictation — not FINALIZE_ACK_TIMEOUT or FINALIZE_TIMEOUT in
+        // engine/deepgram.rs, both of which stayed well inside their own
+        // budget while the engine session itself never concluded. Keeping
+        // this comfortably under the old 10s value is the fix for that worst
+        // case; nothing in production has ever needed close to 6s on a
+        // healthy connection (see the doc comment on the constant).
+        assert!(
+            DEFAULT_FINAL_TIMEOUT <= Duration::from_secs(6),
+            "DEFAULT_FINAL_TIMEOUT crept back toward the old, unbounded-feeling \
+             10s ceiling: {DEFAULT_FINAL_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn a_stalled_engine_error_still_carries_the_real_timeline() {
+        // Regression: the captain's two zero-audio failures on 2026-08-02
+        // logged `audio_secs: 0.0` even though real audio had almost
+        // certainly been captured — an artifact of the caller (iris-app's
+        // `capture()`) building a blank Timeline on any error instead of
+        // keeping the one Dictation had already stamped. That is what made
+        // "did the previous session leave capture in a bad state" look
+        // plausible when the real cause was a Deepgram connection failure.
+        // This drives an engine that connects, receives real audio, and then
+        // never concludes — the shape of a session stalled by a network
+        // failure — and checks the error still carries what actually
+        // happened.
+        struct StallsAfterConnect;
+        struct StallsAfterConnectSession {
+            events: crossbeam_channel::Receiver<TranscriptEvent>,
+            _keep: crossbeam_channel::Sender<TranscriptEvent>,
+        }
+        impl Engine for StallsAfterConnect {
+            fn name(&self) -> &'static str {
+                "stalls-after-connect"
+            }
+            fn open(&self) -> Result<Box<dyn Session>> {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                tx.send(TranscriptEvent::Connected).unwrap();
+                Ok(Box::new(StallsAfterConnectSession {
+                    events: rx,
+                    _keep: tx,
+                }))
+            }
+        }
+        impl Session for StallsAfterConnectSession {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.events
+            }
+            fn finish(&mut self) -> Result<()> {
+                // Never sends a terminal event, no matter how long finish()
+                // waits — the network failure this models does not resolve
+                // itself within any bound the app enforces.
+                Ok(())
+            }
+        }
+
+        let mut dictation = Dictation::start(&StallsAfterConnect).unwrap();
+        dictation.feed(&tone(1.5)).unwrap();
+        let err = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .unwrap_err();
+
+        assert!(err.to_string().contains("did not return a transcript"));
+        assert!(
+            (err.timeline.audio_secs - 1.5).abs() < 0.05,
+            "the timeline on error must keep the real captured audio, not read as zero: {}",
+            err.timeline.audio_secs
+        );
+        assert!(
+            err.timeline.at(Mark::StreamReady).is_some(),
+            "marks stamped before the stall must survive on the error path"
+        );
     }
 
     /// Engine that emits a terminal Final after the first half-second of audio

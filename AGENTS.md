@@ -133,6 +133,25 @@ wrongly-deleted word is worse than a duplicated one. Containment rather than
 overlap, and where the one tolerance constant may and may not be applied, are
 load-bearing; the reasoning is in the same module doc.
 
+**`FINALIZE_ACK_TIMEOUT` and `FINALIZE_TIMEOUT` do not bound how long a
+dictation can hang.** They bound `deepgram.rs`'s own internal wait
+(ack-before-`CloseStream`, then silence-after-`CloseStream` — the second is
+re-armed on every inbound message, so it bounds *silence*, not the whole
+finalisation). The actual outer bound on `key-up → transcript` is
+`Dictation::DEFAULT_FINAL_TIMEOUT` (`iris-core/src/dictation.rs`), a plain
+`recv_timeout` in `Dictation::finish` that wraps the entire engine session,
+independent of and invisible from any per-engine timeout. A 2026-08-02
+regression (perceived latency up to ~10s during a network blip) traced to
+exactly this: a stalled Deepgram session kept trickling messages just often
+enough to keep re-arming `FINALIZE_TIMEOUT` without ever sending the close
+sign-off, so only the outer bound ended the wait. Diagnosing a hang from its
+milliseconds: check `DEFAULT_FINAL_TIMEOUT` before assuming a Deepgram-side
+constant is misbehaving. Relatedly, `Dictation::finish`'s error type
+(`DictationError`) carries the `Timeline` as it stood when the engine gave
+up, so a caller logging diagnostics (`iris-app`'s session log) sees the real
+`audio_secs` and marks on a failed dictation instead of an all-zero
+timeline — do not reintroduce a blank fallback `Timeline` on that path.
+
 ## Sharp edges
 
 - API keys come from the environment only (`IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY`).
