@@ -133,21 +133,40 @@
 //! arithmetic is a bigger risk than the duplicate it would avoid, and more
 //! machinery than this guard is meant to carry.
 //!
-//! Comparisons carry a tolerance of [`SPAN_TOLERANCE_SECS`] (1 ms). Deepgram
-//! documents its streaming timestamps as not guaranteed accurate below
-//! millisecond precision even though the JSON carries more decimal digits
-//! than that, and an accepted segment's end is our own `start + duration` in
-//! f64 while the next segment's start is an independently formatted decimal
-//! — two numbers that can disagree in their last digits for a boundary that
-//! is really the same instant. Without a tolerance that disagreement decides
-//! real cases: a first "No." reported as `start 0.0, duration 0.4400001` and
-//! a second as `start 0.44` overlap by a hair, and an overlap rule deletes
-//! the second word. The tolerance only ever forgives rounding noise on an
-//! otherwise-matching boundary; it never lets coverage reach outward far
-//! enough to swallow genuinely new content, because a millisecond of audio
-//! holds no speech. For the same reason a new span shorter than the
-//! tolerance is never treated as covered at all — under it there is nothing
-//! to compare, so the segment is kept.
+//! No comparison in that containment test adds slack anywhere, and that is
+//! what enforces the direction rather than any claim about it. The coverage
+//! walk rejects a gap outright — `start > covered_to` ends it with nothing
+//! forgiven, so uncovered audio stays uncovered however many accepted spans
+//! the walk crosses, and no per-span allowance can accumulate — and the
+//! decision itself is the plain `covered_to >= new_span.1`. A new segment
+//! whose end exceeds the coverage by any amount at all, however small, is
+//! kept. That exact comparison still catches what it must: a re-emission
+//! whose end lands exactly on the coverage boundary, such as one merging two
+//! exactly-adjacent accepted spans, is covered and suppressed. Widening
+//! either side would be the wrong direction — comparing against
+//! `covered_to + tolerance` would let a boundary that merely comes *close*
+//! to being covered count as covered, which is how a guard like this deletes
+//! speech, and demanding `covered_to >= new_span.1 + tolerance` would let a
+//! plain exact-match duplicate through.
+//!
+//! [`SPAN_TOLERANCE_SECS`] (1 ms) is therefore consumed in exactly one place:
+//! a new span whose own duration is at or under it is never treated as
+//! covered at all. Deepgram documents its streaming timestamps as not
+//! guaranteed accurate below millisecond precision even though the JSON
+//! carries more decimal digits than that, and an accepted segment's end is
+//! our own `start + duration` in f64 while the next segment's start is an
+//! independently formatted decimal — at that scale the two numbers are noise
+//! rather than evidence, so a span that short cannot be classified with
+//! confidence and is kept. That use only ever removes suppression cases; it
+//! can never create one.
+//!
+//! Boundary noise between adjoining segments needs no tolerance under this
+//! rule, which is why none is applied there. The case that originally seemed
+//! to need one — a first "No." reported as `start 0.0, duration 0.4400001`
+//! and a second as `start 0.44`, overlapping by a hair — is decided by
+//! containment alone: the second span runs 0.44 s past everything accepted,
+//! so it is kept. It is the move from overlap to containment that saves that
+//! word, not a tolerance.
 //!
 //! Suppression only ever withholds a *new* segment from being added; it never
 //! removes anything already accepted, and it leaves the in-flight interim
@@ -160,6 +179,20 @@
 //! job is not to double it. Because a suppression does remove words from
 //! what the user would otherwise see, it is logged under `--verbose` like
 //! every other consequential decision in this module.
+//!
+//! How often any of this fires in production is unknown, and should not be
+//! assumed. Suppression needs a re-emission whose span is contained in
+//! accepted coverage under the exact comparison above; the tests here assume
+//! that shape (a subset span like `[0.2, 1.2]` inside `[0.0, 1.5]`) because
+//! that is how they were written, not because it was observed in captured
+//! traffic. If real re-emissions instead arrive with slightly wider
+//! boundaries than the finals they repeat, this guard never fires and the
+//! duplicate still reaches the user. That is the conservative end of the
+//! tradeoff this feature accepts, and it is deliberately not widened to
+//! catch more — a duplicate is cheaper than a deletion. The `--verbose` log
+//! line on the suppressed branch is what would settle it against a real
+//! session; until then the containment shape is an assumption, not a
+//! measurement.
 //!
 //! Missing or unusable timing — no `start`/`duration` on the message, a
 //! non-finite value, a negative `start`, or a non-positive `duration` (a
@@ -619,12 +652,14 @@ fn parse_span(value: &serde_json::Value) -> Option<(f64, f64)> {
     Some((start, start + duration))
 }
 
-/// How far two span boundaries may disagree and still be read as the same
-/// instant: Deepgram documents its streaming timestamps as not accurate below
+/// The span length under which Deepgram's timing is noise rather than
+/// evidence: it documents its streaming timestamps as not accurate below
 /// millisecond precision, and an accepted end (`start + duration` in f64) and
-/// the next reported start are independently rounded numbers. See the module
-/// doc's "Suppressing a re-emitted segment" section for why the tolerance
-/// only ever makes a suppression harder to reach.
+/// the next reported start are independently rounded numbers. This is used in
+/// exactly one place — [`is_fully_covered`]'s too-short-to-classify guard,
+/// which only ever declines a suppression. No comparison anywhere adds it to
+/// widen what counts as covered. See the module doc's "Suppressing a
+/// re-emitted segment" section.
 const SPAN_TOLERANCE_SECS: f64 = 0.001;
 
 /// True only when every part of `new_span` already falls inside the audio
@@ -632,24 +667,29 @@ const SPAN_TOLERANCE_SECS: f64 = 0.001;
 /// re-emission spanning two adjacent accepted segments is recognised. A
 /// segment that runs on past that coverage in either direction — a revised
 /// or merged boundary carrying speech nobody has transcribed yet — is not
-/// covered, and is kept whole; so is a span shorter than the tolerance,
-/// which is too small to compare meaningfully.
-fn is_fully_covered(new_span: (f64, f64), accepted: &[(f64, f64)]) -> bool {
+/// covered, and is kept whole; so is a span at or under
+/// [`SPAN_TOLERANCE_SECS`] long, which is too short to classify.
+///
+/// Both comparisons below are exact, with no slack added on either side: a
+/// gap in coverage is never forgiven, and an end that exceeds the coverage by
+/// any amount at all keeps the segment, while an end landing exactly on it is
+/// covered. That is what makes the tolerance unable to reach outward and
+/// swallow audio nobody transcribed.
+fn is_fully_covered(new_span: (f64, f64), mut accepted: Vec<(f64, f64)>) -> bool {
     if new_span.1 - new_span.0 <= SPAN_TOLERANCE_SECS {
         return false;
     }
-    let mut spans = accepted.to_vec();
-    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    accepted.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let mut covered_to = new_span.0;
-    for (start, end) in spans {
-        if start > covered_to + SPAN_TOLERANCE_SECS {
+    for (start, end) in accepted {
+        if start > covered_to {
             return false;
         }
         if end > covered_to {
             covered_to = end;
         }
-        if covered_to + SPAN_TOLERANCE_SECS >= new_span.1 {
+        if covered_to >= new_span.1 {
             return true;
         }
     }
@@ -717,7 +757,7 @@ impl Transcript {
                 // A `None` span is never covered by anything, so missing or
                 // unusable timing always falls through to being kept.
                 let covered =
-                    span.filter(|new_span| is_fully_covered(*new_span, &self.accepted_spans()));
+                    span.filter(|new_span| is_fully_covered(*new_span, self.accepted_spans()));
                 match covered {
                     Some((start, end)) => {
                         vlog!(
@@ -995,6 +1035,18 @@ mod tests {
         t.absorb(&results_with_span("brown fox", 1.0, 1.0));
         t.absorb(&results_with_span("the quick brown fox", 0.0, 1.6));
         assert_eq!(t.finished_text(), "brown fox the quick brown fox");
+    }
+
+    #[test]
+    fn a_segment_running_past_coverage_by_less_than_the_tolerance_is_still_kept() {
+        // The tolerance is never added to what counts as covered: an end that
+        // exceeds the accepted coverage by even a fraction of a millisecond
+        // keeps the segment. This test fails if that direction is flipped.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("hello there", 0.0, 1.5));
+        let overshoot = SPAN_TOLERANCE_SECS / 5.0;
+        t.absorb(&results_with_span("hello there", 0.5, 1.0 + overshoot));
+        assert_eq!(t.finished_text(), "hello there hello there");
     }
 
     #[test]
