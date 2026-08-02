@@ -333,8 +333,10 @@ network, and a `RecordingInjector` instead of `SendInput`.
 > to remember. Real typing is verified by a person running the app.
 
 `--demo-dictation` and `--speak-wav <file>` run one full dictation — engine,
-polish, session log, latency report, pill adapter — with dry-run injection, on
-any platform. They are the portable way to see the loop work end to end.
+polish, session log, pill adapter — with dry-run injection, on any platform.
+They are the portable way to see the loop work end to end. Like the resident
+loop they print nothing per dictation: add `--report` for the per-span latency
+table, `--verbose` for diagnostics on stderr.
 `--speak-wav` feeds the file at real-time speed (one frame per frame-length,
 like a live microphone), so the run takes about as long as the WAV: bursting it
 would finish the utterance before the key came up and hide the finalisation

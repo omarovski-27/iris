@@ -463,6 +463,7 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
 fn banner<A: AudioSource>(app: &App<A>, config_path: &std::path::Path) {
     let config = app.config();
     println!("Iris is running. Hold {} and speak.", config.hotkey);
+    println!("Listening on {}.", app.describe_audio());
     println!(
         "Right-click the tray icon for settings ({}).",
         config_path.display()
@@ -480,5 +481,4 @@ fn banner<A: AudioSource>(app: &App<A>, config_path: &std::path::Path) {
         }
     );
     iris_core::vlog!("inject      {}", config.inject.method);
-    iris_core::vlog!("microphone  {}", app.describe_audio());
 }
