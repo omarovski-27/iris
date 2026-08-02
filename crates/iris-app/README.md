@@ -334,9 +334,10 @@ network, and a `RecordingInjector` instead of `SendInput`.
 
 `--demo-dictation` and `--speak-wav <file>` run one full dictation — engine,
 polish, session log, pill adapter — with dry-run injection, on any platform.
-They are the portable way to see the loop work end to end. Like the resident
-loop they print nothing per dictation: add `--report` for the per-span latency
-table, `--verbose` for diagnostics on stderr.
+They are the portable way to see the loop work end to end. Each still prints its
+own result line — the transcript for `--speak-wav`, the demo summary for
+`--demo-dictation` — but the per-span latency table is now behind `--report`,
+same as the resident loop, and diagnostics are behind `--verbose`.
 `--speak-wav` feeds the file at real-time speed (one frame per frame-length,
 like a live microphone), so the run takes about as long as the WAV: bursting it
 would finish the utterance before the key came up and hide the finalisation

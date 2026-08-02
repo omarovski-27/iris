@@ -43,7 +43,8 @@ pub trait AudioSource: Send {
         Ok(())
     }
 
-    /// What to show in the startup banner.
+    /// The microphone in use, named in plain language for the startup banner
+    /// and the tray: a resolved device name, never internal stream state.
     fn describe(&self) -> String;
 }
 
@@ -223,10 +224,10 @@ mod mic {
         }
 
         fn describe(&self) -> String {
-            match (&self.stream, &self.device) {
-                (Some(c), _) => format!("{} (kept open)", c.device_name),
-                (None, Some(want)) => format!("{want:?}, opened on key-press"),
-                (None, None) => "system default, opened on key-press".into(),
+            match (self.device_name(), &self.device) {
+                (Some(name), _) => name.to_string(),
+                (None, Some(want)) => format!("the microphone matching \"{want}\""),
+                (None, None) => "the default microphone".into(),
             }
         }
     }
