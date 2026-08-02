@@ -43,8 +43,10 @@ is written *after* the text has been injected.
 
 Threads: the hotkey hook and the tray each own one and do nothing on it but pump
 Windows messages (a low-level hook whose callback takes >300 ms is silently
-uninstalled); WASAPI owns the audio callback; the main thread owns the engine
-session, injection and the log. Nothing is shared behind a lock.
+uninstalled); the settings window owns one more; WASAPI owns the audio callback;
+the main thread owns the engine session, injection and the log. Nothing is
+shared behind a lock. The full inventory, with each thread's rule, is the table
+in `lib.rs`'s crate docs.
 
 ## Configuration
 
@@ -219,19 +221,19 @@ contains no `[keys]` section at all.
 
 ## Tray
 
-`tray-icon` 0.24 (+ `muda` for the menu). Chosen because it is the maintained
-extraction of Tauri's tray, it is pure Rust over Win32 — no C toolchain — so it
-cross-compiles to `x86_64-pc-windows-gnu`, which is how this project builds from
-WSL, and it drags in no windowing framework. `systray` is unmaintained (2021),
-`trayicon` has no submenus, and pulling in `tao`/`winit` for their event loop
-would put a UI framework in a crate whose only UI is meant to be the tray. On
-Linux `tray-icon` needs GTK, so the dependency is `[target.'cfg(windows)']` and
-the tray is simply absent elsewhere.
+`tray-icon` 0.24 (+ `muda` for the menu): the maintained extraction of Tauri's
+tray, pure Rust over Win32 — no C toolchain — so it cross-compiles to
+`x86_64-pc-windows-gnu`, which is how this project builds from WSL, and it needs
+no windowing framework of its own. The alternatives weighed against it are in
+`tray.rs`'s module docs. On Linux `tray-icon` needs GTK, so the dependency is
+`[target.'cfg(windows)']` and the tray is simply absent elsewhere.
 
 Menu: engine picker, microphone picker, theme, polish toggle, open settings,
 reload settings, quit. "Open settings" opens the settings window (below) —
 opening it twice focuses the existing window rather than making a second one,
 and closing it never stops dictation, which owns its own thread throughout.
+The config file is still one click away, from that window's Settings tab, so
+"Reload settings" keeps meaning what it always did.
 
 While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,
@@ -318,7 +320,15 @@ priority order:
   one-click copy per entry; a failed injection shows its reason in place, not
   buried, because this is the recovery path.
 - **Settings** — engine, input device, theme, polish, the overlay toggle and
-  hotkey rebinding, all written through `Config`. Never renders an API key.
+  hotkey rebinding, all written through `Config`. Never renders an API key;
+  "Open config file" hands `config.toml` to the user's editor instead, which
+  is still where the keys are set. `hotkey` and `overlay_enabled` are read
+  once at startup, so the window is given the *running* values too — the
+  sidebar always names the key that works right now — and marks either one
+  "until restart" once the file has moved since launch. Moved since launch,
+  not merely different from what is running: `--hotkey` is a run-only
+  override that never reaches the file, and it is already in force, so it is
+  not something a restart would apply.
 - **Insights** — most repeated words/phrases (stopwords and filler stripped),
   dictations today/all-time, total words, average/median perceived latency,
   success-vs-failure rate — all computed from the session log on the window's
@@ -351,12 +361,30 @@ inherited rather than solved differently.
 Colour is `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT` tokens,
 mapped onto `egui::Visuals` by `egui_theme` and painted directly for the
 background wash and the spectrum accent bar — the window and the pill are
-meant to read as one product.
+meant to read as one product. A failed injection is the one warm thing on
+screen (`theme.warn`, amber — not the banned rec-red), and History gives it a
+square marker and bold label as well as the colour, so "failed" and
+"injected" stay a pair of glances apart without relying on colour vision.
+
+"Dictations today" counts the user's *local* calendar day, and History stamps
+each card in local time, even though records are stored in UTC. The offset
+comes from `GetTimeZoneInformation` in `window::shell`, not from `time`'s
+local-offset lookup, which is unsound in a multi-threaded process — the same
+reason `history.rs` stamps in UTC at all.
+
+History draws a page of cards at a time (`window::state::HISTORY_PAGE`, 100)
+with a `Show more` button for the rest. `egui` lays out every widget it is
+handed, on screen or not, and its own row virtualisation wants a uniform row
+height these cards do not have — so what bounds the work is the count, rather
+than all `history.max_entries` cards being rebuilt on every repaint while the
+user types in the search box.
 
 `cargo run -p iris-app -- --demo-window` opens a real window against a
 seeded config and session log under the system temp directory — no hotkey, no
 microphone, no injector — the manual verification and screenshot path, the
-window's counterpart to `--demo-dictation`.
+window's counterpart to `--demo-dictation`. Settings changed in it are really
+written to that seeded config: a demo that flashed "Saved" over a change
+nothing persisted would hide the one bug this path exists to catch.
 
 ## Session log
 

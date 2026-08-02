@@ -39,11 +39,15 @@ crossbeam-channel.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 toml = "0.9"
-# Only used to stamp session-log entries with a wall-clock RFC 3339 timestamp;
-# `Instant` is monotonic and cannot be written to a file.
+# Stamps session-log entries with a wall-clock RFC 3339 timestamp (`Instant`
+# is monotonic and cannot be written to a file), and reads them back in the
+# settings window to show them in local time. Deliberately no `local-offset`
+# feature: that lookup is unsound in a multi-threaded process, which is why
+# the offset comes from `GetTimeZoneInformation` in `window::shell` instead.
 time = { version = "0.3", default-features = false, features = [
     "std",
     "formatting",
+    "parsing",
 ] }
 # The settings window's view layer (crate::window::ui and friends) is built on
 # plain egui — no windowing, no GL — so it type-checks and can be exercised

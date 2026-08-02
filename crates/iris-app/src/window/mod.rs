@@ -17,9 +17,9 @@
 //!   (`TextEdit`, `ScrollArea`, `ComboBox`, clipboard) plus a `Painter`
 //!   escape hatch for porting `iris-overlay`'s `Rgba` tokens directly. `egui`
 //!   itself (not `eframe`) has no OS dependency at all, so the entire view —
-//!   [`ui`], [`state`], [`insights`], [`search`], [`egui_theme`] — is a plain
+//!   [`ui`], `state`, `insights`, `search`, `egui_theme` — is a plain
 //!   dependency (see `Cargo.toml`) that type-checks and unit-tests on Linux;
-//!   only [`shell`] (the native window/GL bootstrap) needs `eframe`, and it
+//!   only `shell` (the native window/GL bootstrap) needs `eframe`, and it
 //!   is `[target.'cfg(windows)'.dependencies]`-gated the same way
 //!   `tray-icon` already is, so nothing GUI-shaped compiles on a non-Windows
 //!   `cargo check --workspace`.
@@ -44,7 +44,7 @@
 //!
 //! # Design
 //!
-//! [`egui_theme`] maps `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT`
+//! `egui_theme` maps `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT`
 //! tokens onto egui, and [`ui::chrome`] paints the background wash and the
 //! spectrum accent bar from the same tokens — the window and the pill are
 //! meant to read as one product, not two.
@@ -67,8 +67,10 @@ pub mod ui;
 #[cfg(windows)]
 mod shell;
 
-pub use insights::{Insights, Ranked};
-pub use state::{Env, Tab, WindowState};
+pub use insights::{DayWindow, Insights, Ranked};
+pub use state::{
+    Env, InForce, RestartPending, Status, StatusLevel, Tab, WindowState, HISTORY_PAGE,
+};
 
 /// What the dictation loop asks the settings window to do.
 ///
@@ -91,6 +93,64 @@ impl WindowSink for NoopWindow {
     fn open(&self) {}
 }
 
+/// A test double that counts [`WindowSink::open`] calls.
+///
+/// Cloneable and shared, because the loop takes ownership of its window sink
+/// and a test still has to see what the loop did with it — the same shape as
+/// [`crate::pill::RecordingPill`].
+#[derive(Debug, Clone, Default)]
+pub struct RecordingWindow {
+    opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RecordingWindow {
+    /// A sink that has not been opened.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many times [`WindowSink::open`] was called.
+    #[must_use]
+    pub fn opens(&self) -> usize {
+        self.opens.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl WindowSink for RecordingWindow {
+    fn open(&self) {
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The two settings that cannot change without a restart, as `main` saw them
+/// at launch — both what the process actually runs on and what the file said.
+///
+/// Each is read exactly once, before this window can exist: the hotkey when
+/// the hook is installed, `overlay_enabled` when the overlay is (or is not)
+/// spawned. So the window is handed the running values, and names those
+/// rather than the saved ones — without that the sidebar would confidently
+/// name a key that does nothing.
+///
+/// The file values are here because "running ≠ saved" alone does not mean a
+/// change is pending. A run-only CLI override (`iris --hotkey f9`) diverges
+/// from the file by design and never converges, and flagging that as pending
+/// would nag about an edit the user never made. Nor is "the file moved since
+/// launch" enough on its own — it also fires when the user saves the value
+/// that override already put in force. Both values are paired into an
+/// [`InForce`] for the window, which is where the one comparison lives.
+#[derive(Debug, Clone, Copy)]
+pub struct Startup {
+    /// The key the installed hook listens for.
+    pub hotkey: iris_core::hotkey::Key,
+    /// Whether `iris-overlay` was spawned this run.
+    pub overlay_enabled: bool,
+    /// `hotkey` as `config.toml` held it at launch, before any CLI override.
+    pub saved_hotkey: iris_core::hotkey::Key,
+    /// `overlay_enabled` as `config.toml` held it at launch, likewise.
+    pub saved_overlay_enabled: bool,
+}
+
 /// Start the settings window on its own thread.
 ///
 /// On Windows this is a real `eframe` window, opened lazily on the first
@@ -100,14 +160,15 @@ impl WindowSink for NoopWindow {
 pub fn spawn(
     config_path: std::path::PathBuf,
     commands: crossbeam_channel::Sender<crate::app::Command>,
+    startup: Startup,
 ) -> anyhow::Result<Box<dyn WindowSink>> {
     #[cfg(windows)]
     {
-        shell::spawn(config_path, commands)
+        shell::spawn(config_path, commands, startup)
     }
     #[cfg(not(windows))]
     {
-        let _ = (config_path, commands);
+        let _ = (config_path, commands, startup);
         Ok(Box::new(NoopWindow))
     }
 }
@@ -121,5 +182,15 @@ mod tests {
         NoopWindow.open();
         let boxed: Box<dyn WindowSink> = Box::new(NoopWindow);
         boxed.open();
+    }
+
+    #[test]
+    fn recording_window_counts_opens_through_a_clone() {
+        let window = RecordingWindow::new();
+        let observer = window.clone();
+        assert_eq!(observer.opens(), 0);
+        window.open();
+        window.open();
+        assert_eq!(observer.opens(), 2);
     }
 }
