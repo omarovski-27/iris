@@ -37,11 +37,14 @@ For someone who just wants to run Iris — no Rust, no build tools:
 4. First run writes `%APPDATA%\iris\config.toml` — commented defaults, no
    key needed yet (it starts on the offline mock engine, so dictation "works"
    but the transcript is a stub, not what you said).
-5. To dictate for real: right-click the tray icon → **Settings**, which opens
+5. To dictate for real: right-click the tray icon → **Open settings…**, which opens
    `config.toml` in your editor. The header comment walks through getting a
    Deepgram or Groq key and where to paste it (a `[keys]` section — never
-   printed back by Iris, including by `--print-config`). Save, then **Reload**
-   from the tray menu (or just restart Iris).
+   printed back by Iris, including by `--print-config`). Save the file, then
+   restart Iris — right-click the tray icon → **Quit Iris**, and launch it
+   again. A key is read once at startup, so **Reload settings** does not apply
+   one: it reports that the keys changed and keeps running on the engine Iris
+   started with.
 6. Hold **Right-Ctrl**, speak, release. Your words appear in whatever window
    had focus.
 

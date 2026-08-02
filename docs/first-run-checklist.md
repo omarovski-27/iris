@@ -48,16 +48,19 @@ on the machine you're actually going to use Iris on.
 - [ ] With no key configured, the app runs on the mock engine without
       crashing (dictation "works" but transcribes to a stub).
 - [ ] Deliberately misconfigure `engine = "deepgram"` with no key: the error
-      is a clear sentence naming the config path and the tray Settings entry
-      — not a Rust panic or stack trace.
+      is a clear sentence naming the config path and telling you to start Iris
+      again after editing it — not a Rust panic or stack trace.
 - [ ] Do the same again, but launched from the Start Menu shortcut: the
       message arrives as an "Iris could not start" dialog box, not a console
       window that flashes and closes before it can be read.
 - [ ] The same misconfiguration launched from an open PowerShell prompt
       prints to the console and shows *no* dialog.
 - [ ] Tray → Settings opens `config.toml` in the default editor.
-- [ ] After adding a real key and saving, tray → Reload picks it up without
-      a restart.
+- [ ] After adding a real key and saving, a full restart is what puts it in
+      force — not tray → Reload settings. Launched from an open PowerShell
+      prompt so the console output is visible, Reload prints "keys changed:
+      restart Iris for that to take effect" and stays on the engine it
+      started with. Quit from the tray, launch again, and the key is live.
 
 ## Hotkey
 
@@ -67,14 +70,18 @@ on the machine you're actually going to use Iris on.
       disabled label, not a menu — there is no rebinding from the tray on this
       build, and its absence is not a broken build.
 - [ ] Rebinding works the way it actually ships: set `hotkey` in
-      `config.toml` (tray → Settings), save, then tray → Reload. `iris.exe
-      --hotkey f9` does the same for one run without touching the file.
+      `config.toml` (tray → Settings), save, then quit from the tray and
+      launch Iris again. The low-level hook is installed once at startup, so
+      tray → Reload settings only reports "hotkey changed: restart Iris for
+      that to take effect" and keeps the old binding (`suppress_hotkey` is
+      the same story). `iris.exe --hotkey f9` does the rebind for one run
+      without touching the file.
 - [ ] Each accepted key binds and fires: `rctrl`, `lctrl`,
       `rshift`, `ralt`, `rwin`, `capslock`, `scrolllock`, `pause`, `f8`,
       `f9`, `f10`. That is the whole set (`iris_core::hotkey::Key`); anything
       else is rejected at load. None have been exercised on real hardware.
-- [ ] After a rebind, the old hotkey stops working and the new one starts,
-      with no double trigger or stuck-key behavior.
+- [ ] After a rebind and the restart it needs, the old hotkey stops working
+      and the new one starts, with no double trigger or stuck-key behavior.
 
 ## Overlay
 

@@ -55,6 +55,8 @@ const HEADER: &str = "\
 #      TOML puts every line after a [keys] header inside that table, so a
 #      [keys] block placed anywhere but the end swallows the settings that
 #      follow it and Iris will refuse to start.
+#   4. Save this file, then quit Iris from the tray and launch it again. A key
+#      is read once at startup, so \"Reload settings\" does not apply one.
 #
 # Groq works the same way with engine = \"groq\" and a groq entry in that same
 # [keys] table, from https://console.groq.com/keys.

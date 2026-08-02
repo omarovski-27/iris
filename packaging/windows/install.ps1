@@ -110,14 +110,13 @@ try {
 catch {
     Write-Host ""
     Write-Host "Install failed: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+finally {
+    # PowerShell runs this before the `exit` above, so one copy covers the
+    # failure path, the success path, and any exit added later.
     if (Test-Interactive) {
         Write-Host ""
         Read-Host "Press Enter to close"
     }
-    exit 1
-}
-
-if (Test-Interactive) {
-    Write-Host ""
-    Read-Host "Press Enter to close"
 }

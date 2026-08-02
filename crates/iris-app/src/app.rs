@@ -119,8 +119,8 @@ impl<A: AudioSource> App<A> {
         let config_path = config_path.into();
         let engine = engines::build(&config).with_context(|| {
             format!(
-                "starting the {} engine (edit {} — or right-click the tray icon → Settings — \
-                 to add a key or pick a different engine)",
+                "starting the {} engine (edit {} to add a key or pick a different engine, \
+                 then start Iris again)",
                 config.engine,
                 config_path.display()
             )
