@@ -12,16 +12,23 @@
 //! setting changed here and one changed from the tray a moment later can
 //! never race to overwrite each other. [`WindowState::refresh`] re-reads the
 //! file and the session log periodically, so external changes — the tray, a
-//! hand edit, a rejected switch rolled back by the loop — show up here too,
-//! within one refresh interval; see the tray's own "known limitations" for
-//! the same accepted trade-off.
+//! hand edit — show up here too, within one refresh interval; see the tray's
+//! own "known limitations" for the same accepted trade-off.
+//!
+//! Sending is not applying. `App` can decline `SetEngine` (no API key) or
+//! `SetDevice` (a microphone that will not open) and keep what works, so each
+//! command is held in [`WindowState::inflight`] until a [`CommandOutcome`]
+//! comes back on `Env::outcomes`, and only then does the control move and the
+//! status line say "Saved". A rejected change says why instead, in the words
+//! `App` already had — see [`WindowState::poll_outcomes`].
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
-use crate::app::Command;
+use crate::app::{Command, CommandOutcome};
 use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
@@ -30,8 +37,9 @@ use super::insights::{DayWindow, Insights};
 use super::search;
 
 /// How often the window re-reads `config.toml` and the session log while it
-/// is open and visible.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// is open and visible. Also the slowest anything on screen can change, and
+/// therefore what `crate::window::ui::draw_root` paces its repaints to.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long [`WindowState::status`] stays on screen after [`WindowState::flash`].
 pub const STATUS_HOLD: Duration = Duration::from_secs(3);
@@ -78,6 +86,9 @@ pub struct Env<'a> {
     pub config_path: &'a Path,
     /// The channel [`crate::App::run`] also drains tray commands from.
     pub commands: &'a Sender<Command>,
+    /// What the loop did with each of those commands, one per command sent
+    /// and in the same order. See [`WindowState::poll_outcomes`].
+    pub outcomes: &'a Receiver<CommandOutcome>,
     /// Enumerate input devices. Empty on a platform/build with no capture.
     pub list_devices: &'a dyn Fn() -> Vec<String>,
     /// Hand `config.toml` to whatever the desktop opens `.toml` with. The one
@@ -188,6 +199,18 @@ pub struct Status {
     pub at: Instant,
 }
 
+/// A [`Command`] the loop has been sent and has not answered yet.
+///
+/// It carries the change itself, not a copy of the new value, so the one
+/// place that knows what a command means to [`WindowState::config`] is
+/// [`WindowState::absorb`] — and it only runs once the loop says the change
+/// happened.
+struct Inflight {
+    command: Command,
+    /// What to flash if the loop takes it.
+    message: String,
+}
+
 /// The window's in-memory state. Built fresh each time the window opens.
 pub struct WindowState {
     /// The active section.
@@ -210,6 +233,13 @@ pub struct WindowState {
     /// Size and mtime of the session log as `history` was last read from it.
     /// See [`WindowState::refresh`].
     history_stamp: Option<(u64, Option<SystemTime>)>,
+    /// The local calendar day `insights` counts "today" as. Held because it
+    /// moves on its own clock: a window left open across local midnight has
+    /// to recount, with the log untouched. See [`WindowState::refresh`].
+    insights_day: DayWindow,
+    /// Commands sent to the loop that have not been answered yet, oldest
+    /// first. See [`WindowState::poll_outcomes`].
+    inflight: VecDeque<Inflight>,
     /// Positions in `history` matching `search`, as of `filtered_for`. See
     /// [`WindowState::sync_filter`].
     filtered: Vec<usize>,
@@ -229,7 +259,8 @@ impl WindowState {
         let history_path = config.history_path(env.config_path);
         let history_stamp = history_stamp(&history_path);
         let history = load_history(&history_path);
-        let insights = Insights::compute(&history, &local_day(env.utc_offset_seconds));
+        let insights_day = local_day(env.utc_offset_seconds);
+        let insights = Insights::compute(&history, &insights_day);
         let devices = (env.list_devices)();
         Self {
             tab: Tab::History,
@@ -241,6 +272,8 @@ impl WindowState {
             status: None,
             last_refresh: Instant::now(),
             history_stamp,
+            insights_day,
+            inflight: VecDeque::new(),
             filtered: Vec::new(),
             filtered_for: None,
             visible: HISTORY_PAGE,
@@ -258,6 +291,11 @@ impl WindowState {
     /// log gates it, and only the config snapshot is taken every time (it is
     /// one small file, and the tray can move it at any moment). `force` reads
     /// regardless, so the Refresh button always means what it says.
+    ///
+    /// [`Insights`] is recomputed whenever *either* input moved, and the local
+    /// day is an input: "Dictations today" is counted against a window that
+    /// rolls over at local midnight whether or not anyone dictates, so a
+    /// window left open overnight has to recount over the log it already has.
     pub fn refresh(&mut self, env: &Env, force: bool) {
         if !force && self.last_refresh.elapsed() < REFRESH_INTERVAL {
             return;
@@ -271,13 +309,18 @@ impl WindowState {
         }
         let history_path = self.config.history_path(env.config_path);
         let stamp = history_stamp(&history_path);
-        if !force && stamp == self.history_stamp {
+        let reload = force || stamp != self.history_stamp;
+        let day = local_day(env.utc_offset_seconds);
+        if !reload && day == self.insights_day {
             return;
         }
-        self.history_stamp = stamp;
-        self.history = load_history(&history_path);
-        self.insights = Insights::compute(&self.history, &local_day(env.utc_offset_seconds));
-        self.filtered_for = None;
+        if reload {
+            self.history_stamp = stamp;
+            self.history = load_history(&history_path);
+            self.filtered_for = None;
+        }
+        self.insights_day = day;
+        self.insights = Insights::compute(&self.history, &self.insights_day);
     }
 
     /// Bring [`WindowState::filtered`] up to date with `search` and `history`,
@@ -378,82 +421,140 @@ impl WindowState {
         self.status_flash().map(|(message, _)| message)
     }
 
-    /// Switch the transcription engine. Takes effect immediately; rolled
-    /// back by the loop (and self-corrected here on the next refresh) if the
-    /// engine cannot be built, e.g. no API key.
+    /// Switch the transcription engine. Applied by the loop, which declines it
+    /// and keeps the working engine if the new one cannot be built (no API
+    /// key) — so the picker only moves once the loop says it did.
     pub fn set_engine(&mut self, env: &Env, choice: EngineChoice) {
-        if self.dispatch(env, Command::SetEngine(choice), "Saved") {
-            self.config.engine = choice;
-        }
+        self.dispatch(env, Command::SetEngine(choice), "Saved");
     }
 
-    /// Switch the input device. Takes effect immediately.
+    /// Switch the input device. Applied by the loop, which declines it and
+    /// keeps the working microphone if the new one will not open.
     pub fn set_device(&mut self, env: &Env, device: Option<String>) {
-        if self.dispatch(env, Command::SetDevice(device.clone()), "Saved") {
-            self.config.audio.device = device;
-        }
+        self.dispatch(env, Command::SetDevice(device), "Saved");
     }
 
     /// Switch dark/light. Takes effect immediately, on this window too.
     pub fn set_theme(&mut self, env: &Env, theme: Theme) {
-        if self.dispatch(env, Command::SetTheme(theme), "Saved") {
-            self.config.theme = theme;
-        }
+        self.dispatch(env, Command::SetTheme(theme), "Saved");
     }
 
     /// Turn transcript cleanup on or off. Takes effect immediately.
     pub fn set_polish(&mut self, env: &Env, enabled: bool) {
-        if self.dispatch(env, Command::SetPolish(enabled), "Saved") {
-            self.config.polish.enabled = enabled;
-        }
+        self.dispatch(env, Command::SetPolish(enabled), "Saved");
     }
 
     /// Rebind the push-to-talk key. Saved now; needs a restart to take
     /// effect, because the hook is installed once in `main` before this
     /// window exists — the same restart the tray's own hotkey change needs.
     pub fn set_hotkey(&mut self, env: &Env, key: Key) {
-        if self.dispatch(
+        self.dispatch(
             env,
             Command::SetHotkey(key),
             "Saved — restart Iris to use the new key",
-        ) {
-            self.config.hotkey = key;
-        }
+        );
     }
 
     /// Show or hide the live-text pill overlay. Saved now; needs a restart —
     /// the overlay is spawned once in `main` before this window exists.
     pub fn set_overlay_enabled(&mut self, env: &Env, enabled: bool) {
-        if self.dispatch(
+        self.dispatch(
             env,
             Command::SetOverlayEnabled(enabled),
             "Saved — restart Iris for this to take effect",
-        ) {
-            self.config.overlay_enabled = enabled;
+        );
+    }
+
+    /// Hand `command` to the loop and wait to be told what became of it.
+    ///
+    /// Nothing here claims success: a queued command is not an applied one,
+    /// and [`crate::App`] is both the sole writer of the file and the only
+    /// place that can tell whether the change is possible. So the command
+    /// waits in [`WindowState::inflight`] and [`WindowState::poll_outcomes`]
+    /// finishes the job. A send that cannot even be delivered is the one
+    /// failure this end can diagnose itself: the loop has already returned and
+    /// this window is outliving it by a moment.
+    fn dispatch(&mut self, env: &Env, command: Command, saved: &str) {
+        match env.commands.send(command.clone()) {
+            Ok(()) => {
+                self.inflight.push_back(Inflight {
+                    command,
+                    message: saved.to_string(),
+                });
+                self.flash("Saving…");
+            }
+            Err(_) => self.flash_failure(NOT_RUNNING),
         }
     }
 
-    /// Hand `command` to the loop, and report what happened.
+    /// Take in whatever the loop has said about the commands sent so far.
     ///
-    /// Returns whether the loop took it, which is the only case where the
-    /// local [`WindowState::config`] may move: [`crate::App`] writes the file,
-    /// so if the receiver is gone (the loop has already returned, and this
-    /// window is outliving it by a moment) nothing is saved. Mutating anyway
-    /// would leave the form showing a value no file holds, until the next
-    /// [`WindowState::refresh`] silently put it back with no explanation.
-    fn dispatch(&mut self, env: &Env, command: Command, saved: &str) -> bool {
-        match env.commands.send(command) {
-            Ok(()) => {
-                self.flash(saved);
-                true
-            }
-            Err(_) => {
-                self.flash_failure("Not saved — Iris is no longer running. Restart Iris.");
-                false
+    /// Called once a frame, before anything is drawn. One outcome answers one
+    /// command, in order, because this window is the only sender on that
+    /// channel — which is what lets a rejection be reported against the change
+    /// that was actually refused, with the loop's own reason for it.
+    pub fn poll_outcomes(&mut self, env: &Env) {
+        loop {
+            match env.outcomes.try_recv() {
+                Ok(outcome) => {
+                    let Some(pending) = self.inflight.pop_front() else {
+                        continue;
+                    };
+                    match outcome {
+                        CommandOutcome::Applied => {
+                            self.absorb(pending.command);
+                            self.flash(pending.message);
+                        }
+                        CommandOutcome::Rejected(reason) => {
+                            self.flash_failure(format!("Not saved — {reason}"));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => return,
+                // The loop has returned. Anything still waiting will never be
+                // answered, and saying so beats a status line stuck on
+                // "Saving…" over a change that is not going to happen.
+                Err(TryRecvError::Disconnected) => {
+                    if !self.inflight.is_empty() {
+                        self.inflight.clear();
+                        self.flash_failure(NOT_RUNNING);
+                    }
+                    return;
+                }
             }
         }
     }
+
+    /// Whether the loop still owes an answer, which is the one thing on screen
+    /// that can change faster than [`REFRESH_INTERVAL`]. See
+    /// `crate::window::ui::draw_root`.
+    #[must_use]
+    pub fn awaiting_loop(&self) -> bool {
+        !self.inflight.is_empty()
+    }
+
+    /// Move [`WindowState::config`] onto a change the loop has confirmed.
+    ///
+    /// The next [`WindowState::refresh`] would read the same value back from
+    /// the file; this only means the control stops lagging a click by up to a
+    /// refresh interval.
+    fn absorb(&mut self, command: Command) {
+        match command {
+            Command::SetEngine(choice) => self.config.engine = choice,
+            Command::SetDevice(device) => self.config.audio.device = device,
+            Command::SetTheme(theme) => self.config.theme = theme,
+            Command::SetPolish(enabled) => self.config.polish.enabled = enabled,
+            Command::SetHotkey(key) => self.config.hotkey = key,
+            Command::SetOverlayEnabled(enabled) => self.config.overlay_enabled = enabled,
+            // Nothing this window sends, and nothing that changes the form.
+            Command::OpenSettings | Command::Reload | Command::Quit => {}
+        }
+    }
 }
+
+/// What the status line says when the dictation loop is gone: the window can
+/// outlive it by a moment, and nothing it asks for will be saved after that.
+const NOT_RUNNING: &str = "Not saved — Iris is no longer running. Restart Iris.";
 
 fn load_history(path: &Path) -> Vec<DictationRecord> {
     let mut records = SessionLog::read_all(path).unwrap_or_default();
@@ -517,12 +618,14 @@ mod tests {
     fn env_with<'a>(
         config_path: &'a Path,
         commands: &'a Sender<Command>,
+        outcomes: &'a Receiver<CommandOutcome>,
         devices: &'a dyn Fn() -> Vec<String>,
         reopen_signal: &'a Receiver<()>,
     ) -> Env<'a> {
         Env {
             config_path,
             commands,
+            outcomes,
             list_devices: devices,
             open_config_file: &refuse_to_open,
             reopen_signal,
@@ -543,6 +646,23 @@ mod tests {
         crossbeam_channel::never()
     }
 
+    /// An outcome channel for tests that never make the loop answer. `never()`
+    /// rather than a dropped sender: a disconnected one is itself an answer
+    /// ("the loop is gone"), which these tests are not asking about.
+    fn no_outcomes() -> Receiver<CommandOutcome> {
+        crossbeam_channel::never()
+    }
+
+    /// Play the loop for everything the window has sent: take it all, the way
+    /// `App::apply` does when nothing objects, then let the window notice —
+    /// which is what `ui::draw_root` does once a frame.
+    fn take_everything(state: &mut WindowState, env: &Env, outcomes: &Sender<CommandOutcome>) {
+        for _ in 0..state.inflight.len() {
+            outcomes.send(CommandOutcome::Applied).unwrap();
+        }
+        state.poll_outcomes(env);
+    }
+
     #[test]
     fn new_loads_defaults_when_nothing_is_on_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -550,7 +670,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
 
         let state = WindowState::new(&env);
         assert_eq!(state.tab, Tab::History);
@@ -571,7 +692,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let state = WindowState::new(&env);
 
         assert_eq!(state.history.len(), 2);
@@ -580,21 +702,29 @@ mod tests {
     }
 
     #[test]
-    fn set_engine_updates_locally_and_sends_a_command() {
+    fn set_engine_sends_a_command_and_moves_only_once_the_loop_takes_it() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let (tx, rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
+        let before = state.config.engine;
 
         state.set_engine(&env, EngineChoice::Groq);
-        assert_eq!(state.config.engine, EngineChoice::Groq);
         assert_eq!(
             rx.try_recv().unwrap(),
             Command::SetEngine(EngineChoice::Groq)
         );
+        assert_eq!(
+            state.config.engine, before,
+            "the picker may not move on a command that has only been queued"
+        );
+
+        take_everything(&mut state, &env, &outcomes_tx);
+        assert_eq!(state.config.engine, EngineChoice::Groq);
         assert_eq!(state.status_text(), Some("Saved"));
         // No file was written — the loop is the sole writer.
         assert!(!config_path.exists());
@@ -607,14 +737,98 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         state.set_hotkey(&env, Key::F9);
         assert_eq!(rx.try_recv().unwrap(), Command::SetHotkey(Key::F9));
         state.set_overlay_enabled(&env, false);
         assert_eq!(rx.try_recv().unwrap(), Command::SetOverlayEnabled(false));
+        take_everything(&mut state, &env, &outcomes_tx);
         assert!(state.status_text().unwrap().contains("restart"));
+    }
+
+    /// The whole point of the outcome channel: a change the loop refuses says
+    /// so, in the loop's own words, instead of flashing "Saved" over a picker
+    /// that is about to snap back on its own.
+    #[test]
+    fn a_change_the_loop_rejects_is_reported_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        let before = state.config.engine;
+
+        state.set_engine(&env, EngineChoice::Groq);
+        outcomes_tx
+            .send(CommandOutcome::Rejected(
+                "cannot switch to groq: IRIS_GROQ_KEY is not set".into(),
+            ))
+            .unwrap();
+        state.poll_outcomes(&env);
+
+        assert_eq!(state.config.engine, before, "a refused change may not show");
+        let (message, level) = state.status_flash().unwrap();
+        assert!(message.contains("IRIS_GROQ_KEY"), "{message}");
+        assert_eq!(level, StatusLevel::Warn);
+        assert!(!state.awaiting_loop());
+    }
+
+    /// One outcome answers one command, in order — so a rejection lands on the
+    /// change that was actually refused and not on whatever was clicked next.
+    #[test]
+    fn outcomes_answer_the_commands_they_belong_to_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.set_device(&env, Some("Absent Mic".into()));
+        state.set_theme(&env, Theme::Light);
+        outcomes_tx
+            .send(CommandOutcome::Rejected("cannot switch microphone".into()))
+            .unwrap();
+        outcomes_tx.send(CommandOutcome::Applied).unwrap();
+        state.poll_outcomes(&env);
+
+        assert_eq!(state.config.audio.device, None, "the refused one");
+        assert_eq!(state.config.theme, Theme::Light, "the accepted one");
+        assert_eq!(state.status_flash(), Some(("Saved", StatusLevel::Info)));
+    }
+
+    /// A loop that returns while a change is in flight will never answer it.
+    /// Leaving the status line on "Saving…" would be the same untruth as
+    /// "Saved": nothing is being saved, and nothing will be.
+    #[test]
+    fn a_loop_that_goes_away_mid_change_stops_the_window_waiting_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded::<CommandOutcome>();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.set_theme(&env, Theme::Light);
+        assert!(state.awaiting_loop());
+        drop(outcomes_tx); // the dictation loop has returned
+        state.poll_outcomes(&env);
+
+        assert!(!state.awaiting_loop());
+        assert_eq!(state.config.theme, Theme::Dark);
+        let (message, level) = state.status_flash().unwrap();
+        assert!(message.contains("no longer running"), "{message}");
+        assert_eq!(level, StatusLevel::Warn);
     }
 
     #[test]
@@ -625,7 +839,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         // Change the file on disk directly, simulating the loop persisting a
@@ -667,7 +882,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
         assert_eq!(state.history.len(), 1);
 
@@ -690,6 +906,40 @@ mod tests {
         assert_eq!(state.history.len(), 2);
     }
 
+    /// "Dictations today" is counted against a day that ends at local
+    /// midnight, which arrives whether or not anyone dictates. A window left
+    /// open across it must recount over the log it already has, rather than
+    /// keep yesterday's figure until the next dictation appends a line.
+    #[test]
+    fn refresh_recounts_today_when_the_local_day_moves_under_an_unchanged_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        Config::default().save(&config_path).unwrap();
+        let mut log = SessionLog::open(dir.path().join("history.jsonl"), 10);
+        log.append(&DictationRecord::now("mock", "today")).unwrap();
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        assert_eq!(state.insights.dictations_today, 1);
+
+        // Yesterday, still on screen: what the window would be holding a
+        // moment after local midnight, with nothing having touched the log.
+        state.insights_day = DayWindow::new("1999-01-01T00:00:00", "1999-01-02T00:00:00");
+        state.insights = Insights::compute(&state.history, &state.insights_day);
+        assert_eq!(state.insights.dictations_today, 0);
+
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        assert_eq!(
+            state.insights.dictations_today, 1,
+            "the day rolled over with the log untouched"
+        );
+    }
+
     #[test]
     fn status_text_expires() {
         let dir = tempfile::tempdir().unwrap();
@@ -697,7 +947,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         state.flash("hello");
@@ -717,7 +968,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
         let before = state.config.clone();
         drop(rx); // the dictation loop has returned
@@ -742,10 +994,12 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         state.set_theme(&env, Theme::Light);
+        take_everything(&mut state, &env, &outcomes_tx);
         assert_eq!(state.config.theme, Theme::Light);
         assert_eq!(state.status_flash(), Some(("Saved", StatusLevel::Info)));
     }
@@ -763,7 +1017,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         state.sync_filter();
@@ -821,12 +1076,14 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         assert_eq!(state.config.hotkey, env.hotkey.running);
         assert!(!env.restart_pending(&state.config).hotkey);
         state.set_hotkey(&env, Key::F9);
+        take_everything(&mut state, &env, &outcomes_tx);
         assert_eq!(state.config.hotkey, Key::F9);
         assert_ne!(state.config.hotkey, env.hotkey.running);
         assert!(env.restart_pending(&state.config).hotkey);
@@ -843,7 +1100,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let mut env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let mut env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         // What `--hotkey f9` leaves behind, and what an overlay that failed
         // to spawn leaves behind: in force differs from the file, and the
         // file never moved.
@@ -872,13 +1130,15 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let mut env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let mut env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         env.hotkey.running = Key::F9;
         env.hotkey.at_startup = Key::RightCtrl;
 
         let mut state = WindowState::new(&env);
         state.config.hotkey = Key::RightCtrl;
         state.set_hotkey(&env, Key::F9);
+        take_everything(&mut state, &env, &outcomes_tx);
 
         assert_eq!(state.config.hotkey, Key::F9);
         assert!(!env.restart_pending(&state.config).hotkey);
@@ -887,6 +1147,7 @@ mod tests {
         // Any *other* key is a real edit: it is neither what the file held at
         // launch nor what is running.
         state.set_hotkey(&env, Key::F8);
+        take_everything(&mut state, &env, &outcomes_tx);
         assert!(env.restart_pending(&state.config).hotkey);
     }
 
@@ -900,7 +1161,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let mut env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let mut env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         env.overlay_enabled.running = false;
 
         let saved = Config::default();
@@ -923,7 +1185,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
         state.sync_filter();
 
@@ -955,10 +1218,12 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         state.set_overlay_enabled(&env, false);
+        take_everything(&mut state, &env, &outcomes_tx);
         let pending = env.restart_pending(&state.config);
         assert!(pending.overlay_enabled);
         assert!(!pending.hotkey);
@@ -971,7 +1236,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
         state.open_config_file(&env);

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{select, Receiver};
+use crossbeam_channel::{select, Receiver, Sender};
 use iris_core::dictation::{Dictation, DictationOutcome};
 use iris_core::engine::Engine;
 use iris_core::hotkey::{HotkeyEvent, Key};
@@ -76,6 +76,22 @@ pub enum Command {
     Quit,
 }
 
+/// What the loop did with a [`Command`] the settings window sent.
+///
+/// The window shows the user what happened, so a queued command is not yet an
+/// answer: [`App::apply`] can decline a change and keep what works (a missing
+/// API key, a microphone that will not open). One of these goes back for every
+/// command the window sends, in the order they were sent, so the window can
+/// say "Saved" only for the ones that were, and say why for the ones that were
+/// not — see `crate::window::state`'s `dispatch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// The loop took the change (and persisted it, where it persists).
+    Applied,
+    /// The loop declined it and kept what it had, for this reason.
+    Rejected(String),
+}
+
 /// What one dictation produced.
 #[derive(Debug, Clone)]
 pub struct Dictated {
@@ -110,6 +126,11 @@ pub struct App<A: AudioSource> {
     /// reach [`App::apply`] the same way tray commands do. `never()` by
     /// default, which simply never becomes ready; see [`App::with_window_commands`].
     window_commands: Receiver<Command>,
+    /// Where the result of each of those commands goes back. `None` until
+    /// [`App::with_window_commands`] wires one, and only ever fed for commands
+    /// that arrived on `window_commands`: the tray has no status line to put
+    /// an answer in.
+    window_outcomes: Option<Sender<CommandOutcome>>,
     history: SessionLog,
     audio: A,
     count: usize,
@@ -162,6 +183,7 @@ impl<A: AudioSource> App<A> {
             pill,
             window: Box::new(NoopWindow),
             window_commands: crossbeam_channel::never(),
+            window_outcomes: None,
             history,
             audio,
             count: 0,
@@ -178,10 +200,21 @@ impl<A: AudioSource> App<A> {
     }
 
     /// Drain [`Command`]s the settings window sends directly, alongside the
-    /// tray's `control` channel passed to [`App::run`].
+    /// tray's `control` channel passed to [`App::run`], and answer each one on
+    /// `outcomes`.
+    ///
+    /// The two are one wiring step because they are one conversation: the
+    /// window has to be told whether the change it asked for happened, and
+    /// nothing else sends on this command channel, so the answers arrive in
+    /// the order the questions were asked.
     #[must_use]
-    pub fn with_window_commands(mut self, commands: Receiver<Command>) -> Self {
+    pub fn with_window_commands(
+        mut self,
+        commands: Receiver<Command>,
+        outcomes: Sender<CommandOutcome>,
+    ) -> Self {
         self.window_commands = commands;
+        self.window_outcomes = Some(outcomes);
         self
     }
 
@@ -274,7 +307,7 @@ impl<A: AudioSource> App<A> {
                 },
                 recv(control) -> command => match command {
                     Ok(command) => {
-                        if self.apply(command)?.is_break() {
+                        if self.apply(command, false)?.is_break() {
                             return Ok(());
                         }
                         continue;
@@ -283,7 +316,7 @@ impl<A: AudioSource> App<A> {
                 },
                 recv(window_commands) -> command => match command {
                     Ok(command) => {
-                        if self.apply(command)?.is_break() {
+                        if self.apply(command, true)?.is_break() {
                             return Ok(());
                         }
                         continue;
@@ -303,13 +336,22 @@ impl<A: AudioSource> App<A> {
         }
     }
 
-    /// Apply a tray command, persisting anything the user would expect to
-    /// survive a restart.
-    fn apply(&mut self, command: Command) -> Result<std::ops::ControlFlow<()>> {
+    /// Apply a tray or window command, persisting anything the user would
+    /// expect to survive a restart.
+    ///
+    /// `from_window` decides whether the result is reported back on
+    /// [`App::with_window_commands`]' channel. Two of these commands can be
+    /// declined — an engine that will not build, a microphone that will not
+    /// open — and the loop keeping what works is only half the answer: the UI
+    /// that asked has to be able to say so instead of showing "Saved" over a
+    /// change that never happened.
+    fn apply(&mut self, command: Command, from_window: bool) -> Result<std::ops::ControlFlow<()>> {
+        let mut outcome = CommandOutcome::Applied;
         match command {
             Command::Quit => return Ok(std::ops::ControlFlow::Break(())),
             Command::SetEngine(choice) => {
                 if choice == self.config.engine {
+                    self.report(from_window, outcome);
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
                 let previous = self.config.engine;
@@ -327,6 +369,8 @@ impl<A: AudioSource> App<A> {
                         // app in a state where every hotkey press fails.
                         self.config.engine = previous;
                         eprintln!("  cannot switch to {choice}: {e:#}");
+                        outcome =
+                            CommandOutcome::Rejected(format!("cannot switch to {choice}: {e:#}"));
                     }
                 }
             }
@@ -337,7 +381,10 @@ impl<A: AudioSource> App<A> {
                     println!("  microphone: {}", self.audio.describe());
                     self.persist();
                 }
-                Err(e) => eprintln!("  cannot switch microphone: {e:#}"),
+                Err(e) => {
+                    eprintln!("  cannot switch microphone: {e:#}");
+                    outcome = CommandOutcome::Rejected(format!("cannot switch microphone: {e:#}"));
+                }
             },
             Command::SetPolish(enabled) => {
                 self.config.polish.enabled = enabled;
@@ -459,7 +506,21 @@ impl<A: AudioSource> App<A> {
                 Err(e) => eprintln!("  cannot reload the configuration: {e:#}"),
             },
         }
+        self.report(from_window, outcome);
         Ok(std::ops::ControlFlow::Continue(()))
+    }
+
+    /// Tell the settings window what became of the command it sent.
+    ///
+    /// Best-effort: a window that has closed between sending and now is not a
+    /// dictation-loop problem, and the change stands either way.
+    fn report(&self, from_window: bool, outcome: CommandOutcome) {
+        if !from_window {
+            return;
+        }
+        if let Some(outcomes) = &self.window_outcomes {
+            let _ = outcomes.send(outcome);
+        }
     }
 
     fn persist(&self) {

@@ -215,6 +215,27 @@ struct Resident {
     _tray: iris_app::tray::Tray,
 }
 
+/// Start the settings-window thread, on the same terms as the overlay above:
+/// best-effort, because it is an accessory. Dictation is the product and it
+/// needs neither window, so a thread that cannot start costs the user the
+/// tray's `Settings` item — logged, and a no-op from then on — rather than the
+/// whole application.
+#[cfg(windows)]
+fn try_spawn_window(
+    config_path: &std::path::Path,
+    commands: crossbeam_channel::Sender<iris_app::Command>,
+    outcomes: crossbeam_channel::Receiver<iris_app::CommandOutcome>,
+    startup: iris_app::window::Startup,
+) -> Box<dyn iris_app::WindowSink> {
+    match iris_app::window::spawn(config_path.to_path_buf(), commands, outcomes, startup) {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("  settings window unavailable: {e:#}");
+            Box::new(iris_app::NoopWindow)
+        }
+    }
+}
+
 /// The resident loop.
 #[cfg(windows)]
 fn run(
@@ -289,13 +310,14 @@ fn start_resident(
         saved_overlay_enabled: file_config.overlay_enabled,
     };
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
-    let window = iris_app::window::spawn(config_path.to_path_buf(), window_commands_tx, startup)?;
+    let (window_outcomes_tx, window_outcomes_rx) = crossbeam_channel::unbounded();
+    let window = try_spawn_window(config_path, window_commands_tx, window_outcomes_rx, startup);
 
     let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
         .with_file_config(file_config)
         .with_window(window)
-        .with_window_commands(window_commands_rx);
+        .with_window_commands(window_commands_rx, window_outcomes_tx);
 
     Ok(Resident {
         app,
@@ -507,18 +529,26 @@ fn demo_window() -> Result<()> {
         log.append(&record)?;
     }
 
-    // The window reports "Saved" when the loop *takes* a change, and `App` —
-    // absent here — is what turns that into a file. Without a receiver this
-    // demo would flash "Saved" for every change, write nothing, and put the
-    // control back on the next refresh, which is exactly the failure a
-    // screenshot of this path is supposed to catch. So the demo stands in for
-    // the loop: it applies each command to the seeded file, or says why not.
+    // The window reports "Saved" only once the loop says a change landed, and
+    // `App` — absent here — is what turns that into a file *and* answers. With
+    // no stand-in the demo would sit on "Saving…" forever and write nothing,
+    // which is exactly the failure a screenshot of this path is supposed to
+    // catch. So the demo plays the loop: it applies each command to the seeded
+    // file and reports the same accept/reject `App::apply` would.
     let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
     let demo_config_path = config_path.clone();
     std::thread::spawn(move || {
         for command in commands_rx {
-            if let Err(e) = apply_demo_command(&demo_config_path, &command) {
-                eprintln!("  demo: {command:?} not saved: {e:#}");
+            let outcome = match apply_demo_command(&demo_config_path, &command) {
+                Ok(()) => iris_app::CommandOutcome::Applied,
+                Err(e) => {
+                    eprintln!("  demo: {command:?} not saved: {e:#}");
+                    iris_app::CommandOutcome::Rejected(format!("{e:#}"))
+                }
+            };
+            if outcomes_tx.send(outcome).is_err() {
+                break;
             }
         }
     });
@@ -526,6 +556,7 @@ fn demo_window() -> Result<()> {
     let handle = window::spawn(
         config_path.clone(),
         commands_tx,
+        outcomes_rx,
         window::Startup {
             hotkey: config.hotkey,
             // No overlay process in the demo, whatever the seeded file says.

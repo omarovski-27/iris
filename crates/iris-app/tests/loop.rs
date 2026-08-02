@@ -19,7 +19,9 @@ use iris_app::app::Command;
 use iris_app::audio::ChannelAudio;
 use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
-use iris_app::{App, Injector, RecordingInjector, RecordingPill, RecordingWindow, SessionLog};
+use iris_app::{
+    App, CommandOutcome, Injector, RecordingInjector, RecordingPill, RecordingWindow, SessionLog,
+};
 use iris_core::engine::{Engine, Session, TranscriptEvent};
 use iris_core::hotkey::{HotkeyEvent, Key};
 
@@ -1133,6 +1135,7 @@ fn open_settings_opens_the_window() {
 /// The window sends `Command`s on its own channel, distinct from the tray's,
 /// and `App::run` must drain both — this is what lets a setting changed in
 /// the window take effect without a second, window-owned copy of `App::apply`.
+/// It must also answer, because the window shows the user what happened.
 #[test]
 fn a_window_command_is_applied_the_same_as_a_tray_command() {
     let rig = rig();
@@ -1140,6 +1143,7 @@ fn a_window_command_is_applied_the_same_as_a_tray_command() {
     let commands_rx = rig.commands_rx.clone();
     let tray_commands = rig.commands.clone();
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
 
     window_commands_tx
         .send(Command::SetTheme(Theme::Light))
@@ -1147,12 +1151,59 @@ fn a_window_command_is_applied_the_same_as_a_tray_command() {
     tray_commands.send(Command::Quit).unwrap();
 
     let loop_thread = std::thread::spawn(move || {
-        let mut app = rig.app.with_window_commands(window_commands_rx);
+        let mut app = rig
+            .app
+            .with_window_commands(window_commands_rx, outcomes_tx);
         app.run(&keys_rx, &commands_rx).map(|()| app)
     });
     let app = loop_thread.join().expect("the loop panicked").unwrap();
 
     assert_eq!(app.config().theme, Theme::Light);
+    assert_eq!(outcomes_rx.try_recv().unwrap(), CommandOutcome::Applied);
+}
+
+/// The loop declines an engine it cannot build and keeps dictating on the one
+/// that works — and the window that asked has to hear *why*, or it flashes
+/// "Saved" over a picker that snaps back on its own a moment later.
+#[test]
+fn a_window_command_the_loop_declines_comes_back_with_the_reason() {
+    // The rejection under test is a missing key, so a machine that has one
+    // cannot produce it. Skipped rather than mutating the environment: keys
+    // are read from it, and `App` runs on another thread here.
+    if std::env::var("IRIS_DEEPGRAM_KEY").is_ok() {
+        return;
+    }
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let tray_commands = rig.commands.clone();
+    let before = rig.app.config().engine;
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    // Deepgram with no key in the environment: `engines::build` fails, so
+    // `App::apply` rolls the choice back rather than leaving every hotkey
+    // press failing.
+    window_commands_tx
+        .send(Command::SetEngine(EngineChoice::Deepgram))
+        .unwrap();
+    tray_commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig
+            .app
+            .with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(app.config().engine, before, "the loop kept what works");
+    match outcomes_rx.try_recv().unwrap() {
+        CommandOutcome::Rejected(reason) => {
+            assert!(reason.contains("IRIS_DEEPGRAM_KEY"), "{reason}");
+        }
+        CommandOutcome::Applied => panic!("an engine with no key must not report success"),
+    }
 }
 
 #[test]

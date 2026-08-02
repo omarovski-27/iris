@@ -70,6 +70,7 @@ mod shell;
 pub use insights::{DayWindow, Insights, Ranked};
 pub use state::{
     Env, InForce, RestartPending, Status, StatusLevel, Tab, WindowState, HISTORY_PAGE,
+    REFRESH_INTERVAL,
 };
 
 /// What the dictation loop asks the settings window to do.
@@ -157,18 +158,23 @@ pub struct Startup {
 /// [`WindowSink::open`]. Elsewhere it is [`NoopWindow`], so a caller builds
 /// and runs on Linux with the window simply absent — the same shape as
 /// `tray::spawn` and `iris_overlay::spawn`.
+///
+/// `outcomes` is the other half of `commands`: the loop answers every command
+/// the window sends on it, so the window can report what actually happened
+/// rather than what it asked for — see [`crate::App::with_window_commands`].
 pub fn spawn(
     config_path: std::path::PathBuf,
     commands: crossbeam_channel::Sender<crate::app::Command>,
+    outcomes: crossbeam_channel::Receiver<crate::app::CommandOutcome>,
     startup: Startup,
 ) -> anyhow::Result<Box<dyn WindowSink>> {
     #[cfg(windows)]
     {
-        shell::spawn(config_path, commands, startup)
+        shell::spawn(config_path, commands, outcomes, startup)
     }
     #[cfg(not(windows))]
     {
-        let _ = (config_path, commands, startup);
+        let _ = (config_path, commands, outcomes, startup);
         Ok(Box::new(NoopWindow))
     }
 }

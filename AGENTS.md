@@ -417,7 +417,10 @@ When updating this file, preserve this bar for all agents and keep entries conci
   `SetTheme`/`SetPolish`) plus two new ones this window introduced
   (`SetHotkey`, `SetOverlayEnabled`) — on a channel `App::run` selects on
   alongside the tray's. `App` stays the sole writer; see `window::state`'s
-  module docs for why a second writer would race it.
+  module docs for why a second writer would race it. `App` answers each of
+  those commands with a `CommandOutcome`, and the window moves the control
+  and says "Saved" only on that answer — `App::apply` can decline `SetEngine`
+  and `SetDevice`, so a queued command is not an applied one.
 - `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
   like `hotkey`, changing it needs a restart (both are read once at startup).
   `main` therefore hands `window::spawn` a `Startup` snapshot: what the

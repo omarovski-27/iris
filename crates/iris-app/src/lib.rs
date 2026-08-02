@@ -67,7 +67,7 @@ pub mod polish;
 pub mod tray;
 pub mod window;
 
-pub use app::{App, Command, Dictated};
+pub use app::{App, Command, CommandOutcome, Dictated};
 pub use config::{Config, EngineChoice, Theme};
 pub use history::{DictationRecord, LatencyBreakdown, SessionLog};
 pub use inject::{Injector, RecordingInjector};

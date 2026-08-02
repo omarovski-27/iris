@@ -3,31 +3,55 @@
 //! here type-checks on every platform; `crate::window::shell` is the only
 //! `cfg(windows)` piece, and it does nothing but bootstrap `eframe` and call
 //! [`draw_root`] once a frame.
+//!
+//! The view has no independent unit tests: it is exercised by
+//! `crate::window::state`'s tests (the data it renders) and by eye — rendered
+//! evidence lives in the PR, and `iris --demo-window` (see `main.rs`) is the
+//! manual verification path, the same split `iris-overlay` uses for its own
+//! window shell.
 
 pub mod chrome;
 mod history_tab;
 mod insights_tab;
 mod settings_tab;
 
+use std::time::Duration;
+
 use egui::{Align, CentralPanel, Color32, Frame, Layout, RichText};
 
 use crate::pill::overlay_theme;
 
+use super::state::REFRESH_INTERVAL;
 use super::{egui_theme, Env, StatusLevel, Tab, WindowState};
+
+/// How soon to come back while the loop still owes an answer to a setting
+/// change. Short, because it is the one thing the user is waiting on, and
+/// needed at all because the loop applies commands between dictations — the
+/// answer can be a whole utterance away.
+const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 
 /// Draw one frame of the whole window.
 ///
 /// Order: pick up a pending "focus me" request from a second `open()` call,
-/// refresh from disk on the state's own timer, apply the theme, then paint
-/// the background wash, the nav sidebar and the active tab.
+/// take in what the loop did with the changes already sent, refresh from disk
+/// on the state's own timer, apply the theme, then paint the background wash,
+/// the nav sidebar and the active tab.
 pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
     while env.reopen_signal.try_recv().is_ok() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
+    state.poll_outcomes(env);
     state.refresh(env, false);
     // A dictation can land while the window is open; keep the view live
-    // without the user having to touch anything.
-    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    // without the user having to touch anything — at the rate the state can
+    // actually move and no faster, since `refresh` is what re-reads the config
+    // and the log and it does nothing in between. The exception is an answer
+    // the loop still owes, which arrives on its own schedule.
+    ctx.request_repaint_after(if state.awaiting_loop() {
+        AWAITING_LOOP_POLL
+    } else {
+        REFRESH_INTERVAL
+    });
 
     let theme = overlay_theme(state.config.theme);
     ctx.set_visuals(egui_theme::visuals(&theme));
@@ -150,13 +174,4 @@ fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overl
                 .color(chrome::ink_faint(theme)),
         );
     });
-}
-
-#[cfg(test)]
-mod tests {
-    // The view itself has no independent unit tests: it is exercised by
-    // `crate::window::state`'s tests (the data it renders) and by eye —
-    // rendered evidence lives in the PR, and `iris_window_demo.rs` is the
-    // manual verification path, the same split `iris-overlay` uses for its
-    // window shell.
 }

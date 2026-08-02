@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::app::Command;
+use crate::app::{Command, CommandOutcome};
 use crate::config::Config;
 
 use super::state::{Env, WindowState};
@@ -49,6 +49,7 @@ impl WindowSink for WindowHandle {
 pub fn spawn(
     config_path: PathBuf,
     commands: Sender<Command>,
+    outcomes: Receiver<CommandOutcome>,
     startup: Startup,
 ) -> Result<Box<dyn WindowSink>> {
     let (open_tx, open_rx) = crossbeam_channel::unbounded::<()>();
@@ -61,6 +62,7 @@ pub fn spawn(
                     open_rx.clone(),
                     config_path.clone(),
                     commands.clone(),
+                    outcomes.clone(),
                     startup,
                 );
             }
@@ -75,6 +77,7 @@ fn run_window(
     reopen_signal: Receiver<()>,
     config_path: PathBuf,
     commands: Sender<Command>,
+    outcomes: Receiver<CommandOutcome>,
     startup: Startup,
 ) {
     // Best-effort: a config that fails to load just draws the default-theme
@@ -108,6 +111,7 @@ fn run_window(
     let app = SettingsApp {
         config_path,
         commands,
+        outcomes,
         reopen_signal,
         startup,
         // Asked once per window, not once per frame: a timezone change while
@@ -131,6 +135,11 @@ fn run_window(
 struct SettingsApp {
     config_path: PathBuf,
     commands: Sender<Command>,
+    /// The loop's answers to what went out on `commands`. A clone of the one
+    /// receiver, so an outcome that arrived after the last window closed is
+    /// simply drained by the next one — [`WindowState::poll_outcomes`] has no
+    /// command of its own waiting for it.
+    outcomes: Receiver<CommandOutcome>,
     reopen_signal: Receiver<()>,
     startup: Startup,
     utc_offset_seconds: i32,
@@ -144,6 +153,7 @@ impl eframe::App for SettingsApp {
         let env = Env {
             config_path: &self.config_path,
             commands: &self.commands,
+            outcomes: &self.outcomes,
             list_devices: &list_devices,
             open_config_file: &open_config_file,
             reopen_signal: &self.reopen_signal,

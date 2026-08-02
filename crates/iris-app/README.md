@@ -360,9 +360,16 @@ tray sends for engine/device/theme/polish, plus two new ones (`SetHotkey`,
 `SetOverlayEnabled`) that follow the same shape. `App` stays the one writer,
 so a window change and a tray change can never race to overwrite each other.
 `WindowState::refresh` re-reads the file and the log every couple of seconds,
-so external changes (the tray, a hand edit, a rejected switch rolled back by
-the loop) show up here too — the tray's own known-limitations trade-off,
-inherited rather than solved differently.
+so external changes (the tray, a hand edit) show up here too — the tray's own
+known-limitations trade-off, inherited rather than solved differently.
+
+**A queued change is not a saved one.** `App::apply` can decline two of these
+commands and keep what works — an engine that will not build (no API key), a
+microphone that will not open — so it answers every window command with a
+`CommandOutcome` on a channel back. The control moves and the status line says
+"Saved" only once that answer says the change landed; a refused one says why,
+in the loop's own words, instead of flashing "Saved" over a picker that snaps
+back on the next refresh.
 
 Colour is `iris_overlay::theme`'s `PRISM_DARK`/`PORCELAIN_LIGHT` tokens,
 mapped onto `egui::Visuals` by `egui_theme` and painted directly for the
