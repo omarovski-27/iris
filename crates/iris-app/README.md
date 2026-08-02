@@ -324,11 +324,17 @@ priority order:
   "Open config file" hands `config.toml` to the user's editor instead, which
   is still where the keys are set. `hotkey` and `overlay_enabled` are read
   once at startup, so the window is given the *running* values too — the
-  sidebar always names the key that works right now — and marks either one
-  "until restart" once the file has moved since launch. Moved since launch,
-  not merely different from what is running: `--hotkey` is a run-only
-  override that never reaches the file, and it is already in force, so it is
-  not something a restart would apply.
+  sidebar always names the key that works right now — paired with the
+  launch-time file values as an `InForce`. Either one is marked "until
+  restart" only when `InForce::pending` holds: the file has moved since
+  launch *and* what it now holds is not already running. Both halves matter.
+  `--hotkey` is a run-only override that never reaches the file, so it is not
+  an unsaved edit; and picking that same key in the picker does move the
+  file, but onto the value already in force, where a restart would change
+  nothing. `InForce::diverged` is the separate question — saved is not what
+  is running, whatever moved — and it is what makes the overlay checkbox say
+  "not running this session" when the overlay was asked for and failed to
+  start.
 - **Insights** — most repeated words/phrases (stopwords and filler stripped),
   dictations today/all-time, total words, average/median perceived latency,
   success-vs-failure rate — all computed from the session log on the window's

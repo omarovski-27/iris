@@ -14,10 +14,9 @@ cargo build --release --target x86_64-pc-windows-gnu    # produces runnable .exe
 ./target/x86_64-pc-windows-gnu/release/iris.exe         # WSL runs it as a real Windows process
 ```
 
-Everything except microphone capture, the hotkey hook, text injection, and the
-overlay window is portable and `#[cfg(windows)]`-free, so tests and the latency
-harness run natively on Linux. Keep it that way — it is what makes the project
-CI-testable at all.
+Only the OS-bound layer is `#[cfg(windows)]` — `docs/dev-windows.md` keeps the
+list. Everything else is portable, so tests and the latency harness run natively
+on Linux. Keep it that way — it is what makes the project CI-testable at all.
 
 ## Packaging and release
 
@@ -421,6 +420,25 @@ When updating this file, preserve this bar for all agents and keep entries conci
   module docs for why a second writer would race it.
 - `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
   like `hotkey`, changing it needs a restart (both are read once at startup).
+  `main` therefore hands `window::spawn` a `Startup` snapshot: what the
+  process is really running on *and* what the file held before CLI overrides.
+  Both halves live in one `state::InForce<T>` (`running`, `at_startup`), and
+  every claim the view makes comes from its two comparisons — do not answer
+  either question anywhere else:
+  - `InForce::pending` — "a restart is owed": the file moved since launch
+    **and** what it now holds is not already running. Both conditions are
+    load-bearing. `--hotkey f9` over a `right-ctrl` file diverges by design
+    and must not read as an unsaved edit; picking `f9` in the picker moves
+    the file *onto the running value*, where a restart would change nothing.
+  - `InForce::diverged` — "asked for but not running": the saved value is not
+    what is in force, whatever moved. This is what stops a ticked overlay
+    checkbox from reading as a live overlay after `try_spawn_overlay` failed.
+- Anything the window cannot reach the OS for crosses through `Env` as a
+  callback or a plain value (`list_devices`, `open_config_file`, the local UTC
+  offset from `GetTimeZoneInformation`), so `window::ui` stays `egui`-only.
+  Note the offset: `time`'s `current_local_offset` is unsound in a
+  multi-threaded process — that is why `history.rs` stamps UTC — so
+  `window::shell` asks Windows and `insights::DayWindow` does the arithmetic.
 - `cargo run -p iris-app -- --demo-window` opens the real window against a
   seeded config/session log under the system temp dir — no hotkey, no
   microphone, no injector — the manual verification and screenshot path.
