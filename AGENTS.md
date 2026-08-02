@@ -123,6 +123,16 @@ an unused connection in roughly 12-15s (see Sharp edges), far short of real
 gaps between dictations, so it protected against a race that barely occurred
 in practice.
 
+**A re-emitted final segment is discriminated by the audio span it covers, never
+by when it arrived.** A guard keyed on arrival — anything landing after the
+`Finalize` ack — was built and removed: the short hold above has *everything*
+arrive there, including a genuine "No. No.". `Transcript::absorb` instead
+withholds a new final only when the span it reports is *fully covered* by the
+spans already accepted, and unusable timing keeps both candidates, because a
+wrongly-deleted word is worse than a duplicated one. Containment rather than
+overlap, and where the one tolerance constant may and may not be applied, are
+load-bearing; the reasoning is in the same module doc.
+
 ## Sharp edges
 
 - API keys come from the environment only (`IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY`).

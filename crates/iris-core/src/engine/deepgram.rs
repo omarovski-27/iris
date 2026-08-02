@@ -88,6 +88,130 @@
 //! about flush abandonment. Closing it would need the quiet window that was
 //! measured and rejected on latency grounds, so it stands as a known residual
 //! risk.
+//!
+//! # Suppressing a re-emitted segment: time-span containment
+//!
+//! Deepgram occasionally re-emits a segment it already sent an `is_final`
+//! result for — the same words, tagged final a second time. A first attempt
+//! at a guard for this (a previous branch, since removed) narrowed detection
+//! to the window right after a `Finalize` ack, on the theory that anything
+//! landing there is provably a repeat rather than new speech. That premise is
+//! false: a hold shorter than connect-plus-first-result (see above) has
+//! *everything* arrive after `Finalize`, including a genuine "No. No." A
+//! guard keyed on *when* a result arrives cannot tell an artefact from real
+//! speech in exactly the case it most needs to, so it was removed rather than
+//! shipped.
+//!
+//! The discriminator that survives is *what audio the result covers*, not
+//! when it arrived or what it says. Every streaming `Results` message carries
+//! top-level `start` and `duration` fields (seconds into the utterance, and
+//! the length covered — confirmed against Deepgram's current streaming
+//! reference; distinct from the per-word `start`/`end` timestamps nested
+//! under `channel.alternatives[0].words`, which this guard does not need: the
+//! existing accumulator already keys accepted text by segment, and a
+//! segment-level span is the natural unit to compare against segments already
+//! held). A re-emission covers audio that was already accepted; a genuinely
+//! repeated word — "No. No." — occupies a later span even though the text is
+//! identical. So [`Transcript`] keeps the `(start, start + duration)` span
+//! alongside each accepted final segment.
+//!
+//! The rule on those spans is **containment, not overlap**: a new final
+//! segment is withheld only when *every part of it* is already covered by
+//! the spans accepted so far (`is_fully_covered`, which walks the accepted
+//! spans as one coverage set, so a re-emission that merges two adjacent
+//! accepted segments is recognised too). Overlap alone is not enough, and
+//! deliberately so. Deepgram can revise a segment boundary or merge
+//! segments, producing a final that starts inside accepted audio and then
+//! runs on into speech nobody has transcribed yet — `[0.0, 1.5] "the quick
+//! brown fox"` followed by `[1.4, 5.0] "fox jumps over the lazy dog"`. An
+//! overlap rule drops that whole second segment and with it six words the
+//! user actually said. Containment keeps it, in full: the seam may duplicate
+//! a word, and that is the cheaper error by the rule this whole feature
+//! exists under (a wrongly-deleted word is strictly worse than a duplicated
+//! one). What is *not* done is trimming the covered prefix off such a
+//! segment before keeping it: cutting words out of a transcript by timing
+//! arithmetic is a bigger risk than the duplicate it would avoid, and more
+//! machinery than this guard is meant to carry.
+//!
+//! No comparison in that containment test adds slack anywhere, and that is
+//! what enforces the direction rather than any claim about it. The coverage
+//! walk rejects a gap outright — `start > covered_to` ends it with nothing
+//! forgiven, so uncovered audio stays uncovered however many accepted spans
+//! the walk crosses, and no per-span allowance can accumulate — and the
+//! decision itself is the plain `covered_to >= new_span.1`. A new segment
+//! whose end exceeds the coverage by any amount at all, however small, is
+//! kept. That exact comparison still catches what it must: a re-emission
+//! whose end lands exactly on the coverage boundary, such as one merging two
+//! exactly-adjacent accepted spans, is covered and suppressed. Widening
+//! either side would be the wrong direction — comparing against
+//! `covered_to + tolerance` would let a boundary that merely comes *close*
+//! to being covered count as covered, which is how a guard like this deletes
+//! speech, and demanding `covered_to >= new_span.1 + tolerance` would let a
+//! plain exact-match duplicate through.
+//!
+//! [`SPAN_TOLERANCE_SECS`] (1 ms) is therefore consumed in exactly one place:
+//! a new span whose own duration is at or under it is never treated as
+//! covered at all. Deepgram documents its streaming timestamps as not
+//! guaranteed accurate below millisecond precision even though the JSON
+//! carries more decimal digits than that, and an accepted segment's end is
+//! our own `start + duration` in f64 while the next segment's start is an
+//! independently formatted decimal — at that scale the two numbers are noise
+//! rather than evidence, so a span that short cannot be classified with
+//! confidence and is kept. That use only ever removes suppression cases; it
+//! can never create one.
+//!
+//! Boundary noise between adjoining segments needs no tolerance under this
+//! rule, which is why none is applied there. The case that originally seemed
+//! to need one — a first "No." reported as `start 0.0, duration 0.4400001`
+//! and a second as `start 0.44`, overlapping by a hair — is decided by
+//! containment alone: the second span runs 0.44 s past everything accepted,
+//! so it is kept. It is the move from overlap to containment that saves that
+//! word, not a tolerance.
+//!
+//! Suppression only ever withholds a *new* segment from being added; it never
+//! removes anything already accepted, and it leaves the in-flight interim
+//! alone (a re-emission of old audio says nothing about the not-yet-final
+//! segment currently accumulating, and `finished_text` reports that interim
+//! text). That asymmetry is deliberate. It also means a re-emission carrying
+//! a revised transcription of fully-covered audio is not merged in even
+//! though it might be an improvement: taking that upside would require
+//! replacing already-shown text, which is out of scope for a guard whose only
+//! job is not to double it. Because a suppression does remove words from
+//! what the user would otherwise see, it is logged under `--verbose` like
+//! every other consequential decision in this module.
+//!
+//! How often any of this fires in production is unknown, and should not be
+//! assumed. Suppression needs a re-emission whose span is contained in
+//! accepted coverage under the exact comparison above; the tests here assume
+//! that shape (a subset span like `[0.2, 1.2]` inside `[0.0, 1.5]`) because
+//! that is how they were written, not because it was observed in captured
+//! traffic. If real re-emissions instead arrive with slightly wider
+//! boundaries than the finals they repeat, this guard never fires and the
+//! duplicate still reaches the user. That is the conservative end of the
+//! tradeoff this feature accepts, and it is deliberately not widened to
+//! catch more — a duplicate is cheaper than a deletion. The `--verbose` log
+//! line on the suppressed branch is what would settle it against a real
+//! session; until then the containment shape is an assumption, not a
+//! measurement.
+//!
+//! Missing or unusable timing — no `start`/`duration` on the message, a
+//! non-finite value, a negative `start`, or a non-positive `duration` (a
+//! zero-or-negative span asserts nothing about what it covers) — makes the
+//! new segment's span `None`. A `None` span is never covered by anything, by
+//! construction (`parse_span` is the only place a `Some` is produced, and
+//! `is_fully_covered` is only ever reached through one), so an ambiguous
+//! result is always kept. This is the same bias the rest of the module
+//! applies to uncertainty: when the evidence needed to act is missing, do
+//! nothing rather than guess.
+//!
+//! The check costs one linear scan over the segments already accepted in
+//! this session (bounded by how many finals a single dictation produces —
+//! never large) and adds no waiting: it runs synchronously inside `absorb`,
+//! on data already in hand, so it cannot add latency to when a result is
+//! reported. It does not touch `from_finalize`, `FINALIZE_ACK_TIMEOUT`, or
+//! any part of the catch-up mechanism above — this is a separate comparison
+//! at the point a segment is accepted, not another layer on top of deciding
+//! when to stop waiting.
 
 use std::time::{Duration, Instant};
 
@@ -507,6 +631,71 @@ fn conclude(acc: &Transcript, sent_secs: f64, failure: Option<String>) -> Transc
     }
 }
 
+/// One accepted final segment: its text, and the audio span it covers when
+/// Deepgram reported usable timing for it. See the module doc's "Suppressing
+/// a re-emitted segment" section.
+struct FinalSegment {
+    text: String,
+    span: Option<(f64, f64)>,
+}
+
+/// Parse the top-level `start`/`duration` timing off a Results message into
+/// an (start, end) span, or `None` when the timing is missing or not usable
+/// as evidence — the only two outcomes, by design, so a caller can never
+/// mistake absent timing for a zero-width or zero-based span.
+fn parse_span(value: &serde_json::Value) -> Option<(f64, f64)> {
+    let start = value.get("start").and_then(|v| v.as_f64())?;
+    let duration = value.get("duration").and_then(|v| v.as_f64())?;
+    if !start.is_finite() || !duration.is_finite() || start < 0.0 || duration <= 0.0 {
+        return None;
+    }
+    Some((start, start + duration))
+}
+
+/// The span length under which Deepgram's timing is noise rather than
+/// evidence: it documents its streaming timestamps as not accurate below
+/// millisecond precision, and an accepted end (`start + duration` in f64) and
+/// the next reported start are independently rounded numbers. This is used in
+/// exactly one place — [`is_fully_covered`]'s too-short-to-classify guard,
+/// which only ever declines a suppression. No comparison anywhere adds it to
+/// widen what counts as covered. See the module doc's "Suppressing a
+/// re-emitted segment" section.
+const SPAN_TOLERANCE_SECS: f64 = 0.001;
+
+/// True only when every part of `new_span` already falls inside the audio
+/// `accepted` covers, treating the accepted spans as one coverage set so a
+/// re-emission spanning two adjacent accepted segments is recognised. A
+/// segment that runs on past that coverage in either direction — a revised
+/// or merged boundary carrying speech nobody has transcribed yet — is not
+/// covered, and is kept whole; so is a span at or under
+/// [`SPAN_TOLERANCE_SECS`] long, which is too short to classify.
+///
+/// Both comparisons below are exact, with no slack added on either side: a
+/// gap in coverage is never forgiven, and an end that exceeds the coverage by
+/// any amount at all keeps the segment, while an end landing exactly on it is
+/// covered. That is what makes the tolerance unable to reach outward and
+/// swallow audio nobody transcribed.
+fn is_fully_covered(new_span: (f64, f64), mut accepted: Vec<(f64, f64)>) -> bool {
+    if new_span.1 - new_span.0 <= SPAN_TOLERANCE_SECS {
+        return false;
+    }
+    accepted.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut covered_to = new_span.0;
+    for (start, end) in accepted {
+        if start > covered_to {
+            return false;
+        }
+        if end > covered_to {
+            covered_to = end;
+        }
+        if covered_to >= new_span.1 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Accumulates Deepgram's segmented results into one transcript.
 ///
 /// Deepgram sends interim hypotheses for the current segment and then a final
@@ -514,7 +703,7 @@ fn conclude(acc: &Transcript, sent_secs: f64, failure: Option<String>) -> Transc
 /// transcript is `finals + current interim`.
 #[derive(Default)]
 struct Transcript {
-    finals: Vec<String>,
+    finals: Vec<FinalSegment>,
     interim: String,
     done: bool,
     /// Set once a Results message arrives tagged `"from_finalize": true` —
@@ -562,10 +751,29 @@ impl Transcript {
             .unwrap_or(false);
 
         if is_final {
+            let mut suppressed = false;
             if !text.is_empty() {
-                self.finals.push(text);
+                let span = parse_span(&value);
+                // A `None` span is never covered by anything, so missing or
+                // unusable timing always falls through to being kept.
+                let covered =
+                    span.filter(|new_span| is_fully_covered(*new_span, self.accepted_spans()));
+                match covered {
+                    Some((start, end)) => {
+                        vlog!(
+                            "deepgram: withholding a re-emitted segment covering \
+                             [{start:.3}s, {end:.3}s], already transcribed: {text:?}"
+                        );
+                        suppressed = true;
+                    }
+                    None => self.finals.push(FinalSegment { text, span }),
+                }
             }
-            self.interim.clear();
+            // A re-emission of already-accepted audio says nothing about the
+            // later segment the interim is accumulating, so it is left alone.
+            if !suppressed {
+                self.interim.clear();
+            }
         } else {
             if text.is_empty() || text == self.interim {
                 return None;
@@ -575,8 +783,14 @@ impl Transcript {
         Some(self.running_text())
     }
 
+    /// The audio the accepted segments cover, for segments Deepgram reported
+    /// usable timing for.
+    fn accepted_spans(&self) -> Vec<(f64, f64)> {
+        self.finals.iter().filter_map(|seg| seg.span).collect()
+    }
+
     fn running_text(&self) -> String {
-        let mut parts: Vec<&str> = self.finals.iter().map(String::as_str).collect();
+        let mut parts: Vec<&str> = self.finals.iter().map(|seg| seg.text.as_str()).collect();
         if !self.interim.is_empty() {
             parts.push(&self.interim);
         }
@@ -609,6 +823,34 @@ mod tests {
             "type": "Results",
             "is_final": true,
             "from_finalize": from_finalize,
+            "channel": { "alternatives": [ { "transcript": text } ] }
+        })
+        .to_string()
+    }
+
+    /// A final Results message carrying the top-level `start`/`duration`
+    /// timing real Deepgram traffic includes — see `parse_span`.
+    fn results_with_span(text: &str, start: f64, duration: f64) -> String {
+        serde_json::json!({
+            "type": "Results",
+            "is_final": true,
+            "start": start,
+            "duration": duration,
+            "channel": { "alternatives": [ { "transcript": text } ] }
+        })
+        .to_string()
+    }
+
+    /// The same, but tagged `from_finalize` — for pinning that the dedup
+    /// guard applies just as much to results the post-`Finalize` catch-up
+    /// mechanism accepts as to ordinary mid-stream ones.
+    fn results_from_finalize_with_span(text: &str, start: f64, duration: f64) -> String {
+        serde_json::json!({
+            "type": "Results",
+            "is_final": true,
+            "from_finalize": true,
+            "start": start,
+            "duration": duration,
             "channel": { "alternatives": [ { "transcript": text } ] }
         })
         .to_string()
@@ -735,6 +977,142 @@ mod tests {
         t.absorb(&results_from_finalize("", true));
         assert!(t.finalize_acked);
         assert_eq!(t.finished_text(), "");
+    }
+
+    #[test]
+    fn a_reemitted_segment_covering_an_accepted_span_is_suppressed() {
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        // Deepgram re-sends the same audio span a second time.
+        t.absorb(&results_with_span("the quick brown fox", 0.2, 1.0));
+        assert_eq!(t.finished_text(), "the quick brown fox");
+    }
+
+    #[test]
+    fn containment_suppresses_a_reemission_even_with_revised_wording() {
+        // The discriminator is the span, not the text: a re-emission whose
+        // audio is already covered is suppressed even when Deepgram revised
+        // its wording for it, because accepting it would mean replacing
+        // already-shown text — out of scope for a guard whose only job is not
+        // to double it. See the module doc.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        t.absorb(&results_with_span("the quick brown", 0.1, 1.0));
+        assert_eq!(t.finished_text(), "the quick brown fox");
+    }
+
+    #[test]
+    fn a_reemission_merging_two_accepted_segments_is_suppressed() {
+        // Accepted coverage is one set, not a list of unrelated spans: a
+        // final that re-covers two adjacent accepted segments at once adds no
+        // audio nobody has transcribed.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick", 0.0, 0.8));
+        t.absorb(&results_with_span("brown fox", 0.8, 0.7));
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        assert_eq!(t.finished_text(), "the quick brown fox");
+    }
+
+    #[test]
+    fn a_segment_running_past_accepted_coverage_is_kept_whole() {
+        // A revised or merged boundary that starts inside accepted audio and
+        // then runs on into speech nobody has transcribed: keeping it whole
+        // may duplicate a word at the seam, and that is the cheaper error.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        t.absorb(&results_with_span("fox jumps over the lazy dog", 1.4, 3.6));
+        assert_eq!(
+            t.finished_text(),
+            "the quick brown fox fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn a_segment_starting_before_accepted_coverage_is_kept_whole() {
+        // The same rule in the other direction: audio ahead of the earliest
+        // accepted span is not covered, so the segment carrying it survives.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("brown fox", 1.0, 1.0));
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.6));
+        assert_eq!(t.finished_text(), "brown fox the quick brown fox");
+    }
+
+    #[test]
+    fn a_segment_running_past_coverage_by_less_than_the_tolerance_is_still_kept() {
+        // The tolerance is never added to what counts as covered: an end that
+        // exceeds the accepted coverage by even a fraction of a millisecond
+        // keeps the segment. This test fails if that direction is flipped.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("hello there", 0.0, 1.5));
+        let overshoot = SPAN_TOLERANCE_SECS / 5.0;
+        t.absorb(&results_with_span("hello there", 0.5, 1.0 + overshoot));
+        assert_eq!(t.finished_text(), "hello there hello there");
+    }
+
+    #[test]
+    fn genuinely_repeated_word_in_adjacent_spans_survives_even_after_finalize() {
+        // The case this branch exists for: two genuine "No."s, both arriving
+        // after Finalize (the short-hold shape where a prior, since-removed
+        // guard could not tell this apart from a re-emission). Adjacent spans
+        // must not be suppressed.
+        let mut t = Transcript::default();
+        t.absorb(&results_from_finalize_with_span("No.", 0.0, 0.4));
+        t.absorb(&results_from_finalize_with_span("No.", 0.4, 0.4));
+        assert_eq!(t.finished_text(), "No. No.");
+    }
+
+    #[test]
+    fn a_hairline_float_overlap_at_a_segment_boundary_keeps_both_words() {
+        // The same "No. No.", but with the boundary reported as two
+        // independently rounded numbers: the first segment's end computes to
+        // 0.4400001 while the second starts at exactly 0.44. That hair of
+        // overlap is rounding noise, not shared audio, and must not delete
+        // the second word.
+        let mut t = Transcript::default();
+        t.absorb(&results_from_finalize_with_span("No.", 0.0, 0.4400001));
+        t.absorb(&results_from_finalize_with_span("No.", 0.44, 0.44));
+        assert_eq!(t.finished_text(), "No. No.");
+    }
+
+    #[test]
+    fn a_suppressed_reemission_leaves_an_in_flight_interim_alone() {
+        // A re-emission of already-accepted audio says nothing about the
+        // later segment the interim is accumulating, and `finished_text`
+        // reports that interim — clearing it here would delete the tail.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("hello", 0.0, 1.5));
+        t.absorb(&results("world", false));
+        t.absorb(&results_with_span("hello", 0.2, 1.0));
+        assert_eq!(t.finished_text(), "hello world");
+    }
+
+    #[test]
+    fn missing_timing_data_is_never_suppressed() {
+        // No start/duration on either message: the evidence needed to prove
+        // a re-emission is absent, so both are kept even though the text is
+        // identical.
+        let mut t = Transcript::default();
+        t.absorb(&results("hello", true));
+        t.absorb(&results("hello", true));
+        assert_eq!(t.finished_text(), "hello hello");
+    }
+
+    #[test]
+    fn non_positive_duration_is_treated_as_unusable_timing() {
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("hi", 0.0, 1.0));
+        // A zero-duration span asserts nothing about what it covers, so it
+        // must not be read as proof of overlap.
+        t.absorb(&results_with_span("hi", 0.0, 0.0));
+        assert_eq!(t.finished_text(), "hi hi");
+    }
+
+    #[test]
+    fn negative_start_is_treated_as_unusable_timing() {
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("hi", 0.0, 1.0));
+        t.absorb(&results_with_span("hi", -1.0, 1.0));
+        assert_eq!(t.finished_text(), "hi hi");
     }
 
     #[test]
