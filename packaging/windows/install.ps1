@@ -28,12 +28,15 @@ $ErrorActionPreference = "Stop"
 
 # "Run with PowerShell" closes the window the moment the script returns, so
 # every line below - success or failure - would otherwise flash and vanish.
-# Only pause when there is actually a console keyboard to read from: a
-# redirected or piped run (install.ps1 > install.log) must not hang waiting
-# for an Enter nobody can type.
+# Only pause when there is actually a console keyboard to read from. The last
+# two tests cover different callers and both are needed: a redirected or piped
+# run (install.ps1 > install.log) redirects the streams but carries no
+# -NonInteractive, and -NonInteractive in a real console redirects neither
+# stream but makes the host refuse the prompt outright.
 function Test-Interactive {
     if ([Environment]::UserInteractive -ne $true) { return $false }
     if ($Host.Name -eq "ServerRemoteHost") { return $false }
+    if ([Environment]::GetCommandLineArgs() -contains "-NonInteractive") { return $false }
     if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
     return $true
 }

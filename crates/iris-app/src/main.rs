@@ -517,7 +517,9 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
 fn report_startup_failure(err: &anyhow::Error) {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Console::GetConsoleProcessList;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
 
     let mut pids = [0u32; 2];
     // SAFETY: `pids` is a valid, writable buffer of the length passed in;
@@ -529,13 +531,20 @@ fn report_startup_failure(err: &anyhow::Error) {
 
     let text = HSTRING::from(format!("{err:#}"));
     let caption = HSTRING::from("Iris could not start");
+    // MB_SETFOREGROUND and MB_TOPMOST are what make this visible at all in the
+    // launch it exists for: a process started from the Startup folder has
+    // never held the foreground, so Windows' foreground lock would otherwise
+    // leave the box behind the active window with only a flashing taskbar
+    // button — and the installed shortcut minimizes the console, so there is
+    // no second cue.
+    //
     // SAFETY: both strings are NUL-terminated and outlive the modal call.
     unsafe {
         MessageBoxW(
             None,
             PCWSTR(text.as_ptr()),
             PCWSTR(caption.as_ptr()),
-            MB_OK | MB_ICONERROR,
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
