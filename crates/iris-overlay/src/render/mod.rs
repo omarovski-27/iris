@@ -1540,7 +1540,7 @@ mod tests {
     /// opaque, which is the whole point of the treatment and what a
     /// reintroduced text-driven opacity ramp would break.
     #[test]
-    fn a_listening_orb_is_glass_around_an_opaque_core_and_clear_at_the_corners() {
+    fn a_listening_capsule_is_glass_around_an_opaque_core_and_clear_at_the_corners() {
         let (r, _) = drive(
             &[Command::ShowListening, Command::Level(0.8)],
             400,
@@ -1904,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_ribbon_draws_more_than_the_closed_orb() {
+    fn an_open_ribbon_draws_more_than_the_resting_capsule() {
         let (closed, _) = drive(&[Command::ShowListening], 200, PRISM_DARK);
         let (open, _) = drive(
             &[

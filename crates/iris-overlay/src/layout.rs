@@ -28,7 +28,7 @@
 //! monitor change already causes today. This is deliberate: it was the
 //! lower-risk of two options considered (the other being a window that
 //! resizes live with the ribbon), and the fixed transparent margin around a
-//! narrow orb costs nothing extra to composite.
+//! narrow capsule costs nothing extra to composite.
 //!
 //! Geometry is deliberately *not* a theme property — see [`crate::theme`].
 
