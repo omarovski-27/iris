@@ -89,7 +89,7 @@
 //! measured and rejected on latency grounds, so it stands as a known residual
 //! risk.
 //!
-//! # Suppressing a re-emitted segment: time-span overlap
+//! # Suppressing a re-emitted segment: time-span containment
 //!
 //! Deepgram occasionally re-emits a segment it already sent an `is_final`
 //! result for — the same words, tagged final a second time. A first attempt
@@ -110,30 +110,63 @@
 //! under `channel.alternatives[0].words`, which this guard does not need: the
 //! existing accumulator already keys accepted text by segment, and a
 //! segment-level span is the natural unit to compare against segments already
-//! held). A re-emission covers a span that was already accepted; a
-//! genuinely repeated word — "No. No." — occupies a later, non-overlapping
-//! span even though the text is identical. So [`Transcript`] keeps the
-//! `(start, start + duration)` span alongside each accepted final segment,
-//! and a new final segment is suppressed only when its span strictly
-//! overlaps one already held (`spans_overlap`) — not when it merely touches
-//! one at an endpoint, which is a distinct, later segment abutting the
-//! previous one, exactly the "No. No." shape.
+//! held). A re-emission covers audio that was already accepted; a genuinely
+//! repeated word — "No. No." — occupies a later span even though the text is
+//! identical. So [`Transcript`] keeps the `(start, start + duration)` span
+//! alongside each accepted final segment.
+//!
+//! The rule on those spans is **containment, not overlap**: a new final
+//! segment is withheld only when *every part of it* is already covered by
+//! the spans accepted so far (`is_fully_covered`, which walks the accepted
+//! spans as one coverage set, so a re-emission that merges two adjacent
+//! accepted segments is recognised too). Overlap alone is not enough, and
+//! deliberately so. Deepgram can revise a segment boundary or merge
+//! segments, producing a final that starts inside accepted audio and then
+//! runs on into speech nobody has transcribed yet — `[0.0, 1.5] "the quick
+//! brown fox"` followed by `[1.4, 5.0] "fox jumps over the lazy dog"`. An
+//! overlap rule drops that whole second segment and with it six words the
+//! user actually said. Containment keeps it, in full: the seam may duplicate
+//! a word, and that is the cheaper error by the rule this whole feature
+//! exists under (a wrongly-deleted word is strictly worse than a duplicated
+//! one). What is *not* done is trimming the covered prefix off such a
+//! segment before keeping it: cutting words out of a transcript by timing
+//! arithmetic is a bigger risk than the duplicate it would avoid, and more
+//! machinery than this guard is meant to carry.
+//!
+//! Comparisons carry a tolerance of [`SPAN_TOLERANCE_SECS`] (1 ms). Deepgram
+//! documents its streaming timestamps as not guaranteed accurate below
+//! millisecond precision even though the JSON carries more decimal digits
+//! than that, and an accepted segment's end is our own `start + duration` in
+//! f64 while the next segment's start is an independently formatted decimal
+//! — two numbers that can disagree in their last digits for a boundary that
+//! is really the same instant. Without a tolerance that disagreement decides
+//! real cases: a first "No." reported as `start 0.0, duration 0.4400001` and
+//! a second as `start 0.44` overlap by a hair, and an overlap rule deletes
+//! the second word. The tolerance only ever forgives rounding noise on an
+//! otherwise-matching boundary; it never lets coverage reach outward far
+//! enough to swallow genuinely new content, because a millisecond of audio
+//! holds no speech. For the same reason a new span shorter than the
+//! tolerance is never treated as covered at all — under it there is nothing
+//! to compare, so the segment is kept.
 //!
 //! Suppression only ever withholds a *new* segment from being added; it never
-//! removes anything already accepted. That asymmetry is deliberate — see the
-//! "wrongly-deleted word is strictly worse than a duplicated one" rule this
-//! whole feature exists under. It also means a re-emission carrying a revised
-//! transcription of an already-accepted span is not merged in even though it
-//! might be an improvement: taking that upside would require replacing
-//! already-shown text, which is out of scope for a guard whose only job is
-//! not to double it.
+//! removes anything already accepted, and it leaves the in-flight interim
+//! alone (a re-emission of old audio says nothing about the not-yet-final
+//! segment currently accumulating, and `finished_text` reports that interim
+//! text). That asymmetry is deliberate. It also means a re-emission carrying
+//! a revised transcription of fully-covered audio is not merged in even
+//! though it might be an improvement: taking that upside would require
+//! replacing already-shown text, which is out of scope for a guard whose only
+//! job is not to double it. Because a suppression does remove words from
+//! what the user would otherwise see, it is logged under `--verbose` like
+//! every other consequential decision in this module.
 //!
 //! Missing or unusable timing — no `start`/`duration` on the message, a
 //! non-finite value, a negative `start`, or a non-positive `duration` (a
 //! zero-or-negative span asserts nothing about what it covers) — makes the
-//! new segment's span `None`. A `None` span never overlaps anything, by
+//! new segment's span `None`. A `None` span is never covered by anything, by
 //! construction (`parse_span` is the only place a `Some` is produced, and
-//! `spans_overlap` is only ever called on two `Some`s), so an ambiguous
+//! `is_fully_covered` is only ever reached through one), so an ambiguous
 //! result is always kept. This is the same bias the rest of the module
 //! applies to uncertainty: when the evidence needed to act is missing, do
 //! nothing rather than guess.
@@ -586,10 +619,41 @@ fn parse_span(value: &serde_json::Value) -> Option<(f64, f64)> {
     Some((start, start + duration))
 }
 
-/// True only when the two spans genuinely overlap — sharing an endpoint
-/// (spans that merely abut, the "No. No." shape) is not overlap.
-fn spans_overlap(a: (f64, f64), b: (f64, f64)) -> bool {
-    a.0 < b.1 && b.0 < a.1
+/// How far two span boundaries may disagree and still be read as the same
+/// instant: Deepgram documents its streaming timestamps as not accurate below
+/// millisecond precision, and an accepted end (`start + duration` in f64) and
+/// the next reported start are independently rounded numbers. See the module
+/// doc's "Suppressing a re-emitted segment" section for why the tolerance
+/// only ever makes a suppression harder to reach.
+const SPAN_TOLERANCE_SECS: f64 = 0.001;
+
+/// True only when every part of `new_span` already falls inside the audio
+/// `accepted` covers, treating the accepted spans as one coverage set so a
+/// re-emission spanning two adjacent accepted segments is recognised. A
+/// segment that runs on past that coverage in either direction — a revised
+/// or merged boundary carrying speech nobody has transcribed yet — is not
+/// covered, and is kept whole; so is a span shorter than the tolerance,
+/// which is too small to compare meaningfully.
+fn is_fully_covered(new_span: (f64, f64), accepted: &[(f64, f64)]) -> bool {
+    if new_span.1 - new_span.0 <= SPAN_TOLERANCE_SECS {
+        return false;
+    }
+    let mut spans = accepted.to_vec();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut covered_to = new_span.0;
+    for (start, end) in spans {
+        if start > covered_to + SPAN_TOLERANCE_SECS {
+            return false;
+        }
+        if end > covered_to {
+            covered_to = end;
+        }
+        if covered_to + SPAN_TOLERANCE_SECS >= new_span.1 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Accumulates Deepgram's segmented results into one transcript.
@@ -647,21 +711,29 @@ impl Transcript {
             .unwrap_or(false);
 
         if is_final {
+            let mut suppressed = false;
             if !text.is_empty() {
                 let span = parse_span(&value);
-                // A `None` span can never overlap anything (see
-                // `spans_overlap`'s callers here), so missing or unusable
-                // timing always falls through to being kept.
-                let reemission = span.is_some_and(|new_span| {
-                    self.finals
-                        .iter()
-                        .any(|seg| seg.span.is_some_and(|prior| spans_overlap(new_span, prior)))
-                });
-                if !reemission {
-                    self.finals.push(FinalSegment { text, span });
+                // A `None` span is never covered by anything, so missing or
+                // unusable timing always falls through to being kept.
+                let covered =
+                    span.filter(|new_span| is_fully_covered(*new_span, &self.accepted_spans()));
+                match covered {
+                    Some((start, end)) => {
+                        vlog!(
+                            "deepgram: withholding a re-emitted segment covering \
+                             [{start:.3}s, {end:.3}s], already transcribed: {text:?}"
+                        );
+                        suppressed = true;
+                    }
+                    None => self.finals.push(FinalSegment { text, span }),
                 }
             }
-            self.interim.clear();
+            // A re-emission of already-accepted audio says nothing about the
+            // later segment the interim is accumulating, so it is left alone.
+            if !suppressed {
+                self.interim.clear();
+            }
         } else {
             if text.is_empty() || text == self.interim {
                 return None;
@@ -669,6 +741,12 @@ impl Transcript {
             self.interim = text;
         }
         Some(self.running_text())
+    }
+
+    /// The audio the accepted segments cover, for segments Deepgram reported
+    /// usable timing for.
+    fn accepted_spans(&self) -> Vec<(f64, f64)> {
+        self.finals.iter().filter_map(|seg| seg.span).collect()
     }
 
     fn running_text(&self) -> String {
@@ -871,12 +949,12 @@ mod tests {
     }
 
     #[test]
-    fn overlap_suppresses_a_reemission_even_with_revised_wording() {
-        // The discriminator is the span, not the text: a re-emission that
-        // covers already-accepted audio is suppressed even when Deepgram
-        // revised its wording for that span, because accepting it would mean
-        // replacing already-shown text — out of scope for a guard whose only
-        // job is not to double it. See the module doc.
+    fn containment_suppresses_a_reemission_even_with_revised_wording() {
+        // The discriminator is the span, not the text: a re-emission whose
+        // audio is already covered is suppressed even when Deepgram revised
+        // its wording for it, because accepting it would mean replacing
+        // already-shown text — out of scope for a guard whose only job is not
+        // to double it. See the module doc.
         let mut t = Transcript::default();
         t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
         t.absorb(&results_with_span("the quick brown", 0.1, 1.0));
@@ -884,15 +962,76 @@ mod tests {
     }
 
     #[test]
+    fn a_reemission_merging_two_accepted_segments_is_suppressed() {
+        // Accepted coverage is one set, not a list of unrelated spans: a
+        // final that re-covers two adjacent accepted segments at once adds no
+        // audio nobody has transcribed.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick", 0.0, 0.8));
+        t.absorb(&results_with_span("brown fox", 0.8, 0.7));
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        assert_eq!(t.finished_text(), "the quick brown fox");
+    }
+
+    #[test]
+    fn a_segment_running_past_accepted_coverage_is_kept_whole() {
+        // A revised or merged boundary that starts inside accepted audio and
+        // then runs on into speech nobody has transcribed: keeping it whole
+        // may duplicate a word at the seam, and that is the cheaper error.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        t.absorb(&results_with_span("fox jumps over the lazy dog", 1.4, 3.6));
+        assert_eq!(
+            t.finished_text(),
+            "the quick brown fox fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn a_segment_starting_before_accepted_coverage_is_kept_whole() {
+        // The same rule in the other direction: audio ahead of the earliest
+        // accepted span is not covered, so the segment carrying it survives.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("brown fox", 1.0, 1.0));
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.6));
+        assert_eq!(t.finished_text(), "brown fox the quick brown fox");
+    }
+
+    #[test]
     fn genuinely_repeated_word_in_adjacent_spans_survives_even_after_finalize() {
         // The case this branch exists for: two genuine "No."s, both arriving
         // after Finalize (the short-hold shape where a prior, since-removed
-        // guard could not tell this apart from a re-emission). Adjacent,
-        // non-overlapping spans must not be suppressed.
+        // guard could not tell this apart from a re-emission). Adjacent spans
+        // must not be suppressed.
         let mut t = Transcript::default();
         t.absorb(&results_from_finalize_with_span("No.", 0.0, 0.4));
         t.absorb(&results_from_finalize_with_span("No.", 0.4, 0.4));
         assert_eq!(t.finished_text(), "No. No.");
+    }
+
+    #[test]
+    fn a_hairline_float_overlap_at_a_segment_boundary_keeps_both_words() {
+        // The same "No. No.", but with the boundary reported as two
+        // independently rounded numbers: the first segment's end computes to
+        // 0.4400001 while the second starts at exactly 0.44. That hair of
+        // overlap is rounding noise, not shared audio, and must not delete
+        // the second word.
+        let mut t = Transcript::default();
+        t.absorb(&results_from_finalize_with_span("No.", 0.0, 0.4400001));
+        t.absorb(&results_from_finalize_with_span("No.", 0.44, 0.44));
+        assert_eq!(t.finished_text(), "No. No.");
+    }
+
+    #[test]
+    fn a_suppressed_reemission_leaves_an_in_flight_interim_alone() {
+        // A re-emission of already-accepted audio says nothing about the
+        // later segment the interim is accumulating, and `finished_text`
+        // reports that interim — clearing it here would delete the tail.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("hello", 0.0, 1.5));
+        t.absorb(&results("world", false));
+        t.absorb(&results_with_span("hello", 0.2, 1.0));
+        assert_eq!(t.finished_text(), "hello world");
     }
 
     #[test]
