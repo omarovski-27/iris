@@ -40,10 +40,13 @@ fn main() {
     // output is easy to miss — the failure would only surface as a shipped exe
     // with a generic icon and blank Properties, after the zip was cut.
     if let Err(e) = res.compile() {
+        let tool = match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => "the Windows SDK's `rc.exe`",
+            _ => "the mingw `windres` that linking x86_64-pc-windows-gnu already requires",
+        };
         panic!(
             "could not embed the Windows resources (icon and version metadata): {e}\n\
-             This needs the mingw `windres` that linking x86_64-pc-windows-gnu already \
-             requires — see docs/dev-windows.md."
+             winresource drives {tool} — see docs/dev-windows.md."
         );
     }
 }

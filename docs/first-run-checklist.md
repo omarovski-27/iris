@@ -69,7 +69,7 @@ on the machine you're actually going to use Iris on.
 - [ ] Rebinding works the way it actually ships: set `hotkey` in
       `config.toml` (tray → Settings), save, then tray → Reload. `iris.exe
       --hotkey f9` does the same for one run without touching the file.
-- [ ] Each of the ten accepted keys binds and fires: `rctrl`, `lctrl`,
+- [ ] Each accepted key binds and fires: `rctrl`, `lctrl`,
       `rshift`, `ralt`, `rwin`, `capslock`, `scrolllock`, `pause`, `f8`,
       `f9`, `f10`. That is the whole set (`iris_core::hotkey::Key`); anything
       else is rejected at load. None have been exercised on real hardware.
