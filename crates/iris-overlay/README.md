@@ -273,6 +273,39 @@ Three changes, all in `iris-app` and this crate together:
   stays; what they flagged (the black scrim, the wide rectangle, the plain
   circle) is what changed.
 
+**A first cut of this composition still read as a green dot plus a timer** —
+the wave row was still sized for its old job (a decoration sharing the shape
+with a wide text run: `WAVE_MAX_H` 6, `WAVE_Y_OFFSET` 12.5), and at the
+default capsule's size that reads as a few flat, barely-visible ticks once
+there is no text for it to share space with. The old sizing could not simply
+grow, either: its bottom edge has to stay clear of the live text's ink box
+once the ribbon opens, or `theme.text_scrim` cannot cover the glyphs it backs
+— `the_wave_row_clears_the_live_text_ink_box` pins that relationship, and at
+this shape's height it only leaves a couple of px of headroom above the old
+numbers. So the row now has two sizes (`wave_geometry`, in `render/mod.rs`),
+crossfed by the same `open` tween as everything else that changes as the
+ribbon opens: `WAVE_MAX_H_REST` (22, centred on the shape) at rest, where
+nothing else shares the row's space but the core glyph — which paints over
+it, not beside it — and the timer, off to the side via `right_reserve`;
+`WAVE_MAX_H_RIBBON`/`WAVE_Y_OFFSET_RIBBON` (6 / 12.5, **unchanged** from
+before this round) once real text needs the row below it.
+`the_wave_row_has_real_presence_at_a_loud_sustained_level` pins the rest-state
+amplitude against real pixels at a sustained loud level, the same failure
+mode a quiet-only review frame cannot catch — see the evidence's
+`*-quiet-sustained.png` / `*-loud-sustained.png` pairs, held at fixed levels
+long enough to settle, specifically because an oscillating synthetic envelope
+can otherwise land every reviewed frame near a quiet moment and never show
+whether the response works at all.
+
+The core glyph (the pulsing dot / spinner / checkmark) was deliberately left
+alone. It is not only a "listening" indicator that the bigger wave row now
+duplicates — it is the *only* glyph carrying `Processing` (the spinner) and
+`Inserted` (the checkmark), so removing it just during `Listening` would mean
+it flickers in and out across state transitions, a new problem rather than a
+simplification. Any overlap between it and the now-taller centred wave row is
+resolved by draw order (`draw_glyph` paints after `draw_wave`), the same way
+it already coexisted with the old row.
+
 ## Why a CPU raster path
 
 The pill is small — even at its widest (the open ribbon) the whole frame is a

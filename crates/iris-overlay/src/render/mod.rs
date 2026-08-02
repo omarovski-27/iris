@@ -95,16 +95,32 @@ const WAVE_TARGET_PITCH: f32 = 12.0;
 const WAVE_MIN_BARS: usize = 7;
 const WAVE_MAX_BARS: usize = 40;
 const WAVE_BAR_W_FRAC: f32 = 0.46;
-/// Height of a bar at full deflection, and how far the row's centre sits
-/// above the shape's. Together they place the row's bottom edge — `h/2 -
-/// (WAVE_Y_OFFSET - WAVE_MAX_H/2)` — which has to stay clear of the top of
-/// the live text's ink box, or the text scrim (which is held below the row,
-/// see [`draw_ribbon`]) cannot cover the glyphs it exists to back.
-/// `the_wave_row_clears_the_live_text_ink_box` pins that relationship against
-/// the real font at every scale; it is the check to run before retuning
-/// either constant.
-const WAVE_MAX_H: f32 = 6.0;
-const WAVE_Y_OFFSET: f32 = 12.5;
+/// Bar height at full deflection, and how far the row's centre sits above the
+/// shape's — for the two ends of the `open` tween.
+///
+/// Round 3 (captain, live-desktop review): "waves that get bigger whenever
+/// the voice is louder" is the primary content of the default (no live text)
+/// presentation, and the row was still sized for its old job — a decoration
+/// sharing the shape with a wide text run — which reads as a few flat ticks
+/// at this shape's size. But that old sizing cannot simply grow: `_RIBBON`'s
+/// bottom edge — `h/2 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON/2)` — has to
+/// stay clear of the top of the live text's ink box once the ribbon opens, or
+/// the text scrim (held below the row, see [`draw_ribbon`]) cannot cover the
+/// glyphs it exists to back; at this shape height that ceiling is only a
+/// couple of px above the old numbers. So the row now has two sizes, crossfed
+/// by `open` exactly like everything else that changes as the ribbon opens
+/// (see [`wave_geometry`]): big and centred at rest, where nothing else
+/// shares its vertical space but the core glyph (which paints over it, not
+/// beside it) and the timer (off to the side, out of the row's x-range via
+/// `right_reserve`); small and offset once real text needs the row below it.
+/// `_RIBBON`'s numbers are untouched from before this round —
+/// `the_wave_row_clears_the_live_text_ink_box` still pins them against the
+/// real font at every scale, and that guard is the one to run before
+/// retuning either `_RIBBON` constant.
+const WAVE_MAX_H_REST: f32 = 22.0;
+const WAVE_Y_OFFSET_REST: f32 = 0.0;
+const WAVE_MAX_H_RIBBON: f32 = 6.0;
+const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
 const WAVE_IDLE_FLOOR: f32 = 0.05;
 const WAVE_PROCESSING_ENV: f32 = 0.16;
 const WAVE_RESTING_ENV: f32 = 0.05;
@@ -116,6 +132,20 @@ const SCRIM_PAD_Y: f32 = 3.0;
 /// Gap between the wave row's right edge and the timer's left edge, so the
 /// two read as sharing the capsule rather than colliding. See [`draw_timer`].
 const WAVE_TIMER_GAP: f32 = 8.0;
+
+/// The wave row's `(max_h, y_offset)`, in logical px, at a given `open`
+/// (0 = closed/rest, 1 = fully-open ribbon). Linear in `open`, the same shape
+/// of interpolation [`draw`](Renderer::draw) already uses for the shape's
+/// width, so the row's size and position track the ribbon's own morph rather
+/// than snapping between the two states.
+fn wave_geometry(open: f32) -> (f32, f32) {
+    let open = open.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| a + (b - a) * open;
+    (
+        lerp(WAVE_MAX_H_REST, WAVE_MAX_H_RIBBON),
+        lerp(WAVE_Y_OFFSET_REST, WAVE_Y_OFFSET_RIBBON),
+    )
+}
 
 /// scaleY for one wave bar. `p` is its position across the row, 0.0–1.0;
 /// `i` is its raw index, used only to decorrelate neighbours.
@@ -143,9 +173,10 @@ fn wave_alpha(listening: f32, processing: f32, inserted: f32) -> f32 {
 }
 
 /// The live waveform: a row of bars whose count and pitch are recomputed
-/// from the shape's current width every frame, sitting in a band above the
-/// shape's centre so it coexists with the text and the core glyph rather
-/// than competing with either.
+/// from the shape's current width every frame — big and centred at rest,
+/// where it is the primary content of the shape; smaller and offset once
+/// live text opens the ribbon and needs the row below it. See
+/// [`wave_geometry`] for the two sizes and why the row cannot simply grow.
 ///
 /// `right_reserve` is the device-pixel zone [`draw_timer`] needs at the right
 /// edge, in the default (no live text) presentation — the wave row's usable
@@ -161,6 +192,7 @@ fn draw_wave(
     y: f32,
     w: f32,
     h: f32,
+    open: f32,
     right_reserve: f32,
     clip: Option<&Mask>,
 ) {
@@ -189,8 +221,9 @@ fn draw_wave(
     let pitch = usable / count as f32;
     let bar_w = (pitch * WAVE_BAR_W_FRAC).max(l.scale * 0.75);
 
-    let cy = y + h * 0.5 - WAVE_Y_OFFSET * l.scale;
-    let max_h = WAVE_MAX_H * l.scale;
+    let (row_max_h, row_y_offset) = wave_geometry(open);
+    let cy = y + h * 0.5 - row_y_offset * l.scale;
+    let max_h = row_max_h * l.scale;
     let now_ms = model.now_ms();
 
     for i in 0..count {
@@ -490,6 +523,7 @@ impl Renderer {
             y,
             w,
             h,
+            open,
             timer_zone,
             cached.map(|m| &m.clip),
         );
@@ -1025,7 +1059,13 @@ fn text_band(atlas: &FontAtlas, l: &Layout, y: f32, h: f32) -> (f32, f32) {
     let (ascent, descent) = atlas.line_extents(l.text_font);
     let baseline = y + h * 0.5 + atlas.baseline_offset(l.text_font);
     let pad_y = SCRIM_PAD_Y * l.scale;
-    let wave_bottom = y + h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
+    // Deliberately the ribbon-end geometry, not `wave_geometry(open)`: this
+    // is only ever reached once live text is actually being drawn (`open`
+    // already past `HANDOFF_LO` — see `draw_ribbon`'s early return on
+    // `text_alpha`), and using the fixed, already-protected numbers here
+    // keeps this round's bigger rest-state wave row from ever affecting the
+    // one relationship `the_wave_row_clears_the_live_text_ink_box` pins.
+    let wave_bottom = y + h * 0.5 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON * 0.5) * l.scale;
     let top = (baseline - ascent - pad_y).max(wave_bottom);
     let bottom = (baseline - descent + pad_y).min(y + h);
     (top, bottom)
@@ -1307,6 +1347,48 @@ mod tests {
         );
     }
 
+    /// A visual review of the first cut of this composition found the wave
+    /// row reading as a few flat, barely-visible ticks: it was still sized
+    /// for its old job (a decoration sharing the shape with a wide text run),
+    /// not the primary content of a shape with nothing else in it. This
+    /// drives a sustained loud level and checks that some bar's ink actually
+    /// reaches well away from the row's own centre — not merely that
+    /// something, anything, is lit there.
+    #[test]
+    fn the_wave_row_has_real_presence_at_a_loud_sustained_level() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        model.apply(Command::Level(1.0));
+        let mut r = Renderer::new(1.0);
+        let mut t = 0u64;
+        // Long enough for the one-pole level smoothing to settle near 1.0.
+        while t < 600 {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+        }
+        let l = r.layout();
+        // A column inside the wave's usable span but clear of the core
+        // glyph's own small circle at dead centre, so this measures a bar,
+        // not the dot.
+        let x = (l.center_x - l.shape_h * 0.3) as u32;
+        let center_y = l.center_y as u32;
+        let mut furthest = 0u32;
+        for dy in 0..(l.shape_h * 0.5) as u32 {
+            let y = center_y.saturating_sub(dy);
+            if r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha() > 40 {
+                furthest = dy;
+            }
+        }
+        let min_reach = (WAVE_MAX_H_REST * 0.3 * l.scale) as u32;
+        assert!(
+            furthest >= min_reach,
+            "loudest bar only reached {furthest} px from centre, wanted at least {min_reach} \
+             (WAVE_MAX_H_REST {WAVE_MAX_H_REST}) — the row reads as flat ticks again"
+        );
+    }
+
     /// The captain's round-3 complaint was specifically the black band behind
     /// live text ruining the glass. Turning live text off by default (the
     /// fix) only holds if the scrim genuinely never paints without it: this
@@ -1416,12 +1498,14 @@ mod tests {
             let (ink_top, _) = atlas.ink_extents(&printable, l.text_font);
             let baseline = l.shape_h * 0.5 + atlas.baseline_offset(l.text_font);
             let ink_box_top = baseline - ink_top;
-            let wave_bottom = l.shape_h * 0.5 - (WAVE_Y_OFFSET - WAVE_MAX_H * 0.5) * l.scale;
+            let wave_bottom =
+                l.shape_h * 0.5 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON * 0.5) * l.scale;
             assert!(
                 wave_bottom < ink_box_top,
                 "scale {scale}: wave row ends at {wave_bottom}, into an ink box starting at {ink_box_top}"
             );
-            let wave_top = l.shape_h * 0.5 - (WAVE_Y_OFFSET + WAVE_MAX_H * 0.5) * l.scale;
+            let wave_top =
+                l.shape_h * 0.5 - (WAVE_Y_OFFSET_RIBBON + WAVE_MAX_H_RIBBON * 0.5) * l.scale;
             assert!(
                 wave_top > 0.0,
                 "scale {scale}: wave row starts at {wave_top}, outside the shape"
@@ -1612,8 +1696,24 @@ mod tests {
         // transform the frame was drawn with: the exit slides the shape up by
         // 10 px and shrinks it to 90 %, so a fixed window rectangle would
         // watch different parts of the shape drift past and prove nothing.
-        // The strip is the upper half of the bar row, which the checkmark
-        // (half a shape-height tall, centred) never reaches.
+        //
+        // No text is ever sent, so `wave_alpha` is a deterministic 0 for the
+        // whole monitored window: once `Inserted` is entered directly from
+        // `Listening` (skipping `Processing`, as a streaming engine's final
+        // does), its cross-fade completes long before `INSERTED_HOLD_MS`
+        // expires, and [`Ctx::state_alpha`] freezes every state weight at
+        // that value for the rest of the exit — so by the time this closure
+        // is ever sampled (only once `state()` has become `Hidden`) there is
+        // no live path left for wave ink to reappear on its own account. What
+        // this still protects is the more general property the docstring
+        // above describes: the whole row's worth of ink — shell, frozen
+        // glow, frozen checkmark, all fading only through `presence` — must
+        // never read as *more* opaque frame over frame while leaving. The
+        // sampled rectangle is the row's *entire* footprint (not a thin
+        // slice of it): large enough that the ±1 device px a continuously
+        // moving `map()` can round a rectangle edge to does not itself swing
+        // the sum by a meaningful fraction, which a narrower strip here was
+        // found to do.
         let band_alpha = |r: &Renderer, model: &Model| -> u64 {
             let l = r.layout();
             let (dy, s) = model.enter_transform(l.scale);
@@ -1624,9 +1724,15 @@ mod tests {
                     (oy + dy + (y - oy) * s).round() as u32,
                 )
             };
-            let row = l.center_y - WAVE_Y_OFFSET * l.scale;
-            let (x0, y0) = map(l.center_x - l.shape_h * 0.35, row - WAVE_MAX_H * 0.5);
-            let (x1, y1) = map(l.center_x + l.shape_h * 0.35, row);
+            let row = l.center_y - WAVE_Y_OFFSET_REST * l.scale;
+            let (x0, y0) = map(
+                l.center_x - l.shape_h * 0.45,
+                row - WAVE_MAX_H_REST * 0.5 * l.scale,
+            );
+            let (x1, y1) = map(
+                l.center_x + l.shape_h * 0.45,
+                row + WAVE_MAX_H_REST * 0.5 * l.scale,
+            );
             let mut sum = 0u64;
             for y in y0..=y1 {
                 for x in x0..=x1 {
