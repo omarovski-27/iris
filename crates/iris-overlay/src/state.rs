@@ -378,9 +378,11 @@ impl Model {
 
 /// Format elapsed milliseconds as `m:ss`, the way the mockup's timer read.
 ///
-/// No longer used by the pill itself (the ribbon shows words, not a timer),
-/// kept because `docs/spike-findings.md`-style latency tooling and the crate's
-/// own tests still find it useful for formatting elapsed time.
+/// This is the pill's timer: `render::Renderer::draw` calls it every frame on
+/// [`Model::listening_ms`] and `render::draw_timer` puts the result on screen
+/// beside the wave row (captain, round 3: "the timer beside it, of course").
+/// It went a round unrendered — the ribbon showed words there instead — which
+/// is why the round-3 timer needed no new state machinery, only a draw step.
 #[must_use]
 pub fn format_timer(ms: u64) -> String {
     let total = ms / 1000;

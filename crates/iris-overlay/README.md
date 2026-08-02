@@ -206,18 +206,19 @@ fix a problem the old one had:
 
 Bar count and pitch are recomputed from the shape's *current* width every
 frame rather than fixed, so the row is never sparse-and-thin at the wide-open
-ribbon or crowded-past-legibility at the 34px orb — a direct application of
-the fill-width lesson the old row's bug taught. It sits in a band above the
-shape's centre, coexisting with the text and the core glyph rather than
-replacing either.
+ribbon or crowded-past-legibility at the narrow resting capsule — a direct
+application of the fill-width lesson the old row's bug taught. Where the row
+sits depends on the morph, and has since round 3: centred on the shape at
+rest, in a band above the centre once live text opens the ribbon — see "Round
+3", below, for the two sizes and the `open` crossfade between them.
 
 That band has a hard lower bound. The text scrim is held below the row so it
 never darkens the bars, which means the row's bottom edge decides how much of
 the text the scrim can cover — reach too far down and the scrim gets clamped
-off the top of the ascenders, leaving them on bare glass. `WAVE_MAX_H` and
-`WAVE_Y_OFFSET` are sized to clear the tallest ink the live font can produce,
-and `the_wave_row_clears_the_live_text_ink_box` fails if either is retuned
-past that.
+off the top of the ascenders, leaving them on bare glass.
+`WAVE_MAX_H_RIBBON` and `WAVE_Y_OFFSET_RIBBON` are sized to clear the tallest
+ink the live font can produce, and `the_wave_row_clears_the_live_text_ink_box`
+fails if either is retuned past that.
 
 ## Round 3: text off by default, a narrower capsule, and a timer
 
@@ -275,7 +276,8 @@ Three changes, all in `iris-app` and this crate together:
 
 **A first cut of this composition still read as a green dot plus a timer** —
 the wave row was still sized for its old job (a decoration sharing the shape
-with a wide text run: `WAVE_MAX_H` 6, `WAVE_Y_OFFSET` 12.5), and at the
+with a wide text run: max height 6, y-offset 12.5 — the numbers now named
+`WAVE_MAX_H_RIBBON` / `WAVE_Y_OFFSET_RIBBON`), and at the
 default capsule's size that reads as a few flat, barely-visible ticks once
 there is no text for it to share space with. The old sizing could not simply
 grow, either: its bottom edge has to stay clear of the live text's ink box
@@ -289,6 +291,17 @@ nothing else shares the row's space but the core glyph — which paints over
 it, not beside it — and the timer, off to the side via `right_reserve`;
 `WAVE_MAX_H_RIBBON`/`WAVE_Y_OFFSET_RIBBON` (6 / 12.5, **unchanged** from
 before this round) once real text needs the row below it.
+Two sizes means the scrim's ceiling is now a function of `open` too.
+`text_band` takes the frame's `open` and reads the row's bottom edge from
+`wave_row_bottom` — the same `wave_geometry` crossfade `draw_wave` places its
+bars from, not a second curve. Pinning it to the ribbon-end numbers instead
+looked safe (they are the protected ones) but painted the band straight
+through the still-large bars for the whole handoff window: the row only
+reaches its `_RIBBON` size at `open == 1.0`, while the scrim is at full alpha
+from `HANDOFF_HI` (0.55). That window is invisible at both endpoints, so
+`the_text_scrim_stays_below_the_wave_row_at_every_point_of_the_morph` samples
+across the whole tween rather than at its ends.
+
 `the_wave_row_has_real_presence_at_a_loud_sustained_level` pins the rest-state
 amplitude against real pixels at a sustained loud level, the same failure
 mode a quiet-only review frame cannot catch — see the evidence's

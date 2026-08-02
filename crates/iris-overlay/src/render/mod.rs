@@ -147,6 +147,19 @@ fn wave_geometry(open: f32) -> (f32, f32) {
     )
 }
 
+/// The bottom edge of the wave row's full-deflection envelope, in device
+/// pixels, for a shape whose top is `y` and height `h`, at a given `open`.
+///
+/// The one place both [`draw_wave`] and [`text_band`] read the row's extent
+/// from, so the scrim's ceiling can never be pinned to a size the bars do not
+/// actually have yet. [`draw_wave`] places its tallest bar at `cy ± max_h/2`
+/// off the same [`wave_geometry`] pair; this is that lower edge, in closed
+/// form.
+fn wave_row_bottom(l: &Layout, y: f32, h: f32, open: f32) -> f32 {
+    let (max_h, y_offset) = wave_geometry(open);
+    y + h * 0.5 - (y_offset - max_h * 0.5) * l.scale
+}
+
 /// scaleY for one wave bar. `p` is its position across the row, 0.0–1.0;
 /// `i` is its raw index, used only to decorrelate neighbours.
 fn wave_bar_scale(p: f32, i: f32, env: f32, now_ms: u64) -> f32 {
@@ -1055,18 +1068,19 @@ fn draw_timer(
 /// window, and the run with it. The top is held at or below the waveform
 /// row's bottom edge, which
 /// `the_wave_row_clears_the_live_text_ink_box` pins against the real glyphs.
-fn text_band(atlas: &FontAtlas, l: &Layout, y: f32, h: f32) -> (f32, f32) {
+///
+/// It takes `open` for exactly one reason: the row it has to stay clear of is
+/// itself a function of `open` (see [`wave_geometry`]), and only reaches the
+/// small `_RIBBON` size at `open == 1.0`. The scrim is already at full alpha
+/// by [`HANDOFF_HI`], well before that, so pinning this ceiling to the
+/// ribbon-end numbers painted the band straight over the still-large bars for
+/// the whole handoff window. Both sides read the one `open` value the frame
+/// already has; there is no second curve here.
+fn text_band(atlas: &FontAtlas, l: &Layout, y: f32, h: f32, open: f32) -> (f32, f32) {
     let (ascent, descent) = atlas.line_extents(l.text_font);
     let baseline = y + h * 0.5 + atlas.baseline_offset(l.text_font);
     let pad_y = SCRIM_PAD_Y * l.scale;
-    // Deliberately the ribbon-end geometry, not `wave_geometry(open)`: this
-    // is only ever reached once live text is actually being drawn (`open`
-    // already past `HANDOFF_LO` — see `draw_ribbon`'s early return on
-    // `text_alpha`), and using the fixed, already-protected numbers here
-    // keeps this round's bigger rest-state wave row from ever affecting the
-    // one relationship `the_wave_row_clears_the_live_text_ink_box` pins.
-    let wave_bottom = y + h * 0.5 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON * 0.5) * l.scale;
-    let top = (baseline - ascent - pad_y).max(wave_bottom);
+    let top = (baseline - ascent - pad_y).max(wave_row_bottom(l, y, h, open));
     let bottom = (baseline - descent + pad_y).min(y + h);
     (top, bottom)
 }
@@ -1141,7 +1155,7 @@ fn draw_ribbon(
         let band_w = (text_w + 2.0 * scrim_pad).min(w);
         let band_x = (band_right - band_w).max(x);
 
-        let (band_top, band_bottom) = text_band(atlas, l, y, h);
+        let (band_top, band_bottom) = text_band(atlas, l, y, h, open);
         let band_h = band_bottom - band_top;
         if band_h > 0.0 {
             if let Some(path) = shapes::round_rect(band_x, band_top, band_w, band_h, band_h * 0.5) {
@@ -1347,45 +1361,82 @@ mod tests {
         );
     }
 
+    /// How far above the row's centre the wave's own ink reaches, in device
+    /// px, at the loudest bar in the frame.
+    ///
+    /// Measures *bar ink*, not "anything lit": the glass body fills the whole
+    /// capsule interior at [`GLASS_FILL_ALPHA`] with the ambient shadow and
+    /// state glow under it, so a low alpha threshold here is satisfied by
+    /// every interior pixel before a single bar is drawn. Bars are painted at
+    /// full alpha (`wave_alpha` is 1.0 while listening), so they are the only
+    /// thing in the row that composites to near-opaque. The run has to be
+    /// *contiguous* upward from the centre for the same reason: the lit top
+    /// edge (`inner_highlight`) is a near-opaque hairline of its own along the
+    /// top of the shape, and a plain topmost-hit scan would find it instead of
+    /// a bar.
+    fn wave_reach(r: &Renderer) -> u32 {
+        let l = r.layout();
+        let px = |x: u32, y: u32| r.pixmap().pixels()[(y * l.window_w + x) as usize];
+        let cy = l.center_y as u32;
+        // Every column of the row except the core glyph's own opaque circle at
+        // dead centre (radius ~0.17 * shape_h with its pulse) and the timer's
+        // zone off to the right — so this measures bars, never the dot or a
+        // digit. The loudest bar is whichever one the wobble has up at this
+        // instant, so all of them are considered.
+        let lo = (l.center_x - l.rest_w * 0.5 + WAVE_INSET * l.scale) as u32;
+        let hi = (l.center_x - l.shape_h * 0.25) as u32;
+        let mut furthest = 0;
+        for x in lo..hi {
+            let mut dy = 0;
+            while dy < (l.shape_h * 0.5) as u32 && px(x, cy.saturating_sub(dy)).alpha() > 200 {
+                dy += 1;
+            }
+            furthest = furthest.max(dy.saturating_sub(1));
+        }
+        furthest
+    }
+
     /// A visual review of the first cut of this composition found the wave
     /// row reading as a few flat, barely-visible ticks: it was still sized
     /// for its old job (a decoration sharing the shape with a wide text run),
     /// not the primary content of a shape with nothing else in it. This
     /// drives a sustained loud level and checks that some bar's ink actually
-    /// reaches well away from the row's own centre — not merely that
-    /// something, anything, is lit there.
+    /// reaches well away from the row's own centre — and, against a silent
+    /// frame drawn the same way, that what is being measured is the bars
+    /// responding to level at all rather than the glass underneath them.
     #[test]
     fn the_wave_row_has_real_presence_at_a_loud_sustained_level() {
-        let mut model = Model::new(PRISM_DARK);
-        model.tick(0);
-        model.apply(Command::ShowListening);
-        model.apply(Command::Level(1.0));
-        let mut r = Renderer::new(1.0);
-        let mut t = 0u64;
-        // Long enough for the one-pole level smoothing to settle near 1.0.
-        while t < 600 {
-            t += 16;
-            model.tick(t);
-            r.draw(&model);
-        }
-        let l = r.layout();
-        // A column inside the wave's usable span but clear of the core
-        // glyph's own small circle at dead centre, so this measures a bar,
-        // not the dot.
-        let x = (l.center_x - l.shape_h * 0.3) as u32;
-        let center_y = l.center_y as u32;
-        let mut furthest = 0u32;
-        for dy in 0..(l.shape_h * 0.5) as u32 {
-            let y = center_y.saturating_sub(dy);
-            if r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha() > 40 {
-                furthest = dy;
-            }
-        }
-        let min_reach = (WAVE_MAX_H_REST * 0.3 * l.scale) as u32;
+        // Long enough for the one-pole level smoothing to settle.
+        let (loud, _) = drive(
+            &[Command::ShowListening, Command::Level(1.0)],
+            600,
+            PRISM_DARK,
+        );
+        let (silent, _) = drive(
+            &[Command::ShowListening, Command::Level(0.0)],
+            600,
+            PRISM_DARK,
+        );
+
+        let reach = wave_reach(&loud);
+        let quiet_reach = wave_reach(&silent);
+        // The bar the flat-ticks cut actually drew: `_RIBBON`-sized, so its
+        // *whole* height was `WAVE_MAX_H_RIBBON`. Reaching further than that
+        // above the row's centre alone is what "real presence" means here.
+        // Deliberately not a fraction of `WAVE_MAX_H_REST` — a threshold
+        // derived from the constant under test shrinks with it and passes the
+        // regression it exists to catch.
+        let min_reach = (WAVE_MAX_H_RIBBON * loud.layout().scale) as u32;
         assert!(
-            furthest >= min_reach,
-            "loudest bar only reached {furthest} px from centre, wanted at least {min_reach} \
-             (WAVE_MAX_H_REST {WAVE_MAX_H_REST}) — the row reads as flat ticks again"
+            reach > min_reach,
+            "loudest bar only reached {reach} px from the row's centre, wanted more than \
+             {min_reach} (the whole height of the `_RIBBON`-sized row) — the row reads as \
+             flat ticks again"
+        );
+        assert!(
+            quiet_reach * 2 < reach,
+            "a silent frame measured {quiet_reach} px against the loud frame's {reach} — this \
+             is measuring the glass body, not the bars"
         );
     }
 
@@ -1434,9 +1485,15 @@ mod tests {
     /// The addendum's second requirement: an elapsed-recording timer shares
     /// the capsule with the wave row in the default presentation. This does
     /// not assert exact digits (that's `state::tests::timer_formats_like_a_stopwatch`
-    /// and `the_timer_freezes_when_speech_ends`) — just that *something* is
-    /// drawn in the right-aligned zone `draw_timer` owns, and that it is
-    /// `theme.ink`, never the near-black scrim.
+    /// and `the_timer_freezes_when_speech_ends`) — just that glyph ink is
+    /// drawn in the right-aligned zone `draw_timer` owns, in `theme.ink` and
+    /// never the near-black scrim.
+    ///
+    /// Colour is the whole of the assertion, deliberately. The zone sits
+    /// inside the capsule, so the glass body lights every pixel in it at
+    /// [`GLASS_FILL_ALPHA`] whether or not `draw_timer` runs at all; only the
+    /// crisp ink pass composites to a near-opaque pixel carrying `theme.ink`'s
+    /// own near-white RGB.
     #[test]
     fn the_timer_draws_ink_coloured_pixels_beside_the_waves() {
         let (r, _) = drive(
@@ -1445,16 +1502,35 @@ mod tests {
             PRISM_DARK,
         );
         let l = r.layout();
-        let y = l.center_y as u32;
-        let right_edge = (l.center_x + l.rest_w * 0.5) as u32;
-        let zone_start = right_edge.saturating_sub(l.text_pad_x as u32 + 40);
-        let mut lit = 0;
-        for x in zone_start..right_edge {
-            if r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha() > 0 {
-                lit += 1;
+        let ink = PRISM_DARK.ink;
+        // The run is right-aligned at `x + w - text_pad_x`; this is the zone
+        // from that edge back across the widest `m:ss` the face can produce,
+        // clear of the shape's own near-black rim at the very edge.
+        let right_edge = (l.center_x + l.rest_w * 0.5 - l.text_pad_x) as u32;
+        let zone_start = right_edge.saturating_sub(48);
+        let mut ink_px = 0;
+        for y in (l.center_y - 6.0 * l.scale) as u32..=(l.center_y + 6.0 * l.scale) as u32 {
+            for x in zone_start..=right_edge {
+                let p = r.pixmap().pixels()[(y * l.window_w + x) as usize];
+                if p.alpha() < 200 {
+                    continue;
+                }
+                // Premultiplied, but at this alpha that is a rounding error.
+                let near = |got: u8, want: u8| i32::from(got).abs_diff(i32::from(want)) < 24;
+                assert!(
+                    i32::from(p.red()) + i32::from(p.green()) + i32::from(p.blue()) >= 120,
+                    "near-black opaque pixel at ({x},{y}) in the timer zone — text_scrim \
+                     painted where only ink belongs"
+                );
+                if near(p.red(), ink.r) && near(p.green(), ink.g) && near(p.blue(), ink.b) {
+                    ink_px += 1;
+                }
             }
         }
-        assert!(lit > 3, "timer zone drew almost nothing: {lit} px");
+        assert!(
+            ink_px > 3,
+            "timer zone drew {ink_px} ink-coloured px — the timer is not rendering"
+        );
     }
 
     /// The three things one listening frame has to get right at once, and the
@@ -1513,6 +1589,45 @@ mod tests {
         }
     }
 
+    /// The same relationship, held at *every* point of the morph rather than
+    /// only at its ends — which is where it actually broke.
+    ///
+    /// `the_wave_row_clears_the_live_text_ink_box` above checks the ribbon-end
+    /// constants, and the row is only that small at `open == 1.0`; the scrim
+    /// is already at full alpha from `HANDOFF_HI` (0.55). Pinning the band's
+    /// ceiling to the ribbon-end numbers therefore painted it straight through
+    /// the still-large bars for the whole handoff window — invisible to a test
+    /// that only samples the endpoints, because the defect corrects itself
+    /// once the tween settles. The bar envelope here is recomputed from
+    /// `wave_geometry` the way `draw_wave` places its bars, not read back out
+    /// of `text_band`'s own input.
+    #[test]
+    fn the_text_scrim_stays_below_the_wave_row_at_every_point_of_the_morph() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let l = Layout::new(scale);
+            let atlas = FontAtlas::new();
+            let y = l.center_y - l.shape_h * 0.5;
+            for step in 0..=40 {
+                let open = step as f32 / 40.0;
+                if text_alpha(open) <= 0.0 {
+                    continue;
+                }
+                // Exactly `draw_wave`'s tallest bar: centred `y_offset` above
+                // the shape's centre, `max_h` tall at full deflection.
+                let (max_h, y_offset) = wave_geometry(open);
+                let cy = y + l.shape_h * 0.5 - y_offset * l.scale;
+                let bars_bottom = cy + max_h * l.scale * 0.5;
+
+                let (band_top, _) = text_band(&atlas, &l, y, l.shape_h, open);
+                assert!(
+                    band_top >= bars_bottom - 0.01,
+                    "scale {scale}, open {open}: scrim starts at {band_top}, \
+                     into a wave row reaching down to {bars_bottom}"
+                );
+            }
+        }
+    }
+
     /// The band the live text sits in must be a function of the ribbon's
     /// geometry and the face, and of nothing else. Anything derived from the
     /// shown substring moves as words scroll off the left, and the text moves
@@ -1524,7 +1639,7 @@ mod tests {
             let l = Layout::new(scale);
             let mut atlas = FontAtlas::new();
             let y = l.center_y - l.shape_h * 0.5;
-            let reference = text_band(&atlas, &l, y, l.shape_h);
+            let reference = text_band(&atlas, &l, y, l.shape_h, 1.0);
             // Every shape of run the marquee can leave behind: x-height only,
             // ascenders only, descenders only, tall punctuation, and empty.
             for text in [
@@ -1537,7 +1652,7 @@ mod tests {
             ] {
                 atlas.measure(text, l.text_font, 0.0);
                 assert_eq!(
-                    text_band(&atlas, &l, y, l.shape_h),
+                    text_band(&atlas, &l, y, l.shape_h, 1.0),
                     reference,
                     "scale {scale}: band moved for {text:?}"
                 );
