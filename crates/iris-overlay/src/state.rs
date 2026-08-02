@@ -28,8 +28,8 @@ pub enum OverlayState {
     /// shimmer sweeps the open ribbon (or a spinner, if nothing was captured).
     Processing,
     /// Text has landed in the target application. The shape collapses back to
-    /// its resting width, a check draws itself into it, latency prints, then
-    /// the pill leaves on its own.
+    /// its resting width, a check draws itself into it, then the pill leaves
+    /// on its own.
     Inserted,
 }
 
@@ -376,16 +376,32 @@ impl Model {
     }
 }
 
-/// Format elapsed milliseconds as `m:ss`, the way the mockup's timer read.
+/// The longest elapsed time the readout shows, in seconds. Past it the run
+/// saturates rather than growing a fifth character — see [`format_timer`].
+const TIMER_CEILING_S: u64 = 9 * 60 + 59;
+
+/// Format elapsed milliseconds as `m:ss`, the way the mockup's timer read,
+/// saturating at [`TIMER_CEILING_S`].
 ///
 /// This is the pill's timer: `render::Renderer::draw` calls it every frame on
 /// [`Model::listening_ms`] and `render::draw_timer` puts the result on screen
 /// beside the wave row (captain, round 3: "the timer beside it, of course").
 /// It went a round unrendered — the ribbon showed words there instead — which
 /// is why the round-3 timer needed no new state machinery, only a draw step.
+///
+/// The ceiling is a *layout* guarantee, not a claim about the recording. The
+/// resting capsule is narrow by decision, and `render::timer_right_edge`
+/// reserves the run's width away from the centred glyph's ink; a readout that
+/// could grow a character at ten minutes would spend that reservation and
+/// draw its leading digit through the spinner or the check. Bounding the
+/// format is what makes the reserved width the width the run can ever have.
+/// A dictation held past ten continuous minutes is far outside what this
+/// surface is for — the number stops being informative long before it stops
+/// being true, and `format_timer(0)`'s four characters are what the geometry
+/// is built around.
 #[must_use]
 pub fn format_timer(ms: u64) -> String {
-    let total = ms / 1000;
+    let total = (ms / 1000).min(TIMER_CEILING_S);
     format!("{}:{:02}", total / 60, total % 60)
 }
 
@@ -645,7 +661,27 @@ mod tests {
         assert_eq!(format_timer(999), "0:00");
         assert_eq!(format_timer(1_000), "0:01");
         assert_eq!(format_timer(63_000), "1:03");
-        assert_eq!(format_timer(600_000), "10:00");
+        assert_eq!(format_timer(599_000), "9:59");
+    }
+
+    /// The overlay reserves the run's width away from the centred glyph's ink
+    /// inside a capsule that is narrow by decision, so the readout growing a
+    /// character would draw a digit straight through the spinner or the
+    /// check. Every duration has to render at the width `format_timer(0)`
+    /// does — including the ones nobody should ever produce.
+    #[test]
+    fn the_timer_readout_never_grows_past_four_characters() {
+        let width = format_timer(0).chars().count();
+        assert_eq!(width, 4);
+        for ms in [0, 59_999, 599_999, 600_000, 3_600_000, 86_400_000, u64::MAX] {
+            let shown = format_timer(ms);
+            assert_eq!(
+                shown.chars().count(),
+                width,
+                "{ms} ms formatted as {shown:?}, which is wider than the geometry reserves"
+            );
+        }
+        assert_eq!(format_timer(600_000), "9:59", "the readout must saturate");
     }
 
     #[test]

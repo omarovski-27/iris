@@ -150,11 +150,12 @@ fn wave_geometry(open: f32) -> (f32, f32) {
 /// The bottom edge of the wave row's full-deflection envelope, in device
 /// pixels, for a shape whose top is `y` and height `h`, at a given `open`.
 ///
-/// The one place both [`draw_wave`] and [`text_band`] read the row's extent
-/// from, so the scrim's ceiling can never be pinned to a size the bars do not
-/// actually have yet. [`draw_wave`] places its tallest bar at `cy ± max_h/2`
-/// off the same [`wave_geometry`] pair; this is that lower edge, in closed
-/// form.
+/// [`text_band`] is the only caller: this is how the scrim's ceiling reads the
+/// row's real extent instead of a size the bars do not actually have yet.
+/// [`wave_geometry`] — not this function — is what both sides share.
+/// [`draw_wave`] calls it directly and places its tallest bar at
+/// `cy ± max_h/2`; this is that lower edge off the same pair, in closed form,
+/// so retuning the row means retuning [`wave_geometry`] and both follow.
 fn wave_row_bottom(l: &Layout, y: f32, h: f32, open: f32) -> f32 {
     let (max_h, y_offset) = wave_geometry(open);
     y + h * 0.5 - (y_offset - max_h * 0.5) * l.scale
@@ -193,10 +194,12 @@ fn wave_alpha(listening: f32, processing: f32, inserted: f32) -> f32 {
 ///
 /// `right_reserve` is the device-pixel zone [`draw_timer`] needs at the right
 /// edge, in the default (no live text) presentation — the wave row's usable
-/// width shrinks to leave it room rather than the two overlapping. It shrinks
-/// to zero in lockstep with the timer's own fade as live text opens the
-/// ribbon, so the row smoothly reclaims the full width exactly as the timer
-/// vacates it.
+/// width shrinks to leave it room rather than the two overlapping. It is
+/// measured from where the run actually lands (see [`timer_right_edge`], which
+/// may push the timer in past the resting padding to clear the centred glyph)
+/// and scales by [`timer_alpha`], so it shrinks to zero in lockstep with the
+/// timer's own fade as live text opens the ribbon and the row reclaims the
+/// full width exactly as the timer vacates it.
 #[allow(clippy::too_many_arguments)]
 fn draw_wave(
     pixmap: &mut Pixmap,
@@ -339,6 +342,89 @@ fn glyph_alpha(open: f32) -> f32 {
 /// exposure.
 fn text_alpha(open: f32) -> f32 {
     ((open - HANDOFF_LO) / (HANDOFF_HI - HANDOFF_LO)).clamp(0.0, 1.0)
+}
+
+/// How visible the elapsed-recording timer is.
+///
+/// Deliberately *not* [`glyph_alpha`], which is what it used to borrow. The
+/// centred glyph can afford a crossfade that overlaps [`text_alpha`]'s
+/// because it sits in the middle of the shape; the timer is drawn at the
+/// ribbon's own right-aligned anchor — the exact pixels the newest live word
+/// occupies — so every `open` leaving both non-zero composites digits over
+/// that word. Being a *steeper* ramp that reaches zero at [`HANDOFF_LO`], the
+/// open value below which `text_alpha` is zero, is the whole mechanism: the
+/// two supports are disjoint by construction, and the timer still fades
+/// rather than popping.
+/// `the_timer_and_the_live_text_never_share_the_right_aligned_row` walks the
+/// tween and holds both halves of that.
+fn timer_alpha(open: f32) -> f32 {
+    ((HANDOFF_LO - open) / HANDOFF_LO).clamp(0.0, 1.0)
+}
+
+// The centred glyph's own measurements, as fractions of the shape's height.
+// [`draw_glyph`] paints with them and [`glyph_half_w`] reserves clearance
+// from them, so the zone the timer keeps out of cannot drift away from the
+// ink it exists to keep clear of.
+const CORE_R_FRAC: f32 = 0.15;
+const CORE_PULSE_MAX: f32 = 1.12;
+const HALO_R_FRAC: f32 = 0.16;
+const HALO_GROW_FRAC: f32 = 0.22;
+const SPINNER_R_FRAC: f32 = 0.32;
+const SPINNER_STROKE_FRAC: f32 = 0.045;
+const CHECK_SIZE_FRAC: f32 = 0.6;
+const CHECK_STROKE_FRAC: f32 = 0.09;
+
+/// Clear air between the centred glyph's ink and the timer's leading digit,
+/// in logical pixels.
+const GLYPH_TIMER_GAP: f32 = 5.0;
+/// Least air the timer leaves between its last digit and the capsule's right
+/// edge, in logical pixels — the bound on how far [`timer_right_edge`] may
+/// push the run inward from its resting anchor to buy that clearance.
+const TIMER_EDGE_PAD_MIN: f32 = 9.0;
+
+/// How far the centred glyph's ink can reach either side of the shape's
+/// centre, in device pixels: the widest of everything [`draw_glyph`] paints
+/// there — the listening halo at its outermost, the pulsing core at the top of
+/// its pulse, the processing spinner's stroked outer edge, and the inserted
+/// check.
+///
+/// The timer shares that row, so this is what it has to clear. Measuring the
+/// halo at its *fully grown* radius rather than only the solid marks is
+/// deliberate: the ring is faint by then, but a readout clearing the spinner
+/// alone would still have it sweep through the digits once a pulse. The check
+/// is measured from its own path bounds because its ink fills only the middle
+/// of the box it is authored in — half the box would over-reserve by 5 px.
+fn glyph_half_w(l: &Layout) -> f32 {
+    let half_stroke = |frac: f32| (l.shape_h * frac).max(l.scale) * 0.5;
+    let halo = l.shape_h * (HALO_R_FRAC + HALO_GROW_FRAC);
+    let core = l.shape_h * CORE_R_FRAC * CORE_PULSE_MAX;
+    let spinner = l.shape_h * SPINNER_R_FRAC + half_stroke(SPINNER_STROKE_FRAC);
+    let check = shapes::check_mark(0.0, 0.0, l.shape_h * CHECK_SIZE_FRAC)
+        .map_or(0.0, |(path, _)| path.bounds().right())
+        + half_stroke(CHECK_STROKE_FRAC);
+    halo.max(core).max(spinner).max(check)
+}
+
+/// The device-pixel x the timer's run is right-aligned on, for a shape that
+/// starts at `x` and is `w` wide and a run that measures `timer_w`.
+///
+/// The resting answer is the ribbon's own right padding, so the timer sits in
+/// the same padded interior live text would. It is pushed further in only as
+/// far as clearing [`glyph_half_w`] by [`GLYPH_TIMER_GAP`] takes, and never
+/// closer to the capsule's edge than [`TIMER_EDGE_PAD_MIN`].
+///
+/// This exists because the shape is narrow on purpose ([`crate::layout::REST_W`],
+/// captain-locked) and both the glyph and the timer are centred on fixed
+/// anchors inside it: at the resting padding a four-character readout's
+/// leading digit landed *on* the spinner's outer edge. Reserving against the
+/// glyph rather than widening the capsule is the trade this shape asks for —
+/// and the clamp is the honest half of it, so a future wider run degrades to
+/// less clearance instead of digits hanging off the glass.
+fn timer_right_edge(l: &Layout, x: f32, w: f32, timer_w: f32) -> f32 {
+    let clear_of_glyph = l.center_x + glyph_half_w(l) + GLYPH_TIMER_GAP * l.scale + timer_w;
+    (x + w - l.text_pad_x)
+        .max(clear_of_glyph)
+        .min(x + w - TIMER_EDGE_PAD_MIN * l.scale)
 }
 
 /// Draws one pill frame into an RGBA pixmap.
@@ -520,13 +606,21 @@ impl Renderer {
             fill_through(pixmap, &m.glow, glow.fade(presence));
         }
 
-        // The timer shares the closed-state glyph's crossfade: it fades out
-        // exactly as live text fades in, so the two never fight over the
-        // same right-aligned zone. See `draw_wave`'s `right_reserve`.
+        // The timer and the live text are drawn on one shared right-aligned
+        // anchor, so they must never both be visible: `timer_alpha` is zero at
+        // every `open` where `text_alpha` is non-zero, which is what enforces
+        // that — not the wider `glyph_alpha` window the centred glyph can
+        // afford. `timer_zone` is measured from where the run actually lands
+        // (`timer_right_edge` may push it in past the resting padding to clear
+        // the glyph), so `draw_wave`'s `right_reserve` tracks the timer rather
+        // than a nominal position.
         let glyph_a = glyph_alpha(open);
+        let timer_a = timer_alpha(open);
         let timer_text = format_timer(model.listening_ms());
         let timer_w = atlas.measure(&timer_text, layout.text_font, 0.0);
-        let timer_zone = (layout.text_pad_x + timer_w + WAVE_TIMER_GAP * layout.scale) * glyph_a;
+        let timer_right = timer_right_edge(layout, x, w, timer_w);
+        let timer_zone =
+            ((x + w - timer_right) + timer_w + WAVE_TIMER_GAP * layout.scale) * timer_a;
 
         draw_shell(pixmap, &ctx, &shape, x, y, w, h, r, cached.map(|m| &m.clip));
         draw_wave(
@@ -541,7 +635,15 @@ impl Renderer {
             cached.map(|m| &m.clip),
         );
         draw_glyph(pixmap, &ctx, glyph_a);
-        draw_timer(pixmap, &ctx, atlas, x, y, w, h, glyph_a, &timer_text);
+        draw_timer(
+            pixmap,
+            &ctx,
+            atlas,
+            timer_right,
+            y + h * 0.5,
+            timer_a,
+            &timer_text,
+        );
         if open > 0.02 && has_text {
             draw_ribbon(
                 pixmap,
@@ -920,7 +1022,7 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
     if listening > 0.001 {
         let t = (model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
         let grow = (t / 0.7).min(1.0);
-        let halo_r = l.shape_h * 0.16 + l.shape_h * 0.22 * grow;
+        let halo_r = l.shape_h * HALO_R_FRAC + l.shape_h * HALO_GROW_FRAC * grow;
         let halo_a = 0.4 * (1.0 - grow) * listening * alpha;
         if let Some(p) = shapes::circle(cx, cy, halo_r) {
             fill(pixmap, ctx, &p, ctx.c(theme.rec.fade(halo_a)));
@@ -928,13 +1030,14 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
     }
 
     let core_colour = core_colour(theme, model);
-    let mut core_r = l.shape_h * 0.15;
+    let mut core_r = l.shape_h * CORE_R_FRAC;
     if listening > 0.0 {
         let t = (model.now_ms() % u64::from(REC_PULSE_MS)) as f32 / REC_PULSE_MS as f32;
+        let swell = CORE_PULSE_MAX - 1.0;
         let pulse = if t < 0.7 {
-            1.0 + 0.12 * (t / 0.7)
+            1.0 + swell * (t / 0.7)
         } else {
-            1.12 - 0.12 * ((t - 0.7) / 0.3)
+            CORE_PULSE_MAX - swell * ((t - 0.7) / 0.3)
         };
         core_r *= 1.0 + (pulse - 1.0) * listening;
     }
@@ -949,20 +1052,20 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
         let turn = (model.now_ms() % u64::from(SPINNER_PERIOD_MS)) as f32
             / SPINNER_PERIOD_MS as f32
             * 360.0;
-        let radius = l.shape_h * 0.32;
+        let radius = l.shape_h * SPINNER_R_FRAC;
         for (offset, colour) in [(-45.0, theme.spinner.0), (45.0, theme.spinner.1)] {
             stroke(
                 pixmap,
                 ctx,
                 shapes::arc(cx, cy, radius, turn + offset, 90.0),
                 ctx.c(colour.fade(processing * alpha)),
-                (l.shape_h * 0.045).max(l.scale),
+                (l.shape_h * SPINNER_STROKE_FRAC).max(l.scale),
             );
         }
     }
 
     if inserted > 0.001 {
-        if let Some((path, length)) = shapes::check_mark(cx, cy, l.shape_h * 0.6) {
+        if let Some((path, length)) = shapes::check_mark(cx, cy, l.shape_h * CHECK_SIZE_FRAC) {
             // `age_ms` restarts at every transition, so once the pill has left
             // `Inserted` it no longer measures how long the check has been
             // drawing itself — reading it during the exit made a finished
@@ -977,7 +1080,7 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
             paint.set_color(ctx.c(theme.ok.fade(inserted * alpha)).to_color());
             paint.anti_alias = true;
             let stroke_style = Stroke {
-                width: (l.shape_h * 0.09).max(l.scale),
+                width: (l.shape_h * CHECK_STROKE_FRAC).max(l.scale),
                 line_cap: tiny_skia::LineCap::Round,
                 line_join: tiny_skia::LineJoin::Round,
                 dash: StrokeDash::new(vec![length, length], length * (1.0 - progress)),
@@ -992,14 +1095,18 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 /// live-text ribbon used, sharing the capsule with the wave row rather than
 /// sitting under it — this design's second round rejected an under-pill
 /// caption outright, and the fix here is not to resurrect that placement in
-/// a new form. `alpha` is [`glyph_alpha`], the same crossfade the closed-state
-/// core glyph uses, so the timer is what occupies this row's default (no
-/// live text) state and steps aside the instant real words arrive.
+/// a new form. `alpha` is [`timer_alpha`], *not* the [`glyph_alpha`] the
+/// centred glyph uses: this run and the ribbon's are drawn on one anchor, so
+/// only a fade that is zero wherever [`text_alpha`] is non-zero keeps digits
+/// off the newest live word. `right` is [`timer_right_edge`], which holds the
+/// run clear of the centred glyph inside a capsule too narrow for the resting
+/// padding to do it alone.
 ///
 /// Cascadia Mono is monospaced (`the_face_is_monospaced` pins this), so every
-/// digit and the colon share one advance width: the run never reshuffles
-/// itself as the seconds tick, only grows a character every ten minutes of
-/// continuous listening.
+/// digit and the colon share one advance width and the run never reshuffles
+/// itself as the seconds tick. It cannot grow a character either:
+/// [`format_timer`] saturates, so the width reserved against the glyph is the
+/// width the run can ever have.
 ///
 /// Legibility is solved without a dark backing plate — the captain's
 /// complaint this round is specifically that something black behind text
@@ -1007,15 +1114,12 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 /// sub-pixel in four directions at low alpha in the same ink colour before
 /// the crisp full-alpha pass: a soft, colour-matched glow that thickens the
 /// strokes rather than a plate that sits on top of the surface.
-#[allow(clippy::too_many_arguments)]
 fn draw_timer(
     pixmap: &mut Pixmap,
     ctx: &Ctx<'_>,
     atlas: &mut FontAtlas,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+    right: f32,
+    center_y: f32,
     alpha: f32,
     text: &str,
 ) {
@@ -1026,7 +1130,7 @@ fn draw_timer(
     let theme = ctx.theme;
     let a = ctx.alpha * alpha;
 
-    let (tx, ty) = ctx.map(x + w - l.text_pad_x, y + h * 0.5);
+    let (tx, ty) = ctx.map(right, center_y);
 
     let halo_a = a * 0.35;
     if halo_a > 0.001 {
@@ -1503,11 +1607,15 @@ mod tests {
         );
         let l = r.layout();
         let ink = PRISM_DARK.ink;
-        // The run is right-aligned at `x + w - text_pad_x`; this is the zone
-        // from that edge back across the widest `m:ss` the face can produce,
-        // clear of the shape's own near-black rim at the very edge.
-        let right_edge = (l.center_x + l.rest_w * 0.5 - l.text_pad_x) as u32;
-        let zone_start = right_edge.saturating_sub(48);
+        // The zone the run actually lands in, read from the same helper the
+        // renderer places it with rather than a repeated formula — the two
+        // drifted apart once the timer started being pushed in to clear the
+        // glyph.
+        let mut atlas = FontAtlas::new();
+        let timer_w = atlas.measure(&format_timer(1_200), l.text_font, 0.0);
+        let x = l.center_x - l.rest_w * 0.5;
+        let right_edge = timer_right_edge(l, x, l.rest_w, timer_w) as u32;
+        let zone_start = (right_edge as f32 - timer_w) as u32;
         let mut ink_px = 0;
         for y in (l.center_y - 6.0 * l.scale) as u32..=(l.center_y + 6.0 * l.scale) as u32 {
             for x in zone_start..=right_edge {
@@ -2094,6 +2202,101 @@ mod tests {
                 "open={open}: glyph is nearly opaque while text is not yet faded, the original bug"
             );
             open += 0.01;
+        }
+    }
+
+    /// `draw_timer` and `draw_ribbon` draw on the *same* anchor — right
+    /// aligned at the shape's text padding — so, unlike the centred glyph,
+    /// they cannot share a crossfade window: any `open` leaving both visible
+    /// composites the elapsed digits over the newest live word. That was real
+    /// for the ~30-50 ms the ribbon spends between `HANDOFF_LO` and
+    /// `HANDOFF_HI` on every open and every collapse.
+    ///
+    /// The second half matters as much as the first: mutual exclusion is
+    /// trivial to get by hard-cutting the timer to zero the moment text
+    /// exists, which would pop a fully-opaque readout off the glass. This
+    /// pins that the timer still *fades*.
+    #[test]
+    fn the_timer_and_the_live_text_never_share_the_right_aligned_row() {
+        let steps = 1_000;
+        let mut previous = timer_alpha(0.0);
+        assert!(previous > 0.99, "the resting capsule must show its timer");
+        for i in 0..=steps {
+            let open = i as f32 / steps as f32;
+            let (timer, text) = (timer_alpha(open), text_alpha(open));
+            assert!(
+                timer <= 0.001 || text <= 0.001,
+                "open={open}: timer at {timer} and live text at {text} over one anchor"
+            );
+            assert!(
+                (timer - previous).abs() < 0.02,
+                "open={open}: the timer's alpha jumped {} in one step — that is a pop, not a fade",
+                (timer - previous).abs()
+            );
+            previous = timer;
+        }
+        assert!(
+            timer_alpha(1.0) <= 0.001,
+            "the open ribbon must not carry a timer"
+        );
+    }
+
+    /// The capsule is narrow by decision, and both the glyph and the timer are
+    /// centred on fixed anchors inside it, so nothing about the composition
+    /// guarantees they miss each other — at the resting padding a four-character
+    /// readout's leading digit landed on the spinner's outer edge, and an
+    /// unbounded format put it inside the checkmark. Measured with the real
+    /// face at every scale, against the widest run the format can produce.
+    #[test]
+    fn the_timer_keeps_real_air_between_itself_and_the_centred_glyph() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
+            let l = Layout::new(scale);
+            let mut atlas = FontAtlas::new();
+            // Saturating format: this is the widest run that can ever be
+            // drawn, whatever the model's clock says.
+            let widest = format_timer(u64::MAX);
+            let timer_w = atlas.measure(&widest, l.text_font, 0.0);
+            let x = l.center_x - l.rest_w * 0.5;
+            let right = timer_right_edge(&l, x, l.rest_w, timer_w);
+            let gap = (right - timer_w) - (l.center_x + glyph_half_w(&l));
+            assert!(
+                gap >= GLYPH_TIMER_GAP * scale - 0.01,
+                "scale {scale}: only {gap} device px between the glyph's ink and {widest:?}"
+            );
+            assert!(
+                right <= x + l.rest_w - TIMER_EDGE_PAD_MIN * scale + 0.01,
+                "scale {scale}: the run was pushed to {right}, past the capsule's own padding"
+            );
+            assert!(
+                right >= x + l.rest_w - l.text_pad_x - 0.01,
+                "scale {scale}: the run moved left of its resting anchor"
+            );
+        }
+    }
+
+    /// `glyph_half_w` is what buys that clearance, so it has to cover every
+    /// mark `draw_glyph` can paint — including the listening halo at its
+    /// widest, which is the outermost of them and the easiest to forget
+    /// because it is faint by the time it gets there.
+    #[test]
+    fn the_reserved_glyph_width_covers_every_mark_the_glyph_draws() {
+        let l = Layout::new(1.0);
+        let reserved = glyph_half_w(&l);
+        let spinner = l.shape_h * SPINNER_R_FRAC + (l.shape_h * SPINNER_STROKE_FRAC) * 0.5;
+        let halo = l.shape_h * (HALO_R_FRAC + HALO_GROW_FRAC);
+        let core = l.shape_h * CORE_R_FRAC * CORE_PULSE_MAX;
+        let (check, _) = shapes::check_mark(0.0, 0.0, l.shape_h * CHECK_SIZE_FRAC).unwrap();
+        let check = check.bounds().right() + (l.shape_h * CHECK_STROKE_FRAC) * 0.5;
+        for (name, reach) in [
+            ("spinner", spinner),
+            ("halo", halo),
+            ("core", core),
+            ("check", check),
+        ] {
+            assert!(
+                reserved >= reach - 0.01,
+                "the {name} reaches {reach} px from centre, but only {reserved} is reserved"
+            );
         }
     }
 }

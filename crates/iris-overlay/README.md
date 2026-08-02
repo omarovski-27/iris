@@ -254,17 +254,45 @@ Three changes, all in `iris-app` and this crate together:
   (`render::draw_timer`), built entirely from machinery that already existed
   unrendered in `state.rs` (`listen_started_at`, `freeze_timer`,
   `Model::listening_ms`, `format_timer`) — no second timer was built. It
-  crossfades with the same `glyph_alpha(open)` token the closed-state core
-  glyph already used, so it is what occupies the default presentation and
-  steps aside the instant live text opens the ribbon; `render::draw_wave`
-  gained a `right_reserve` parameter that shrinks in lockstep so the wave row
-  reclaims the freed width rather than the two overlapping. Cascadia Mono is
-  monospaced (`the_face_is_monospaced` pins this, with the timer named in the
-  test itself), so the digits never jitter as seconds tick over. Legibility is
+  occupies the default presentation and steps aside the instant live text
+  opens the ribbon; `render::draw_wave` gained a `right_reserve` parameter
+  that shrinks in lockstep so the wave row reclaims the freed width rather
+  than the two overlapping. Cascadia Mono is monospaced
+  (`the_face_is_monospaced` pins this, with the timer named in the test
+  itself), so the digits never jitter as seconds tick over. Legibility is
   solved without a dark backing plate — the captain's exact complaint this
   round — by drawing the run a second time at a sub-pixel offset in the same
   ink colour at low alpha before the crisp pass: a soft, colour-matched glow
   instead of a plate sitting on the glass.
+
+  **Two things the timer does not get to borrow from the glyph beside it.**
+  It first shipped fading on `glyph_alpha(open)` and anchored on the ribbon's
+  right padding, and both are wrong for a run that is neither centred nor
+  bounded by the shape alone:
+  - *The anchor is shared with the live text.* `draw_timer` and `draw_ribbon`
+    both draw right-aligned at `x + w - text_pad_x`, so a crossfade window
+    where `glyph_alpha` and `text_alpha` are both non-zero — every `open`
+    between `HANDOFF_LO` and `HANDOFF_HI`, i.e. ~30–50 ms of each open and
+    each collapse — composited elapsed digits over the newest word. The
+    centred glyph can afford that overlap; this cannot. `render::timer_alpha`
+    is a steeper ramp that reaches zero exactly at `HANDOFF_LO`, so the two
+    supports are disjoint by construction and the timer still fades rather
+    than popping.
+    `the_timer_and_the_live_text_never_share_the_right_aligned_row` holds both
+    halves.
+  - *Nothing made it miss the glyph.* At `REST_W = 128` a four-character
+    `0:00` at the resting padding put its leading digit on the spinner's outer
+    edge, and an unbounded format put a five-character `10:00` inside the
+    checkmark. `state::format_timer` now saturates at `9:59` — a layout
+    guarantee, so the reserved width is the width the run can ever have — and
+    `render::timer_right_edge` pushes the run in from the resting padding by
+    however much clearing `glyph_half_w` (the widest mark `draw_glyph` paints,
+    the listening halo included) by `GLYPH_TIMER_GAP` takes, never past
+    `TIMER_EDGE_PAD_MIN` of the capsule's edge. `REST_W` did not grow: the
+    clearance is bought from the timer's own right padding (18 → ~11 logical
+    px), which the capsule's end cap has to spare and the captain's "narrow"
+    does not. `right_reserve` is measured from where the run actually lands,
+    so the wave row follows it.
 - **`theme.text_scrim` was already correctly gated** — `render::mod.rs`'s
   `draw_ribbon` (the only place it paints) is called only when the ribbon is
   meaningfully open *and* live text is non-empty, so turning `show_live_text`
@@ -417,6 +445,13 @@ cargo run --example pill-demo -- --filmstrip /tmp/iris-pill --utterance long --s
 
 # The opt-in ribbon, as `iris-app`'s show_live_text = true gives it.
 cargo run --example pill-demo -- --filmstrip /tmp/iris-ribbon --live-text on
+
+# A held level on a synthetic desktop — how the wave row's volume response is
+# judged, and the two pieces `--evidence` is built from.
+cargo run --example pill-demo -- --filmstrip /tmp/iris-loud --hold-level 1.0 --backdrop
+
+# Regenerate the committed review set in place (both themes, every phase).
+cargo run --example pill-demo -- --evidence crates/iris-overlay/docs/round3-evidence
 ```
 
 The demo drives a full cycle with a synthetic speech envelope — syllables
@@ -427,6 +462,13 @@ review, when `--live-text on`). `--live-text off`, the demo's own default,
 sends no partial text at all — exactly what `show_live_text = false` does to
 this crate in the shipped app — so the default capsule-with-waves-and-timer
 presentation is reviewable the same way.
+
+`--hold-level` replaces that envelope with a constant, which is the only way
+to compare a quiet frame with a loud one (an oscillating level can put every
+frame of a review pass near the same moment of the swell), and `--backdrop`
+composites onto a synthetic desktop, without which a glass shape is reviewed
+against nothing. `--evidence` is those two plus a fixed shot list, and is what
+regenerates `docs/round3-evidence/` — see that directory's README.
 
 ### From WSL
 
