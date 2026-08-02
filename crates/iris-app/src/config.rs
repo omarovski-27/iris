@@ -640,7 +640,7 @@ mod tests {
             engine: EngineChoice::Deepgram,
             hotkey: Key::F9,
             theme: Theme::Light,
-            show_live_text: false,
+            show_live_text: true,
             ..Config::default()
         };
         config.polish.budget_ms = 220;

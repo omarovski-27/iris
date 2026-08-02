@@ -137,7 +137,7 @@ and the motion budget are not.
 | Motion | `motion.rs` timings and curves | **Identical** — every constant is imported, none copied |
 | Colour | Prism dark / Porcelain light | Same two palettes, same tokens, no new colours needed |
 | Waveform | 28-bar spectrum (`spectrum.rs`) | A new, independently-tuned bar row in `render/mod.rs`'s `draw_wave` — see "Glass, and the wave came back", below. `spectrum.rs` itself is gone; nothing shares code with it. |
-| Shell | Opaque | Translucent glass at a constant `GLASS_FILL_ALPHA`; legibility is `theme.text_scrim` behind the run alone, never a text-linked opacity ramp on the shell |
+| Shell | Opaque | Translucent glass at a constant `GLASS_FILL_ALPHA`; legibility is carried per-run — `theme.text_scrim` behind the live text, `theme.timer_edge` around the timer's digits — never a text-linked opacity ramp on the shell |
 | Transcript | Never held (`set_partial_len`, a count) | Held while on screen (`set_partial_text`, the string) |
 | Engine chip | Rendered below the pill | Carried on the model, not rendered — no room without competing with the words |
 
@@ -259,11 +259,33 @@ Three changes, all in `iris-app` and this crate together:
   that shrinks in lockstep so the wave row reclaims the freed width rather
   than the two overlapping. Cascadia Mono is monospaced
   (`the_face_is_monospaced` pins this, with the timer named in the test
-  itself), so the digits never jitter as seconds tick over. Legibility is
-  solved without a dark backing plate — the captain's exact complaint this
-  round — by drawing the run a second time at a sub-pixel offset in the same
-  ink colour at low alpha before the crisp pass: a soft, colour-matched glow
-  instead of a plate sitting on the glass.
+  itself), so the digits never jitter as seconds tick over.
+
+  **Legibility, without a dark backing plate.** A plate is the captain's exact
+  complaint this round, and `theme.text_scrim` — the token that does carry a
+  contrast promise — is gated on live text and stays that way, so the timer
+  cannot borrow it. The first attempt drew the run a second time at a
+  sub-pixel offset *in `theme.ink` itself* at low alpha; that thickens the
+  strokes and adds no contrast whatsoever, because a same-colour halo cannot
+  separate a glyph from a backing at the same luminance. Prism's near-white
+  digits over a white desktop showing through the glass scored a contrast
+  ratio of about **1.03** — the readout effectively disappeared in the
+  presentation most users now see. What replaced it is an outline rather than
+  a plate: the run is traced `TIMER_EDGE_OFFSET` out in eight directions in a
+  new `theme.timer_edge` token before the crisp `theme.ink` pass. The colour
+  is the mechanism — `timer_edge` is the opposite end of each theme's
+  luminance range from its `ink` (Prism: a saturated steel blue `#1B4D7A`;
+  Porcelain: a cool near-white `#F4F8FF`), so whatever the desktop is doing,
+  one of the two reads: the fill when the backing is far from `ink`, the
+  outline when it is near. There is no third case, which is why this needs no
+  backdrop sampling — which a layered window does not get anyway.
+  `theme::tests::the_timer_edge_reads_against_any_desktop_the_ink_cannot`
+  holds both halves against the real composited shell, its sibling
+  `the_ink_alone_does_disappear_somewhere_which_is_why_the_outline_exists`
+  keeps that from passing on the ink's own contribution, and
+  `render::tests::the_timer_is_traced_in_an_outline_colour_that_is_not_its_ink`
+  checks the outline actually reaches the pixmap — a gap the same-colour halo
+  it replaced was invisible to by construction.
 
   **Two things the timer does not get to borrow from the glyph beside it.**
   It first shipped fading on `glyph_alpha(open)` and anchored on the ribbon's

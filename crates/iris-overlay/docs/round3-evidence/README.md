@@ -20,6 +20,18 @@ pieces are available on their own for one-off review passes —
 `--filmstrip <dir> --hold-level 1.0 --backdrop` — see the crate README's
 "Running the demo".
 
+**What the backdrop is arranged to show.** Its two contrast bands — one near
+black, one near white — are anchored on the shape's own rectangle, rebuilt
+from `Layout` rather than from fractions of the frame, and the seam between
+them is placed to fall through the middle of the four-character timer
+readout. So each default frame shows the same digits over both contrast
+directions at once, which is what these frames have to answer for: the timer
+is drawn straight onto the glass with no scrim behind it, and its legibility
+rests on `theme.timer_edge` outlining it in the opposite end of the theme's
+luminance range (see the crate README, "Round 3"). An earlier version of this
+set gated the bands on frame corners; neither band intersected the shape, so
+every capsule sat on plain mid-gradient and the set demonstrated none of this.
+
 - `*-quiet-sustained.png` / `*-loud-sustained.png` — the volume response,
   judged by eye: `Command::Level` held constant (0.05 vs 1.0) long enough for
   the level smoothing to settle, so these two are directly comparable rather

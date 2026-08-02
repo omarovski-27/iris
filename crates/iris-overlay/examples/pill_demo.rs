@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use iris_overlay::{
-    spawn, Command, HeadlessOverlay, OverlayConfig, OverlayState, Theme, PORCELAIN_LIGHT,
+    spawn, Command, HeadlessOverlay, Layout, OverlayConfig, OverlayState, Theme, PORCELAIN_LIGHT,
     PRISM_DARK,
 };
 use tiny_skia::{Pixmap, PremultipliedColorU8};
@@ -115,22 +115,24 @@ struct Args {
     filmstrip_step: u64,
 
     /// Hold the microphone level at this value (0.0–1.0) instead of running
-    /// the synthetic speech envelope.
+    /// the synthetic speech envelope. Applies in every mode.
     ///
     /// The envelope oscillates, so two arbitrary frames of it say nothing
     /// about whether the wave row answers volume at all — every frame of a
     /// review pass can land near a quiet moment by chance. A held level, given
     /// long enough for the one-pole level smoothing to settle, makes a quiet
     /// frame and a loud one directly comparable.
-    #[arg(long)]
+    #[arg(long, value_parser = unit_level)]
     hold_level: Option<f32>,
 
     /// Composite each written PNG over a synthetic busy desktop instead of
-    /// leaving it transparent.
+    /// leaving it transparent — in filmstrip and evidence modes.
     ///
     /// The shape is glass: on a transparent PNG (or a viewer's checkerboard)
     /// there is nothing behind it to refract, which is most of what there is
-    /// to review. See [`backdrop_pixmap`].
+    /// to review. See [`backdrop_pixmap`]. Live mode writes no PNG and has a
+    /// real desktop behind the window already, so there is nothing for this
+    /// to stand in for there.
     #[arg(long)]
     backdrop: bool,
 
@@ -138,6 +140,21 @@ struct Args {
     /// `docs/round3-evidence/` — to this directory. Implies `--backdrop`.
     #[arg(long)]
     evidence: Option<PathBuf>,
+}
+
+/// Parse a microphone level, rejecting anything outside 0.0–1.0 at the
+/// command line rather than letting `Command::Level` quietly clamp it: a
+/// `--hold-level 50` meaning "50 %" would otherwise render as a silent full
+/// deflection and be read as the wave row ignoring the flag.
+fn unit_level(raw: &str) -> Result<f32, String> {
+    let v: f32 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("level must be between 0.0 and 1.0, got {v}"))
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -184,6 +201,9 @@ fn live(
     let pill = overlay.handle();
 
     println!("theme: {}", theme.name);
+    if let Some(level) = args.hold_level {
+        println!("level: held at {level:.2}, not the synthetic speech envelope");
+    }
     println!(
         "cycle: listen {} ms -> processing {} ms -> inserted (latency {} ms) -> hidden",
         cycle.listen_ms, cycle.process_ms, cycle.latency_ms
@@ -198,7 +218,7 @@ fn live(
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(cycle.listen_ms) {
             let t = start.elapsed().as_millis() as u64;
-            pill.update_level(synthetic_level(t));
+            pill.update_level(args.hold_level.unwrap_or_else(|| synthetic_level(t)));
             if live_text {
                 pill.set_partial_text(words_said_by(t, utterance));
             }
@@ -434,7 +454,7 @@ fn write_frame(
         return Ok(());
     }
     let frame = pill.frame();
-    let mut pixmap = backdrop_pixmap(frame.width, frame.height).ok_or_else(|| {
+    let mut pixmap = backdrop_pixmap(frame.width, frame.height, pill.scale()).ok_or_else(|| {
         format!(
             "cannot allocate a {}x{} backdrop",
             frame.width, frame.height
@@ -460,6 +480,25 @@ fn write_frame(
     Ok(())
 }
 
+/// How far past the shape's own edges the two contrast bands run, in logical
+/// pixels: enough that they read as something on the desktop rather than as a
+/// second shape traced around the first, while still leaving the warm-to-cool
+/// sweep visible above, below and beyond them.
+const BAND_OVERSHOOT_X: f32 = 22.0;
+const BAND_OVERSHOOT_Y: f32 = 14.0;
+/// Where the seam between the dark band and the light one falls, measured in
+/// logical pixels inward from the shape's right edge.
+///
+/// Not the shape's midpoint, and not a round number: it is chosen to land in
+/// the middle of the four-character timer readout, which sits right-aligned
+/// near that edge (`render::timer_right_edge` puts a `0:00` at roughly 12–48
+/// logical px in from it at 100 %). The timer is the one run of text the
+/// default presentation draws and the element whose legibility this evidence
+/// has to answer for, so the seam is placed so a single frame shows the same
+/// digits over both contrast directions rather than two frames each showing
+/// one.
+const BAND_SEAM_FROM_RIGHT: f32 = 28.0;
+
 /// A synthetic busy desktop for the pill to sit on.
 ///
 /// The overlay's own frames are transparent everywhere but the shape, and the
@@ -467,27 +506,48 @@ fn write_frame(
 /// treatment does. This is a stand-in desktop: a wide warm-to-cool sweep for
 /// the spectrum ramp to sit against, plus a dark band and a light band so both
 /// contrast directions appear in the same frame.
-fn backdrop_pixmap(w: u32, h: u32) -> Option<Pixmap> {
+///
+/// Both bands are anchored on the *shape's* real rectangle, rebuilt here from
+/// the same [`Layout`] the renderer places it with, rather than on fractions
+/// of the frame. An earlier version gated them on frame corners (`u < 0.30`,
+/// `u > 0.55`) and neither one intersected the shape at all: every committed
+/// frame had the capsule sitting on plain mid-gradient, so the set could not
+/// show what its own caption claimed. Anchoring on the layout also means a
+/// later change to `REST_W` or `MARGIN` moves the bands with the shape
+/// instead of silently un-anchoring them again.
+fn backdrop_pixmap(w: u32, h: u32, scale: f32) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(w, h)?;
     let (fw, fh) = (w.max(1) as f32, h.max(1) as f32);
+
+    let l = Layout::new(scale);
+    let shape_left = l.center_x - l.rest_w * 0.5;
+    let shape_right = l.center_x + l.rest_w * 0.5;
+    let band_left = shape_left - BAND_OVERSHOOT_X * l.scale;
+    let band_right = shape_right + BAND_OVERSHOOT_X * l.scale;
+    let band_top = l.center_y - l.shape_h * 0.5 - BAND_OVERSHOOT_Y * l.scale;
+    let band_bottom = l.center_y + l.shape_h * 0.5 + BAND_OVERSHOOT_Y * l.scale;
+    let seam = shape_right - BAND_SEAM_FROM_RIGHT * l.scale;
+
     let pixels = pixmap.pixels_mut();
     for y in 0..h {
         for x in 0..w {
             let (u, v) = (x as f32 / fw, y as f32 / fh);
+            // Pixel centres, so a band edge lands between pixels rather than
+            // on one and the two bands cannot both claim the seam column.
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
             let mut r = 240.0 - 150.0 * u;
             let mut g = 130.0 + 40.0 * v;
             let mut b = 70.0 + 170.0 * u;
-            // A dark band across the top left and a light one across the
-            // bottom right, both well inside the frame.
-            if v < 0.30 && u < 0.30 {
-                r *= 0.12;
-                g *= 0.12;
-                b *= 0.12;
-            }
-            if v > 0.72 && u > 0.55 {
-                r = 235.0;
-                g = 238.0;
-                b = 245.0;
+            if (band_top..band_bottom).contains(&py) {
+                if (band_left..seam).contains(&px) {
+                    r *= 0.12;
+                    g *= 0.12;
+                    b *= 0.12;
+                } else if (seam..band_right).contains(&px) {
+                    r = 235.0;
+                    g = 238.0;
+                    b = 245.0;
+                }
             }
             let clamp = |c: f32| c.clamp(0.0, 255.0) as u8;
             if let Some(px) = PremultipliedColorU8::from_rgba(clamp(r), clamp(g), clamp(b), 255) {

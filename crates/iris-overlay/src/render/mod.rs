@@ -45,10 +45,14 @@ use crate::state::{format_timer, Model, OverlayState};
 use crate::theme::{sample_ramp, Rgba, Theme};
 
 /// Alpha the glass body's spectrum ramp is painted at, at every moment of the
-/// shape's life. Constant on purpose: legibility of the live text is carried
-/// by `theme.text_scrim` alone (see [`draw_ribbon`]), so the surface never has
-/// to trade its glassiness for contrast. `theme::tests` composites this over
-/// the spectrum to check that guarantee against the real on-screen colour.
+/// shape's life. Constant on purpose: the surface never has to trade its
+/// glassiness for contrast, because each of the two runs of text drawn on it
+/// carries its own guarantee instead — `theme.text_scrim`, a band behind the
+/// live text only (see [`draw_ribbon`]), and `theme.timer_edge`, an outline
+/// around the timer's digits (see [`draw_timer`]), which is what the default
+/// no-live-text presentation needs since the scrim is gated off there.
+/// `theme::tests` composites this over the spectrum to check both guarantees
+/// against the real on-screen colour.
 pub(crate) const GLASS_FILL_ALPHA: f32 = 0.20;
 
 /// Standard deviation of the shape's drop-shadow blur, in logical pixels.
@@ -381,6 +385,19 @@ const GLYPH_TIMER_GAP: f32 = 5.0;
 /// edge, in logical pixels — the bound on how far [`timer_right_edge`] may
 /// push the run inward from its resting anchor to buy that clearance.
 const TIMER_EDGE_PAD_MIN: f32 = 9.0;
+
+/// How far the timer's outline passes are offset from the run, in logical
+/// pixels, and the alpha each single pass is drawn at.
+///
+/// Sub-pixel on purpose: this is an outline traced around the digits in
+/// `theme.timer_edge`, not a plate behind them (see [`draw_timer`]). Eight
+/// passes around the compass at this alpha accumulate to a near-solid hairline
+/// where they overlap at the glyph edge and to nothing a couple of pixels out,
+/// so the run gains a rim without gaining a footprint — which is what keeps it
+/// clear of the [`GLYPH_TIMER_GAP`] and [`TIMER_EDGE_PAD_MIN`] budgets
+/// [`timer_right_edge`] measured against the crisp run alone.
+const TIMER_EDGE_OFFSET: f32 = 0.9;
+const TIMER_EDGE_PASS_ALPHA: f32 = 0.5;
 
 /// How far the centred glyph's ink can reach either side of the shape's
 /// centre, in device pixels: the widest of everything [`draw_glyph`] paints
@@ -1110,10 +1127,22 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 ///
 /// Legibility is solved without a dark backing plate — the captain's
 /// complaint this round is specifically that something black behind text
-/// ruins the glass. Instead the run is drawn a second time, offset by a
-/// sub-pixel in four directions at low alpha in the same ink colour before
-/// the crisp full-alpha pass: a soft, colour-matched glow that thickens the
-/// strokes rather than a plate that sits on top of the surface.
+/// ruins the glass, and `theme.text_scrim` (the token that does carry a
+/// contrast promise) is gated on live text and stays that way. Instead the
+/// run is traced: drawn [`TIMER_EDGE_OFFSET`] out in eight directions in
+/// `theme.timer_edge` before the crisp full-alpha pass in `theme.ink`.
+///
+/// The colour is the whole mechanism, and it is why the first attempt at this
+/// did not work: that one re-drew the run in `ink` itself, which thickens the
+/// strokes but cannot separate them from a backing at `ink`'s own luminance —
+/// Prism's near-white digits over a white desktop showing through the glass
+/// scored a contrast ratio of about 1.03. `timer_edge` is the opposite end of
+/// each theme's luminance range from its `ink`, so one of the two always
+/// reads: the fill when the desktop is far from it, the outline when it is
+/// near. No backdrop sampling is involved — a layered window does not get one
+/// (see [`draw_shell`]) and this deliberately does not need one.
+/// `theme::tests::the_timer_edge_reads_against_any_desktop_the_ink_cannot`
+/// holds that against the real composited shell in both directions.
 fn draw_timer(
     pixmap: &mut Pixmap,
     ctx: &Ctx<'_>,
@@ -1132,10 +1161,20 @@ fn draw_timer(
 
     let (tx, ty) = ctx.map(right, center_y);
 
-    let halo_a = a * 0.35;
-    if halo_a > 0.001 {
-        let d = 0.6 * l.scale;
-        for (ox, oy) in [(-d, 0.0), (d, 0.0), (0.0, -d), (0.0, d)] {
+    let edge_a = a * TIMER_EDGE_PASS_ALPHA;
+    if edge_a > 0.001 {
+        let d = TIMER_EDGE_OFFSET * l.scale;
+        let diag = d * std::f32::consts::FRAC_1_SQRT_2;
+        for (ox, oy) in [
+            (-d, 0.0),
+            (d, 0.0),
+            (0.0, -d),
+            (0.0, d),
+            (-diag, -diag),
+            (diag, -diag),
+            (-diag, diag),
+            (diag, diag),
+        ] {
             atlas.draw(
                 pixmap,
                 text,
@@ -1144,8 +1183,8 @@ fn draw_timer(
                 tx + ox,
                 ty + oy,
                 Align::Right,
-                TextPaint::Solid(theme.ink),
-                halo_a,
+                TextPaint::Solid(theme.timer_edge),
+                edge_a,
             );
         }
     }
@@ -1638,6 +1677,56 @@ mod tests {
         assert!(
             ink_px > 3,
             "timer zone drew {ink_px} ink-coloured px — the timer is not rendering"
+        );
+    }
+
+    /// The theme side of the timer's contrast guarantee is pinned in
+    /// `theme::tests::the_timer_edge_reads_against_any_desktop_the_ink_cannot`;
+    /// this is the renderer's half of it — that `theme.timer_edge` reaches
+    /// the pixmap at all, in the zone the run occupies, and at a strength
+    /// that survives compositing.
+    ///
+    /// It exists because the mechanism it replaced was invisible to every
+    /// test: the old halo re-drew the run in `theme.ink`, so a frame with it
+    /// and a frame without it differed only in stroke weight. Un-premultiplying
+    /// before comparing is what makes "the outline is there" separable from
+    /// "the outline is faint", which is the regression a lowered pass alpha
+    /// would be.
+    #[test]
+    fn the_timer_is_traced_in_an_outline_colour_that_is_not_its_ink() {
+        let (r, _) = drive(
+            &[Command::ShowListening, Command::Level(0.5)],
+            1200,
+            PRISM_DARK,
+        );
+        let l = r.layout();
+        let edge = PRISM_DARK.timer_edge;
+        let mut atlas = FontAtlas::new();
+        let timer_w = atlas.measure(&format_timer(1_200), l.text_font, 0.0);
+        let x = l.center_x - l.rest_w * 0.5;
+        let right_edge = timer_right_edge(l, x, l.rest_w, timer_w) as u32;
+        let zone_start = (right_edge as f32 - timer_w - TIMER_EDGE_OFFSET * l.scale) as u32;
+        let mut edge_px = 0;
+        for y in (l.center_y - 8.0 * l.scale) as u32..=(l.center_y + 8.0 * l.scale) as u32 {
+            for x in zone_start..=right_edge {
+                let p = r.pixmap().pixels()[(y * l.window_w + x) as usize];
+                if p.alpha() < 200 {
+                    continue;
+                }
+                let straight = |c: u8| (u32::from(c) * 255 / u32::from(p.alpha())).min(255) as u8;
+                let near = |got: u8, want: u8| i32::from(got).abs_diff(i32::from(want)) < 30;
+                if near(straight(p.red()), edge.r)
+                    && near(straight(p.green()), edge.g)
+                    && near(straight(p.blue()), edge.b)
+                {
+                    edge_px += 1;
+                }
+            }
+        }
+        assert!(
+            edge_px > 3,
+            "timer zone drew {edge_px} px of theme.timer_edge — the readout is back to being \
+             outlined in its own ink, which adds weight and no contrast"
         );
     }
 

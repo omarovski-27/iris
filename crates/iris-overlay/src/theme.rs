@@ -184,6 +184,22 @@ pub struct Theme {
     /// Tertiary text, and the idle capsule core. Same caption story as
     /// [`Self::ink_dim`].
     pub ink_faint: Rgba,
+    /// Outline traced around the elapsed-recording timer's glyphs, and only
+    /// those — `render::draw_timer` is the sole painter.
+    ///
+    /// The timer is the one run of text the default presentation draws, and
+    /// it is drawn straight onto the glass: [`Self::text_scrim`] is gated on
+    /// live text and must stay that way (round 3's whole complaint was a dark
+    /// band on the glass), so the timer cannot borrow the promise that token
+    /// carries. This is the timer-scoped substitute, and it works by being
+    /// *opposite* [`Self::ink`] in luminance rather than by knowing anything
+    /// about the desktop underneath: whatever is behind the shape either
+    /// contrasts with `ink`, in which case the fill reads, or sits near
+    /// `ink`'s own luminance, in which case this outline does. There is no
+    /// third case, which is why no backdrop sampling is needed.
+    /// `the_timer_edge_reads_against_any_desktop_the_ink_cannot` holds both
+    /// halves of that against the real composited shell.
+    pub timer_edge: Rgba,
 
     // ---- capsule ----
     /// Live core fill (mint/sky — never a rec-red cue).
@@ -256,6 +272,12 @@ pub const PRISM_DARK: Theme = Theme {
     ink: Rgba::hex(0xED_EFF5),
     ink_dim: Rgba::hex(0x9A_A3B5),
     ink_faint: Rgba::hex(0x5E_6778),
+    // Ink is near-white here, so the timer's outline is the deep end of the
+    // same cool family the shell already lives in — a saturated steel blue,
+    // not black: it has to separate near-white digits from a near-white
+    // desktop showing through the glass without putting anything on the
+    // surface that reads as the scrim this round removed.
+    timer_edge: Rgba::hex(0x1B_4D7A),
 
     // Live core: mint spectrum tip — never solid rec-red.
     rec: Rgba::hex(0x5C_E6A8),
@@ -307,6 +329,10 @@ pub const PORCELAIN_LIGHT: Theme = Theme {
     ink: Rgba::hex(0x1C_2430),
     ink_dim: Rgba::hex(0x5A_6678),
     ink_faint: Rgba::hex(0x8B_97A8),
+    // The mirror of Prism's: this ink is dark, so the outline is the light
+    // end — a cool near-white that only becomes visible when the desktop
+    // behind the glass is dark enough to swallow the digits.
+    timer_edge: Rgba::hex(0xF4_F8FF),
 
     // Live core: mint — never rose/rec-red.
     rec: Rgba::hex(0x3D_BF8A),
@@ -396,6 +422,7 @@ mod tests {
                 theme.ink,
                 theme.ink_dim,
                 theme.ink_faint,
+                theme.timer_edge,
                 theme.rec,
                 theme.ok,
                 theme.accent,
@@ -432,6 +459,95 @@ mod tests {
             g: ch(src.g, dst.g),
             b: ch(src.b, dst.b),
             a: 1.0,
+        }
+    }
+
+    /// WCAG relative-contrast ratio between two opaque colours.
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (la, lb) = (a.relative_luminance(), b.relative_luminance());
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// What the glass actually composites to over `desktop` at `stop` — the
+    /// shell fill and nothing else, which is exactly what the timer is drawn
+    /// onto in the default presentation.
+    fn shell_over(stop: Rgba, desktop: Rgba) -> Rgba {
+        composite(stop.fade(crate::render::GLASS_FILL_ALPHA), desktop)
+    }
+
+    /// The timer is the one run of text the *default* presentation draws, and
+    /// `text_scrim` — the token that carries the legibility promise — is
+    /// gated on live text and has to stay that way. `timer_edge` is the
+    /// timer-scoped substitute, and this is the property it exists for:
+    /// against any desktop, at any point of the shell's ramp, *something* in
+    /// the drawn glyph separates from what is behind it.
+    ///
+    /// Two assertions, because either alone is satisfiable by a token that
+    /// does not work. The outline has to be genuinely distinct from the ink
+    /// it traces — the mechanism this replaced re-drew the run in `ink`
+    /// itself, which thickened the strokes and added no contrast at all — and
+    /// then, for every stop over both extreme desktops, at least one of the
+    /// two has to clear the floor against the composited shell. There is no
+    /// backdrop sampling anywhere in this crate, so "at least one" is the
+    /// only form the guarantee can take: a backing near `ink`'s luminance is
+    /// exactly where `timer_edge` carries it, and vice versa.
+    #[test]
+    fn the_timer_edge_reads_against_any_desktop_the_ink_cannot() {
+        for theme in THEMES {
+            let apart = contrast(theme.ink, theme.timer_edge);
+            assert!(
+                apart >= 4.5,
+                "{}: timer_edge contrasts only {apart:.2} with the ink it outlines — an \
+                 outline that close to the fill only adds weight",
+                theme.name
+            );
+
+            let mut worst = f32::MAX;
+            let mut worst_where = String::new();
+            for desktop in [Rgba::hex(0x00_0000), Rgba::hex(0xFF_FFFF)] {
+                for (i, stop) in theme.spectrum.iter().enumerate() {
+                    let backing = shell_over(*stop, desktop);
+                    let best = contrast(theme.ink, backing).max(contrast(theme.timer_edge, backing));
+                    if best < worst {
+                        worst = best;
+                        worst_where = format!(
+                            "stop {i} over #{:02X}{:02X}{:02X}",
+                            desktop.r, desktop.g, desktop.b
+                        );
+                    }
+                }
+            }
+            assert!(
+                worst >= 3.0,
+                "{}: the timer's best-contrasting part scores only {worst:.2} against the \
+                 composited glass ({worst_where}) — the readout disappears there",
+                theme.name
+            );
+        }
+    }
+
+    /// The failure this round's fix answers, kept as a test so nobody
+    /// "simplifies" the outline back out: the ink *alone* genuinely does
+    /// vanish against one of the two extreme desktops in each theme. Without
+    /// this, `the_timer_edge_reads_against_any_desktop_the_ink_cannot` above
+    /// would keep passing on the ink's own contribution if the outline were
+    /// deleted.
+    #[test]
+    fn the_ink_alone_does_disappear_somewhere_which_is_why_the_outline_exists() {
+        for theme in THEMES {
+            let mut worst = f32::MAX;
+            for desktop in [Rgba::hex(0x00_0000), Rgba::hex(0xFF_FFFF)] {
+                for stop in theme.spectrum {
+                    worst = worst.min(contrast(theme.ink, shell_over(*stop, desktop)));
+                }
+            }
+            assert!(
+                worst < 3.0,
+                "{}: ink now clears 3.0 ({worst:.2}) unaided — re-derive timer_edge rather \
+                 than leaving a token nothing depends on",
+                theme.name
+            );
         }
     }
 
