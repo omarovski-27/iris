@@ -500,7 +500,10 @@ fn demo_window() -> Result<()> {
             .with_context(|| format!("clearing {}", history_path.display()))?;
     }
     let mut log = SessionLog::open(&history_path, 500);
-    for record in demo_records() {
+    // A real session log is appended to as dictations happen, so it is oldest
+    // first on disk and the window reverses it. Seed it the same way round, or
+    // the demo — the screenshot path — shows History backwards.
+    for record in demo_records().into_iter().rev() {
         log.append(&record)?;
     }
 

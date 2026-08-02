@@ -17,7 +17,7 @@
 //! the same accepted trade-off.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -207,6 +207,9 @@ pub struct WindowState {
     /// The current status line, if any. See [`WindowState::status_flash`].
     pub status: Option<Status>,
     last_refresh: Instant,
+    /// Size and mtime of the session log as `history` was last read from it.
+    /// See [`WindowState::refresh`].
+    history_stamp: Option<(u64, Option<SystemTime>)>,
     /// Positions in `history` matching `search`, as of `filtered_for`. See
     /// [`WindowState::sync_filter`].
     filtered: Vec<usize>,
@@ -223,7 +226,9 @@ impl WindowState {
     #[must_use]
     pub fn new(env: &Env) -> Self {
         let config = Config::load(env.config_path).unwrap_or_default();
-        let history = load_history(&config, env.config_path);
+        let history_path = config.history_path(env.config_path);
+        let history_stamp = history_stamp(&history_path);
+        let history = load_history(&history_path);
         let insights = Insights::compute(&history, &local_day(env.utc_offset_seconds));
         let devices = (env.list_devices)();
         Self {
@@ -235,6 +240,7 @@ impl WindowState {
             devices,
             status: None,
             last_refresh: Instant::now(),
+            history_stamp,
             filtered: Vec::new(),
             filtered_for: None,
             visible: HISTORY_PAGE,
@@ -244,20 +250,34 @@ impl WindowState {
     /// Re-read `config.toml` and the session log if `REFRESH_INTERVAL` has
     /// elapsed since the last read, or unconditionally when `force` (a
     /// manual refresh).
+    ///
+    /// Rereading the log is the expensive half — every record is parsed, then
+    /// retokenised into [`Insights`]' n-gram maps, over a log whose cap the
+    /// user sets — and most refreshes have nothing to read: dictations are
+    /// minutes apart, this fires every two seconds. So a cheap `stat` of the
+    /// log gates it, and only the config snapshot is taken every time (it is
+    /// one small file, and the tray can move it at any moment). `force` reads
+    /// regardless, so the Refresh button always means what it says.
     pub fn refresh(&mut self, env: &Env, force: bool) {
         if !force && self.last_refresh.elapsed() < REFRESH_INTERVAL {
             return;
         }
+        self.last_refresh = Instant::now();
         // A config that fails to parse (mid-write, or hand-edited badly)
         // keeps the last good snapshot rather than resetting the form to
         // defaults out from under the user.
         if let Ok(config) = Config::load(env.config_path) {
             self.config = config;
         }
-        self.history = load_history(&self.config, env.config_path);
+        let history_path = self.config.history_path(env.config_path);
+        let stamp = history_stamp(&history_path);
+        if !force && stamp == self.history_stamp {
+            return;
+        }
+        self.history_stamp = stamp;
+        self.history = load_history(&history_path);
         self.insights = Insights::compute(&self.history, &local_day(env.utc_offset_seconds));
         self.filtered_for = None;
-        self.last_refresh = Instant::now();
     }
 
     /// Bring [`WindowState::filtered`] up to date with `search` and `history`,
@@ -435,11 +455,23 @@ impl WindowState {
     }
 }
 
-fn load_history(config: &Config, config_path: &Path) -> Vec<DictationRecord> {
-    let path = config.history_path(config_path);
-    let mut records = SessionLog::read_all(&path).unwrap_or_default();
+fn load_history(path: &Path) -> Vec<DictationRecord> {
+    let mut records = SessionLog::read_all(path).unwrap_or_default();
     records.reverse(); // newest first: the recovery path reads top-down
     records
+}
+
+/// A cheap fingerprint of the session log: its size and, where the platform
+/// reports one, its modification time.
+///
+/// Size alone already moves on every append, which is the only way the log
+/// grows; the mtime covers a rewrite that happens to land on the same length
+/// (`SessionLog` trimming to `history.max_entries`). `None` means there is no
+/// log yet — a state that compares equal to itself, so an absent log costs
+/// nothing to keep checking.
+fn history_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
 }
 
 /// The UTC range covering the *local* calendar day that is current now, given
@@ -618,6 +650,44 @@ mod tests {
             Theme::Light,
             "forced refresh should pick it up"
         );
+    }
+
+    /// The log is reread only when it has actually moved: a window left open
+    /// refreshes every two seconds, and reparsing an unchanged log — plus
+    /// rebuilding the n-gram maps over it — is the one expensive thing here.
+    #[test]
+    fn refresh_rereads_the_log_only_when_it_has_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        Config::default().save(&config_path).unwrap();
+        let history_path = dir.path().join("history.jsonl");
+        let mut log = SessionLog::open(&history_path, 10);
+        log.append(&DictationRecord::now("mock", "first")).unwrap();
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let env = env_with(&config_path, &tx, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        assert_eq!(state.history.len(), 1);
+
+        // A sentinel no reload would produce: it survives a refresh only if
+        // the refresh decided there was nothing to read.
+        state.history.push(DictationRecord::now("mock", "sentinel"));
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        assert_eq!(state.history.len(), 2, "unchanged log was reread");
+
+        log.append(&DictationRecord::now("mock", "second")).unwrap();
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[0].text, "second", "newest first");
+
+        // And the Refresh button reads regardless of what `stat` says.
+        state.history.clear();
+        state.refresh(&env, true);
+        assert_eq!(state.history.len(), 2);
     }
 
     #[test]

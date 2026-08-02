@@ -32,8 +32,14 @@ pub struct WindowHandle {
 impl WindowSink for WindowHandle {
     fn open(&self) {
         // Unbounded and never awaited: a click that arrives while the window
-        // is already mid-open queues harmlessly, per the module docs.
-        let _ = self.open_tx.send(());
+        // is already mid-open queues harmlessly, per the module docs. A send
+        // that fails is not that case — the only way it can fail is the
+        // window thread being gone (an `egui` panic unwinds it alone, leaving
+        // the dictation loop running), which turns the tray's `Settings` item
+        // into a permanent no-op and is worth saying out loud.
+        if self.open_tx.send(()).is_err() {
+            eprintln!("  settings window unavailable: its thread is no longer running");
+        }
     }
 }
 
