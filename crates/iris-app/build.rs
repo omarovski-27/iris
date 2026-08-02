@@ -35,9 +35,16 @@ fn main() {
         .set("InternalName", "iris")
         .set_version_info(winresource::VersionInfo::FILEVERSION, packed)
         .set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);
+    // Fatal, not a cargo:warning. The icon and the version metadata are the
+    // whole reason this build script exists, and a warning in a release build's
+    // output is easy to miss — the failure would only surface as a shipped exe
+    // with a generic icon and blank Properties, after the zip was cut.
     if let Err(e) = res.compile() {
-        // A packaging nicety, not a reason to fail the whole build.
-        println!("cargo:warning=could not embed Windows resources (icon/version): {e}");
+        panic!(
+            "could not embed the Windows resources (icon and version metadata): {e}\n\
+             This needs the mingw `windres` that linking x86_64-pc-windows-gnu already \
+             requires — see docs/dev-windows.md."
+        );
     }
 }
 

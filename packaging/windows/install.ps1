@@ -26,51 +26,93 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$sourceExe = Join-Path $PSScriptRoot "iris.exe"
-if (-not (Test-Path $sourceExe)) {
-    Write-Error "iris.exe not found next to install.ps1 - run this script from inside the extracted Iris folder."
+# "Run with PowerShell" closes the window the moment the script returns, so
+# every line below - success or failure - would otherwise flash and vanish.
+# Only pause when a human is actually watching: an automated caller
+# (-NonInteractive, a redirected host) must not hang waiting for Enter.
+function Test-Interactive {
+    if ([Environment]::UserInteractive -ne $true) { return $false }
+    if ($Host.Name -eq "ServerRemoteHost") { return $false }
+    return -not ([Environment]::GetCommandLineArgs() -contains "-NonInteractive")
+}
+
+try {
+    $sourceExe = Join-Path $PSScriptRoot "iris.exe"
+    if (-not (Test-Path $sourceExe)) {
+        throw "iris.exe not found next to install.ps1 - run this script from inside the extracted Iris folder."
+    }
+
+    $installDir = Join-Path $env:LOCALAPPDATA "Iris"
+    $targetExe = Join-Path $installDir "iris.exe"
+
+    # Windows locks a running image against writes, so upgrading over a live
+    # Iris fails with a raw "used by another process". Say what to do instead.
+    if (Get-Process -Name "iris" -ErrorAction SilentlyContinue) {
+        throw "Iris is running. Quit it first (right-click the tray icon -> Quit), then run this installer again."
+    }
+
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+    Copy-Item -Path $sourceExe -Destination $targetExe -Force
+
+    $shell = New-Object -ComObject WScript.Shell
+
+    function New-IrisShortcut {
+        param([string]$Path)
+        $parent = Split-Path -Parent $Path
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        $shortcut = $shell.CreateShortcut($Path)
+        $shortcut.TargetPath = $targetExe
+        $shortcut.WorkingDirectory = $installDir
+        $shortcut.Description = "Iris - push-to-talk dictation"
+        # iris.exe is a console binary (the startup banner is deliberate), so
+        # without this every launch pops a console window and leaves it open
+        # for the life of the app. 7 = minimized.
+        $shortcut.WindowStyle = 7
+        $shortcut.Save()
+    }
+
+    # Resolved through the shell, not as literal %APPDATA% subpaths: folder
+    # redirection (Group Policy, some OEM images) moves these, and a shortcut
+    # written to the unredirected path is never enumerated by Windows.
+    $startMenuDir = [Environment]::GetFolderPath("Programs")
+    New-IrisShortcut -Path (Join-Path $startMenuDir "Iris.lnk")
+    Write-Host "Start Menu shortcut created."
+
+    if ($Desktop) {
+        $desktopDir = [Environment]::GetFolderPath("Desktop")
+        New-IrisShortcut -Path (Join-Path $desktopDir "Iris.lnk")
+        Write-Host "Desktop shortcut created."
+    }
+
+    if ($RunAtLogin) {
+        $startupDir = [Environment]::GetFolderPath("Startup")
+        $startupShortcut = Join-Path $startupDir "Iris.lnk"
+        New-IrisShortcut -Path $startupShortcut
+        Write-Host "Iris will now start automatically at login."
+        Write-Host "To undo: delete `"$startupShortcut`""
+    }
+
+    Write-Host ""
+    Write-Host "Installed to $targetExe"
+    Write-Host "Launch it from the Start Menu, or directly:"
+    Write-Host "  & `"$targetExe`""
+    Write-Host ""
+    Write-Host "First run creates %APPDATA%\iris\config.toml with a commented"
+    Write-Host "example for adding a Deepgram or Groq key. See the README.md"
+    Write-Host "next to this script, section `"Install (Windows)`", for the"
+    Write-Host "full first-run walkthrough."
+}
+catch {
+    Write-Host ""
+    Write-Host "Install failed: $($_.Exception.Message)" -ForegroundColor Red
+    if (Test-Interactive) {
+        Write-Host ""
+        Read-Host "Press Enter to close"
+    }
     exit 1
 }
 
-$installDir = Join-Path $env:LOCALAPPDATA "Iris"
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-$targetExe = Join-Path $installDir "iris.exe"
-Copy-Item -Path $sourceExe -Destination $targetExe -Force
-
-$shell = New-Object -ComObject WScript.Shell
-
-function New-IrisShortcut {
-    param([string]$Path)
-    $shortcut = $shell.CreateShortcut($Path)
-    $shortcut.TargetPath = $targetExe
-    $shortcut.WorkingDirectory = $installDir
-    $shortcut.Description = "Iris - push-to-talk dictation"
-    $shortcut.Save()
+if (Test-Interactive) {
+    Write-Host ""
+    Read-Host "Press Enter to close"
 }
-
-$startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
-New-IrisShortcut -Path (Join-Path $startMenuDir "Iris.lnk")
-Write-Host "Start Menu shortcut created."
-
-if ($Desktop) {
-    $desktopDir = [Environment]::GetFolderPath("Desktop")
-    New-IrisShortcut -Path (Join-Path $desktopDir "Iris.lnk")
-    Write-Host "Desktop shortcut created."
-}
-
-if ($RunAtLogin) {
-    $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
-    $startupShortcut = Join-Path $startupDir "Iris.lnk"
-    New-IrisShortcut -Path $startupShortcut
-    Write-Host "Iris will now start automatically at login."
-    Write-Host "To undo: delete `"$startupShortcut`""
-}
-
-Write-Host ""
-Write-Host "Installed to $targetExe"
-Write-Host "Launch it from the Start Menu, or directly:"
-Write-Host "  & `"$targetExe`""
-Write-Host ""
-Write-Host "First run creates %APPDATA%\iris\config.toml with a commented-out"
-Write-Host "example for adding a Deepgram or Groq key. See README.md's INSTALL"
-Write-Host "section for the full first-run walkthrough."

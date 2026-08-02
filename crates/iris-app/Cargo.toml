@@ -54,6 +54,7 @@ time = { version = "0.3", default-features = false, features = [
 tray-icon = { version = "0.24", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

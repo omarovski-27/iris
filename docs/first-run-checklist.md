@@ -28,7 +28,13 @@ on the machine you're actually going to use Iris on.
       on many machines — if it refuses, confirm the `-ExecutionPolicy Bypass`
       fallback in the README's Install section works and reads clearly to
       someone who has never used PowerShell.
-- [ ] The Start Menu shortcut appears and launches Iris.
+- [ ] The installer's closing output is still readable after it finishes —
+      it pauses on "Press Enter to close" rather than vanishing with the
+      window.
+- [ ] Running it a second time while Iris is running says "Iris is running.
+      Quit it first" instead of a raw file-in-use error.
+- [ ] The Start Menu shortcut appears and launches Iris, with its console
+      window minimized rather than sitting open on the desktop.
 - [ ] `-Desktop` adds a working desktop shortcut.
 - [ ] `-RunAtLogin` actually starts Iris after a real login (not just a
       shortcut sitting in the Startup folder) — log out and back in, or
@@ -44,6 +50,11 @@ on the machine you're actually going to use Iris on.
 - [ ] Deliberately misconfigure `engine = "deepgram"` with no key: the error
       is a clear sentence naming the config path and the tray Settings entry
       — not a Rust panic or stack trace.
+- [ ] Do the same again, but launched from the Start Menu shortcut: the
+      message arrives as an "Iris could not start" dialog box, not a console
+      window that flashes and closes before it can be read.
+- [ ] The same misconfiguration launched from an open PowerShell prompt
+      prints to the console and shows *no* dialog.
 - [ ] Tray → Settings opens `config.toml` in the default editor.
 - [ ] After adding a real key and saving, tray → Reload picks it up without
       a restart.
@@ -52,11 +63,18 @@ on the machine you're actually going to use Iris on.
 
 - [ ] Holding the default (Right-Ctrl) push-to-talk key works from a cold
       start.
-- [ ] Rebinding the hotkey from the tray menu takes effect immediately,
-      including for the widened F1-F12 set — this widened set has not been
-      exercised on real hardware.
-- [ ] The old hotkey stops working and the new one starts, with no double
-      trigger or stuck-key behavior.
+- [ ] The tray menu's top line reads "Hold Right-Ctrl to dictate". It is a
+      disabled label, not a menu — there is no rebinding from the tray on this
+      build, and its absence is not a broken build.
+- [ ] Rebinding works the way it actually ships: set `hotkey` in
+      `config.toml` (tray → Settings), save, then tray → Reload. `iris.exe
+      --hotkey f9` does the same for one run without touching the file.
+- [ ] Each of the ten accepted keys binds and fires: `rctrl`, `lctrl`,
+      `rshift`, `ralt`, `rwin`, `capslock`, `scrolllock`, `pause`, `f8`,
+      `f9`, `f10`. That is the whole set (`iris_core::hotkey::Key`); anything
+      else is rejected at load. None have been exercised on real hardware.
+- [ ] After a rebind, the old hotkey stops working and the new one starts,
+      with no double trigger or stuck-key behavior.
 
 ## Overlay
 

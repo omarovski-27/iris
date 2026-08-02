@@ -22,7 +22,8 @@ CI-testable at all.
 ## Packaging and release
 
 `scripts/package-windows.sh [output-dir]` builds the release `.exe` and zips it
-with `packaging/windows/install.ps1` into `dist/iris-<version>-windows-x64.zip`
+with `packaging/windows/install.ps1`, `README.md` and `LICENSE` into
+`dist/iris-<version>-windows-x64.zip`
 — the repeatable path from source to something a non-developer installs. See
 the README's "Install (Windows)" section for the user-facing walkthrough and
 "Why a zip and not an installer" for why this stops at a zip + per-user
@@ -32,7 +33,8 @@ this project is built around (`docs/dev-windows.md`).
 
 `crates/iris-app/build.rs` embeds the prism icon and version metadata into the
 `.exe` via `winresource` (drives the mingw `windres` already required to link
-this target — no new host dependency). The icon geometry is a deliberate,
+this target — no new host dependency); an embed failure panics the build rather
+than warning, because a warning ships a generic-icon exe. The icon geometry is a deliberate,
 hand-synced duplicate of `tray::icon_rgba`'s dark plate — a build script cannot
 depend on the crate it builds, so keep the two in sync by hand if the mark ever
 changes.

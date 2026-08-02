@@ -91,15 +91,53 @@ fn a_saved_file_explains_itself() {
 #[test]
 fn an_unwritable_key_is_never_written_by_accident() {
     // Keys supplied through the environment must not end up in the file just
-    // because the tray saved a setting.
+    // because the tray saved a setting. Asserted on the parsed document, not
+    // on the rendered text: the header comment documents a [keys] example, so
+    // a substring check would be testing the wording of a comment.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let config = Config::default();
     config.save(&path).unwrap();
 
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(!text.contains("deepgram ="), "{text}");
-    assert!(!text.contains("[keys]\ngroq"), "{text}");
+    assert!(Config::from_toml(&text).unwrap().keys.is_empty(), "{text}");
+    let settings: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!settings.contains("[keys]"), "{settings}");
+}
+
+/// The file Iris writes for a first-time user has to load again unchanged —
+/// the header is instructions, and instructions that produce an unloadable
+/// file are worse than no instructions.
+#[test]
+fn the_generated_default_file_loads_back_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let created = Config::load_or_create(&path).unwrap();
+
+    assert_eq!(created, Config::default());
+    assert_eq!(Config::load(&path).unwrap(), Config::default());
+}
+
+/// The header tells the user to append `[keys]` at the very end of the file.
+/// This does exactly that, to the file Iris actually generates.
+#[test]
+fn the_documented_keys_example_appends_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    Config::default().save(&path).unwrap();
+
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\n[keys]\ndeepgram = \"paste-your-key-here\"\n");
+    write(&path, &text);
+
+    let loaded = Config::load(&path).unwrap();
+    assert_eq!(loaded.keys.deepgram.as_deref(), Some("paste-your-key-here"));
+    assert_eq!(loaded.engine, Config::default().engine);
+    assert_eq!(loaded.hotkey, Config::default().hotkey);
 }
 
 /// Both halves of the path resolution live in one test on purpose: they mutate

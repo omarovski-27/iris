@@ -44,14 +44,20 @@ const HEADER: &str = "\
 # a real one. To use Deepgram:
 #
 #   1. Get a key at https://console.deepgram.com
-#   2. Set engine = \"deepgram\" above
-#   3. Add the key below:
+#   2. In the settings below this comment, change engine = \"mock\" to
+#      engine = \"deepgram\"
+#   3. Add these two lines at the very END of this file, below every other
+#      setting:
 #
 #        [keys]
-#        deepgram=\"paste-your-key-here\"
+#        deepgram = \"paste-your-key-here\"
 #
-# Groq works the same way with engine = \"groq\" and a [keys] groq entry from
-# https://console.groq.com/keys.
+#      TOML puts every line after a [keys] header inside that table, so a
+#      [keys] block placed anywhere but the end swallows the settings that
+#      follow it and Iris will refuse to start.
+#
+# Groq works the same way with engine = \"groq\" and a groq entry in that same
+# [keys] table, from https://console.groq.com/keys.
 #
 # Keys may also come from the environment (IRIS_DEEPGRAM_KEY, IRIS_GROQ_KEY,
 # IRIS_LLM_KEY) instead of this file; an environment variable takes precedence

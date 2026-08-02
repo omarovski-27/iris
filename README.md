@@ -45,6 +45,19 @@ For someone who just wants to run Iris — no Rust, no build tools:
 6. Hold **Right-Ctrl**, speak, release. Your words appear in whatever window
    had focus.
 
+### "Windows protected your PC"
+
+`iris.exe` is not code-signed — signing needs a paid certificate this project
+does not have. If the zip was downloaded rather than built locally, Windows
+marks it, and the first launch shows SmartScreen's blue **"Windows protected
+your PC"** box, whose only obvious button is *Don't run*. Click **More info**,
+then **Run anyway**. You can also head it off before extracting: right-click
+the zip → Properties → tick **Unblock** → OK.
+
+Only do this for a zip you built yourself or got from someone you trust — that
+dialog is doing its job, and this section is telling you how to answer it, not
+that it is wrong.
+
 ### Why a zip and not an installer
 
 Building an MSI/EXE installer needs either MSVC or the WiX toolset, both of

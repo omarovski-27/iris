@@ -217,7 +217,8 @@ fn run(
     let overlay = try_spawn_overlay(&config);
     let pill = pill_for(args, &config, overlay.as_ref());
 
-    let mut app = App::new(config, config_path, audio, injector, pill)?
+    let mut app = App::new(config, config_path, audio, injector, pill)
+        .inspect_err(report_startup_failure)?
         .with_report(args.report)
         .with_file_config(file_config);
     banner(&app, config_path);
@@ -457,6 +458,43 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
     }
     println!("\n  {} ({} entries)", path.display(), records.len());
     Ok(())
+}
+
+/// Put a failed startup in front of the user when stderr has nowhere to land.
+///
+/// `iris` is a console binary, so launching it from the Start Menu or the
+/// Startup folder gives it a console window all of its own — one that closes
+/// with the process. `App::new`'s missing-key message is an actionable
+/// sentence, and in that launch path it would be a black rectangle that
+/// flashes and vanishes. When another process shares this console (a shell the
+/// user typed in), the message survives on stderr and there is nothing to do;
+/// `GetConsoleProcessList` is what tells the two apart. This is the startup
+/// path only — nothing else in Iris opens a dialog.
+#[cfg(windows)]
+fn report_startup_failure(err: &anyhow::Error) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::System::Console::GetConsoleProcessList;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let mut pids = [0u32; 2];
+    // SAFETY: `pids` is a valid, writable buffer of the length passed in;
+    // the call only fills it and returns the count.
+    let sharing_console = unsafe { GetConsoleProcessList(&mut pids) } > 1;
+    if sharing_console {
+        return;
+    }
+
+    let text = HSTRING::from(format!("{err:#}"));
+    let caption = HSTRING::from("Iris could not start");
+    // SAFETY: both strings are NUL-terminated and outlive the modal call.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
 }
 
 #[cfg(windows)]
