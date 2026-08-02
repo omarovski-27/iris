@@ -133,6 +133,14 @@ impl Rig {
         })
     }
 
+    /// Shorten the wait for a final transcript. For a test whose engine is
+    /// never going to conclude, the default 5s is 5s of wall clock spent
+    /// proving nothing the assertion depends on.
+    fn with_final_timeout(mut self, timeout: Duration) -> Self {
+        self.app = self.app.with_final_timeout(timeout);
+        self
+    }
+
     /// Run one dictation to completion.
     fn dictate(&mut self) -> anyhow::Result<iris_app::Dictated> {
         let speaker = self.speak();
@@ -397,7 +405,7 @@ fn a_stalled_dictation_still_logs_the_real_audio_captured() {
     // that connects and captures normally but then never concludes, and
     // checks the logged record still shows the audio that was actually
     // captured instead of reading as an empty hold.
-    let mut rig = rig();
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
     rig.app.set_engine(Arc::new(NeverConcludesEngine));
 
     let err = rig.dictate().expect_err("the engine never concludes");
@@ -413,6 +421,49 @@ fn a_stalled_dictation_still_logs_the_real_audio_captured() {
         records[0].latency.audio_secs > 0.5,
         "the log must show the real captured audio, not read as an empty \
          hold: {:.2}s",
+        records[0].latency.audio_secs
+    );
+}
+
+#[test]
+fn a_mid_hold_failure_still_logs_the_real_audio_captured() {
+    // The sibling of the test above, for the failures that never reach
+    // `finish()` at all: the audio thread stopping, the hotkey thread
+    // stopping, or a frame the engine refuses. Those used to `?` straight out
+    // of `capture` into `dictate`'s blank-timeline fallback, logging
+    // `audio_secs: 0.0` for a hold that had captured half a second of speech —
+    // the same misleading record, on a different path.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(PushFailsMidHoldEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    // No key-up: the hold is meant to end on the engine failure, and waiting
+    // for one would only test which of the two the `select!` happened to see.
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+    });
+
+    let app_frames = rig.app.frames();
+    let err = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect_err("the engine rejects audio mid-hold");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(err.to_string().contains("died mid-hold"), "{err}");
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].injected);
+    assert!(records[0].error.is_some());
+    assert!(
+        records[0].latency.audio_secs > 0.4,
+        "the log must show the audio captured before the failure, not read as \
+         an empty hold: {:.2}s",
         records[0].latency.audio_secs
     );
 }
@@ -868,6 +919,49 @@ impl Engine for NeverConcludesEngine {
 
 impl Session for NeverConcludesSession {
     fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Connects, takes half a second of audio, then refuses the rest — a socket
+/// dying in the middle of a hold, which fails the *feed* rather than anything
+/// `finish()` would ever see.
+struct PushFailsMidHoldEngine;
+
+struct PushFailsMidHoldSession {
+    events: Receiver<TranscriptEvent>,
+    _keep: Sender<TranscriptEvent>,
+    samples: usize,
+}
+
+impl Engine for PushFailsMidHoldEngine {
+    fn name(&self) -> &'static str {
+        "push-fails-mid-hold"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PushFailsMidHoldSession {
+            events: rx,
+            _keep: tx,
+            samples: 0,
+        }))
+    }
+}
+
+impl Session for PushFailsMidHoldSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        self.samples += pcm.len();
+        // 8000 samples at 16 kHz: half a second of very real speech.
+        if self.samples >= 8_000 {
+            anyhow::bail!("the websocket died mid-hold");
+        }
         Ok(())
     }
     fn events(&self) -> &Receiver<TranscriptEvent> {

@@ -230,11 +230,26 @@ const DEFAULT_MODEL: &str = "nova-3";
 const DEFAULT_BASE_URL: &str = "wss://api.deepgram.com/v1/listen";
 
 /// How long to wait for the socket to come up before giving up.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+///
+/// Must stay strictly under [`crate::dictation::DEFAULT_FINAL_TIMEOUT`] (6s),
+/// the outer bound on the whole dictation: this one runs from key-down and
+/// that one from key-up, so on a hold of near-zero length they race directly,
+/// and whichever fires first decides what the session log says. At the old 8s
+/// the outer bound always won on a short hold and a genuine connection failure
+/// was reported as the generic "did not return a transcript", hiding the real
+/// cause — the exact diagnosis the 2026-08-02 latency investigation depended
+/// on. 5s keeps that error diagnosable while still clearing every successful
+/// connect ever observed in the captain's session log (worst 4.85s, during a
+/// degraded-network window; every other one under ~4.1s).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `finish()` may take, once `CloseStream` has actually been sent,
 /// before we return whatever we have. Re-armed on every inbound message, so
 /// this bounds *silence*, not the whole finalisation — see
-/// `FINALIZE_ACK_TIMEOUT` for the wait before `CloseStream` goes out.
+/// `FINALIZE_ACK_TIMEOUT` for the wait before `CloseStream` goes out. Being
+/// re-armed is also why this one cannot be checked against
+/// [`crate::dictation::DEFAULT_FINAL_TIMEOUT`] the way [`CONNECT_TIMEOUT`] is:
+/// a trickling connection can hold it open indefinitely, and the outer bound
+/// is the only thing that ends that.
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Absolute safety net for the wait on `from_finalize`, covering only
 /// protocol failure (a missing or malformed signal) — not a tuning knob.
@@ -808,6 +823,22 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_timeout_stays_strictly_inside_the_outer_dictation_bound() {
+        // An inner timeout that outranks the outer one never fires, so its
+        // specific error ("timed out connecting to Deepgram") is replaced by
+        // the generic "did not return a transcript" — losing the diagnosis on
+        // exactly the failure it exists to name. CONNECT_TIMEOUT runs from
+        // key-down while the outer bound runs from key-up, so a near-zero hold
+        // leaves no slack to trade on: strictly shorter is the whole margin.
+        assert!(
+            CONNECT_TIMEOUT < crate::dictation::DEFAULT_FINAL_TIMEOUT,
+            "CONNECT_TIMEOUT ({CONNECT_TIMEOUT:?}) must stay under \
+             DEFAULT_FINAL_TIMEOUT ({:?})",
+            crate::dictation::DEFAULT_FINAL_TIMEOUT
+        );
+    }
 
     fn results(text: &str, is_final: bool) -> String {
         serde_json::json!({

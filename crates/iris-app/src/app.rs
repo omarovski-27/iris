@@ -403,6 +403,12 @@ impl<A: AudioSource> App<A> {
                 // No transcript to save, but the failure still belongs in the
                 // log: "nothing happened when I pressed the key" is the hardest
                 // bug to report without one.
+                //
+                // Only opening the session or arming capture can land here —
+                // both happen before any audio exists, so this timeline is
+                // legitimately blank. Every failure *after* that point returns
+                // its own real timeline through `capture` (see `App::failed`);
+                // do not widen this fallback to cover them.
                 let mut record = DictationRecord::now(self.engine.name(), "");
                 record.error = Some(format!("{e:#}"));
                 Dictated {
@@ -476,7 +482,11 @@ impl<A: AudioSource> App<A> {
         let never_events = crossbeam_channel::never();
         let mut engine_events_open = true;
 
-        let released_at = loop {
+        // A mid-hold failure ends the loop the same way a key-up does, carrying
+        // the error out instead of `?`-ing it away: by this point the hold has
+        // real audio and real marks in it, and `abandoned` below is what keeps
+        // those in the session log rather than reporting an empty hold.
+        let held = loop {
             let event_rx = if engine_events_open {
                 &events
             } else {
@@ -484,9 +494,14 @@ impl<A: AudioSource> App<A> {
             };
             select! {
                 recv(frames) -> frame => {
-                    let frame = frame.context("the audio thread stopped")?;
+                    let frame = match frame.context("the audio thread stopped") {
+                        Ok(frame) => frame,
+                        Err(e) => break Err(e),
+                    };
                     self.pill.update_level(audio::level(&frame));
-                    dictation.feed(&frame)?;
+                    if let Err(e) = dictation.feed(&frame) {
+                        break Err(e);
+                    }
                 }
                 recv(event_rx) -> event => match event {
                     Ok(event) => {
@@ -504,15 +519,26 @@ impl<A: AudioSource> App<A> {
                     }
                 },
                 recv(keys) -> event => {
-                    match event.context("the hotkey thread stopped")? {
-                        HotkeyEvent::Up(at) => break at,
+                    match event.context("the hotkey thread stopped") {
+                        Ok(HotkeyEvent::Up(at)) => break Ok(at),
                         // A repeat press we never saw the release of. Ignore it
                         // rather than ending an utterance the user is still in.
-                        HotkeyEvent::Down(_) => {}
+                        Ok(HotkeyEvent::Down(_)) => {}
+                        Err(e) => break Err(e),
                     }
                 }
             }
         };
+
+        let released_at = match held {
+            Ok(at) => at,
+            Err(e) => return Ok(self.abandoned(dictation, e)),
+        };
+
+        // Stamped before the tail is fed so a failure down there still logs a
+        // hold that reached key-up; `mark_at` records `released_at` itself, so
+        // the number is the same wherever this sits.
+        dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
 
         // Whatever the device buffered but had not delivered is still the
         // user's speech; dropping it would truncate the last word.
@@ -521,10 +547,11 @@ impl<A: AudioSource> App<A> {
             tail.extend_from_slice(&frame);
         }
         if !tail.is_empty() {
-            dictation.feed(&tail)?;
+            if let Err(e) = dictation.feed(&tail) {
+                return Ok(self.abandoned(dictation, e));
+            }
         }
 
-        dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
         self.pill.processing();
 
         let finished = {
@@ -542,13 +569,8 @@ impl<A: AudioSource> App<A> {
                 // `e.timeline` carries that, so the record below reports what
                 // actually happened instead of reading as if the hold never
                 // captured anything.
-                let mut record = DictationRecord::now(self.engine.name(), "");
-                record.error = Some(format!("{e:#}"));
-                record.latency = LatencyBreakdown::from_timeline(&e.timeline);
-                return Ok(Dictated {
-                    record,
-                    timeline: e.timeline,
-                });
+                let message = format!("{e:#}");
+                return Ok(self.failed(e.timeline, message));
             }
         };
         let mut timeline = outcome.timeline;
@@ -599,6 +621,27 @@ impl<A: AudioSource> App<A> {
         record.latency = LatencyBreakdown::from_timeline(&timeline);
         record.latency.polish_ms = polish_ms;
         Ok(Dictated { record, timeline })
+    }
+
+    /// A hold that produced no transcript, recorded against the timeline as it
+    /// actually stood. Every no-transcript path inside [`App::capture`] goes
+    /// through here: a blank timeline would log real audio as `audio_secs:
+    /// 0.0` and make a network failure read as a broken microphone, which is
+    /// exactly the false trail the 2026-08-02 investigation had to walk back.
+    fn failed(&self, timeline: Timeline, message: String) -> Dictated {
+        let mut record = DictationRecord::now(self.engine.name(), "");
+        record.error = Some(message);
+        record.latency = LatencyBreakdown::from_timeline(&timeline);
+        Dictated { record, timeline }
+    }
+
+    /// As [`App::failed`], for a hold abandoned before the engine was ever
+    /// asked to finalise — the audio or hotkey thread stopped, or a frame
+    /// could not be fed. [`Dictation::abandon`] hands over what the hold had
+    /// captured up to that point, which is the whole reason these paths do not
+    /// simply `?` out to [`App::dictate`]'s blank-timeline fallback.
+    fn abandoned(&self, dictation: Dictation, error: anyhow::Error) -> Dictated {
+        self.failed(dictation.abandon(), format!("{error:#}"))
     }
 
     /// Clean up the transcript, falling back to the raw text on any failure.

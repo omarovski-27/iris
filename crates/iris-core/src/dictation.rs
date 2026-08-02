@@ -34,6 +34,15 @@ use crate::vlog;
 /// investigation found a degraded-network dictation whose engine session
 /// never concluded at all, so only this outer bound ended the wait — at,
 /// essentially, its full old value.
+///
+/// **Every engine-internal timeout must stay strictly shorter than this.**
+/// This bound is what the user actually waits out, so an inner timeout that
+/// outranks it never gets to fire: its specific, diagnosable error is replaced
+/// by the generic "did not return a transcript" below, and the session log
+/// loses the real cause. Deepgram's `CONNECT_TIMEOUT` is the sharp case — it
+/// runs from key-down while this deadline starts at key-up, so a short hold
+/// leaves it almost no room, and it is held at 5s for exactly that reason.
+/// Lowering this constant means checking `engine/deepgram.rs` again.
 pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A completed dictation.
@@ -51,7 +60,28 @@ pub struct DictationOutcome {
 #[derive(Debug)]
 pub struct DictationError {
     message: String,
+    /// The engine's own error, when there was one, kept structured so a caller
+    /// converting back into `anyhow::Error` still has the chain rather than
+    /// only the flattened text in `message`.
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     pub timeline: Timeline,
+}
+
+impl DictationError {
+    /// The only way to build one: every failure arm has to hand over the
+    /// timeline as it stood, so none can quietly report a dictation as if
+    /// nothing had been captured.
+    fn fail(
+        timeline: Timeline,
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Box<Self> {
+        Box::new(Self {
+            message,
+            source,
+            timeline,
+        })
+    }
 }
 
 impl std::fmt::Display for DictationError {
@@ -60,7 +90,13 @@ impl std::fmt::Display for DictationError {
     }
 }
 
-impl std::error::Error for DictationError {}
+impl std::error::Error for DictationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Owns one engine session for the duration of one dictation.
 pub struct Dictation {
@@ -136,6 +172,19 @@ impl Dictation {
         }
         self.samples += pcm.len();
         self.session.push(pcm)
+    }
+
+    /// Give up on this dictation without asking the engine to finalise, and
+    /// take the timeline as it stands — audio fed and marks stamped so far.
+    ///
+    /// The counterpart to [`DictationError`] for a hold that never reaches
+    /// [`Dictation::finish`] at all (the microphone or the hotkey thread died,
+    /// or [`Dictation::feed`] failed). `audio_secs` is stamped here for the
+    /// same reason `finish` stamps it: a caller logging the failure must see
+    /// what was actually captured, not a timeline that reads as an empty hold.
+    pub fn abandon(mut self) -> Timeline {
+        self.timeline.audio_secs = self.audio_secs();
+        self.timeline
     }
 
     /// A handle on the engine's event stream, for callers that want to `select!`
@@ -231,10 +280,8 @@ impl Dictation {
         self.finishing = true;
         if let Err(e) = self.session.finish() {
             self.timeline.audio_secs = self.audio_secs();
-            return Err(Box::new(DictationError {
-                message: format!("{e:#}"),
-                timeline: self.timeline,
-            }));
+            let message = format!("{e:#}");
+            return Err(DictationError::fail(self.timeline, message, Some(e.into())));
         }
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
@@ -284,10 +331,8 @@ impl Dictation {
                         timeline: self.timeline,
                     })
                 } else {
-                    Err(Box::new(DictationError {
-                        message: format!("{} engine: {message}", self.timeline.engine),
-                        timeline: self.timeline,
-                    }))
+                    let text = format!("{} engine: {message}", self.timeline.engine);
+                    Err(DictationError::fail(self.timeline, text, None))
                 }
             }
             Some(Ending::Closed) | None => {
@@ -298,22 +343,18 @@ impl Dictation {
                         timeline: self.timeline,
                     })
                 } else if matches!(self.ended, Some(Ending::Closed)) {
-                    Err(Box::new(DictationError {
-                        message: format!(
-                            "{} engine closed without returning a transcript",
-                            self.timeline.engine
-                        ),
-                        timeline: self.timeline,
-                    }))
+                    let text = format!(
+                        "{} engine closed without returning a transcript",
+                        self.timeline.engine
+                    );
+                    Err(DictationError::fail(self.timeline, text, None))
                 } else {
-                    Err(Box::new(DictationError {
-                        message: format!(
-                            "{} engine did not return a transcript within {:.1}s",
-                            self.timeline.engine,
-                            timeout.as_secs_f64()
-                        ),
-                        timeline: self.timeline,
-                    }))
+                    let text = format!(
+                        "{} engine did not return a transcript within {:.1}s",
+                        self.timeline.engine,
+                        timeout.as_secs_f64()
+                    );
+                    Err(DictationError::fail(self.timeline, text, None))
                 }
             }
         }
@@ -597,6 +638,73 @@ mod tests {
             err.timeline.at(Mark::StreamReady).is_some(),
             "marks stamped before the stall must survive on the error path"
         );
+    }
+
+    #[test]
+    fn a_finish_failure_keeps_the_engine_error_as_a_source() {
+        // `run_offline` and the spike pipeline convert this straight back into
+        // an anyhow::Error; flattening the engine's chain into one string at
+        // this boundary would lose the cause for good.
+        struct FinishFails;
+        struct FinishFailsSession {
+            events: crossbeam_channel::Receiver<TranscriptEvent>,
+            _keep: crossbeam_channel::Sender<TranscriptEvent>,
+        }
+        impl Engine for FinishFails {
+            fn name(&self) -> &'static str {
+                "finish-fails"
+            }
+            fn open(&self) -> Result<Box<dyn Session>> {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                Ok(Box::new(FinishFailsSession {
+                    events: rx,
+                    _keep: tx,
+                }))
+            }
+        }
+        impl Session for FinishFailsSession {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.events
+            }
+            fn finish(&mut self) -> Result<()> {
+                Err(anyhow::anyhow!("the socket was already gone")
+                    .context("sending Finalize to Deepgram"))
+            }
+        }
+
+        let mut dictation = Dictation::start(&FinishFails).unwrap();
+        dictation.feed(&tone(0.6)).unwrap();
+        let err = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .unwrap_err();
+
+        let source = std::error::Error::source(&*err)
+            .expect("the engine error must survive")
+            .to_string();
+        assert!(source.contains("sending Finalize"), "{source}");
+        let chain = anyhow::Error::from(err).chain().count();
+        assert!(chain >= 2, "the cause chain was flattened: {chain} link(s)");
+    }
+
+    #[test]
+    fn abandoning_a_hold_keeps_the_audio_it_captured() {
+        // The caller-side counterpart of the error timeline: a hold that never
+        // reaches finish() at all (dead microphone, dead hotkey thread) still
+        // has to report what it captured.
+        let engine = MockEngine::new(MockConfig::default());
+        let mut dictation = Dictation::start(&engine).unwrap();
+        dictation.feed(&tone(1.2)).unwrap();
+
+        let timeline = dictation.abandon();
+        assert!(
+            (timeline.audio_secs - 1.2).abs() < 0.05,
+            "{}",
+            timeline.audio_secs
+        );
+        assert!(timeline.at(Mark::CaptureStart).is_some());
     }
 
     /// Engine that emits a terminal Final after the first half-second of audio

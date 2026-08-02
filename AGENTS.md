@@ -146,11 +146,22 @@ exactly this: a stalled Deepgram session kept trickling messages just often
 enough to keep re-arming `FINALIZE_TIMEOUT` without ever sending the close
 sign-off, so only the outer bound ended the wait. Diagnosing a hang from its
 milliseconds: check `DEFAULT_FINAL_TIMEOUT` before assuming a Deepgram-side
-constant is misbehaving. Relatedly, `Dictation::finish`'s error type
-(`DictationError`) carries the `Timeline` as it stood when the engine gave
-up, so a caller logging diagnostics (`iris-app`'s session log) sees the real
-`audio_secs` and marks on a failed dictation instead of an all-zero
-timeline — do not reintroduce a blank fallback `Timeline` on that path.
+constant is misbehaving. The layering also has one hard rule: **an
+engine-internal timeout must stay strictly shorter than
+`DEFAULT_FINAL_TIMEOUT`**, or it never fires and its specific, diagnosable
+error is replaced by the generic "did not return a transcript". Deepgram's
+`CONNECT_TIMEOUT` is the sharp case — it runs from key-down while the outer
+deadline runs from key-up, so a short hold leaves it no slack; it is 5s for
+that reason, and a unit test in `deepgram.rs` holds the invariant.
+`FINALIZE_TIMEOUT` is exempt only because it is re-armed and so bounds nothing
+absolutely. Relatedly, a dictation that fails carries its real `Timeline` out
+to the caller — `Dictation::finish`'s error type (`DictationError`) for an
+engine that gave up, `Dictation::abandon` for a hold that never got that far
+(dead microphone or hotkey thread, a rejected frame) — so `iris-app`'s session
+log shows the real `audio_secs` and marks instead of an all-zero record. In
+`App::capture` every no-transcript path goes through `App::failed`; the blank
+`Timeline` in `App::dictate` covers only failures before any audio exists. Do
+not widen it back.
 
 ## Sharp edges
 
