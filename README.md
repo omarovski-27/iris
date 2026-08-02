@@ -11,7 +11,61 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 - **Minimal** — a pill, a tray icon, a settings file. Nothing else.
 - **Yours** — pluggable engines: bring a cloud API key for maximum speed, or run a local model for full privacy. Open source, MIT.
 
-## Quickstart
+## Install (Windows)
+
+For someone who just wants to run Iris — no Rust, no build tools:
+
+1. Get `iris-<version>-windows-x64.zip` (build one yourself with
+   `scripts/package-windows.sh`, or take one someone already built) and
+   extract it anywhere.
+2. Right-click `install.ps1` inside the extracted folder → **Run with
+   PowerShell**. If Windows refuses ("running scripts is disabled on this
+   system"), open PowerShell in that folder instead and run:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install.ps1
+   ```
+   Add `-Desktop` for a desktop shortcut and/or `-RunAtLogin` to start Iris
+   automatically at login:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Desktop -RunAtLogin
+   ```
+   This copies `iris.exe` into `%LOCALAPPDATA%\Iris` and adds a Start Menu
+   shortcut. No admin rights needed; nothing is touched outside your user
+   profile. `-RunAtLogin` adds a shortcut in your Startup folder — delete it
+   to undo, there is no registry entry.
+3. Launch **Iris** from the Start Menu (or your shortcut).
+4. First run writes `%APPDATA%\iris\config.toml` — commented defaults, no
+   key needed yet (it starts on the offline mock engine, so dictation "works"
+   but the transcript is a stub, not what you said).
+5. To dictate for real: right-click the tray icon → **Settings**, which opens
+   `config.toml` in your editor. The header comment walks through getting a
+   Deepgram or Groq key and where to paste it (a `[keys]` section — never
+   printed back by Iris, including by `--print-config`). Save, then **Reload**
+   from the tray menu (or just restart Iris).
+6. Hold **Right-Ctrl**, speak, release. Your words appear in whatever window
+   had focus.
+
+### Why a zip and not an installer
+
+Building an MSI/EXE installer needs either MSVC or the WiX toolset, both of
+which pull in tooling this project deliberately avoids (see
+[`docs/dev-windows.md`](docs/dev-windows.md) "Why gnu and not msvc") — the
+whole point of the `x86_64-pc-windows-gnu` target is a cross-compile that
+needs nothing but `mingw-w64`. A portable zip plus a per-user PowerShell
+installer gets a Start Menu entry and a real `%LOCALAPPDATA%` install without
+trading that away. A native Windows build (real MSVC on the machine, not
+cross-compiled) would unlock a proper MSI if that's ever wanted.
+
+### Building the zip yourself
+
+```bash
+scripts/package-windows.sh              # writes dist/iris-<version>-windows-x64.zip
+scripts/package-windows.sh /some/dir     # or pick the output directory
+```
+
+Same toolchain as building from source below — nothing extra to install.
+
+## Quickstart (build from source)
 
 Windows first. From WSL2 (or native Windows with the MSVC/gnu toolchain — see [`docs/dev-windows.md`](docs/dev-windows.md)):
 
@@ -100,6 +154,8 @@ run anywhere.
 - [`docs/spike-findings.md`](docs/spike-findings.md) — measured latency, where
   the budget goes, architecture recommendation
 - [`docs/dev-windows.md`](docs/dev-windows.md) — building for Windows from WSL2
+- [`docs/first-run-checklist.md`](docs/first-run-checklist.md) — what to
+  verify by eye on a real Windows machine after installing a new build
 
 ## License
 

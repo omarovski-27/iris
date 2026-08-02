@@ -1,0 +1,87 @@
+# First-run checklist: verify by eye on real Windows
+
+This build was produced and reviewed entirely from WSL2, which has no Windows
+interop in this environment — nothing below has ever actually run. Everything
+here compiles, cross-compiles, and is unit/integration-tested on the portable
+half of the codebase (`cargo test --workspace`), but none of it substitutes
+for someone looking at a real Windows desktop. Work through this list once,
+on the machine you're actually going to use Iris on.
+
+## Launch
+
+- [ ] `iris.exe` starts without a console flash-and-vanish (a silent crash on
+      launch looks exactly like that).
+- [ ] The startup banner prints exactly three lines — hotkey, listening
+      device, and the settings path — and nothing else (no per-dictation
+      output, no millisecond figures). Compile- and review-verified only;
+      `banner()` is `#[cfg(windows)]` and has never executed anywhere this
+      build was produced.
+- [ ] The `.exe` shows the prism-triangle icon (Explorer, taskbar, Alt-Tab) —
+      not the default Rust/generic binary icon.
+- [ ] Right-click `iris.exe` → Properties → Details shows the version and
+      description ("Iris - push-to-talk dictation") instead of blank fields.
+
+## Install script
+
+- [ ] `install.ps1` actually runs from a double-click / "Run with
+      PowerShell". Windows' default execution policy blocks unsigned scripts
+      on many machines — if it refuses, confirm the `-ExecutionPolicy Bypass`
+      fallback in the README's Install section works and reads clearly to
+      someone who has never used PowerShell.
+- [ ] The Start Menu shortcut appears and launches Iris.
+- [ ] `-Desktop` adds a working desktop shortcut.
+- [ ] `-RunAtLogin` actually starts Iris after a real login (not just a
+      shortcut sitting in the Startup folder) — log out and back in, or
+      restart, to confirm.
+
+## First-run config
+
+- [ ] `%APPDATA%\iris\config.toml` is created on first launch, with the
+      header comment readable and the `[keys]` example easy to follow for
+      someone who has never opened a TOML file.
+- [ ] With no key configured, the app runs on the mock engine without
+      crashing (dictation "works" but transcribes to a stub).
+- [ ] Deliberately misconfigure `engine = "deepgram"` with no key: the error
+      is a clear sentence naming the config path and the tray Settings entry
+      — not a Rust panic or stack trace.
+- [ ] Tray → Settings opens `config.toml` in the default editor.
+- [ ] After adding a real key and saving, tray → Reload picks it up without
+      a restart.
+
+## Hotkey
+
+- [ ] Holding the default (Right-Ctrl) push-to-talk key works from a cold
+      start.
+- [ ] Rebinding the hotkey from the tray menu takes effect immediately,
+      including for the widened F1-F12 set — this widened set has not been
+      exercised on real hardware.
+- [ ] The old hotkey stops working and the new one starts, with no double
+      trigger or stuck-key behavior.
+
+## Overlay
+
+- [ ] The pill appears and animates at real speed — the motion timings are
+      unverified outside the filmstrip renderer (`pill-demo --filmstrip`),
+      which is not the same as watching it live.
+- [ ] Dark and Light themes both render legibly against real desktop
+      backgrounds.
+- [ ] The confirmation hold and self-dismiss after a successful insert look
+      right, not truncated or stuck.
+
+## Dictation quality
+
+- [ ] Latency "feels" fast — the budget in `docs/spike-findings.md` was
+      measured on different hardware and network conditions.
+- [ ] Accuracy is reasonable for normal speech.
+- [ ] Injection lands correctly in a few different real target apps
+      (browser address bar, a chat app, a plain text editor, something that
+      only accepts paste). `inject::effective_method`'s clipboard fallback
+      for long transcripts is unit-tested but never watched land on a real
+      focused window.
+
+## What this build does not include
+
+This build is packaged from `main` and predates two branches still in
+flight: the Settings window (PR #13) and the round-3 overlay capsule (PR
+#15). If either has since merged, this checklist and the packaged zip are
+stale — repackage with `scripts/package-windows.sh` and re-run this list.

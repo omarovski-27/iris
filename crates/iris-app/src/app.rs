@@ -117,7 +117,14 @@ impl<A: AudioSource> App<A> {
         pill: Box<dyn PillSink>,
     ) -> Result<Self> {
         let config_path = config_path.into();
-        let engine = engines::build(&config)?;
+        let engine = engines::build(&config).with_context(|| {
+            format!(
+                "starting the {} engine (edit {} — or right-click the tray icon → Settings — \
+                 to add a key or pick a different engine)",
+                config.engine,
+                config_path.display()
+            )
+        })?;
         let polisher = polish::build(&config);
         let history = open_history(&config, &config_path);
         let mut pill = pill;

@@ -15,6 +15,11 @@ readme = "README.md"
 name = "iris"
 path = "src/main.rs"
 
+[build-dependencies]
+# Embeds the icon and version metadata (build.rs). Drives the mingw `windres`
+# already required to link this target — see build.rs's module doc.
+winresource = "0.1"
+
 [features]
 default = []
 # Real offline ASR. Off by default because the native engines (sherpa-onnx,
