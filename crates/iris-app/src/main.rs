@@ -285,7 +285,7 @@ fn speak_wav(
     let audio = ChannelAudio::new();
     let frames_tx = audio.sender();
     let armed = audio.armed();
-    let mut app = App::new(config, config_path, audio, injector, pill)?.with_report(true);
+    let mut app = App::new(config, config_path, audio, injector, pill)?.with_report(args.report);
     let frames = app.frames();
 
     let (keys_tx, keys) = crossbeam_channel::unbounded();
@@ -359,7 +359,7 @@ fn demo_dictation(mut config: Config, config_path: &std::path::Path, args: &Args
     let audio = ChannelAudio::new();
     let frames_tx = audio.sender();
     let armed = audio.armed();
-    let mut app = App::new(config, config_path, audio, injector, pill)?.with_report(true);
+    let mut app = App::new(config, config_path, audio, injector, pill)?.with_report(args.report);
     let frames = app.frames();
 
     let (keys_tx, keys) = crossbeam_channel::unbounded();
@@ -462,22 +462,23 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
 #[cfg(windows)]
 fn banner<A: AudioSource>(app: &App<A>, config_path: &std::path::Path) {
     let config = app.config();
-    println!("iris");
-    println!("  engine      {}", config.engine);
-    println!("  hotkey      {} (hold to talk)", config.hotkey);
+    println!("Iris is running. Hold {} and speak.", config.hotkey);
+    println!("Listening on {}.", app.describe_audio());
     println!(
-        "  polish      {}",
+        "Right-click the tray icon for settings ({}).",
+        config_path.display()
+    );
+
+    // The full resolved-setting dump only serves a developer, so it moves
+    // behind --verbose rather than greeting every user on launch.
+    iris_core::vlog!("engine      {}", config.engine);
+    iris_core::vlog!(
+        "polish      {}",
         if config.polish.enabled {
             format!("on, {} ms budget", config.polish.budget_ms)
         } else {
             "off".into()
         }
     );
-    println!("  inject      {}", config.inject.method);
-    println!("  microphone  {}", app.describe_audio());
-    println!("  settings    {}", config_path.display());
-    println!(
-        "\n  Right-click the tray icon for settings. Hold {} and speak.",
-        config.hotkey
-    );
+    iris_core::vlog!("inject      {}", config.inject.method);
 }
