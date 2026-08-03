@@ -3,7 +3,9 @@
 //! A build script cannot depend on the crate it builds, so the icon geometry
 //! below is a deliberate, minimal duplicate of `tray::icon_rgba` (dark plate
 //! only — the file icon does not switch with the app theme). Keep the two in
-//! sync by hand if the mark ever changes; nothing enforces that automatically.
+//! sync by hand if the mark ever changes: the generated `.ico` is left in
+//! `OUT_DIR`, and `tray`'s `the_embedded_exe_icon_still_matches_the_tray_mark`
+//! reads it back and fails on any drift.
 //!
 //! Uses `winresource`, which drives the mingw `windres` already required to
 //! link `x86_64-pc-windows-gnu` (see `docs/dev-windows.md`) — no MSVC, no

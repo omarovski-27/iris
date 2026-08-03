@@ -57,7 +57,22 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-    Copy-Item -Path $sourceExe -Destination $targetExe -Force
+
+    # Extracting the zip straight into %LOCALAPPDATA%\Iris makes source and
+    # target the same file, and Copy-Item refuses to copy a file onto itself -
+    # which would abort an install that is in fact already correct. Compare
+    # resolved paths, since either side can arrive via a link or a short name.
+    $resolvedSource = (Resolve-Path -LiteralPath $sourceExe).Path
+    $resolvedTarget = if (Test-Path -LiteralPath $targetExe) {
+        (Resolve-Path -LiteralPath $targetExe).Path
+    } else {
+        $null
+    }
+    if ($resolvedTarget -eq $resolvedSource) {
+        Write-Host "Already installed at $targetExe - keeping it in place."
+    } else {
+        Copy-Item -LiteralPath $resolvedSource -Destination $targetExe -Force
+    }
 
     $shell = New-Object -ComObject WScript.Shell
 
@@ -104,8 +119,8 @@ try {
     Write-Host ""
     Write-Host "First run creates %APPDATA%\iris\config.toml with a commented"
     Write-Host "example for adding a Deepgram or Groq key. See the README.md"
-    Write-Host "next to this script, section `"Install (Windows)`", for the"
-    Write-Host "full first-run walkthrough."
+    Write-Host "next to this script, section `"First run`", for the full"
+    Write-Host "walkthrough."
 }
 catch {
     Write-Host ""

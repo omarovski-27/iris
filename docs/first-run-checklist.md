@@ -78,7 +78,8 @@ on the machine you're actually going to use Iris on.
 
 - [ ] Holding the default (Right-Ctrl) push-to-talk key works from a cold
       start.
-- [ ] The tray menu's top line reads "Hold Right-Ctrl to dictate". It is a
+- [ ] The tray menu's top line reads "Hold right-ctrl to dictate" (lower-case
+      — it is `Key::label()` verbatim, not a prettified name). It is a
       disabled label, not a menu — there is no rebinding from the tray on this
       build, and its absence is not a broken build.
 - [ ] Rebinding works the way it actually ships: set `hotkey` in

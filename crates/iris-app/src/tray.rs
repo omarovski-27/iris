@@ -557,6 +557,58 @@ mod tests {
         assert_ne!(icon_rgba(Theme::Light, size)[0], rgba[0]);
     }
 
+    /// `build.rs` re-implements this geometry, because a build script cannot
+    /// depend on the crate it builds. Read back the `.ico` it actually wrote
+    /// and compare pixels, so drift fails the build rather than shipping an
+    /// `.exe` whose icon quietly stops matching the tray.
+    #[test]
+    #[cfg(windows)]
+    fn the_embedded_exe_icon_still_matches_the_tray_mark() {
+        const SIZE: u32 = 256;
+        let ico_path = std::path::Path::new(env!("OUT_DIR")).join("iris.ico");
+        let ico = std::fs::read(&ico_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", ico_path.display()));
+
+        // ICONDIR: 6 bytes, then one 16-byte ICONDIRENTRY per image. A width
+        // byte of 0 is how the format spells 256.
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        let entry = (0..count)
+            .map(|i| 6 + 16 * i)
+            .find(|&e| ico[e] == 0)
+            .expect("the .ico carries a 256x256 image");
+        let len = u32::from_le_bytes(ico[entry + 8..entry + 12].try_into().unwrap()) as usize;
+        let off = u32::from_le_bytes(ico[entry + 12..entry + 16].try_into().unwrap()) as usize;
+        // Past the 40-byte BITMAPINFOHEADER are the bottom-up BGRA pixels,
+        // then the AND mask this comparison ignores.
+        let pixels = &ico[off + 40..off + len];
+
+        let rgba = icon_rgba(Theme::Dark, SIZE);
+        let mut expected = Vec::with_capacity(rgba.len());
+        for y in (0..SIZE).rev() {
+            for x in 0..SIZE {
+                let i = ((y * SIZE + x) * 4) as usize;
+                expected.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
+            }
+        }
+
+        assert!(
+            pixels.len() >= expected.len(),
+            "the .ico's 256x256 image is short: {} < {}",
+            pixels.len(),
+            expected.len()
+        );
+        let mismatch = pixels[..expected.len()]
+            .iter()
+            .zip(&expected)
+            .position(|(a, b)| a != b);
+        assert!(
+            mismatch.is_none(),
+            "build.rs's copy of the icon geometry has drifted from icon_rgba \
+             (first differing byte at {}); re-sync build.rs with this function",
+            mismatch.unwrap()
+        );
+    }
+
     #[test]
     fn the_tooltip_says_what_the_hotkey_is() {
         let config = Config::default();

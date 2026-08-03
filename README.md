@@ -13,7 +13,10 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 
 ## Install (Windows)
 
-For someone who just wants to run Iris — no Rust, no build tools:
+For someone who just wants to run Iris — no Rust, no build tools. The zip
+carries this same walkthrough as its own `README.md`
+([`packaging/windows/README.md`](packaging/windows/README.md)), so a recipient
+never needs this repository:
 
 1. Get `iris-<version>-windows-x64.zip` (build one yourself with
    `scripts/package-windows.sh`, or take one someone already built) and

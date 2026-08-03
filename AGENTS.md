@@ -22,11 +22,13 @@ CI-testable at all.
 ## Packaging and release
 
 `scripts/package-windows.sh [output-dir]` builds the release `.exe` and zips it
-with `packaging/windows/install.ps1`, `README.md` and `LICENSE` into
-`dist/iris-<version>-windows-x64.zip`
-— the repeatable path from source to something a non-developer installs. See
-the README's "Install (Windows)" section for the user-facing walkthrough and
-"Why a zip and not an installer" for why this stops at a zip + per-user
+with `packaging/windows/install.ps1`, `packaging/windows/README.md` (staged as
+the zip's `README.md`) and `LICENSE` into `dist/iris-<version>-windows-x64.zip`
+— the repeatable path from source to something a non-developer installs. The
+zip ships that install-only README, never this repo's, whose links and
+"build the zip first" step are dead inside the zip; keep the two in step when
+the install flow changes. See the repo README's "Why a zip and not an
+installer" for why this stops at a zip + per-user
 PowerShell script rather than an MSI: a real installer needs MSVC or the WiX
 toolset, both of which trade away the no-C-toolchain / no-MSVC cross-compile
 this project is built around (`docs/dev-windows.md`).
@@ -36,8 +38,10 @@ this project is built around (`docs/dev-windows.md`).
 this target — no new host dependency); an embed failure panics the build rather
 than warning, because a warning ships a generic-icon exe. The icon geometry is a deliberate,
 hand-synced duplicate of `tray::icon_rgba`'s dark plate — a build script cannot
-depend on the crate it builds, so keep the two in sync by hand if the mark ever
-changes.
+depend on the crate it builds. The generated `.ico` stays in `OUT_DIR`, and
+`tray::tests::the_embedded_exe_icon_still_matches_the_tray_mark` (Windows
+targets only) reads it back and fails on drift, so re-sync `build.rs` by hand
+when that test goes red.
 
 After packaging a new build, work through
 `docs/first-run-checklist.md` on a real Windows machine — this repo has no WSL
