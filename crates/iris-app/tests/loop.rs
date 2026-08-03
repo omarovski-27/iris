@@ -20,13 +20,18 @@ use iris_app::audio::ChannelAudio;
 use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
 use iris_app::{
-    App, CommandOutcome, Injector, RecordingInjector, RecordingPill, RecordingWindow, SessionLog,
+    App, CommandId, CommandOutcome, Injector, RecordingInjector, RecordingPill, RecordingWindow,
+    SessionLog,
 };
 use iris_core::engine::{Engine, Session, TranscriptEvent};
 use iris_core::hotkey::{HotkeyEvent, Key};
 
 /// What the mock engine transcribes, before polish.
 const TRANSCRIPT: &str = iris_core::engine::mock::DEFAULT_TRANSCRIPT;
+
+/// How long a test waits for the loop to answer a window command. Generous:
+/// it only has to be longer than a channel round-trip on a loaded machine.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A test rig: an app plus every handle needed to drive and observe it.
 struct Rig {
@@ -1145,21 +1150,27 @@ fn a_window_command_is_applied_the_same_as_a_tray_command() {
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
     let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
 
-    window_commands_tx
-        .send(Command::SetTheme(Theme::Light))
-        .unwrap();
-    tray_commands.send(Command::Quit).unwrap();
-
     let loop_thread = std::thread::spawn(move || {
         let mut app = rig
             .app
             .with_window_commands(window_commands_rx, outcomes_tx);
         app.run(&keys_rx, &commands_rx).map(|()| app)
     });
+
+    // `Quit` goes out only once the answer is in hand. Sent up front it would
+    // be racing the window command through `select!`, which picks between two
+    // ready channels at random — the loop can end before the change it is
+    // being tested on is ever drained.
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetTheme(Theme::Light)))
+        .unwrap();
+    let answer = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
     let app = loop_thread.join().expect("the loop panicked").unwrap();
 
     assert_eq!(app.config().theme, Theme::Light);
-    assert_eq!(outcomes_rx.try_recv().unwrap(), CommandOutcome::Applied);
+    assert_eq!(answer, (id, CommandOutcome::Applied));
 }
 
 /// The loop declines an engine it cannot build and keeps dictating on the one
@@ -1181,24 +1192,27 @@ fn a_window_command_the_loop_declines_comes_back_with_the_reason() {
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
     let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
 
-    // Deepgram with no key in the environment: `engines::build` fails, so
-    // `App::apply` rolls the choice back rather than leaving every hotkey
-    // press failing.
-    window_commands_tx
-        .send(Command::SetEngine(EngineChoice::Deepgram))
-        .unwrap();
-    tray_commands.send(Command::Quit).unwrap();
-
     let loop_thread = std::thread::spawn(move || {
         let mut app = rig
             .app
             .with_window_commands(window_commands_rx, outcomes_tx);
         app.run(&keys_rx, &commands_rx).map(|()| app)
     });
+
+    // Deepgram with no key in the environment: `engines::build` fails, so
+    // `App::apply` rolls the choice back rather than leaving every hotkey
+    // press failing. `Quit` waits for the answer, as above.
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetEngine(EngineChoice::Deepgram)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
     let app = loop_thread.join().expect("the loop panicked").unwrap();
 
     assert_eq!(app.config().engine, before, "the loop kept what works");
-    match outcomes_rx.try_recv().unwrap() {
+    assert_eq!(answered, id, "the answer names the command it answers");
+    match outcome {
         CommandOutcome::Rejected(reason) => {
             assert!(reason.contains("IRIS_DEEPGRAM_KEY"), "{reason}");
         }

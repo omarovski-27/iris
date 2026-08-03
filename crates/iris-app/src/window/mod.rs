@@ -160,12 +160,14 @@ pub struct Startup {
 /// `tray::spawn` and `iris_overlay::spawn`.
 ///
 /// `outcomes` is the other half of `commands`: the loop answers every command
-/// the window sends on it, so the window can report what actually happened
-/// rather than what it asked for — see [`crate::App::with_window_commands`].
+/// the window sends on it — under the [`crate::CommandId`] it came in with —
+/// so the window can report what actually happened rather than what it asked
+/// for, and only for the commands it sent itself. See
+/// [`crate::App::with_window_commands`].
 pub fn spawn(
     config_path: std::path::PathBuf,
-    commands: crossbeam_channel::Sender<crate::app::Command>,
-    outcomes: crossbeam_channel::Receiver<crate::app::CommandOutcome>,
+    commands: crossbeam_channel::Sender<(crate::app::CommandId, crate::app::Command)>,
+    outcomes: crossbeam_channel::Receiver<(crate::app::CommandId, crate::app::CommandOutcome)>,
     startup: Startup,
 ) -> anyhow::Result<Box<dyn WindowSink>> {
     #[cfg(windows)]

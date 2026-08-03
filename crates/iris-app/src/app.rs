@@ -99,14 +99,35 @@ impl Command {
     }
 }
 
+/// Names one command the settings window sent, so the answer to it can be
+/// matched to the question rather than to whatever is at the head of a queue.
+///
+/// Ordering alone is not enough: the command channel outlives any one window,
+/// and a change still in flight when the user closes the window is answered
+/// after the next window has opened with an empty queue of its own. Pairing on
+/// this id lets that answer be recognised as belonging to nobody and dropped —
+/// see [`crate::window::state::WindowState::poll_outcomes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommandId(u64);
+
+impl CommandId {
+    /// The next id, unique for the life of the process — which is the span
+    /// that matters, because the window is rebuilt many times inside it.
+    #[must_use]
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// What the loop did with a [`Command`] the settings window sent.
 ///
 /// The window shows the user what happened, so a queued command is not yet an
 /// answer: [`App::apply`] can decline a change and keep what works (a missing
 /// API key, a microphone that will not open). One of these goes back for every
-/// command the window sends, in the order they were sent, so the window can
-/// say "Saved" only for the ones that were, and say why for the ones that were
-/// not — see `crate::window::state`'s `dispatch`.
+/// command the window sends, tagged with that command's [`CommandId`], so the
+/// window can say "Saved" only for the ones that were, and say why for the
+/// ones that were not — see `crate::window::state`'s `dispatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
     /// The loop took the change (and persisted it, where it persists).
@@ -148,12 +169,12 @@ pub struct App<A: AudioSource> {
     /// A second command source the window sends on directly, so its changes
     /// reach [`App::apply`] the same way tray commands do. `never()` by
     /// default, which simply never becomes ready; see [`App::with_window_commands`].
-    window_commands: Receiver<Command>,
-    /// Where the result of each of those commands goes back. `None` until
-    /// [`App::with_window_commands`] wires one, and only ever fed for commands
-    /// that arrived on `window_commands`: the tray has no status line to put
-    /// an answer in.
-    window_outcomes: Option<Sender<CommandOutcome>>,
+    window_commands: Receiver<(CommandId, Command)>,
+    /// Where the result of each of those commands goes back, tagged with the
+    /// id it came in with. `None` until [`App::with_window_commands`] wires
+    /// one, and only ever fed for commands that arrived on `window_commands`:
+    /// the tray has no status line to put an answer in.
+    window_outcomes: Option<Sender<(CommandId, CommandOutcome)>>,
     history: SessionLog,
     audio: A,
     count: usize,
@@ -227,14 +248,15 @@ impl<A: AudioSource> App<A> {
     /// `outcomes`.
     ///
     /// The two are one wiring step because they are one conversation: the
-    /// window has to be told whether the change it asked for happened, and
-    /// nothing else sends on this command channel, so the answers arrive in
-    /// the order the questions were asked.
+    /// window has to be told whether the change it asked for happened. Each
+    /// answer carries the [`CommandId`] of the command it answers, so a window
+    /// that has been closed and reopened in between cannot read someone else's
+    /// answer as its own.
     #[must_use]
     pub fn with_window_commands(
         mut self,
-        commands: Receiver<Command>,
-        outcomes: Sender<CommandOutcome>,
+        commands: Receiver<(CommandId, Command)>,
+        outcomes: Sender<(CommandId, CommandOutcome)>,
     ) -> Self {
         self.window_commands = commands;
         self.window_outcomes = Some(outcomes);
@@ -330,7 +352,7 @@ impl<A: AudioSource> App<A> {
                 },
                 recv(control) -> command => match command {
                     Ok(command) => {
-                        if self.apply(command, false)?.is_break() {
+                        if self.apply(command, None)?.is_break() {
                             return Ok(());
                         }
                         continue;
@@ -338,8 +360,8 @@ impl<A: AudioSource> App<A> {
                     Err(_) => return Ok(()),
                 },
                 recv(window_commands) -> command => match command {
-                    Ok(command) => {
-                        if self.apply(command, true)?.is_break() {
+                    Ok((id, command)) => {
+                        if self.apply(command, Some(id))?.is_break() {
                             return Ok(());
                         }
                         continue;
@@ -362,13 +384,18 @@ impl<A: AudioSource> App<A> {
     /// Apply a tray or window command, persisting anything the user would
     /// expect to survive a restart.
     ///
-    /// `from_window` decides whether the result is reported back on
-    /// [`App::with_window_commands`]' channel. Two of these commands can be
-    /// declined — an engine that will not build, a microphone that will not
-    /// open — and the loop keeping what works is only half the answer: the UI
-    /// that asked has to be able to say so instead of showing "Saved" over a
-    /// change that never happened.
-    fn apply(&mut self, command: Command, from_window: bool) -> Result<std::ops::ControlFlow<()>> {
+    /// `from_window` — the [`CommandId`] the window sent it under, `None` for
+    /// the tray — decides whether the result is reported back on
+    /// [`App::with_window_commands`]' channel, and under which id. Two of
+    /// these commands can be declined — an engine that will not build, a
+    /// microphone that will not open — and the loop keeping what works is only
+    /// half the answer: the UI that asked has to be able to say so instead of
+    /// showing "Saved" over a change that never happened.
+    fn apply(
+        &mut self,
+        command: Command,
+        from_window: Option<CommandId>,
+    ) -> Result<std::ops::ControlFlow<()>> {
         let mut outcome = CommandOutcome::Applied;
         // Matched by reference so every arm that touches the config can go
         // through `Command::apply_to` rather than naming the field itself.
@@ -544,12 +571,12 @@ impl<A: AudioSource> App<A> {
     ///
     /// Best-effort: a window that has closed between sending and now is not a
     /// dictation-loop problem, and the change stands either way.
-    fn report(&self, from_window: bool, outcome: CommandOutcome) {
-        if !from_window {
+    fn report(&self, from_window: Option<CommandId>, outcome: CommandOutcome) {
+        let Some(id) = from_window else {
             return;
-        }
+        };
         if let Some(outcomes) = &self.window_outcomes {
-            let _ = outcomes.send(outcome);
+            let _ = outcomes.send((id, outcome));
         }
     }
 

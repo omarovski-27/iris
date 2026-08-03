@@ -223,8 +223,8 @@ struct Resident {
 #[cfg(windows)]
 fn try_spawn_window(
     config_path: &std::path::Path,
-    commands: crossbeam_channel::Sender<iris_app::Command>,
-    outcomes: crossbeam_channel::Receiver<iris_app::CommandOutcome>,
+    commands: crossbeam_channel::Sender<(iris_app::CommandId, iris_app::Command)>,
+    outcomes: crossbeam_channel::Receiver<(iris_app::CommandId, iris_app::CommandOutcome)>,
     startup: iris_app::window::Startup,
 ) -> Box<dyn iris_app::WindowSink> {
     match iris_app::window::spawn(config_path.to_path_buf(), commands, outcomes, startup) {
@@ -539,7 +539,7 @@ fn demo_window() -> Result<()> {
     let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
     let demo_config_path = config_path.clone();
     std::thread::spawn(move || {
-        for command in commands_rx {
+        for (id, command) in commands_rx {
             let outcome = match apply_demo_command(&demo_config_path, &command) {
                 Ok(()) => iris_app::CommandOutcome::Applied,
                 Err(e) => {
@@ -547,7 +547,7 @@ fn demo_window() -> Result<()> {
                     iris_app::CommandOutcome::Rejected(format!("{e:#}"))
                 }
             };
-            if outcomes_tx.send(outcome).is_err() {
+            if outcomes_tx.send((id, outcome)).is_err() {
                 break;
             }
         }

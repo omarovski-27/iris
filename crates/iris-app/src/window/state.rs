@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
-use crate::app::{Command, CommandOutcome};
+use crate::app::{Command, CommandId, CommandOutcome};
 use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
@@ -84,11 +84,13 @@ impl Tab {
 pub struct Env<'a> {
     /// Where `config.toml` lives.
     pub config_path: &'a Path,
-    /// The channel [`crate::App::run`] also drains tray commands from.
-    pub commands: &'a Sender<Command>,
+    /// The channel [`crate::App::run`] also drains tray commands from. Each
+    /// command goes out under a [`CommandId`] the answer comes back with.
+    pub commands: &'a Sender<(CommandId, Command)>,
     /// What the loop did with each of those commands, one per command sent
-    /// and in the same order. See [`WindowState::poll_outcomes`].
-    pub outcomes: &'a Receiver<CommandOutcome>,
+    /// and tagged with its id. Outlives any one window, so it can carry an
+    /// answer this one never asked for. See [`WindowState::poll_outcomes`].
+    pub outcomes: &'a Receiver<(CommandId, CommandOutcome)>,
     /// Enumerate input devices. Empty on a platform/build with no capture.
     pub list_devices: &'a dyn Fn() -> Vec<String>,
     /// Hand `config.toml` to whatever the desktop opens `.toml` with. The one
@@ -206,6 +208,9 @@ pub struct Status {
 /// [`WindowState::absorb`] — and it only runs once the loop says the change
 /// happened.
 struct Inflight {
+    /// What the loop will tag its answer with. See
+    /// [`WindowState::poll_outcomes`].
+    id: CommandId,
     command: Command,
     /// What to flash if the loop takes it.
     message: String,
@@ -475,9 +480,11 @@ impl WindowState {
     /// failure this end can diagnose itself: the loop has already returned and
     /// this window is outliving it by a moment.
     fn dispatch(&mut self, env: &Env, command: Command, saved: &str) {
-        match env.commands.send(command.clone()) {
+        let id = CommandId::next();
+        match env.commands.send((id, command.clone())) {
             Ok(()) => {
                 self.inflight.push_back(Inflight {
+                    id,
                     command,
                     message: saved.to_string(),
                 });
@@ -489,15 +496,27 @@ impl WindowState {
 
     /// Take in whatever the loop has said about the commands sent so far.
     ///
-    /// Called once a frame, before anything is drawn. One outcome answers one
-    /// command, in order, because this window is the only sender on that
-    /// channel — which is what lets a rejection be reported against the change
-    /// that was actually refused, with the loop's own reason for it.
+    /// Called once a frame, before anything is drawn. One outcome answers the
+    /// one command carrying its [`CommandId`] — which is what lets a rejection
+    /// be reported against the change that was actually refused, with the
+    /// loop's own reason for it.
+    ///
+    /// Pairing on the id rather than on arrival order is what keeps that true
+    /// across window lifetimes. The channel is one long-lived pair the whole
+    /// process shares while this state is rebuilt on every open, so a change
+    /// still in flight when the user closes the window is answered into a
+    /// window that never sent it: an id no one here is waiting for is a
+    /// stranger's answer and is dropped. Ids only ever grow, so anything still
+    /// queued ahead of the one just answered belongs to a window that is gone
+    /// too, and goes with it rather than holding `awaiting_loop` open forever.
     pub fn poll_outcomes(&mut self, env: &Env) {
         loop {
             match env.outcomes.try_recv() {
-                Ok(outcome) => {
-                    let Some(pending) = self.inflight.pop_front() else {
+                Ok((id, outcome)) => {
+                    let Some(at) = self.inflight.iter().position(|p| p.id == id) else {
+                        continue;
+                    };
+                    let Some(pending) = self.inflight.drain(..=at).next_back() else {
                         continue;
                     };
                     match outcome {
@@ -612,8 +631,8 @@ mod tests {
 
     fn env_with<'a>(
         config_path: &'a Path,
-        commands: &'a Sender<Command>,
-        outcomes: &'a Receiver<CommandOutcome>,
+        commands: &'a Sender<(CommandId, Command)>,
+        outcomes: &'a Receiver<(CommandId, CommandOutcome)>,
         devices: &'a dyn Fn() -> Vec<String>,
         reopen_signal: &'a Receiver<()>,
     ) -> Env<'a> {
@@ -644,18 +663,28 @@ mod tests {
     /// An outcome channel for tests that never make the loop answer. `never()`
     /// rather than a dropped sender: a disconnected one is itself an answer
     /// ("the loop is gone"), which these tests are not asking about.
-    fn no_outcomes() -> Receiver<CommandOutcome> {
+    fn no_outcomes() -> Receiver<(CommandId, CommandOutcome)> {
         crossbeam_channel::never()
     }
 
     /// Play the loop for everything the window has sent: take it all, the way
     /// `App::apply` does when nothing objects, then let the window notice —
     /// which is what `ui::draw_root` does once a frame.
-    fn take_everything(state: &mut WindowState, env: &Env, outcomes: &Sender<CommandOutcome>) {
-        for _ in 0..state.inflight.len() {
-            outcomes.send(CommandOutcome::Applied).unwrap();
+    fn take_everything(
+        state: &mut WindowState,
+        env: &Env,
+        outcomes: &Sender<(CommandId, CommandOutcome)>,
+    ) {
+        for id in state.inflight.iter().map(|p| p.id).collect::<Vec<_>>() {
+            outcomes.send((id, CommandOutcome::Applied)).unwrap();
         }
         state.poll_outcomes(env);
+    }
+
+    /// The id the loop would answer the window's `nth`-oldest unanswered
+    /// command under.
+    fn inflight_id(state: &WindowState, nth: usize) -> CommandId {
+        state.inflight[nth].id
     }
 
     #[test]
@@ -710,7 +739,7 @@ mod tests {
 
         state.set_engine(&env, EngineChoice::Groq);
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().1,
             Command::SetEngine(EngineChoice::Groq)
         );
         assert_eq!(
@@ -737,9 +766,9 @@ mod tests {
         let mut state = WindowState::new(&env);
 
         state.set_hotkey(&env, Key::F9);
-        assert_eq!(rx.try_recv().unwrap(), Command::SetHotkey(Key::F9));
+        assert_eq!(rx.try_recv().unwrap().1, Command::SetHotkey(Key::F9));
         state.set_overlay_enabled(&env, false);
-        assert_eq!(rx.try_recv().unwrap(), Command::SetOverlayEnabled(false));
+        assert_eq!(rx.try_recv().unwrap().1, Command::SetOverlayEnabled(false));
         take_everything(&mut state, &env, &outcomes_tx);
         assert!(state.status_text().unwrap().contains("restart"));
     }
@@ -761,8 +790,11 @@ mod tests {
 
         state.set_engine(&env, EngineChoice::Groq);
         outcomes_tx
-            .send(CommandOutcome::Rejected(
-                "cannot switch to groq: IRIS_GROQ_KEY is not set".into(),
+            .send((
+                inflight_id(&state, 0),
+                CommandOutcome::Rejected(
+                    "cannot switch to groq: IRIS_GROQ_KEY is not set".into(),
+                ),
             ))
             .unwrap();
         state.poll_outcomes(&env);
@@ -774,10 +806,11 @@ mod tests {
         assert!(!state.awaiting_loop());
     }
 
-    /// One outcome answers one command, in order — so a rejection lands on the
-    /// change that was actually refused and not on whatever was clicked next.
+    /// One outcome answers the one command it names — so a rejection lands on
+    /// the change that was actually refused and not on whatever was clicked
+    /// next.
     #[test]
-    fn outcomes_answer_the_commands_they_belong_to_in_order() {
+    fn outcomes_answer_the_commands_they_belong_to() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -789,14 +822,61 @@ mod tests {
 
         state.set_device(&env, Some("Absent Mic".into()));
         state.set_theme(&env, Theme::Light);
+        let device = inflight_id(&state, 0);
+        let theme = inflight_id(&state, 1);
         outcomes_tx
-            .send(CommandOutcome::Rejected("cannot switch microphone".into()))
+            .send((
+                device,
+                CommandOutcome::Rejected("cannot switch microphone".into()),
+            ))
             .unwrap();
-        outcomes_tx.send(CommandOutcome::Applied).unwrap();
+        outcomes_tx.send((theme, CommandOutcome::Applied)).unwrap();
         state.poll_outcomes(&env);
 
         assert_eq!(state.config.audio.device, None, "the refused one");
         assert_eq!(state.config.theme, Theme::Light, "the accepted one");
+        assert_eq!(state.status_flash(), Some(("Saved", StatusLevel::Info)));
+    }
+
+    /// The channel outlives the window, so a change still in flight when the
+    /// user closes it is answered into the *next* window. That answer belongs
+    /// to nobody here: reported against whatever this window has since sent,
+    /// it would put a stale rejection over a change that did land.
+    #[test]
+    fn an_answer_owed_to_a_closed_window_is_not_reported_by_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+
+        let mut closed = WindowState::new(&env);
+        closed.set_engine(&env, EngineChoice::Groq);
+        let owed = inflight_id(&closed, 0);
+        drop(closed); // the user closed the window before the loop answered
+
+        let mut state = WindowState::new(&env);
+        state.set_theme(&env, Theme::Light);
+        outcomes_tx
+            .send((
+                owed,
+                CommandOutcome::Rejected("cannot switch to groq".into()),
+            ))
+            .unwrap();
+        state.poll_outcomes(&env);
+
+        assert_eq!(state.config.engine, EngineChoice::default());
+        assert_eq!(state.status_text(), Some("Saving…"), "still its own answer");
+        assert!(state.awaiting_loop(), "the theme change is still owed one");
+
+        outcomes_tx
+            .send((inflight_id(&state, 0), CommandOutcome::Applied))
+            .unwrap();
+        state.poll_outcomes(&env);
+
+        assert_eq!(state.config.theme, Theme::Light);
         assert_eq!(state.status_flash(), Some(("Saved", StatusLevel::Info)));
     }
 
@@ -810,7 +890,8 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded::<CommandOutcome>();
+        let (outcomes_tx, outcomes) =
+            crossbeam_channel::unbounded::<(CommandId, CommandOutcome)>();
         let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 

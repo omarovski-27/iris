@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::app::{Command, CommandOutcome};
+use crate::app::{Command, CommandId, CommandOutcome};
 use crate::config::Config;
 
 use super::state::{Env, WindowState};
@@ -48,8 +48,8 @@ impl WindowSink for WindowHandle {
 /// `Settings` item).
 pub fn spawn(
     config_path: PathBuf,
-    commands: Sender<Command>,
-    outcomes: Receiver<CommandOutcome>,
+    commands: Sender<(CommandId, Command)>,
+    outcomes: Receiver<(CommandId, CommandOutcome)>,
     startup: Startup,
 ) -> Result<Box<dyn WindowSink>> {
     let (open_tx, open_rx) = crossbeam_channel::unbounded::<()>();
@@ -76,8 +76,8 @@ pub fn spawn(
 fn run_window(
     reopen_signal: Receiver<()>,
     config_path: PathBuf,
-    commands: Sender<Command>,
-    outcomes: Receiver<CommandOutcome>,
+    commands: Sender<(CommandId, Command)>,
+    outcomes: Receiver<(CommandId, CommandOutcome)>,
     startup: Startup,
 ) {
     // Best-effort: a config that fails to load just draws the default-theme
@@ -134,12 +134,12 @@ fn run_window(
 /// straight to [`ui::draw_root`].
 struct SettingsApp {
     config_path: PathBuf,
-    commands: Sender<Command>,
+    commands: Sender<(CommandId, Command)>,
     /// The loop's answers to what went out on `commands`. A clone of the one
-    /// receiver, so an outcome that arrived after the last window closed is
-    /// simply drained by the next one — [`WindowState::poll_outcomes`] has no
-    /// command of its own waiting for it.
-    outcomes: Receiver<CommandOutcome>,
+    /// receiver, so an outcome for a command an earlier window sent can still
+    /// arrive here — [`WindowState::poll_outcomes`] recognises it by its
+    /// [`CommandId`] as belonging to nobody and drops it.
+    outcomes: Receiver<(CommandId, CommandOutcome)>,
     reopen_signal: Receiver<()>,
     startup: Startup,
     utc_offset_seconds: i32,

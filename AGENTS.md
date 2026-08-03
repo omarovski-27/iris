@@ -86,19 +86,6 @@ Load-bearing beyond that crate:
   `crates/iris-app/tests/console.rs` drives the real binary and holds this.
 - **The settings window** (`iris-app::window`) is the History/Settings/Insights
   UI opened from the tray's `Settings` item. See "Settings window" below.
-- **The console is quiet by default; that is a product requirement, not an
-  oversight.** No per-dictation output, no millisecond figures, no raw
-  transcript — the captain rejected that as "AI-slop indicators" a finished
-  product does not show a user. `--report` opts into `Timeline::report`'s
-  full per-span table on stdout; `--verbose` opts into diagnostics on stderr
-  (`iris_core::vlog!`, `iris-core/src/log.rs`). Keep new console output
-  behind one of those two, not printed unconditionally — including in the
-  `--demo-dictation` / `--speak-wav` dev paths, which gate the table on
-  `--report` the same way the resident loop does. Errors and delivery
-  failures are the exception and must stay visible unconditionally (see the
-  injection-failure path in `App::capture`, `app.rs`, which points at the
-  session log or echoes the text back when the log is off).
-  `crates/iris-app/tests/console.rs` drives the real binary and holds this.
 
 ```bash
 cargo run -p iris-app -- --demo-dictation                 # mock + dry-run + pill
