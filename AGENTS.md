@@ -163,11 +163,13 @@ That finding does not rule out *actively* holding a connection open —
 `WarmPool` in the same file does exactly that with Deepgram's documented
 `KeepAlive` control frame, bounded to `MAX_WARM_IDLE` (3 minutes, chosen from
 the captain's own session log: 61% of real gaps between dictations were under
-that, versus 29-37% under Deepgram's raw idle-close window alone). A handed-in
-warm connection is never trusted blindly — see `confirm_pending` in
-`pump_inner` and its module-doc section "The warm spare" for the
-reconnect-and-retry fallback that makes a stale handoff cost latency, never
-data. A shared
+that, versus 29-37% under Deepgram's raw idle-close window alone) measured
+from the last `open()`, after which the maintenance loop stops rather than
+cycling a connection forever; dropping the engine stops it too. A handed-in
+warm connection is never trusted blindly — see `already_closed` and
+`replay_on_fresh_connection` in the same file, and its module-doc section
+"The warm spare", for the read-before-handoff check and the unproven-session
+replay that together make a stale handoff cost latency, never data. A shared
 `rustls::ClientConfig` (`engine/net.rs::tls_connector`) was also tried for TLS
 session resumption on every cold connect: it works (live-verified against the
 real endpoint), but live-measured wall-clock impact was negligible, because
