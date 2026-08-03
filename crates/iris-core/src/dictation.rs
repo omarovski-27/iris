@@ -234,15 +234,30 @@ impl Dictation {
     ///
     /// Call this the instant the hotkey goes down — for streaming engines the
     /// connection then sets itself up while the user is drawing breath.
-    pub fn start(engine: &dyn Engine) -> Result<Self> {
+    pub fn start(engine: &dyn Engine) -> Result<Self, Box<DictationError>> {
         Self::start_at(engine, Instant::now())
     }
 
     /// As [`Dictation::start`], but with the key-press instant supplied by the
     /// hotkey hook rather than measured on arrival.
-    pub fn start_at(engine: &dyn Engine, key_down: Instant) -> Result<Self> {
+    ///
+    /// A connect failure (a dead network, DNS, an unreachable engine) still
+    /// carries the timeline it managed to stamp — just [`Mark::KeyDown`] at
+    /// this point — for the same reason [`Dictation::finish`]'s error does:
+    /// a caller logging diagnostics should see that a session was actually
+    /// attempted rather than a blank record indistinguishable from "nothing
+    /// happened".
+    pub fn start_at(engine: &dyn Engine, key_down: Instant) -> Result<Self, Box<DictationError>> {
         let mut timeline = Timeline::start_at(engine.name(), key_down);
-        let session = engine.open()?;
+        let session = match engine.open() {
+            Ok(session) => session,
+            Err(e) => {
+                return Err(Box::new(DictationError {
+                    message: format!("{e:#}"),
+                    timeline,
+                }))
+            }
+        };
         timeline.mark(Mark::SessionOpen);
         Ok(Self {
             session,
@@ -897,13 +912,16 @@ mod tests {
 
     #[test]
     fn a_stalled_engine_error_still_carries_the_real_timeline() {
-        // Regression: the captain's two zero-audio failures on 2026-08-02
-        // logged `audio_secs: 0.0` even though real audio had almost
-        // certainly been captured — an artifact of the caller (iris-app's
-        // `capture()`) building a blank Timeline on any error instead of
-        // keeping the one Dictation had already stamped. That is what made
-        // "did the previous session leave capture in a bad state" look
-        // plausible when the real cause was a Deepgram connection failure.
+        // Regression: the captain's session log carried several successful
+        // dictations whose `perceived_ms` spiked to 6-10s (e.g. 6484ms,
+        // 10128ms on 2026-08-02) with no engine-reported error at all — the
+        // session simply never sent a close sign-off, so only
+        // `DEFAULT_FINAL_TIMEOUT` ended the wait (see its doc comment). Had
+        // that stall instead outlasted the timeout on a *failed* attempt, the
+        // old code path would have logged `audio_secs: 0.0` regardless of how
+        // much real audio was captured — an artifact of the caller
+        // (iris-app's `capture()`) building a blank Timeline on any `finish()`
+        // error instead of keeping the one `Dictation` had already stamped.
         // This drives an engine that connects, receives real audio, and then
         // never concludes — the shape of a session stalled by a network
         // failure — and checks the error still carries what actually

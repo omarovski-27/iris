@@ -154,11 +154,26 @@ the session close instead. Three earlier designs (unbounded coverage-catch-up, a
 fixed ceiling, a stall detector) were tried and rejected first. The measured
 figures and the full reasoning — including why an inferred "Deepgram is probably
 done" always loses to this authoritative signal — live in the module doc of
-`crates/iris-core/src/engine/deepgram.rs`, beside the constants they set. Session
-prewarming was also tried and dropped: a live idle probe found Deepgram closes
-an unused connection in roughly 12-15s (see Sharp edges), far short of real
-gaps between dictations, so it protected against a race that barely occurred
-in practice.
+`crates/iris-core/src/engine/deepgram.rs`, beside the constants they set. Static
+session prewarming (open one connection ahead of the key press and hope it is
+still there) was tried and dropped: a live idle probe found Deepgram closes an
+unused connection in roughly 12-15s, far short of real gaps between
+dictations, so it protected against a race that barely occurred in practice.
+That finding does not rule out *actively* holding a connection open —
+`WarmPool` in the same file does exactly that with Deepgram's documented
+`KeepAlive` control frame, bounded to `MAX_WARM_IDLE` (3 minutes, chosen from
+the captain's own session log: 61% of real gaps between dictations were under
+that, versus 29-37% under Deepgram's raw idle-close window alone). A handed-in
+warm connection is never trusted blindly — see `confirm_pending` in
+`pump_inner` and its module-doc section "The warm spare" for the
+reconnect-and-retry fallback that makes a stale handoff cost latency, never
+data. A shared
+`rustls::ClientConfig` (`engine/net.rs::tls_connector`) was also tried for TLS
+session resumption on every cold connect: it works (live-verified against the
+real endpoint), but live-measured wall-clock impact was negligible, because
+TLS 1.3's full handshake is already 1-RTT and resumption without 0-RTT saves
+crypto compute, not a round trip — kept as a harmless, real-but-modest win, not
+mistaken for the fix.
 
 **A re-emitted final segment is discriminated by the audio span it covers, never
 by when it arrived.** A guard keyed on arrival — anything landing after the
@@ -322,9 +337,27 @@ the hold collected, but never typed.
   sanctioned way to cover `RightAlt`/`RightWin` — never widen the correction
   in `modifier_to_release`.
 - Deepgram closes an idle websocket connection (no audio sent) in roughly
-  12-15s, live-measured. Relevant to any future connection-reuse idea: it
-  only pays off within that window of the last dictation, not across the
-  minutes-apart gaps typical of real desktop use.
+  12-15s, live-measured — this is what `WarmPool`'s `KeepAlive` frames
+  (`engine/deepgram.rs`) exist to hold off, actively, rather than something a
+  passive reused connection can rely on.
+- The 24-of-31 "Deepgram returned no transcript" failures a 2026-08 session
+  log audit set out to explain were not a live bug: every one predated the
+  `from_finalize` gate (`5e53f96`, 2026-08-01T18:03:56Z) merging to `main`,
+  and zero recurred in the ~42 hours of real use after it landed. Established
+  by timestamp correlation against the merge time, not by re-deriving the
+  mechanism — if a similar cluster resurfaces, check the build actually
+  includes that commit before assuming a new regression.
+- That same audit left two "almost no audio reached the transcription engine"
+  failures unexplained (`sent_secs` genuinely near zero, both right after a
+  36-minute idle gap, 1.3s apart — a retry pattern, not an accidental tap).
+  Suspected but *not established*: `MicAudio` (`iris-app/src/audio.rs`) opens
+  its WASAPI stream once and never revalidates or reopens it, and
+  `capture.rs`'s cpal `on_error` callback only reached `eprintln!` — invisible
+  on a windowless tray app — until this task routed it through `vlog!`. That
+  fix makes a future recurrence diagnosable under `--verbose`; it does not by
+  itself confirm or fix a root cause, which needs live telemetry from a real
+  Windows session to pin down (device staleness after sleep/idle vs. some
+  other cause). Do not assume it is fixed.
 
 ## Maintaining this file
 
