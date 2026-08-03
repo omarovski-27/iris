@@ -140,6 +140,99 @@ fn the_documented_keys_example_appends_cleanly() {
     assert_eq!(loaded.hotkey, Config::default().hotkey);
 }
 
+/// Every ```toml fence in a Markdown document, in order.
+fn toml_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut body = String::new();
+    let mut inside = false;
+    for line in markdown.lines() {
+        match line.trim() {
+            "```toml" if !inside => inside = true,
+            "```" if inside => {
+                inside = false;
+                blocks.push(std::mem::take(&mut body));
+            }
+            _ if inside => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// The zip's `README.md` is what a non-developer follows to add a key, and its
+/// two TOML edits go in two different places for a reason: appended together,
+/// `engine` lands inside the file's last table and `deny_unknown_fields`
+/// refuses the file. So run the document rather than trusting it — read the
+/// real file, apply exactly what it says to the config Iris actually
+/// generates, and load the result.
+#[test]
+fn the_packaged_readme_instructions_produce_a_config_that_loads() {
+    let readme_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/windows/README.md");
+    let readme = std::fs::read_to_string(&readme_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", readme_path.display()));
+
+    let blocks = toml_blocks(&readme);
+    let engine_line = blocks
+        .iter()
+        .find(|b| b.starts_with("engine = "))
+        .expect("a ```toml block that sets `engine`")
+        .trim()
+        .to_string();
+    let keys_block = blocks
+        .iter()
+        .find(|b| b.starts_with("[keys]"))
+        .expect("a ```toml block that adds `[keys]`")
+        .clone();
+    assert!(
+        !engine_line.contains("[keys]") && !keys_block.contains("engine ="),
+        "the two edits must stay in separate blocks, or the document invites \
+         pasting them as one: {engine_line:?} / {keys_block:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    Config::default().save(&path).unwrap();
+    let generated = std::fs::read_to_string(&path).unwrap();
+
+    let mut edits = 0;
+    let with_engine = generated
+        .lines()
+        .map(|line| {
+            if line.starts_with("engine = ") {
+                edits += 1;
+                engine_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        edits, 1,
+        "the README says to edit the existing `engine =` line in place, so the \
+         generated file must contain exactly one:\n{generated}"
+    );
+
+    let followed = format!("{with_engine}\n\n{keys_block}");
+    write(&path, &followed);
+    let loaded = Config::load(&path)
+        .unwrap_or_else(|e| panic!("following the packaged README produced a config Iris rejects: {e}\n\n{followed}"));
+    assert_eq!(loaded.engine, EngineChoice::Deepgram);
+    assert_eq!(loaded.keys.deepgram.as_deref(), Some("paste-your-key-here"));
+
+    let pasted_as_one_block = format!("{generated}\n{engine_line}\n{keys_block}");
+    write(&path, &pasted_as_one_block);
+    assert!(
+        Config::load(&path).is_err(),
+        "appending both edits together is the hazard the README is arranged to \
+         avoid; if it has become harmless, say so there instead of implying it"
+    );
+}
+
 /// Both halves of the path resolution live in one test on purpose: they mutate
 /// the same environment variable, and `cargo test` runs tests in parallel
 /// threads within a binary.

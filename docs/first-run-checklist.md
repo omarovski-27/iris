@@ -26,13 +26,13 @@ on the machine you're actually going to use Iris on.
 - [ ] `install.ps1` actually runs from a double-click / "Run with
       PowerShell". Windows' default execution policy blocks unsigned scripts
       on many machines — if it refuses, confirm the `-ExecutionPolicy Bypass`
-      fallback in the README's Install section works and reads clearly to
-      someone who has never used PowerShell.
+      fallback in the zip's `README.md` (`packaging/windows/README.md`) works
+      and reads clearly to someone who has never used PowerShell.
 - [ ] First launch of `iris.exe` from a downloaded (not locally built) zip
       shows SmartScreen's "Windows protected your PC" box. Confirm **More
-      info → Run anyway** actually gets Iris running, and that the README's
-      "Windows protected your PC" section reads clearly to someone who has
-      never seen that dialog before. `iris.exe` is unsigned by design (no
+      info → Run anyway** actually gets Iris running, and that the zip
+      README's "Windows protected your PC" section reads clearly to someone
+      who has never seen that dialog before. `iris.exe` is unsigned by design (no
       certificate) — this is expected, not a build defect.
 - [ ] The installer's closing output is still readable after it finishes —
       it pauses on "Press Enter to close" rather than vanishing with the

@@ -48,17 +48,34 @@ needed yet. Out of the box Iris runs the offline **mock** engine, so dictation
 "works" but the transcript is a stub, not what you said.
 
 To dictate for real, right-click the tray icon → **Open settings…**, which
-opens `config.toml` in your editor. Its header comment walks through getting a
-Deepgram or Groq key. Set the engine and paste the key:
+opens `config.toml` in your editor. Its header comment says the same as what
+follows. There are two separate edits, and they go in two different places —
+pasting them together as one block leaves a file Iris refuses to load.
+
+**1. Change the engine, in place.** Near the top of the file, among the other
+settings, is a line reading `engine = "mock"`. Edit that line — do not add a
+second one — so it reads:
 
 ```toml
-engine = "deepgram"   # or "groq"
-
-# Keep [keys] last: everything after a table header belongs to that table.
-[keys]
-deepgram = "your-deepgram-key"
-# groq = "your-groq-key"
+engine = "deepgram"
 ```
+
+Use `engine = "groq"` instead if you are using Groq.
+
+**2. Add your key at the very end of the file.** Get a key from
+<https://console.deepgram.com> (or <https://console.groq.com/keys> for Groq),
+then scroll past every other setting, to the very bottom, and add:
+
+```toml
+[keys]
+deepgram = "paste-your-key-here"
+```
+
+For Groq the entry is `groq = "paste-your-key-here"` in that same table.
+
+This has to be the last thing in the file: TOML puts every line after a
+`[keys]` header inside that table, so a `[keys]` block anywhere else swallows
+the settings below it and Iris will not start.
 
 Keys in this file are never printed back by Iris.
 

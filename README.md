@@ -13,56 +13,18 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 
 ## Install (Windows)
 
-For someone who just wants to run Iris — no Rust, no build tools. The zip
-carries this same walkthrough as its own `README.md`
-([`packaging/windows/README.md`](packaging/windows/README.md)), so a recipient
-never needs this repository:
+For someone who just wants to run Iris — no Rust, no build tools: get
+`iris-<version>-windows-x64.zip` (build one yourself with
+`scripts/package-windows.sh`, or take one someone already built), extract it,
+and follow the `README.md` inside.
 
-1. Get `iris-<version>-windows-x64.zip` (build one yourself with
-   `scripts/package-windows.sh`, or take one someone already built) and
-   extract it anywhere.
-2. Right-click `install.ps1` inside the extracted folder → **Run with
-   PowerShell**. If Windows refuses ("running scripts is disabled on this
-   system"), open PowerShell in that folder instead and run:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\install.ps1
-   ```
-   Add `-Desktop` for a desktop shortcut and/or `-RunAtLogin` to start Iris
-   automatically at login:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Desktop -RunAtLogin
-   ```
-   This copies `iris.exe` into `%LOCALAPPDATA%\Iris` and adds a Start Menu
-   shortcut. No admin rights needed; nothing is touched outside your user
-   profile. `-RunAtLogin` adds a shortcut in your Startup folder — delete it
-   to undo, there is no registry entry.
-3. Launch **Iris** from the Start Menu (or your shortcut).
-4. First run writes `%APPDATA%\iris\config.toml` — commented defaults, no
-   key needed yet (it starts on the offline mock engine, so dictation "works"
-   but the transcript is a stub, not what you said).
-5. To dictate for real: right-click the tray icon → **Open settings…**, which opens
-   `config.toml` in your editor. The header comment walks through getting a
-   Deepgram or Groq key and where to paste it (a `[keys]` section — never
-   printed back by Iris, including by `--print-config`). Save the file, then
-   restart Iris — right-click the tray icon → **Quit Iris**, and launch it
-   again. A key is read once at startup, so **Reload settings** does not apply
-   one: it reports that the keys changed and keeps running on the engine Iris
-   started with.
-6. Hold **Right-Ctrl**, speak, release. Your words appear in whatever window
-   had focus.
-
-### "Windows protected your PC"
-
-`iris.exe` is not code-signed — signing needs a paid certificate this project
-does not have. If the zip was downloaded rather than built locally, Windows
-marks it, and the first launch shows SmartScreen's blue **"Windows protected
-your PC"** box, whose only obvious button is *Don't run*. Click **More info**,
-then **Run anyway**. You can also head it off before extracting: right-click
-the zip → Properties → tick **Unblock** → OK.
-
-Only do this for a zip you built yourself or got from someone you trust — that
-dialog is doing its job, and this section is telling you how to answer it, not
-that it is wrong.
+That document —
+[`packaging/windows/README.md`](packaging/windows/README.md), staged into the
+zip — is the single source of truth for the end-user path: the SmartScreen
+"Windows protected your PC" prompt, running `install.ps1` (and its `-Desktop`
+/ `-RunAtLogin` flags), where `%APPDATA%\iris\config.toml` lives, and how to
+switch off the mock engine and add a Deepgram or Groq key. A recipient never
+needs this repository. The rest of this README is the developer path.
 
 ### Why a zip and not an installer
 

@@ -7,6 +7,12 @@
 //! `OUT_DIR`, and `tray`'s `the_embedded_exe_icon_still_matches_the_tray_mark`
 //! reads it back and fails on any drift.
 //!
+//! The `.ico` is therefore written for *every* target, not just Windows: the
+//! rasteriser is portable, and generating it everywhere is what lets that
+//! drift test run in the ordinary `cargo test --workspace` loop on Linux —
+//! the only place this project's CI executes tests at all. Only the
+//! `winresource` embed below is Windows-specific.
+//!
 //! Uses `winresource`, which drives the mingw `windres` already required to
 //! link `x86_64-pc-windows-gnu` (see `docs/dev-windows.md`) — no MSVC, no
 //! Windows SDK, no new host dependency.
@@ -17,13 +23,14 @@ use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let ico_path = Path::new(&out_dir).join("iris.ico");
     write_ico(&ico_path, &[16, 32, 48, 256]);
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
 
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION set by cargo");
     let (major, minor, patch) = parse_version(&version);

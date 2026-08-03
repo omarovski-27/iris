@@ -561,8 +561,11 @@ mod tests {
     /// depend on the crate it builds. Read back the `.ico` it actually wrote
     /// and compare pixels, so drift fails the build rather than shipping an
     /// `.exe` whose icon quietly stops matching the tray.
+    ///
+    /// Deliberately not `#[cfg(windows)]`: `build.rs` generates the `.ico` for
+    /// every target precisely so this runs in the portable test loop, which is
+    /// the only one that executes anywhere.
     #[test]
-    #[cfg(windows)]
     fn the_embedded_exe_icon_still_matches_the_tray_mark() {
         const SIZE: u32 = 256;
         let ico_path = std::path::Path::new(env!("OUT_DIR")).join("iris.ico");
