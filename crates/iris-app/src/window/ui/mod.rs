@@ -36,8 +36,16 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 /// take in what the loop did with the changes already sent, refresh from disk
 /// on the state's own timer, apply the theme, then paint the background wash,
 /// the nav sidebar and the active tab.
+///
+/// The reopen answer un-minimizes before it focuses, and the order is
+/// load-bearing: winit declines to focus a minimized window outright, so
+/// `Focus` alone would drain the signal and do nothing at all — the tray's
+/// `Settings` item would read as dead until the user restored the window by
+/// hand. Both commands run on the event loop thread in the order they are
+/// queued, so the restore has already landed when the focus is attempted.
 pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
     while env.reopen_signal.try_recv().is_ok() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
     state.poll_outcomes(env);

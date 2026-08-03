@@ -585,7 +585,9 @@ fn demo_window() -> Result<()> {
 /// `--demo-window`'s stand-in for `App`'s command handling: persist one
 /// setting change to the seeded config file.
 ///
-/// Only the settings the window can change are handled. The rest of
+/// Only the settings the window can change are handled — which is exactly
+/// what [`Command::apply_to`](iris_app::app::Command::apply_to) writes, and
+/// why the demo asks it rather than repeating the mapping. The rest of
 /// [`Command`](iris_app::app::Command) belongs to the dictation loop, which
 /// this demo deliberately
 /// does not run — there is no engine to switch, no microphone to reopen and
@@ -594,18 +596,10 @@ fn apply_demo_command(
     config_path: &std::path::Path,
     command: &iris_app::app::Command,
 ) -> Result<()> {
-    use iris_app::app::Command;
-
     let mut config =
         Config::load(config_path).with_context(|| format!("reading {}", config_path.display()))?;
-    match command {
-        Command::SetEngine(choice) => config.engine = *choice,
-        Command::SetDevice(device) => config.audio.device = device.clone(),
-        Command::SetPolish(enabled) => config.polish.enabled = *enabled,
-        Command::SetTheme(theme) => config.theme = *theme,
-        Command::SetHotkey(key) => config.hotkey = *key,
-        Command::SetOverlayEnabled(enabled) => config.overlay_enabled = *enabled,
-        Command::OpenSettings | Command::Reload | Command::Quit => return Ok(()),
+    if !command.apply_to(&mut config) {
+        return Ok(());
     }
     config
         .save(config_path)

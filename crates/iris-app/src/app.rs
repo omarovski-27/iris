@@ -76,6 +76,29 @@ pub enum Command {
     Quit,
 }
 
+impl Command {
+    /// Write this command's change into `config`, and say whether it wrote
+    /// anything: `OpenSettings`, `Reload` and `Quit` set no field.
+    ///
+    /// This is the only place that knows which [`Config`] field each command
+    /// stands for. Three callers need that mapping — the loop itself, the
+    /// settings window moving its controls onto a confirmed change, and
+    /// `--demo-window`'s stand-in for the loop — and a seventh settable field
+    /// added to only two of them is a silently half-wired setting.
+    pub fn apply_to(&self, config: &mut Config) -> bool {
+        match self {
+            Command::SetEngine(choice) => config.engine = *choice,
+            Command::SetDevice(device) => config.audio.device = device.clone(),
+            Command::SetPolish(enabled) => config.polish.enabled = *enabled,
+            Command::SetTheme(theme) => config.theme = *theme,
+            Command::SetHotkey(key) => config.hotkey = *key,
+            Command::SetOverlayEnabled(enabled) => config.overlay_enabled = *enabled,
+            Command::OpenSettings | Command::Reload | Command::Quit => return false,
+        }
+        true
+    }
+}
+
 /// What the loop did with a [`Command`] the settings window sent.
 ///
 /// The window shows the user what happened, so a queued command is not yet an
@@ -347,20 +370,23 @@ impl<A: AudioSource> App<A> {
     /// change that never happened.
     fn apply(&mut self, command: Command, from_window: bool) -> Result<std::ops::ControlFlow<()>> {
         let mut outcome = CommandOutcome::Applied;
-        match command {
+        // Matched by reference so every arm that touches the config can go
+        // through `Command::apply_to` rather than naming the field itself.
+        match &command {
             Command::Quit => return Ok(std::ops::ControlFlow::Break(())),
             Command::SetEngine(choice) => {
+                let choice = *choice;
                 if choice == self.config.engine {
                     self.report(from_window, outcome);
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
                 let previous = self.config.engine;
-                self.config.engine = choice;
+                command.apply_to(&mut self.config);
                 match engines::build(&self.config) {
                     Ok(engine) => {
                         self.pill.set_engine(engine.name());
                         self.engine = engine;
-                        self.saved.engine = choice;
+                        command.apply_to(&mut self.saved);
                         println!("  engine: {choice}");
                         self.persist();
                     }
@@ -376,8 +402,8 @@ impl<A: AudioSource> App<A> {
             }
             Command::SetDevice(device) => match self.audio.set_device(device.clone()) {
                 Ok(()) => {
-                    self.config.audio.device = device.clone();
-                    self.saved.audio.device = device;
+                    command.apply_to(&mut self.config);
+                    command.apply_to(&mut self.saved);
                     println!("  microphone: {}", self.audio.describe());
                     self.persist();
                 }
@@ -387,15 +413,17 @@ impl<A: AudioSource> App<A> {
                 }
             },
             Command::SetPolish(enabled) => {
-                self.config.polish.enabled = enabled;
-                self.saved.polish.enabled = enabled;
+                let enabled = *enabled;
+                command.apply_to(&mut self.config);
+                command.apply_to(&mut self.saved);
                 self.polisher = polish::build(&self.config);
                 println!("  polish: {}", if enabled { "on" } else { "off" });
                 self.persist();
             }
             Command::SetTheme(theme) => {
-                self.config.theme = theme;
-                self.saved.theme = theme;
+                let theme = *theme;
+                command.apply_to(&mut self.config);
+                command.apply_to(&mut self.saved);
                 self.pill.set_theme(theme);
                 self.persist();
             }
@@ -405,8 +433,9 @@ impl<A: AudioSource> App<A> {
                 // way until a restart, exactly like a hand-edited hotkey
                 // does through `Command::Reload`. Only `saved` — what the
                 // *next* launch will read — takes the new value.
+                let key = *key;
                 if key != self.saved.hotkey {
-                    self.saved.hotkey = key;
+                    command.apply_to(&mut self.saved);
                     println!("  hotkey: {key} (restart Iris for this to take effect)");
                     self.persist();
                 }
@@ -415,8 +444,9 @@ impl<A: AudioSource> App<A> {
                 // Same reasoning as `SetHotkey`: the overlay is spawned (or
                 // not) once in `main`, so `self.config.overlay_enabled` stays
                 // as it was until a restart.
+                let enabled = *enabled;
                 if enabled != self.saved.overlay_enabled {
-                    self.saved.overlay_enabled = enabled;
+                    command.apply_to(&mut self.saved);
                     println!(
                         "  overlay: {} (restart Iris for this to take effect)",
                         if enabled { "on" } else { "off" }

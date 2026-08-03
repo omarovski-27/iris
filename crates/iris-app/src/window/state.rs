@@ -502,7 +502,7 @@ impl WindowState {
                     };
                     match outcome {
                         CommandOutcome::Applied => {
-                            self.absorb(pending.command);
+                            self.absorb(&pending.command);
                             self.flash(pending.message);
                         }
                         CommandOutcome::Rejected(reason) => {
@@ -538,17 +538,12 @@ impl WindowState {
     /// The next [`WindowState::refresh`] would read the same value back from
     /// the file; this only means the control stops lagging a click by up to a
     /// refresh interval.
-    fn absorb(&mut self, command: Command) {
-        match command {
-            Command::SetEngine(choice) => self.config.engine = choice,
-            Command::SetDevice(device) => self.config.audio.device = device,
-            Command::SetTheme(theme) => self.config.theme = theme,
-            Command::SetPolish(enabled) => self.config.polish.enabled = enabled,
-            Command::SetHotkey(key) => self.config.hotkey = key,
-            Command::SetOverlayEnabled(enabled) => self.config.overlay_enabled = enabled,
-            // Nothing this window sends, and nothing that changes the form.
-            Command::OpenSettings | Command::Reload | Command::Quit => {}
-        }
+    ///
+    /// Which field each command stands for is [`Command::apply_to`]'s to know,
+    /// not this window's — the commands that change no field (nothing this
+    /// window sends anyway) simply do nothing here.
+    fn absorb(&mut self, command: &Command) {
+        command.apply_to(&mut self.config);
     }
 }
 
