@@ -87,6 +87,27 @@ running on the engine Iris started with.
 Then hold **Right-Ctrl**, speak, release. Your words appear in whatever window
 had focus.
 
+## Uninstall
+
+Iris does not register itself with Windows, so it does **not** appear in
+**Settings → Apps → Installed apps** — there is nothing to click there, and
+that is not a bug. Removing it is deleting what `install.ps1` created:
+
+1. Quit Iris — right-click the tray icon → **Quit Iris**.
+2. Delete the folder `%LOCALAPPDATA%\Iris`. That is the whole app.
+3. Delete the shortcuts. The Start Menu one is `Iris.lnk` in
+   `%APPDATA%\Microsoft\Windows\Start Menu\Programs`; if you installed with
+   `-Desktop` there is one on your Desktop, and with `-RunAtLogin` one more in
+   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`. Deleting the
+   Startup one is also how you stop Iris starting at login without removing
+   the rest.
+4. Optional: delete `%APPDATA%\iris` as well. That folder holds your settings
+   (including any key you pasted in) and your dictation history — leave it if
+   you might reinstall, since a fresh install picks it straight back up.
+
+Nothing is written outside your user profile and there are no registry
+entries, so those deletions are the complete uninstall.
+
 ## Anything else
 
 Troubleshooting, the full configuration reference, the source, and the

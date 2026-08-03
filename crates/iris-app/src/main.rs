@@ -217,11 +217,12 @@ fn run(
 
     banner(&resident.app, config_path);
     let result = resident.app.run(&resident.keys, &resident.commands);
-    // Explicit shutdown so the window is gone before we exit.
+    // Explicit shutdown so the window is gone before we exit — and before the
+    // dialog below, which is modal.
     if let Some(overlay) = resident.overlay.take() {
         overlay.shutdown();
     }
-    result
+    result.inspect_err(report_run_failure)
 }
 
 /// Open the microphone, start the tray, install the hook and build the app.
@@ -246,7 +247,7 @@ fn start_resident(
     let devices = iris_core::capture::list_devices()
         .map(|d| d.into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
-    let (tray, commands) = tray::spawn(&config, devices)?;
+    let (tray, commands) = tray::spawn(&config, config_path, devices)?;
 
     let (listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
         .context("installing the push-to-talk hook")?;
@@ -501,20 +502,42 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
 
 /// Put a failed startup in front of the user when stderr has nowhere to land.
 ///
+/// Covers the whole of starting up, in two calls that are each a whole phase
+/// rather than a single fallible step: `Config::load_or_create` in `main`, and
+/// [`start_resident`]. See [`report_failure`] for why a console binary needs a
+/// dialog at all, and [`report_run_failure`] for the one way the loop itself
+/// can end that needs the same treatment.
+#[cfg(windows)]
+fn report_startup_failure(err: &anyhow::Error) {
+    report_failure("Iris could not start", err);
+}
+
+/// The same dialog for the resident loop giving up.
+///
+/// [`App::run`] returns `Err` in exactly one case — the hotkey channel closing,
+/// which means the low-level hook is gone and there is no way left to dictate.
+/// Windows uninstalls that hook itself if a callback ever runs long, so this is
+/// a real end state and not only a bug path. Without the dialog it reads as Iris
+/// silently disappearing partway through a session, which is precisely what
+/// [`report_startup_failure`] exists to prevent one screen earlier.
+#[cfg(windows)]
+fn report_run_failure(err: &anyhow::Error) {
+    report_failure("Iris has stopped", err);
+}
+
+/// Show `err` in a message box, unless someone is watching a console that will
+/// outlive the process.
+///
 /// `iris` is a console binary, so launching it from the Start Menu or the
 /// Startup folder gives it a console window all of its own — one that closes
 /// with the process. A missing key, an unparseable config file, a microphone
-/// that is not there: each is an actionable sentence, and in that launch path
-/// each would be a black rectangle that flashes and vanishes. When another
-/// process shares this console (a shell the user typed in), the message
-/// survives on stderr and there is nothing to do; `GetConsoleProcessList` is
-/// what tells the two apart.
-///
-/// Reached from exactly two places, and both are whole startup phases rather
-/// than single calls: `Config::load_or_create` in `main`, and
-/// [`start_resident`]. Nothing after the loop begins opens a dialog.
+/// that is not there, a hook Windows took away: each is an actionable sentence,
+/// and in that launch path each would be a black rectangle that flashes and
+/// vanishes. When another process shares this console (a shell the user typed
+/// in), the message survives on stderr and there is nothing to do;
+/// `GetConsoleProcessList` is what tells the two apart.
 #[cfg(windows)]
-fn report_startup_failure(err: &anyhow::Error) {
+fn report_failure(caption: &str, err: &anyhow::Error) {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Console::GetConsoleProcessList;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -530,7 +553,7 @@ fn report_startup_failure(err: &anyhow::Error) {
     }
 
     let text = HSTRING::from(format!("{err:#}"));
-    let caption = HSTRING::from("Iris could not start");
+    let caption = HSTRING::from(caption);
     // MB_SETFOREGROUND and MB_TOPMOST are what make this visible at all in the
     // launch it exists for: a process started from the Startup folder has
     // never held the foreground, so Windows' foreground lock would otherwise

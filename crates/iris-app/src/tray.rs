@@ -27,6 +27,8 @@
 //! on a crate that is otherwise CI-testable anywhere — not worth it for a
 //! Windows-first product.
 
+use std::path::Path;
+
 use crossbeam_channel::Receiver;
 
 use crate::app::Command;
@@ -196,14 +198,50 @@ fn spectrum_sample(t: f32) -> (u8, u8, u8) {
     (last.1, last.2, last.3)
 }
 
+/// The two lines the menu shows while Iris is still on the offline mock engine.
+///
+/// The installed shortcut launches `iris.exe` minimized
+/// (`packaging/windows/install.ps1`), so the startup banner's pointer at the
+/// config file is never read on the path a non-developer actually takes: they
+/// see stub transcripts and nothing at all saying why. The tray is the only
+/// surface left, so the state has to be legible there. Both lines are disabled
+/// labels — a signpost at the file the existing "Open settings…" item already
+/// opens, not a second place to configure anything.
+///
+/// `None` for every real engine: this is a first-run signpost, not a status
+/// line, and a menu that always carries two extra rows would stop being read.
+pub fn demo_notice(config: &Config, config_path: &Path) -> Option<DemoNotice> {
+    (config.engine == EngineChoice::Mock).then(|| DemoNotice {
+        headline: "⚠  Demo mode: transcripts are stubs, not what you said".to_string(),
+        pointer: format!("Add a key in {}, then restart Iris", config_path.display()),
+    })
+}
+
+/// What [`demo_notice`] says: the state, then where to fix it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemoNotice {
+    /// The state, stated plainly enough that no one mistakes a stub transcript
+    /// for a transcription failure.
+    pub headline: String,
+    /// Where the key goes, and that a restart — not "Reload settings" — is what
+    /// puts it in force (`promote_keys` runs once, before any thread exists).
+    pub pointer: String,
+}
+
 /// The tooltip: what a user hovering the icon needs to know.
 pub fn tooltip(config: &Config) -> String {
-    format!(
+    let mut tip = format!(
         "Iris — hold {} to dictate\nengine: {}  polish: {}",
         config.hotkey,
         config.engine,
         if config.polish.enabled { "on" } else { "off" }
-    )
+    );
+    // "engine: mock" only means something to someone who already knows what the
+    // mock engine is. The hover is the first thing a puzzled user tries.
+    if config.engine == EngineChoice::Mock {
+        tip.push_str("\ndemo mode: transcripts are stubs — see the tray menu");
+    }
+    tip
 }
 
 /// A running tray. Dropping it removes the icon.
@@ -223,16 +261,21 @@ pub struct Tray {
 ///
 /// `devices` is the list of input device names for the microphone picker;
 /// enumerating them is the caller's job because it is a Windows-only call and
-/// this function has to compile everywhere.
-pub fn spawn(config: &Config, devices: Vec<String>) -> anyhow::Result<(Tray, Receiver<Command>)> {
+/// this function has to compile everywhere. `config_path` is only ever shown —
+/// it is the file [`demo_notice`] points a first-run user at.
+pub fn spawn(
+    config: &Config,
+    config_path: &Path,
+    devices: Vec<String>,
+) -> anyhow::Result<(Tray, Receiver<Command>)> {
     #[cfg(windows)]
     {
-        let (inner, commands) = win::spawn(config, devices)?;
+        let (inner, commands) = win::spawn(config, config_path, devices)?;
         Ok((Tray { _inner: inner }, commands))
     }
     #[cfg(not(windows))]
     {
-        let _ = (config, devices);
+        let _ = (config, config_path, devices);
         // A channel that never carries anything: the sender lives in the
         // returned `Tray`, so the loop selects on the receiver forever and the
         // app is driven entirely by the hotkey — the right behaviour on a
@@ -249,7 +292,9 @@ pub fn spawn(config: &Config, devices: Vec<String>) -> anyhow::Result<(Tray, Rec
 mod win {
     use anyhow::{Context, Result};
     use crossbeam_channel::{Receiver, Sender};
-    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+    use tray_icon::menu::{
+        CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+    };
     use tray_icon::{Icon, TrayIconBuilder};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_QUIT,
@@ -259,8 +304,8 @@ mod win {
     use crate::config::{Config, EngineChoice, Theme};
 
     use super::{
-        command_for, device_id, engine_id, icon_rgba, theme_id, tooltip, DEVICE_DEFAULT, ID_POLISH,
-        ID_QUIT, ID_RELOAD, ID_SETTINGS,
+        command_for, demo_notice, device_id, engine_id, icon_rgba, theme_id, tooltip,
+        DEVICE_DEFAULT, ID_POLISH, ID_QUIT, ID_RELOAD, ID_SETTINGS,
     };
 
     const ICON_SIZE: u32 = 32;
@@ -286,18 +331,23 @@ mod win {
         }
     }
 
-    pub fn spawn(config: &Config, devices: Vec<String>) -> Result<(TrayThread, Receiver<Command>)> {
+    pub fn spawn(
+        config: &Config,
+        config_path: &std::path::Path,
+        devices: Vec<String>,
+    ) -> Result<(TrayThread, Receiver<Command>)> {
         let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
         // Everything the tray thread needs, copied rather than shared: the tray
         // must not hold a lock the dictation loop could ever wait on.
         let config = config.clone();
+        let config_path = config_path.to_path_buf();
 
         let handle = std::thread::Builder::new()
             .name("iris-tray".into())
             .spawn(move || {
-                let result = run(&config, devices, commands_tx);
+                let result = run(&config, &config_path, devices, commands_tx);
                 match result {
                     Ok(pump) => {
                         let _ = ready_tx.send(Ok(unsafe {
@@ -331,6 +381,7 @@ mod win {
     /// owned by the closure rather than returned.
     fn run(
         config: &Config,
+        config_path: &std::path::Path,
         devices: Vec<String>,
         commands: Sender<Command>,
     ) -> Result<impl FnOnce()> {
@@ -397,20 +448,51 @@ mod win {
             None,
         );
 
-        menu.append_items(&[
-            &MenuItem::new(format!("Hold {} to dictate", config.hotkey), false, None),
-            &PredefinedMenuItem::separator(),
+        // Disabled labels at the very top, where a menu is read first, and only
+        // while the mock engine is in force. See `demo_notice`.
+        let demo: Vec<MenuItem> = match demo_notice(config, config_path) {
+            Some(notice) => vec![
+                MenuItem::new(notice.headline, false, None),
+                MenuItem::new(notice.pointer, false, None),
+            ],
+            None => Vec::new(),
+        };
+
+        // Bound rather than built inline: the slice below borrows them, so a
+        // temporary would not live long enough.
+        let demo_separator = PredefinedMenuItem::separator();
+        let hold = MenuItem::new(format!("Hold {} to dictate", config.hotkey), false, None);
+        let (top, middle, bottom) = (
+            PredefinedMenuItem::separator(),
+            PredefinedMenuItem::separator(),
+            PredefinedMenuItem::separator(),
+        );
+        let settings = MenuItem::with_id(ID_SETTINGS, "Open settings…", true, None);
+        let reload = MenuItem::with_id(ID_RELOAD, "Reload settings", true, None);
+        let quit = MenuItem::with_id(ID_QUIT, "Quit Iris", true, None);
+
+        let mut items: Vec<&dyn IsMenuItem> = Vec::new();
+        for item in &demo {
+            items.push(item);
+        }
+        if !demo.is_empty() {
+            items.push(&demo_separator);
+        }
+        items.extend([
+            &hold as &dyn IsMenuItem,
+            &top,
             &engines,
             &mics,
             &themes,
             &polish,
-            &PredefinedMenuItem::separator(),
-            &MenuItem::with_id(ID_SETTINGS, "Open settings…", true, None),
-            &MenuItem::with_id(ID_RELOAD, "Reload settings", true, None),
-            &PredefinedMenuItem::separator(),
-            &MenuItem::with_id(ID_QUIT, "Quit Iris", true, None),
-        ])
-        .context("building the tray menu")?;
+            &middle,
+            &settings,
+            &reload,
+            &bottom,
+            &quit,
+        ]);
+        menu.append_items(&items)
+            .context("building the tray menu")?;
 
         let icon = Icon::from_rgba(icon_rgba(config.theme, ICON_SIZE), ICON_SIZE, ICON_SIZE)
             .context("building the tray icon")?;
@@ -621,10 +703,61 @@ mod tests {
         assert!(tip.contains("polish: on"), "{tip}");
     }
 
+    /// The installed shortcut is minimized, so the startup banner never reaches
+    /// a first-run user: the tray has to carry the mock state on its own.
+    #[test]
+    fn the_menu_says_when_transcripts_are_stubs_and_where_the_key_goes() {
+        let path = Path::new("C:/Users/somebody/AppData/Roaming/iris/config.toml");
+        let notice = demo_notice(&Config::default(), path).expect("mock is the default engine");
+
+        assert!(
+            notice.headline.to_lowercase().contains("demo"),
+            "{notice:?}"
+        );
+        assert!(
+            notice.pointer.contains(&path.display().to_string()),
+            "{notice:?}"
+        );
+        // A key only lands at startup (`Config::promote_keys`), so pointing at
+        // "Reload settings" here would send the user somewhere that cannot work.
+        assert!(
+            notice.pointer.to_lowercase().contains("restart"),
+            "{notice:?}"
+        );
+
+        let tip = tooltip(&Config::default());
+        assert!(tip.to_lowercase().contains("demo mode"), "{tip}");
+    }
+
+    #[test]
+    fn a_real_engine_gets_no_demo_notice_at_all() {
+        let path = Path::new("/tmp/iris/config.toml");
+        for engine in [
+            EngineChoice::Deepgram,
+            EngineChoice::Groq,
+            EngineChoice::Local,
+        ] {
+            let config = Config {
+                engine,
+                ..Config::default()
+            };
+            assert_eq!(demo_notice(&config, path), None, "{engine}");
+            assert!(
+                !tooltip(&config).to_lowercase().contains("demo mode"),
+                "{engine}"
+            );
+        }
+    }
+
     #[test]
     #[cfg(not(windows))]
     fn without_a_tray_the_command_channel_is_empty_but_not_disconnected() {
-        let (_tray, commands) = spawn(&Config::default(), Vec::new()).unwrap();
+        let (_tray, commands) = spawn(
+            &Config::default(),
+            Path::new("/tmp/iris/config.toml"),
+            Vec::new(),
+        )
+        .unwrap();
         // Empty and Disconnected are both `Err`; the loop exits on the latter,
         // so the distinction is the whole point of this test.
         assert_eq!(

@@ -39,6 +39,9 @@ if [[ ! -f "$exe" ]]; then
     echo "error: $exe was not produced by the build" >&2
     exit 1
 fi
+# Before staging and zipping, which are the slow part: the runnable binary is
+# useful on its own, and this is the exact path to run.
+echo "Built $exe"
 
 # From cargo, not from a grep of Cargo.toml: this is the same value the build
 # stamped into the exe as CARGO_PKG_VERSION, and a parse failure here is loud

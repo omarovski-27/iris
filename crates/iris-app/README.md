@@ -213,6 +213,14 @@ reload settings, quit. "Open settings" opens `config.toml` in the user's editor
 — the file is already the source of truth and is commented; a bespoke settings
 window would be the same thing built twice.
 
+While the mock engine is in force the menu opens with two disabled labels above
+all of that (`tray::demo_notice`): what the mock engine means for the transcript,
+and the config path a key goes in. They are there because the installed shortcut
+launches the exe minimized (`packaging/windows/install.ps1`), which is exactly
+the launch where the startup banner's pointer at the same file is never read —
+leaving a first-run user on stub transcripts with no explanation on screen. The
+tooltip says the same thing in one line, for the same reason.
+
 The icon is the captain-locked **prism triangle** (spectrum wedge on a plate),
 drawn in code (`tray::icon_rgba`) from the same mark as
 `iris-overlay/assets/iris-prism.svg`. No binary `.ico` to keep in step with the

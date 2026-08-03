@@ -219,8 +219,9 @@ fn the_packaged_readme_instructions_produce_a_config_that_loads() {
 
     let followed = format!("{with_engine}\n\n{keys_block}");
     write(&path, &followed);
-    let loaded = Config::load(&path)
-        .unwrap_or_else(|e| panic!("following the packaged README produced a config Iris rejects: {e}\n\n{followed}"));
+    let loaded = Config::load(&path).unwrap_or_else(|e| {
+        panic!("following the packaged README produced a config Iris rejects: {e}\n\n{followed}")
+    });
     assert_eq!(loaded.engine, EngineChoice::Deepgram);
     assert_eq!(loaded.keys.deepgram.as_deref(), Some("paste-your-key-here"));
 

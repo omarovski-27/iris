@@ -60,13 +60,35 @@ fn main() {
     }
 }
 
+/// The `major.minor.patch` the Windows version quad is stamped from.
+///
+/// A semver pre-release or build suffix (`0.2.0-rc1`) is dropped, because the
+/// quad has nowhere to put it; anything else that is not three numbers is
+/// fatal, for the same reason the embed above is fatal rather than a
+/// `cargo:warning`. A component quietly defaulting to 0 ships an exe whose
+/// Properties disagree with the version in the zip's name, and that only
+/// surfaces after the zip is cut.
 fn parse_version(v: &str) -> (u16, u16, u16) {
-    let mut parts = v.split('.').map(|p| p.parse::<u16>().unwrap_or(0));
-    (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    )
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let parts: Vec<u16> = core
+        .split('.')
+        .map(|part| {
+            part.parse().unwrap_or_else(|e| {
+                panic!(
+                    "CARGO_PKG_VERSION is {v:?}: component {part:?} is not a number \
+                     below 65536 ({e}), and it is stamped into the exe's FILEVERSION \
+                     and PRODUCTVERSION"
+                )
+            })
+        })
+        .collect();
+    let [major, minor, patch] = parts[..] else {
+        panic!(
+            "CARGO_PKG_VERSION is {v:?}: expected three dot-separated components \
+             (major.minor.patch), optionally followed by a -pre-release or +build suffix"
+        )
+    };
+    (major, minor, patch)
 }
 
 /// Writes a multi-size `.ico` built from the prism-triangle geometry, dark

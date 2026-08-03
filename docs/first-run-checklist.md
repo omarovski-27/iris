@@ -51,6 +51,11 @@ on the machine you're actually going to use Iris on.
 - [ ] `-RunAtLogin` actually starts Iris after a real login (not just a
       shortcut sitting in the Startup folder) — log out and back in, or
       restart, to confirm.
+- [ ] The zip README's **Uninstall** steps are complete: after deleting
+      `%LOCALAPPDATA%\Iris` and the shortcuts it names, nothing of Iris is
+      left running, launchable or listed. Confirm the claim they rest on —
+      that Iris never appears in Settings → Apps → Installed apps, because
+      `install.ps1` writes no registry entry.
 
 ## First-run config
 
@@ -59,6 +64,18 @@ on the machine you're actually going to use Iris on.
       someone who has never opened a TOML file.
 - [ ] With no key configured, the app runs on the mock engine without
       crashing (dictation "works" but transcribes to a stub).
+- [ ] Launched from the Start Menu shortcut — minimized, so the startup banner
+      is never seen, which is the whole point — the tray menu opens with two
+      disabled lines above everything else: "Demo mode: transcripts are stubs,
+      not what you said" and "Add a key in %APPDATA%\iris\config.toml, then
+      restart Iris" (`tray::demo_notice`). Check the full path fits and reads
+      rather than being clipped, and that hovering the icon says the same in
+      one line. This is the only in-app explanation a first-run user gets on
+      that launch path.
+- [ ] Those two lines are gone once a real engine is configured and Iris has
+      been restarted. Note that switching engine *from the tray* does not
+      remove them until a restart — the menu is built once at startup, the
+      same limitation its check marks already have.
 - [ ] Deliberately misconfigure `engine = "deepgram"` with no key: the error
       is a clear sentence naming the config path and telling you to start Iris
       again after editing it — not a Rust panic or stack trace.
@@ -95,6 +112,11 @@ on the machine you're actually going to use Iris on.
       else is rejected at load. None have been exercised on real hardware.
 - [ ] After a rebind and the restart it needs, the old hotkey stops working
       and the new one starts, with no double trigger or stuck-key behavior.
+- [ ] If Windows ever uninstalls the low-level hook mid-session (it does that
+      to a callback that runs long), Iris says so in an "Iris has stopped"
+      dialog rather than disappearing — the same treatment startup failures
+      get, since a shortcut-launched app has no console to print to. There is
+      no way to provoke this on purpose; note it if it ever happens.
 
 ## Overlay
 
