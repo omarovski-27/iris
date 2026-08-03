@@ -401,6 +401,34 @@ simplification. Any overlap between it and the now-taller centred wave row is
 resolved by draw order (`draw_glyph` paints after `draw_wave`), the same way
 it already coexisted with the old row.
 
+**Two further instances of the endpoint-only-reasoning shape above, found in
+review and deliberately left as-is (captain decision: ship as-is).** Both sit
+in `Renderer::draw`, both affect only the opt-in live-text ribbon
+(`show_live_text = true`, off by default — the default presentation, which is
+what almost every user sees, is unaffected by either):
+
+- `timer_zone`, the width `draw_wave`'s `right_reserve` is measured against,
+  is scaled by `timer_a` (the timer's own alpha) rather than being a disjoint
+  binary reservation. For the whole `(0, HANDOFF_LO)` window of every ribbon
+  open/close the reserved zone is narrower than the timer run still actually
+  occupies, so the wave row's bars extend under the still-partially-opaque
+  digits.
+- `text_band`'s ceiling is pinned to `wave_row_bottom(open)` (the fix for the
+  scrim-over-bars artifact earlier in this section) and has the mirror
+  problem at the other handoff: at `open == HANDOFF_HI` the band's top has
+  already clamped to just above the shape's centre while `text_alpha` is at
+  `1.0`, so live text paints at full opacity with the scrim covering only its
+  lower portion for that window.
+
+Both are opt-in-only, self-correct once the tween settles, and are tracked
+outside this branch as `iris-overlay-transition-model` rather than patched
+here — the recurrence itself (this is the fourth and fifth instance of an
+element reasoned about correctly only at its alpha's endpoints found across
+this round's review passes) is the signal that the compositing model —
+independent multi-pass-alpha elements sharing visual space, each reasoned
+about in isolation — may need to change, rather than continuing to patch each
+new instance as it turns up.
+
 ## Why a CPU raster path
 
 The pill is small — even at its widest (the open ribbon) the whole frame is a

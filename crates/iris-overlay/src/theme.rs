@@ -508,7 +508,8 @@ mod tests {
             for desktop in [Rgba::hex(0x00_0000), Rgba::hex(0xFF_FFFF)] {
                 for (i, stop) in theme.spectrum.iter().enumerate() {
                     let backing = shell_over(*stop, desktop);
-                    let best = contrast(theme.ink, backing).max(contrast(theme.timer_edge, backing));
+                    let best =
+                        contrast(theme.ink, backing).max(contrast(theme.timer_edge, backing));
                     if best < worst {
                         worst = best;
                         worst_where = format!(
