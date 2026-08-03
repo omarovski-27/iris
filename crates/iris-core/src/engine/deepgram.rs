@@ -27,24 +27,46 @@
 //! `WarmPool` is a different shape, not a resurrection of that one: it keeps
 //! at most one spare connection *actively* alive with Deepgram's documented
 //! `{"type":"KeepAlive"}` control frame (sent every
-//! [`WARM_KEEPALIVE_INTERVAL`], well under the idle-close window), for up to
-//! [`MAX_WARM_IDLE`] since it was last handed to a real dictation. `open()`
-//! takes the spare if one is ready and hands it straight to `pump_inner`,
-//! skipping the connect entirely; otherwise it connects cold exactly as
-//! before. Either way a fresh spare is queued to replace whatever was just
-//! taken, so the *next* dictation has one waiting again.
+//! [`WARM_KEEPALIVE_INTERVAL`], well under the idle-close window), for as
+//! long as dictations keep happening. `open()` takes the spare if one is
+//! ready and hands it straight to `pump_inner`, skipping the connect
+//! entirely; otherwise it connects cold exactly as before. Either way a
+//! fresh spare is queued to replace whatever was just taken, so the *next*
+//! dictation has one waiting again.
+//!
+//! Two bounds keep the pool from outliving its usefulness, and a resident
+//! tray app needs both: [`maintain`] stops — releasing the spare, leaving
+//! nothing connected and nothing ticking — once [`MAX_WARM_IDLE`] has
+//! passed since the last `open()`, and starts again on the next one; and
+//! the pool is owned by the engine, so replacing the engine (the tray's
+//! engine picker, a config reload) drops the pool and stops its loop rather
+//! than leaving an orphan reconnecting and writing to Deepgram for the life
+//! of the process.
 //!
 //! Deepgram never acknowledges a `KeepAlive` (its docs are explicit: no
-//! response), so a successful send is proof the local write succeeded, not
-//! that the peer is still there — a connection can go dead in the gap
-//! between the last keep-alive and the moment `open()` claims it, and no
-//! amount of pinging closes that window to zero. Rather than accept that as
-//! a data-loss risk, `pump_inner` treats a handed-in spare as unconfirmed
-//! until its first send succeeds: if that first send fails, it transparently
-//! reconnects cold and retries the same bytes before giving up, so a stale
-//! handoff costs a bit of latency (falls back to exactly today's cold-connect
-//! path) and never a dropped word. See the `confirm_pending` handling in
-//! `pump_inner` and `a_stale_warm_handoff_reconnects_without_losing_audio`.
+//! response), so a successful send proves the local write succeeded, not
+//! that the peer is still there. Two mechanisms cover that gap, and neither
+//! is allowed to cost a word:
+//!
+//! * The maintenance loop *reads* the spare — without waiting, before every
+//!   keep-alive — so a peer that went away politely, with a websocket
+//!   `Close` or a FIN that a small write buffers into happily, is noticed
+//!   while the connection is idle and dropped instead of handed out. The
+//!   same check runs once more at handoff, in `pump_inner`. (Reading is
+//!   also what lets tungstenite answer a server `Ping`: it can only queue a
+//!   `Pong` for a `Ping` it has actually read.) See [`already_closed`].
+//! * What that cannot see — a close landing in the microseconds after the
+//!   check, or a half-open connection writes still buffer into — is covered
+//!   by treating a handed-in spare as *unproven* until Deepgram answers on
+//!   it in this session. Every frame sent meanwhile is kept
+//!   (`Message::Binary` is refcounted, so that costs a pointer per frame,
+//!   not a second copy of the utterance), and a send failure, a close, or a
+//!   silent [`FINALIZE_ACK_TIMEOUT`] before that first answer replays the
+//!   whole sequence onto a fresh cold connection. A stale handoff therefore
+//!   costs exactly one cold connect's latency — today's path — and never a
+//!   dropped word. See [`replay_on_fresh_connection`], the `unproven`
+//!   handling in `pump_inner`, and
+//!   `a_stale_warm_handoff_reconnects_without_losing_audio`.
 //!
 //! # Waiting for Deepgram to actually be done: `from_finalize`
 //!
@@ -247,12 +269,13 @@
 //! at the point a segment is accepted, not another layer on top of deciding
 //! when to stop waiting.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -289,7 +312,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How often the warm spare gets a `KeepAlive` frame, comfortably under
 /// Deepgram's ~10-15s idle-connection close (see `WarmPool`'s doc).
 const WARM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
-/// How long the warm spare is worth maintaining after the last dictation.
+/// How long a warm spare is worth maintaining after the last dictation —
+/// measured from the last `open()`, not from when the connection itself was
+/// established, so this is genuinely an *idle* bound and [`maintain`] stops
+/// dead rather than cycling a fresh connection every few minutes forever.
 /// Bounded rather than indefinite: live-measured against the captain's own
 /// session log (`AGENTS.md`), 61% of the gaps between real dictations were
 /// under 3 minutes, versus 29-37% under Deepgram's own idle-close window
@@ -301,14 +327,24 @@ const MAX_WARM_IDLE: Duration = Duration::from_secs(180);
 /// before we return whatever we have. Re-armed on every inbound message, so
 /// this bounds *silence*, not the whole finalisation — see
 /// `FINALIZE_ACK_TIMEOUT` for the wait before `CloseStream` goes out.
-const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// This and [`FINALIZE_ACK_TIMEOUT`] are sized together so the graceful
+/// worst case (ack, then a silent close) totals 5s, comfortably inside
+/// `Dictation::DEFAULT_FINAL_TIMEOUT`'s 6s outer bound on the whole session.
+/// That ordering is load-bearing rather than cosmetic: an engine that
+/// concludes inside the outer bound still gets to hand back the segments it
+/// accumulated, whereas one whose own bounds outlive it is cut off by a
+/// `recv_timeout` that can only discard them.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Absolute safety net for the wait on `from_finalize`, covering only
 /// protocol failure (a missing or malformed signal) — not a tuning knob.
 /// Live-measured `from_finalize` latency across a range of hold shapes
 /// (350ms speech, 400ms and 50ms of silence, a 5.6s multi-segment utterance)
-/// was consistently 200-550ms; this leaves a wide margin without adding
-/// meaningful latency to any real session, and it should never be reached.
-const FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// was consistently 200-550ms; this leaves a wide margin (roughly 4x the
+/// slowest ever observed) without adding meaningful latency to any real
+/// session, and it should never be reached. See [`FINALIZE_TIMEOUT`] for why
+/// the two together must stay under the outer bound.
+const FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Below this, [`conclude`]'s empty-transcript error names the hold as the
 /// cause rather than silence. Wording only — a user who released this fast
 /// should be told they released too early, not that Deepgram heard them and
@@ -394,13 +430,7 @@ impl Engine for DeepgramEngine {
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
-        // Non-blocking: a maintenance tick holding the lock for a few
-        // microseconds must never make the key-press path wait, so a
-        // momentary contention is treated the same as "no spare ready" and
-        // falls through to a cold connect exactly as before.
-        let warm_socket = self.warm.try_take();
-        self.warm
-            .ensure_maintaining(self.url.clone(), self.key.clone());
+        let warm_socket = self.warm.take_and_maintain(rt, &self.url, &self.key);
 
         let url = self.url.clone();
         let key = self.key.clone();
@@ -496,109 +526,272 @@ async fn connect(url: &str, key: &str) -> Result<WsStream> {
     Ok(socket)
 }
 
-/// Sends `msg` on `socket`, clearing `confirm_pending` the moment any send
-/// succeeds. If this is the first send since a warm handoff
-/// (`confirm_pending` still true) and it fails, reconnects cold exactly once
-/// and retries the same message before giving up, rather than treating an
-/// unproven spare's failure as a session failure — see the module doc's "The
-/// warm spare" section. A cold-started session always has `confirm_pending`
-/// already false, so this adds nothing on that path beyond the flag check.
-async fn send_confirming(
+/// Sends `msg` on `socket`, keeping an unproven warm handoff recoverable.
+///
+/// On a cold-started session (`unproven` is `None`) this is a plain send and
+/// costs nothing beyond the check. On a warm one every frame is kept until
+/// Deepgram answers on the connection, and a send that fails takes the whole
+/// kept sequence to a fresh connection rather than failing the dictation —
+/// see the module doc's "The warm spare" section. Exactly one such recovery
+/// happens per session: [`replay_on_fresh_connection`] clears `unproven`, so
+/// a second failure is a real failure and is reported as one.
+async fn send_tracked(
     socket: &mut WsStream,
-    confirm_pending: &mut bool,
+    unproven: &mut Option<Vec<Message>>,
     url: &str,
     key: &str,
     msg: Message,
     context_msg: &'static str,
 ) -> Result<()> {
-    if !*confirm_pending {
+    let Some(sent) = unproven.as_mut() else {
         return socket.send(msg).await.context(context_msg);
-    }
-    match socket.send(msg.clone()).await {
-        Ok(()) => {
-            *confirm_pending = false;
-            Ok(())
-        }
+    };
+    sent.push(msg.clone());
+    match socket.send(msg).await {
+        Ok(()) => Ok(()),
         Err(e) => {
-            vlog!("deepgram: warm spare's first send failed ({e}); reconnecting cold");
-            *socket = connect(url, key).await?;
-            *confirm_pending = false;
-            socket.send(msg).await.context(context_msg)
+            vlog!("deepgram: a send on the unproven warm spare failed ({e}); reconnecting cold");
+            replay_on_fresh_connection(socket, unproven, url, key).await
         }
     }
+}
+
+/// Connect cold and re-send, in order, everything that went to a warm spare
+/// Deepgram never answered on, so a handoff that turns out to have been dead
+/// costs one ordinary connect's latency instead of the user's words.
+///
+/// Clearing `unproven` is what bounds this to a single attempt per session
+/// and what makes the replayed connection behave exactly like a cold-started
+/// one from here on.
+async fn replay_on_fresh_connection(
+    socket: &mut WsStream,
+    unproven: &mut Option<Vec<Message>>,
+    url: &str,
+    key: &str,
+) -> Result<()> {
+    let sent = unproven.take().unwrap_or_default();
+    *socket = connect(url, key).await?;
+    for msg in sent {
+        socket
+            .send(msg)
+            .await
+            .context("replaying audio onto a fresh Deepgram connection")?;
+    }
+    Ok(())
+}
+
+/// True when the peer has already closed, ended or broken this socket —
+/// answered from frames that have *already* arrived, without waiting, so
+/// this can sit on the key-press path.
+///
+/// A websocket `Close` or a FIN is invisible to a writer: a small write
+/// buffers into a connection nobody will ever read from and reports success.
+/// Reading is the only thing that turns it into a signal, and doing so here
+/// means a spare Deepgram let go of while it sat idle is dropped rather than
+/// handed to a dictation that would read the close as its own empty result.
+/// Anything else the peer sent (the open-time Metadata, a `Ping` — which
+/// tungstenite answers by queueing a `Pong` for the next write) is consumed
+/// and ignored: none of it belongs to the session that has not started yet.
+fn already_closed(socket: &mut WsStream) -> bool {
+    while let Some(pending) = socket.next().now_or_never() {
+        match pending {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
+            Some(Ok(_)) => {}
+        }
+    }
+    false
 }
 
 /// Keeps at most one spare Deepgram connection alive across the gap between
 /// dictations. See the module doc's "The warm spare" section for why this is
 /// a different shape from the prewarming that was tried and reverted.
-#[derive(Clone)]
+///
+/// Deliberately not `Clone`: the engine owns exactly one, and dropping it is
+/// what stops [`maintain`], so a second owner would be able to keep a
+/// discarded engine's loop running (or stop a live one's).
 struct WarmPool {
-    slot: Arc<Mutex<Option<(WsStream, Instant)>>>,
-    maintaining: Arc<std::sync::atomic::AtomicBool>,
+    slot: Arc<Mutex<Option<WsStream>>>,
+    state: Arc<PoolState>,
+}
+
+/// Everything [`maintain`] needs in order to decide whether to keep going,
+/// held behind an `Arc` of its own so the loop never keeps the [`WarmPool`]
+/// — and through it the engine — alive.
+struct PoolState {
+    /// Whether a maintenance loop is running right now.
+    maintaining: AtomicBool,
+    /// Tripped by `WarmPool::drop`. `App` rebuilds the engine at runtime
+    /// (the tray's engine picker, a config reload), and without this the
+    /// discarded engine's loop would go on reconnecting and keep-aliving a
+    /// connection nobody can ever take, holding a copy of the API key, once
+    /// per trip through the picker.
+    shutdown: AtomicBool,
+    /// When `open()` last asked for a spare — what [`MAX_WARM_IDLE`] is
+    /// measured from. A `std::sync::Mutex` rather than an async one: it is
+    /// read and written under no contention worth the name, from the
+    /// key-press path, and must not require a runtime to touch.
+    last_open: std::sync::Mutex<Instant>,
+}
+
+impl PoolState {
+    fn note_open(&self) {
+        *self.last_open.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+    }
+
+    fn stopping(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
 }
 
 impl WarmPool {
     fn new() -> Self {
         Self {
             slot: Arc::new(Mutex::new(None)),
-            maintaining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: Arc::new(PoolState {
+                maintaining: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+                last_open: std::sync::Mutex::new(Instant::now()),
+            }),
         }
     }
 
-    /// Take the spare if one is ready right now. Never blocks: a maintenance
-    /// tick holding the lock for the microseconds a send takes is treated the
-    /// same as "nothing ready" rather than making the key-press path wait.
+    /// Take the spare if one is ready right now. Never blocks: [`maintain`]
+    /// holds the slot only for a `take()` and a put-back — never across a
+    /// connect or a send — so contention here means microseconds, and losing
+    /// that race is treated the same as "nothing ready" rather than making
+    /// the key-press path wait.
     fn try_take(&self) -> Option<WsStream> {
-        self.slot.try_lock().ok()?.take().map(|(socket, _)| socket)
+        self.slot.try_lock().ok()?.take()
     }
 
-    /// Start the maintenance loop the first time this is called; every call
-    /// after that is a no-op. Called from every `open()` rather than once in
-    /// `from_env` so the loop naturally lives on the same Tokio runtime
-    /// `open()` already required to exist.
-    fn ensure_maintaining(&self, url: String, key: String) {
-        if self
-            .maintaining
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    /// One call per `open()`: hand over the spare if one is ready, record
+    /// that a dictation just started (what [`MAX_WARM_IDLE`] counts from),
+    /// and make sure a maintenance loop is running to replace whatever was
+    /// just taken.
+    ///
+    /// Spawned on the runtime *handle* rather than with a bare
+    /// `tokio::spawn`: `open()` runs on the app's dictation thread, which is
+    /// not inside the runtime, and a bare spawn there panics.
+    fn take_and_maintain(
+        &self,
+        rt: &'static tokio::runtime::Runtime,
+        url: &str,
+        key: &str,
+    ) -> Option<WsStream> {
+        self.state.note_open();
+        let spare = self.try_take();
+        if !self.state.maintaining.swap(true, Ordering::SeqCst) {
+            rt.spawn(maintain(
+                Arc::clone(&self.slot),
+                Arc::clone(&self.state),
+                url.to_string(),
+                key.to_string(),
+                WARM_KEEPALIVE_INTERVAL,
+                MAX_WARM_IDLE,
+            ));
+        }
+        spare
+    }
+}
+
+impl Drop for WarmPool {
+    fn drop(&mut self) {
+        self.state.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Keeps one spare connected and alive for as long as dictations keep
+/// happening: replaces it the moment it is taken or dies, and holds off
+/// Deepgram's idle close with a `KeepAlive` frame every `keepalive`.
+///
+/// Exits — releasing the spare and clearing `maintaining` so the next
+/// `open()` can start a fresh loop — when the pool is dropped or when no
+/// dictation has started for `max_idle`. That exit is the whole point of the
+/// bound: without it the reconnect arm below would simply open another
+/// connection on the next tick, forever, so a tray app whose user stopped
+/// dictating hours ago would still hold a third-party connection open and
+/// write to it every few seconds.
+///
+/// `keepalive` and `max_idle` are parameters rather than the constants read
+/// directly so a test can drive the idle bound without spending three real
+/// minutes; [`WarmPool::take_and_maintain`] is the only caller and always
+/// passes the production values.
+async fn maintain(
+    slot: Arc<Mutex<Option<WsStream>>>,
+    state: Arc<PoolState>,
+    url: String,
+    key: String,
+    keepalive: Duration,
+    max_idle: Duration,
+) {
+    loop {
+        while !state.stopping() && state.idle_for() <= max_idle {
+            // The spare is serviced *outside* the guard: the slot is locked
+            // only long enough to take it out and put it back, never across
+            // a `connect()` (bounded by CONNECT_TIMEOUT, not microseconds),
+            // which is what makes `try_take`'s non-blocking contract honest.
+            let spare = slot.lock().await.take();
+            match spare {
+                Some(mut socket) => {
+                    if keep_alive(&mut socket).await {
+                        *slot.lock().await = Some(socket);
+                    } else {
+                        vlog!("deepgram: warm spare died; will reconnect");
+                    }
+                }
+                None => match connect(&url, &key).await {
+                    Ok(socket) => *slot.lock().await = Some(socket),
+                    // No backoff: the next tick (`keepalive` away) retrying
+                    // is gentle enough on its own, and a real dictation
+                    // never waits on this loop — a failed warm connect just
+                    // means the next `open()` connects cold, exactly as if
+                    // this loop did not exist.
+                    Err(e) => vlog!("deepgram: warm spare connect failed: {e:#}"),
+                },
+            }
+            tokio::time::sleep(keepalive).await;
+        }
+
+        if slot.lock().await.take().is_some() {
+            vlog!("deepgram: releasing the warm spare; nothing to keep it for");
+        }
+        state.maintaining.store(false, Ordering::SeqCst);
+        // A dictation can land between the idle check above and that store,
+        // find `maintaining` still set, and leave nobody maintaining the
+        // pool at all; take the loop back if so, unless someone else already
+        // did.
+        if state.stopping()
+            || state.idle_for() > max_idle
+            || state.maintaining.swap(true, Ordering::SeqCst)
         {
             return;
         }
-        let slot = Arc::clone(&self.slot);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(WARM_KEEPALIVE_INTERVAL).await;
-                let mut guard = slot.lock().await;
-                match guard.as_mut() {
-                    Some((_, established_at)) if established_at.elapsed() > MAX_WARM_IDLE => {
-                        vlog!("deepgram: warm spare idle past {MAX_WARM_IDLE:?}; letting it go");
-                        *guard = None;
-                    }
-                    Some((socket, _)) => {
-                        // Deepgram never acknowledges this frame (see the
-                        // module doc); a send failure is the only signal
-                        // available here that the spare has died.
-                        if socket
-                            .send(Message::Text(r#"{"type":"KeepAlive"}"#.into()))
-                            .await
-                            .is_err()
-                        {
-                            vlog!("deepgram: warm spare died; will reconnect");
-                            *guard = None;
-                        }
-                    }
-                    None => match connect(&url, &key).await {
-                        Ok(socket) => *guard = Some((socket, Instant::now())),
-                        // No backoff: the next tick (WARM_KEEPALIVE_INTERVAL
-                        // away) retrying is gentle enough on its own, and a
-                        // real dictation never waits on this loop — a failed
-                        // warm connect just means the next `open()` connects
-                        // cold, exactly as if this loop did not exist.
-                        Err(e) => vlog!("deepgram: warm spare connect failed: {e:#}"),
-                    },
-                }
-            }
-        });
     }
+}
+
+/// One maintenance turn on the spare: notice a peer that has gone away, then
+/// hold off the idle close. False means the connection is no longer usable
+/// and must be dropped.
+///
+/// The read comes first and is what makes this more than a write check —
+/// Deepgram never answers a `KeepAlive` (see the module doc), so a
+/// successful send proves only that the local write worked. It also flushes
+/// any `Pong` the read queued for a server `Ping`.
+async fn keep_alive(socket: &mut WsStream) -> bool {
+    if already_closed(socket) {
+        return false;
+    }
+    socket
+        .send(Message::Text(r#"{"type":"KeepAlive"}"#.into()))
+        .await
+        .is_ok()
 }
 
 /// Drives one websocket session to completion, waiting on `from_finalize`
@@ -623,12 +816,21 @@ async fn pump_inner(
     finalize_ack_timeout: Duration,
     warm: Option<WsStream>,
 ) -> Result<()> {
-    // A handed-in spare has only ever exchanged KeepAlive frames Deepgram
-    // does not acknowledge (see the module doc), so it is not proven live
-    // until this session's own first send on it succeeds. `pump_inner`'s
-    // audio-send arm below reconnects cold and retries, exactly once, if
-    // that first send fails — see `confirm_pending`.
-    let mut confirm_pending = warm.is_some();
+    // The cheap half of not trusting a spare: a close the peer already sent
+    // is visible in frames already delivered, so read them before committing
+    // the dictation to this connection.
+    let mut warm = warm;
+    if warm.as_mut().is_some_and(already_closed) {
+        vlog!("deepgram: the warm spare had already closed; connecting cold");
+        warm = None;
+    }
+    // The other half. A handed-in spare has only ever exchanged KeepAlive
+    // frames Deepgram does not acknowledge (see the module doc), so it stays
+    // *unproven* — every frame sent on it kept for replay — until Deepgram
+    // answers on it in this session. `Some(_)` here means "warm and not yet
+    // answered"; a cold session is `None` throughout and pays only the
+    // check.
+    let mut unproven: Option<Vec<Message>> = warm.is_some().then(Vec::new);
     let mut socket = match warm {
         Some(socket) => {
             vlog!("deepgram: reusing a warm connection");
@@ -679,9 +881,9 @@ async fn pump_inner(
                 let sent = match cmd {
                     Some(Command::Audio(bytes)) => {
                         sent_secs += crate::audio::secs(bytes.len() / 2);
-                        send_confirming(
+                        send_tracked(
                             &mut socket,
-                            &mut confirm_pending,
+                            &mut unproven,
                             &url,
                             &key,
                             Message::Binary(bytes.into()),
@@ -695,9 +897,9 @@ async fn pump_inner(
                     // away instead of waiting for a signal that will not come.
                     Some(Command::Finish) | None => {
                         closing = true;
-                        let fin = send_confirming(
+                        let fin = send_tracked(
                             &mut socket,
-                            &mut confirm_pending,
+                            &mut unproven,
                             &url,
                             &key,
                             Message::Text(r#"{"type":"Finalize"}"#.into()),
@@ -742,6 +944,34 @@ async fn pump_inner(
             msg = tokio::time::timeout(poll_timeout, socket.next()) => {
                 let msg = match msg {
                     Ok(m) => m,
+                    Err(_) if finalize_ack_deadline.is_some() && unproven.is_some() => {
+                        // Nothing has come back on this connection at all —
+                        // not one interim result, and now not even the ack,
+                        // which is live-verified to arrive for any session
+                        // that was sent real audio. On an unproven spare
+                        // that reads as a handoff that was already dead
+                        // (writes buffer happily into a half-open socket)
+                        // rather than as a Deepgram protocol failure, and
+                        // the audio is still in hand: spend one cold
+                        // connect replaying it instead of concluding a
+                        // silent dictation, which is the failure this whole
+                        // mechanism exists not to introduce.
+                        vlog!("deepgram: the warm spare never answered; replaying it cold");
+                        match replay_on_fresh_connection(
+                            &mut socket, &mut unproven, &url, &key,
+                        ).await {
+                            Ok(()) => {
+                                acc.finalize_acked = false;
+                                finalize_ack_deadline =
+                                    Some(Instant::now() + finalize_ack_timeout);
+                                continue;
+                            }
+                            Err(e) => {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                    }
                     Err(_) if finalize_ack_deadline.is_some() => {
                         // Safety net only: Deepgram never confirmed the flush
                         // within a generous margin over its measured typical
@@ -764,8 +994,39 @@ async fn pump_inner(
                     }
                     Err(_) => continue,
                 };
+                // A spare that ends the session before it has said anything
+                // at all is a stale handoff, not a conclusion: a websocket
+                // Close or a FIN the peer sent while it sat idle arrives
+                // here, after writes that buffered into it happily, and
+                // breaking on it would report exactly the empty "Deepgram
+                // returned no transcript" this branch exists to eliminate.
+                // Replay instead. `closed_stream` keeps a legitimate
+                // post-CloseStream sign-off out of this.
+                if unproven.is_some()
+                    && !closed_stream
+                    && matches!(&msg, None | Some(Ok(Message::Close(_))) | Some(Err(_)))
+                {
+                    vlog!("deepgram: the warm spare closed before answering; replaying it cold");
+                    match replay_on_fresh_connection(&mut socket, &mut unproven, &url, &key).await {
+                        Ok(()) => {
+                            if finalize_ack_deadline.is_some() {
+                                acc.finalize_acked = false;
+                                finalize_ack_deadline =
+                                    Some(Instant::now() + finalize_ack_timeout);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        // Deepgram answered: the connection is proven, and
+                        // the frames kept for a possible replay can go.
+                        unproven = None;
                         // Captured before `absorb`: a message that itself
                         // *triggers* closing (below) is not a response to
                         // that closing, and must never be read back as its
@@ -801,7 +1062,7 @@ async fn pump_inner(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => unproven = None,
                     Some(Err(e)) => {
                         failure = Some(anyhow::Error::new(e).context("Deepgram socket"));
                         break;
@@ -2071,9 +2332,9 @@ mod tests {
 
     /// The critical safety property behind the whole warm-spare mechanism:
     /// a handed-in connection that has actually died must never cost the
-    /// user their words. `pump_inner` reconnects cold and retries on the
-    /// first send failure (`confirm_pending`); this drives that path against
-    /// a real dead socket on a real (loopback) network and checks the
+    /// user their words. `pump_inner` replays the unproven session onto a
+    /// fresh connection when a send fails; this drives that path against a
+    /// real dead socket on a real (loopback) network and checks the
     /// transcript still arrives whole, exactly as if the spare had never
     /// been offered at all.
     #[tokio::test]
@@ -2141,7 +2402,7 @@ mod tests {
         });
 
         let socket = connect(&url, "test-key").await.unwrap();
-        *pool.slot.lock().await = Some((socket, Instant::now()));
+        *pool.slot.lock().await = Some(socket);
 
         assert!(pool.try_take().is_some());
         assert!(
@@ -2149,5 +2410,329 @@ mod tests {
             "taking the spare must not leave a second one behind"
         );
         server.abort();
+    }
+
+    /// A fake server that accepts connections for as long as the test runs,
+    /// counts them, and holds each one open without ever answering — enough
+    /// for a test to watch what [`maintain`] does over time without
+    /// scripting a whole session.
+    fn spawn_counting_server(
+        listener: tokio::net::TcpListener,
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                held.push(tokio_tungstenite::accept_async(stream).await.unwrap());
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (count, handle)
+    }
+
+    /// Poll `f` until it holds, or give up after `within`. Used instead of a
+    /// fixed sleep so a test that is really waiting on a connect does not
+    /// have to guess how long one takes.
+    async fn eventually(within: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        f()
+    }
+
+    /// The pool exists to have a connection *ready*, so the loop must
+    /// replace what `open()` took immediately rather than at the far end of
+    /// a keep-alive interval — and it must be spawned on the runtime handle
+    /// `open()` holds, because `open()` itself runs on the app's dictation
+    /// thread, where a bare `tokio::spawn` would panic instead.
+    #[tokio::test]
+    async fn take_and_maintain_spawns_the_loop_and_queues_a_fresh_spare() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let (count, server) = spawn_counting_server(listener);
+
+        let pool = WarmPool::new();
+        let rt = net::runtime().unwrap();
+        assert!(
+            pool.take_and_maintain(rt, &url, "test-key").is_none(),
+            "the first dictation of a process has nothing warm to take"
+        );
+
+        assert!(
+            eventually(Duration::from_secs(5), || count
+                .load(Ordering::SeqCst)
+                >= 1)
+            .await,
+            "the maintenance loop never ran: no connection was ever made"
+        );
+        assert!(
+            eventually(Duration::from_secs(5), || {
+                pool.slot.try_lock().is_ok_and(|s| s.is_some())
+            })
+            .await,
+            "the spare taken by a dictation must be replaced for the next one"
+        );
+        server.abort();
+    }
+
+    /// `MAX_WARM_IDLE` has to actually release the connection and stop the
+    /// loop. Dropping the spare alone would not: the reconnect arm would
+    /// simply open another one on the next tick, so a tray app whose user
+    /// stopped dictating hours ago would still hold a Deepgram connection
+    /// open and write to it every few seconds, forever.
+    #[tokio::test]
+    async fn the_pool_stops_entirely_once_the_idle_bound_passes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let (count, server) = spawn_counting_server(listener);
+
+        let pool = WarmPool::new();
+        let state = Arc::clone(&pool.state);
+        state.note_open();
+        state.maintaining.store(true, Ordering::SeqCst);
+        let running = tokio::spawn(maintain(
+            Arc::clone(&pool.slot),
+            Arc::clone(&pool.state),
+            url,
+            "test-key".into(),
+            Duration::from_millis(20),
+            Duration::from_millis(150),
+        ));
+
+        assert!(
+            eventually(Duration::from_secs(5), || count
+                .load(Ordering::SeqCst)
+                >= 1)
+            .await,
+            "the loop should keep a spare while dictations are recent"
+        );
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("the loop must exit once nothing has been dictated for MAX_WARM_IDLE")
+            .unwrap();
+
+        assert!(
+            pool.slot.lock().await.is_none(),
+            "the expired spare must be released, not left connected"
+        );
+        assert!(
+            !state.maintaining.load(Ordering::SeqCst),
+            "a stopped loop must let the next open() start a fresh one"
+        );
+        let settled = count.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            settled,
+            "an expired pool must stop reconnecting altogether"
+        );
+        server.abort();
+    }
+
+    /// `App` rebuilds the engine at runtime (the tray's engine picker, a
+    /// config reload). The discarded engine's pool must take its maintenance
+    /// loop with it, or every trip through the picker leaves another one
+    /// reconnecting and keep-aliving forever, each holding a copy of the API
+    /// key.
+    #[tokio::test]
+    async fn dropping_the_pool_stops_its_maintenance_loop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let (count, server) = spawn_counting_server(listener);
+
+        let pool = WarmPool::new();
+        let state = Arc::clone(&pool.state);
+        state.note_open();
+        state.maintaining.store(true, Ordering::SeqCst);
+        let running = tokio::spawn(maintain(
+            Arc::clone(&pool.slot),
+            Arc::clone(&pool.state),
+            url,
+            "test-key".into(),
+            Duration::from_millis(20),
+            // Far out of the way, so what ends the loop below can only be
+            // the drop.
+            Duration::from_secs(600),
+        ));
+
+        assert!(
+            eventually(Duration::from_secs(5), || count
+                .load(Ordering::SeqCst)
+                >= 1)
+            .await,
+            "the loop should have a spare up before the pool is dropped"
+        );
+
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("an abandoned pool's loop must exit rather than run for the life of the process")
+            .unwrap();
+
+        let settled = count.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            settled,
+            "a dropped pool must stop reconnecting"
+        );
+        server.abort();
+    }
+
+    /// The read-based liveness check, in both directions. A peer that goes
+    /// away *politely* — a websocket `Close`, a Deepgram-side restart, a
+    /// middlebox timeout — is invisible to a writer, so without this a dead
+    /// spare would be handed to a dictation that then reads the close as its
+    /// own empty result. Equally important: a healthy idle connection must
+    /// not read as closed, or the pool would throw away every spare it ever
+    /// made.
+    #[tokio::test]
+    async fn already_closed_sees_a_polite_close_and_nothing_else() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut live = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut closed = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = closed.send(Message::Close(None)).await;
+            // Hold both open so nothing but the Close frame itself can be
+            // what the client observes.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = live.next().now_or_never();
+        });
+
+        let mut live = connect(&url, "test-key").await.unwrap();
+        let mut closed = connect(&url, "test-key").await.unwrap();
+        // Let the Close frame land in the client's buffer: this check reads
+        // what has already arrived, it does not wait for anything.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !already_closed(&mut live),
+            "a healthy idle spare must not be thrown away"
+        );
+        assert!(
+            already_closed(&mut closed),
+            "a spare the peer closed must never be handed to a dictation"
+        );
+        server.abort();
+    }
+
+    /// A fake server whose first connection reads the audio and *then*
+    /// closes politely — the window `already_closed` cannot cover, because
+    /// the close lands after the dictation has already committed to the
+    /// spare. Writes into it succeed (a FIN or a Close frame is invisible to
+    /// a writer), so the only way this is not a silently lost dictation is
+    /// the replay. Its second connection serves the ordinary
+    /// withhold-then-flush session that replay must land on, and asserts the
+    /// audio arrived with it rather than a bare `Finalize`.
+    fn spawn_close_after_audio_then_flush_server(
+        listener: tokio::net::TcpListener,
+        reply_text: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Binary(_))) => break,
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
+            let _ = ws.send(Message::Close(None)).await;
+            drop(ws);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut audio_frames = 0usize;
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Binary(_))) => audio_frames += 1,
+                    Some(Ok(Message::Text(t))) if t.contains("Finalize") => break,
+                    Some(Ok(_)) => continue,
+                    _ => return,
+                }
+            }
+            assert!(
+                audio_frames > 0,
+                "the replay reconnected but arrived without the audio — the \
+                 words were lost, which is the whole failure this guards"
+            );
+            ws.send(Message::Text(
+                results_from_finalize(reply_text, true).into(),
+            ))
+            .await
+            .unwrap();
+            if !wait_for(&mut ws, "CloseStream").await {
+                return;
+            }
+            let metadata = serde_json::json!({ "type": "Metadata", "duration": 1.0 }).to_string();
+            let _ = ws.send(Message::Text(metadata.into())).await;
+        })
+    }
+
+    /// The other half of the stale-handoff net, and the one a write-only
+    /// check cannot reach: the spare dies *after* the first send succeeded.
+    /// Reading the close and concluding there would report "Deepgram
+    /// returned no transcript" for a dictation whose audio is still in hand
+    /// — the exact silent failure this branch exists to eliminate — so the
+    /// session is replayed onto a fresh connection instead.
+    #[tokio::test]
+    async fn a_warm_spare_closing_after_the_first_send_replays_instead_of_losing_the_words() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let server = spawn_close_after_audio_then_flush_server(listener, "Nothing was lost.");
+
+        let warm = connect(&url, "test-key").await.unwrap();
+
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let one_second = vec![0u8; crate::audio::SAMPLE_RATE as usize * 2];
+        audio_tx.send(Command::Audio(one_second)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        pump_inner(
+            url,
+            "test-key".into(),
+            audio_rx,
+            event_tx,
+            FINALIZE_ACK_TIMEOUT,
+            Some(warm),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        assert_eq!(
+            finals(&seen),
+            ["Nothing was lost."],
+            "a spare that closed mid-session must be replayed, not concluded \
+             as an empty transcript: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, TranscriptEvent::Error(_))),
+            "the replay must be invisible to the caller: {seen:?}"
+        );
     }
 }

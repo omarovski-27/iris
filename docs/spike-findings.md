@@ -197,8 +197,9 @@ shape of the same idea — `WarmPool` (`crates/iris-core/src/engine/deepgram.rs`
 actively holds one spare connection alive with Deepgram's `KeepAlive` control
 frame rather than passively hoping a prewarmed one survived, bounded to a
 3-minute idle window chosen from live gap data rather than held indefinitely.
-A stale-handoff safety net (`confirm_pending`, same file) means a spare that
-died anyway costs a reconnect's worth of latency, never a lost transcript.
+A stale-handoff safety net (`already_closed` plus the unproven-session replay
+in `pump_inner`, same file) means a spare that died anyway costs a reconnect's
+worth of latency, never a lost transcript.
 
 *Also resolved:* **TLS session resumption** (`engine/net.rs::tls_connector`,
 sharing one `rustls::ClientConfig` across connects) was tried for the same
