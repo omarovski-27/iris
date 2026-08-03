@@ -287,6 +287,30 @@ Three changes, all in `iris-app` and this crate together:
   checks the outline actually reaches the pixmap — a gap the same-colour halo
   it replaced was invisible to by construction.
 
+  **An outline made of eight passes cannot fade by scaling its per-pass
+  alpha.** Source-over compositing leaves `(1 - p)^8` of the backdrop, so
+  eight passes at `p = 0.5 * a` reach 0.90 at `a = 0.5` and 0.73 at `a = 0.3`
+  while the single crisp `theme.ink` pass beside them is at 0.50 and 0.30 —
+  the digits took the outline's colour for the whole of every enter
+  (`ENTER_MS`) and exit (`EXIT_MS`), on every dictation, and looked correct in
+  every settled screenshot. `accumulating_pass_alpha` inverts the
+  accumulation instead: it solves the per-pass alpha that puts the *stack's*
+  total at `a` times its settled opacity, reproducing the authored
+  `TIMER_EDGE_PASS_ALPHA` exactly at `a == 1.0`, so the settled contrast
+  guarantee above is untouched. `timer_edge_pass_alpha` is the single curve
+  `draw_timer` and the test read.
+
+  That was the third pair on this shape reasoned about only at alpha 0 and 1
+  and wrong in between (after the scrim against the enlarged wave row, and
+  the timer against live text), so the check is shared rather than one-off:
+  `render::tests::assert_fades_in_proportion` takes any multi-pass element's
+  per-pass alpha, its single-pass companion's alpha, and the pass count, and
+  requires the ratio between them to hold at every intermediate presence, not
+  just at the ends. Use it for the next one.
+  `the_fade_proportionality_guard_rejects_the_naive_accumulation` runs the
+  naive scheme through it under `#[should_panic]`, so the guard is known to
+  bite rather than merely to pass.
+
   **Two things the timer does not get to borrow from the glyph beside it.**
   It first shipped fading on `glyph_alpha(open)` and anchored on the ribbon's
   right padding, and both are wrong for a run that is neither centred nor
@@ -351,8 +375,14 @@ looked safe (they are the protected ones) but painted the band straight
 through the still-large bars for the whole handoff window: the row only
 reaches its `_RIBBON` size at `open == 1.0`, while the scrim is at full alpha
 from `HANDOFF_HI` (0.55). That window is invisible at both endpoints, so
-`the_text_scrim_stays_below_the_wave_row_at_every_point_of_the_morph` samples
-across the whole tween rather than at its ends.
+`the_text_scrim_is_a_real_band_across_the_morph_and_backs_the_ink_when_open`
+samples across the whole tween rather than at its ends. It asserts the two
+things that can actually fail — that the raised ceiling never closes the band
+onto its own floor and takes the whole scrim out through `draw_ribbon`'s
+`band_h > 0.0` guard, and that with the ribbon open the band still backs the
+real glyph ink. It deliberately does *not* assert that the band clears the
+row: `text_band`'s top *is* `natural.max(wave_row_bottom(..))`, so restating
+that `max` in a test passes for every `open` and every wave constant.
 
 `the_wave_row_has_real_presence_at_a_loud_sustained_level` pins the rest-state
 amplitude against real pixels at a sustained loud level, the same failure

@@ -387,7 +387,7 @@ const GLYPH_TIMER_GAP: f32 = 5.0;
 const TIMER_EDGE_PAD_MIN: f32 = 9.0;
 
 /// How far the timer's outline passes are offset from the run, in logical
-/// pixels, and the alpha each single pass is drawn at.
+/// pixels, and the alpha each single pass is drawn at *at full presence*.
 ///
 /// Sub-pixel on purpose: this is an outline traced around the digits in
 /// `theme.timer_edge`, not a plate behind them (see [`draw_timer`]). Eight
@@ -396,8 +396,73 @@ const TIMER_EDGE_PAD_MIN: f32 = 9.0;
 /// so the run gains a rim without gaining a footprint — which is what keeps it
 /// clear of the [`GLYPH_TIMER_GAP`] and [`TIMER_EDGE_PAD_MIN`] budgets
 /// [`timer_right_edge`] measured against the crisp run alone.
+///
+/// "At full presence" is load-bearing: below it the per-pass alpha is not this
+/// constant scaled, it is solved by [`accumulating_pass_alpha`]. See there.
 const TIMER_EDGE_OFFSET: f32 = 0.9;
 const TIMER_EDGE_PASS_ALPHA: f32 = 0.5;
+
+/// The eight unit directions [`draw_timer`] traces its outline in, as a table
+/// rather than a loop body, so the pass count the alpha solve needs is
+/// `TIMER_EDGE_DIRS.len()` and cannot drift from the passes actually drawn.
+const TIMER_EDGE_DIRS: [(f32, f32); 8] = {
+    const Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    [
+        (-1.0, 0.0),
+        (1.0, 0.0),
+        (0.0, -1.0),
+        (0.0, 1.0),
+        (-Q, -Q),
+        (Q, -Q),
+        (-Q, Q),
+        (Q, Q),
+    ]
+};
+
+/// What `passes` overlapping passes, each composited at `pass_alpha`, add up
+/// to where all of them land on the same pixel.
+///
+/// Source-over compositing multiplies what each pass leaves uncovered, so the
+/// stack keeps `(1 - pass_alpha)^passes` of the backdrop. This is the closed
+/// form of that, and it is the reason a multi-pass element cannot simply scale
+/// its per-pass alpha to fade.
+fn accumulated_alpha(pass_alpha: f32, passes: usize) -> f32 {
+    1.0 - (1.0 - pass_alpha.clamp(0.0, 1.0)).powi(passes as i32)
+}
+
+/// The alpha one pass of a `passes`-deep accumulating stack has to composite at
+/// for the whole stack to land at `a` times the opacity it reaches at full
+/// presence — where `settled_pass_alpha` is the per-pass alpha that defines
+/// that settled look.
+///
+/// The naive answer, `settled_pass_alpha * a`, is wrong everywhere except the
+/// two endpoints, and wrong in the direction nobody notices from a settled
+/// screenshot: [`accumulated_alpha`] is superlinear in the per-pass alpha, so
+/// eight passes at `0.5 * a` reach 0.90 at `a = 0.5` and 0.73 at `a = 0.3`
+/// against a single companion pass at 0.50 and 0.30. An outline meant to trace
+/// ink therefore *becomes* the digits for the whole of every fade. Inverting
+/// the accumulation instead makes the stack's total alpha exactly proportional
+/// to `a`, so it fades in step with anything drawn in one pass beside it, and
+/// reproduces `settled_pass_alpha` exactly at `a == 1.0`.
+///
+/// `tests::assert_fades_in_proportion` is the mechanical check for that
+/// property, and applies to any future multi-pass element in this file.
+fn accumulating_pass_alpha(settled_pass_alpha: f32, passes: usize, a: f32) -> f32 {
+    let settled = accumulated_alpha(settled_pass_alpha, passes);
+    let target = settled * a.clamp(0.0, 1.0);
+    1.0 - (1.0 - target).powf(1.0 / passes as f32)
+}
+
+/// The alpha one of [`draw_timer`]'s outline passes composites at, for a run
+/// drawn at presence `a`.
+///
+/// A function rather than an expression inline in [`draw_timer`] so the
+/// renderer and `tests::the_timer_outline_fades_in_proportion_with_the_ink_it_traces`
+/// read the same curve: retuning the rim cannot then leave a test agreeing
+/// with a curve the renderer no longer draws.
+fn timer_edge_pass_alpha(a: f32) -> f32 {
+    accumulating_pass_alpha(TIMER_EDGE_PASS_ALPHA, TIMER_EDGE_DIRS.len(), a)
+}
 
 /// How far the centred glyph's ink can reach either side of the shape's
 /// centre, in device pixels: the widest of everything [`draw_glyph`] paints
@@ -1143,6 +1208,14 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 /// (see [`draw_shell`]) and this deliberately does not need one.
 /// `theme::tests::the_timer_edge_reads_against_any_desktop_the_ink_cannot`
 /// holds that against the real composited shell in both directions.
+///
+/// The outline is a stack of eight passes and the fill is one, so the two
+/// only fade together if the stack's *accumulated* alpha is what tracks `a`;
+/// scaling the per-pass alpha instead made the digits take the outline's
+/// colour for the whole of every enter and exit. [`accumulating_pass_alpha`]
+/// carries that solve and the reasoning, and
+/// `tests::the_timer_outline_fades_in_proportion_with_the_ink_it_traces` pins
+/// it mid-fade, where the defect lived.
 fn draw_timer(
     pixmap: &mut Pixmap,
     ctx: &Ctx<'_>,
@@ -1161,27 +1234,17 @@ fn draw_timer(
 
     let (tx, ty) = ctx.map(right, center_y);
 
-    let edge_a = a * TIMER_EDGE_PASS_ALPHA;
+    let edge_a = timer_edge_pass_alpha(a);
     if edge_a > 0.001 {
         let d = TIMER_EDGE_OFFSET * l.scale;
-        let diag = d * std::f32::consts::FRAC_1_SQRT_2;
-        for (ox, oy) in [
-            (-d, 0.0),
-            (d, 0.0),
-            (0.0, -d),
-            (0.0, d),
-            (-diag, -diag),
-            (diag, -diag),
-            (-diag, diag),
-            (diag, diag),
-        ] {
+        for (ux, uy) in TIMER_EDGE_DIRS {
             atlas.draw(
                 pixmap,
                 text,
                 l.text_font,
                 0.0,
-                tx + ox,
-                ty + oy,
+                tx + ux * d,
+                ty + uy * d,
                 Align::Right,
                 TextPaint::Solid(theme.timer_edge),
                 edge_a,
@@ -1730,6 +1793,110 @@ mod tests {
         );
     }
 
+    /// The shared guard for this file's recurring compositing bug: two things
+    /// meant to fade together, reasoned about only at the endpoints, wrong
+    /// everywhere in between. It has now bitten three unrelated pairs on this
+    /// shape — the text scrim against the enlarged wave row through the
+    /// ribbon morph, the elapsed timer against live text, and the timer's
+    /// outline against its own ink.
+    ///
+    /// Use it for **any** element in this renderer drawn as several
+    /// accumulating alpha passes that is supposed to fade in proportion with
+    /// something drawn beside it: pass the element's per-pass alpha as a
+    /// function of presence, its companion's alpha as another, and the number
+    /// of passes that overlap. The check is the only one that matters, and it
+    /// is the one an endpoint test cannot make: that the ratio between the
+    /// stack's accumulated opacity and its companion's is the *same* at every
+    /// intermediate presence as it is at full presence.
+    ///
+    /// It is not a convention to remember. `#[should_panic]` sibling
+    /// `the_fade_proportionality_guard_rejects_the_naive_accumulation` runs
+    /// the naive `pass_alpha * a` scheme through it and requires it to fail,
+    /// so the guard is known to bite rather than merely to pass.
+    fn assert_fades_in_proportion(
+        what: &str,
+        passes: usize,
+        pass_alpha: impl Fn(f32) -> f32,
+        companion_alpha: impl Fn(f32) -> f32,
+    ) {
+        let settled_companion = companion_alpha(1.0);
+        assert!(
+            settled_companion > 0.0,
+            "{what}: the companion is invisible at full presence, so there is \
+             no proportion to hold — check the arguments, not the renderer"
+        );
+        let settled = accumulated_alpha(pass_alpha(1.0), passes);
+        let ratio = settled / settled_companion;
+        for step in 0..=100 {
+            let a = step as f32 / 100.0;
+            let companion = companion_alpha(a);
+            let got = accumulated_alpha(pass_alpha(a), passes);
+            let want = companion * ratio;
+            assert!(
+                (got - want).abs() <= 0.01,
+                "{what}: at presence {a} the {passes} accumulating passes reach \
+                 {got} beside a companion at {companion}; proportional to the \
+                 settled frame would be {want}. The stack outruns what it \
+                 accompanies mid-fade — scale the accumulated alpha, not the \
+                 per-pass alpha (see `accumulating_pass_alpha`)."
+            );
+        }
+    }
+
+    /// The guard above, run against the exact mistake it exists to catch, so a
+    /// green run means it is discriminating and not just arithmetic that
+    /// always agrees with itself.
+    #[test]
+    #[should_panic(expected = "outruns what it accompanies mid-fade")]
+    fn the_fade_proportionality_guard_rejects_the_naive_accumulation() {
+        assert_fades_in_proportion(
+            "a stack compositing every pass at presence * TIMER_EDGE_PASS_ALPHA",
+            TIMER_EDGE_DIRS.len(),
+            |a| a * TIMER_EDGE_PASS_ALPHA,
+            |a| a,
+        );
+    }
+
+    /// Item (1): the timer's outline stack and its single crisp `theme.ink`
+    /// pass fade as one.
+    ///
+    /// `a = ctx.alpha * timer_alpha(open)`, and `ctx.alpha` is the overlay's
+    /// presence ramp, so every value below 1.0 here is a frame the user sees
+    /// on every dictation — `ENTER_MS` in, `EXIT_MS` out. Sampling only the
+    /// settled frame is exactly how this shipped: at full presence the stack
+    /// is near-solid either way and the two schemes are indistinguishable.
+    #[test]
+    fn the_timer_outline_fades_in_proportion_with_the_ink_it_traces() {
+        assert_fades_in_proportion(
+            "theme.timer_edge outline vs the theme.ink fill it traces",
+            TIMER_EDGE_DIRS.len(),
+            timer_edge_pass_alpha,
+            |a| a,
+        );
+
+        // The settled contrast guarantee the outline was added for, unchanged:
+        // at full presence the solve has to return the authored per-pass alpha
+        // itself, not an approximation of it.
+        let settled = timer_edge_pass_alpha(1.0);
+        assert!(
+            (settled - TIMER_EDGE_PASS_ALPHA).abs() < 1e-4,
+            "full presence composites each outline pass at {settled}, not the \
+             authored {TIMER_EDGE_PASS_ALPHA} — the settled rim changed weight"
+        );
+
+        // The two mid-fade values the defect was reported at, named rather
+        // than swept, because these are the numbers a future reader will
+        // check the fix against.
+        for a in [0.5f32, 0.3] {
+            let reached = accumulated_alpha(timer_edge_pass_alpha(a), TIMER_EDGE_DIRS.len());
+            assert!(
+                (reached - a).abs() <= 0.01,
+                "at presence {a} the outline accumulates to {reached} against \
+                 ink at {a}"
+            );
+        }
+    }
+
     /// The three things one listening frame has to get right at once, and the
     /// only one of them that used to be checked was the corner. The centre
     /// pixel is the live core dot, which is opaque `theme.rec`; the body
@@ -1786,42 +1953,64 @@ mod tests {
         }
     }
 
-    /// The same relationship, held at *every* point of the morph rather than
-    /// only at its ends — which is where it actually broke.
+    /// What the scrim has to be for the whole of the morph, and what it has to
+    /// cover once the ribbon is open.
     ///
-    /// `the_wave_row_clears_the_live_text_ink_box` above checks the ribbon-end
-    /// constants, and the row is only that small at `open == 1.0`; the scrim
-    /// is already at full alpha from `HANDOFF_HI` (0.55). Pinning the band's
-    /// ceiling to the ribbon-end numbers therefore painted it straight through
-    /// the still-large bars for the whole handoff window — invisible to a test
-    /// that only samples the endpoints, because the defect corrects itself
-    /// once the tween settles. The bar envelope here is recomputed from
-    /// `wave_geometry` the way `draw_wave` places its bars, not read back out
-    /// of `text_band`'s own input.
+    /// Deliberately *not* "the band starts below the wave row": `text_band`
+    /// computes its top as `natural.max(wave_row_bottom(..))`, so re-deriving
+    /// the row's bottom edge here and asserting the band clears it restates
+    /// the same `max` and passes for any `open` and any value of the wave
+    /// constants. That version could only fail by `text_band` dropping the
+    /// call entirely — it read as coverage while checking nothing.
+    ///
+    /// These two can fail. The clamp raises the band's ceiling, so it can
+    /// close the band onto its own floor and take the whole scrim out through
+    /// `draw_ribbon`'s `band_h > 0.0` guard, silently, for the frames the
+    /// clamp is tightest — that is the first assertion, swept across the tween
+    /// rather than at its ends, because the ceiling only moves in between.
+    /// The second is what the scrim exists for at all: with the ribbon open,
+    /// the band still backs the real glyph ink of every printable character,
+    /// measured from the face rather than assumed from the line box.
     #[test]
-    fn the_text_scrim_stays_below_the_wave_row_at_every_point_of_the_morph() {
+    fn the_text_scrim_is_a_real_band_across_the_morph_and_backs_the_ink_when_open() {
+        let printable: String = (0x20u8..0x7F).map(char::from).collect();
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let l = Layout::new(scale);
-            let atlas = FontAtlas::new();
+            let mut atlas = FontAtlas::new();
             let y = l.center_y - l.shape_h * 0.5;
+
+            let mut sampled = 0;
             for step in 0..=40 {
                 let open = step as f32 / 40.0;
                 if text_alpha(open) <= 0.0 {
                     continue;
                 }
-                // Exactly `draw_wave`'s tallest bar: centred `y_offset` above
-                // the shape's centre, `max_h` tall at full deflection.
-                let (max_h, y_offset) = wave_geometry(open);
-                let cy = y + l.shape_h * 0.5 - y_offset * l.scale;
-                let bars_bottom = cy + max_h * l.scale * 0.5;
-
-                let (band_top, _) = text_band(&atlas, &l, y, l.shape_h, open);
+                let (band_top, band_bottom) = text_band(&atlas, &l, y, l.shape_h, open);
                 assert!(
-                    band_top >= bars_bottom - 0.01,
-                    "scale {scale}, open {open}: scrim starts at {band_top}, \
-                     into a wave row reaching down to {bars_bottom}"
+                    band_bottom - band_top > 1.0 * l.scale,
+                    "scale {scale}, open {open}: the scrim collapsed to \
+                     {band_top}..{band_bottom} — `draw_ribbon` drops a band \
+                     that thin and the text is painted straight onto glass"
                 );
+                sampled += 1;
             }
+            assert!(sampled > 10, "scale {scale}: swept only {sampled} frames");
+
+            let (ink_top, ink_bottom) = atlas.ink_extents(&printable, l.text_font);
+            let baseline = y + l.shape_h * 0.5 + atlas.baseline_offset(l.text_font);
+            let (band_top, band_bottom) = text_band(&atlas, &l, y, l.shape_h, 1.0);
+            assert!(
+                band_top <= baseline - ink_top,
+                "scale {scale}: with the ribbon open the scrim starts at \
+                 {band_top}, below an ink box starting at {}",
+                baseline - ink_top
+            );
+            assert!(
+                band_bottom >= baseline - ink_bottom,
+                "scale {scale}: with the ribbon open the scrim ends at \
+                 {band_bottom}, above an ink box reaching {}",
+                baseline - ink_bottom
+            );
         }
     }
 
