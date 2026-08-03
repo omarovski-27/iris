@@ -39,6 +39,12 @@ reqwest = { version = "0.13", default-features = false, features = [
 # cross-compiles to x86_64-pc-windows-gnu with the mingw toolchain, whereas the
 # default `aws-lc-rs` wants cmake + nasm on the host. See docs/dev-windows.md.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Same version tokio-tungstenite's own `rustls-tls-webpki-roots` feature pins
+# (see its Cargo.toml): building our own `ClientConfig` from the identical
+# root store, once, is what lets `engine/net.rs` share it across connections
+# for TLS session resumption instead of every dictation paying a fresh
+# handshake — see that module's doc comment.
+webpki-roots = "0.26"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.17"

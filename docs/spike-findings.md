@@ -188,11 +188,26 @@ In priority order:
    above to settle it.
 3. **Real microphone end-to-end**, via the checklist in the spike README.
 
-*Resolved since:* **connection reuse.** A pre-warmed spare connection was built
-and then measured out — Deepgram closes an idle socket far short of the gaps
-between real dictations; see `AGENTS.md` (Sharp edges) for the measured window.
-The short-utterance case it was meant to help is covered instead by the
-`from_finalize` wait.
+*Resolved since:* **connection reuse.** A *static* pre-warmed spare connection
+was built and then measured out — Deepgram closes an idle socket far short of
+the gaps between real dictations; see `AGENTS.md` (Sharp edges) for the
+measured window. The short-utterance case it was meant to help is covered
+instead by the `from_finalize` wait. A 2026-08 follow-up shipped a different
+shape of the same idea — `WarmPool` (`crates/iris-core/src/engine/deepgram.rs`)
+actively holds one spare connection alive with Deepgram's `KeepAlive` control
+frame rather than passively hoping a prewarmed one survived, bounded to a
+3-minute idle window chosen from live gap data rather than held indefinitely.
+A stale-handoff safety net (`confirm_pending`, same file) means a spare that
+died anyway costs a reconnect's worth of latency, never a lost transcript.
+
+*Also resolved:* **TLS session resumption** (`engine/net.rs::tls_connector`,
+sharing one `rustls::ClientConfig` across connects) was tried for the same
+`stream_ready_ms` cost. It works — live-verified against the real Deepgram TLS
+endpoint, `handshake_kind()` reports `Resumed` on the second connect — but
+moved wall-clock time by nothing measurable, because TLS 1.3's full handshake
+is already 1-RTT and resumption without 0-RTT saves crypto compute, not a
+round trip. Shipped anyway as a harmless, real-but-modest win; not the answer
+to this section's open question.
 
 ## 7. Architecture recommendation
 

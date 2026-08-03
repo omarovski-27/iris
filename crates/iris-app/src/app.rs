@@ -466,16 +466,20 @@ impl<A: AudioSource> App<A> {
         keys: &Receiver<HotkeyEvent>,
     ) -> Result<Dictated> {
         // The engine session first: for a streaming engine this starts the
-        // websocket handshake, which then overlaps with everything below.
+        // websocket handshake (or, for Deepgram, hands over an already-warm
+        // one — see `WarmPool` in `deepgram.rs`), which then overlaps with
+        // everything below.
         //
-        // A session prewarmed ahead of the key press was tried and measured
-        // out: a live idle probe found Deepgram closes an unused connection
-        // within roughly 12-15 s (see AGENTS.md), far short of the gaps
-        // between real dictations, so a prewarmed session would almost
+        // A *static* session prewarmed ahead of the key press was tried and
+        // measured out: a live idle probe found Deepgram closes an unused
+        // connection within roughly 12-15 s (see AGENTS.md), far short of the
+        // gaps between real dictations, so a prewarmed session would almost
         // always be dead by the time it was needed. `deepgram.rs`'s
-        // `from_finalize` wait addresses the same latency at its actual
-        // source — a short hold's chance of outrunning Deepgram's first
-        // response — without an idle connection to keep alive.
+        // `from_finalize` wait addresses the short-hold-outrunning-connect
+        // case that would have justified it, at the latency's actual source,
+        // independent of whether a warm connection happens to be available.
+        // `WarmPool` covers the ordinary connect cost instead, by *actively*
+        // holding a spare alive rather than hoping a static one survived.
         let mut dictation = Dictation::start_at(&*self.engine, pressed_at)?;
 
         // A warm microphone keeps producing frames while the previous dictation

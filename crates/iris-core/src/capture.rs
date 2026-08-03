@@ -108,6 +108,13 @@ pub fn start(device: Option<&str>, sink: Sender<Vec<i16>>) -> Result<Capture> {
     let mut scratch: Vec<f32> = Vec::new();
     let mut frame: Vec<i16> = Vec::new();
 
+    // Unconditional, not `vlog!`: this is the only signal a WASAPI device
+    // failure (unplugged, invalidated by a format change, a Bluetooth
+    // reconnect) gives once capture is running. AGENTS.md's console rule
+    // exempts errors and delivery failures from the --verbose gate for
+    // exactly this reason — gating this one behind it would just swap which
+    // audience loses the message (a user running iris.exe from a terminal
+    // without --verbose, instead of the windowless tray app either way).
     let on_error = |e| eprintln!("[iris] audio stream error: {e}");
 
     macro_rules! build {
