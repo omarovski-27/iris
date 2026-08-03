@@ -536,6 +536,67 @@ fn a_mid_hold_failure_never_injects_while_the_key_is_still_held() {
         "the log must still show the audio that was captured: {:.2}s",
         rig.records()[0].latency.audio_secs
     );
+    assert!(
+        rig.records()[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("died mid-hold"),
+        "the words that never reached the engine leave no other trace: {:?}",
+        rig.records()[0].error
+    );
+}
+
+#[test]
+fn a_dictation_that_survives_a_mid_hold_failure_still_names_it() {
+    // The engine went on to return a real transcript through `finish()`, so
+    // this is a successful, injected dictation — and it must report as one,
+    // not as a failure. But it is a *truncated* one: everything said after the
+    // microphone died was never captured, and a record that reads as an
+    // ordinary short dictation hides that from whoever is debugging why their
+    // words went missing.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(PushFailsThenFinalEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("a delivered dictation is not a failure, whatever it survived");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(dictated.record.injected);
+    assert!(
+        dictated.record.text.to_ascii_lowercase().contains("caught"),
+        "the engine's own transcript is what gets delivered: {:?}",
+        dictated.record.text
+    );
+    assert_eq!(rig.injector.inserted().len(), 1);
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].injected);
+    assert!(
+        records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("died mid-hold"),
+        "a dictation that lost audio must not read as an ordinary one: {:?}",
+        records[0].error
+    );
 }
 
 #[test]
@@ -646,13 +707,13 @@ fn a_tail_feed_failure_injects_the_words_and_still_records_the_cause() {
     });
 
     let app_frames = rig.app.frames();
-    let err = rig
+    let dictated = rig
         .app
         .dictate(Instant::now(), &app_frames, &rig.keys_rx)
-        .expect_err("the hold ended abnormally, even though the words landed");
+        .expect("the words landed, so this is a dictation and not a failure");
     speaker.join().expect("the speaker panicked");
 
-    assert!(err.to_string().contains("flushing the tail"), "{err}");
+    assert!(dictated.record.injected);
     assert_eq!(
         rig.injector.inserted().len(),
         1,
@@ -1174,6 +1235,51 @@ impl Session for PushFailsMidHoldSession {
         &self.events
     }
     fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Refuses audio mid-hold like [`PushFailsMidHoldEngine`], but still returns a
+/// real transcript when asked to finalise: the hold loses its tail of audio and
+/// succeeds anyway.
+struct PushFailsThenFinalEngine;
+
+struct PushFailsThenFinalSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Sender<TranscriptEvent>,
+    samples: usize,
+}
+
+impl Engine for PushFailsThenFinalEngine {
+    fn name(&self) -> &'static str {
+        "push-fails-then-final"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PushFailsThenFinalSession {
+            events: rx,
+            tx,
+            samples: 0,
+        }))
+    }
+}
+
+impl Session for PushFailsThenFinalSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        self.samples += pcm.len();
+        if self.samples >= 8_000 {
+            anyhow::bail!("the websocket died mid-hold");
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        let _ = self
+            .tx
+            .send(TranscriptEvent::Final("what it caught".into()));
         Ok(())
     }
 }

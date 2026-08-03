@@ -41,15 +41,22 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// The backstop under [`GroqEngine::final_timeout`]: a little above
-/// [`CONNECT_TIMEOUT`] + [`REQUEST_TIMEOUT`], so the request's own error is
-/// what reaches the user and this only fires if the client somehow does not.
+/// [`REQUEST_TIMEOUT`], so the request's own error is what reaches the user and
+/// this only fires if the client somehow does not.
+///
+/// [`REQUEST_TIMEOUT`] alone is the whole client-side worst case —
+/// `reqwest`'s request timeout is one deadline running from the start of the
+/// connect through to the end of the response body, so [`CONNECT_TIMEOUT`] is
+/// contained by it rather than added to it. The margin over it covers only
+/// this side of the channel: the runtime picking the spawned task back up,
+/// parsing the response, and handing the event over.
 ///
 /// **This is a bound on how long the whole app stops responding.**
 /// `Dictation::finish` blocks the resident loop in `iris-app` — the pill stays
 /// frozen on "processing", and tray commands including Quit go unserviced —
 /// for as long as the engine's `final_timeout` allows. Any engine choosing that
 /// value is spending the user's whole UI, not just this dictation's latency.
-const FINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(32);
+const FINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(28);
 
 pub struct GroqEngine {
     key: String,
@@ -249,6 +256,22 @@ mod tests {
             language: None,
         };
         assert!(!engine.streams_partials());
+    }
+
+    #[test]
+    fn the_outer_wait_is_a_backstop_over_the_request_s_own_deadline() {
+        // reqwest's request timeout is one deadline covering connect through
+        // response body, so REQUEST_TIMEOUT alone is the client-side worst
+        // case. This must stay above it — otherwise the outer wait cuts off
+        // requests that were still going to succeed — and not far above it,
+        // because every second here is a second the resident app spends
+        // unresponsive.
+        assert!(FINAL_TIMEOUT > REQUEST_TIMEOUT, "{FINAL_TIMEOUT:?}");
+        assert!(
+            FINAL_TIMEOUT - REQUEST_TIMEOUT < CONNECT_TIMEOUT,
+            "the margin is for handing the answer back, not for a second connect: {:?}",
+            FINAL_TIMEOUT - REQUEST_TIMEOUT
+        );
     }
 
     #[test]

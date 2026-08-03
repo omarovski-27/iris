@@ -168,7 +168,11 @@ socket dying while the tail is fed costs no more than the same socket dying one
 statement later: `App::capture` sends that salvaged text through `App::deliver`
 — polish, injection, a normal record — while `note_cause` keeps the failure on
 the record, so a salvage never reads as an ordinary dictation. A hold that
-transcribed nothing becomes an `App::failed` error record. The blank `Timeline`
+transcribed nothing becomes an `App::failed` error record. `record.error` and
+the `Result` of `App::dictate` are deliberately allowed to disagree: the
+`Result` follows delivery (`record.injected`), because a dictation whose words
+reached the screen is not a failure however abnormally it got there, and the
+console must not contradict the confirmation the user just watched. The blank `Timeline`
 in `App::dictate` covers only failures before any audio exists; do not widen it
 back, and do not let the two exits drift apart.
 

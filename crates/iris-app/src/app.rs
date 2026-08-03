@@ -436,9 +436,15 @@ impl<A: AudioSource> App<A> {
             println!("{}", dictated.timeline.report(self.count));
         }
 
+        // Delivery decides this, not `record.error`: a salvage can carry the
+        // cause of an abnormal hold *and* have put the user's words on screen,
+        // and the second of those is what the caller acted on. Only a dictation
+        // that delivered nothing is a failure — the cause of one that delivered
+        // belongs in the session log, which already has it, not in a console
+        // line contradicting the confirmation the user just watched.
         match &dictated.record.error {
-            Some(message) => anyhow::bail!("{message}"),
-            None => Ok(dictated),
+            Some(message) if !dictated.record.injected => anyhow::bail!("{message}"),
+            _ => Ok(dictated),
         }
     }
 
@@ -609,15 +615,14 @@ impl<A: AudioSource> App<A> {
                 self.failed(e.timeline, message)
             }
         };
-        // The hold survived the mid-hold failure and produced words of its own,
-        // so it is reported as the dictation it turned out to be. The failure
-        // becomes the record's cause only where it is the story: a dictation
-        // that then failed, or one that came back with nothing.
+        // Always, even when the hold went on to produce a transcript: what came
+        // back is then the part of the utterance that survived, and a record
+        // that does not say so reads as an ordinary dictation that happened to
+        // be short. The words the microphone never captured are invisible here
+        // by definition; the cause is the only trace they leave.
         Ok(match mid_hold_failure {
-            Some(cause) if dictated.record.text.is_empty() || dictated.record.error.is_some() => {
-                note_cause(dictated, cause)
-            }
-            _ => dictated,
+            Some(cause) => note_cause(dictated, cause),
+            None => dictated,
         })
     }
 
