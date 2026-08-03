@@ -161,15 +161,27 @@ connected (from `Mark::StreamReady`, engine-agnostically) instead of the
 generic wording.
 
 **A failed dictation keeps its words and its timeline.** `Dictation::finish`
-and `Dictation::abandon` — the latter for a hold that never reached `finish`
-(dead microphone or hotkey thread, a rejected frame) — share one salvage rule:
-a non-empty `latest_partial` becomes the transcript, and the timeline carries
-the real `audio_secs` and marks. So a socket dying while the tail is fed costs
-no more than the same socket dying one statement later: `App::capture` sends
-salvaged text through `App::deliver` — polish, injection, a normal record — and
-only a hold that transcribed nothing becomes an `App::failed` error record. The
-blank `Timeline` in `App::dictate` covers only failures before any audio
-exists. Do not widen it back, and do not let the two exits drift apart.
+and `Dictation::abandon` — the latter for a hold that ended without `finish`
+ever running — share one salvage rule: a non-empty `latest_partial` becomes the
+transcript, and the timeline carries the real `audio_secs` and marks. So a
+socket dying while the tail is fed costs no more than the same socket dying one
+statement later: `App::capture` sends that salvaged text through `App::deliver`
+— polish, injection, a normal record — while `note_cause` keeps the failure on
+the record, so a salvage never reads as an ordinary dictation. A hold that
+transcribed nothing becomes an `App::failed` error record. The blank `Timeline`
+in `App::dictate` covers only failures before any audio exists; do not widen it
+back, and do not let the two exits drift apart.
+
+**Nothing but a confirmed key-up may end a hold, and nothing else may inject.**
+A mid-hold failure — the microphone dying, the engine refusing a frame, the
+event channel closing — is noted, its source swapped for
+`crossbeam_channel::never()`, and the loop keeps waiting for the real
+`HotkeyEvent::Up`; finalising early would type a mid-sentence fragment into
+whatever the user is looking at while they are still speaking. Only two paths
+may reach injection, both after key-up by construction: `Dictation::finish`'s
+own salvage, and the tail-feed failure in `App::capture`. A dead hotkey channel
+is the exception that proves it — no key-up can ever arrive, so that hold ends
+at once and is reported with its real timeline and no injection at all.
 
 ## Sharp edges
 

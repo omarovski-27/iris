@@ -288,6 +288,14 @@ impl Dictation {
     /// throughout: an overlay can keep updating right up to the moment the real
     /// text lands.
     ///
+    /// **This blocks the caller's whole loop for up to `timeout`.** In
+    /// `iris-app` that loop is the resident one: while this waits, the pill
+    /// holds its last frame and no tray command — Quit included — is serviced.
+    /// An engine picking its [`Engine::final_timeout`] is choosing how long the
+    /// application can stop responding, not just how long this dictation may
+    /// take, which is why a generous bound belongs under an engine-internal
+    /// timeout that ends a dead request sooner rather than on its own.
+    ///
     /// A terminal event that arrived *before* this call (a premature Final from
     /// a buggy or segment-oriented engine) does not short-circuit the wait:
     /// [`Session::finish`] is always invoked, and a later, richer Final or the

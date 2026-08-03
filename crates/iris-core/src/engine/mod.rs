@@ -101,6 +101,12 @@ pub trait Engine: Send + Sync {
     ///
     /// The bound is per engine, asked for per dictation, so switching engines
     /// at runtime switches the wait with it.
+    ///
+    /// Choose it knowing what it costs: [`crate::dictation::Dictation::finish`]
+    /// blocks its caller's loop for this long, which in the resident app means
+    /// a frozen overlay and an unresponsive tray. An engine that needs a
+    /// generous value should bound its own work from underneath (a request
+    /// timeout, a connect timeout) and leave this as the backstop.
     fn final_timeout(&self) -> std::time::Duration {
         crate::dictation::DEFAULT_FINAL_TIMEOUT
     }

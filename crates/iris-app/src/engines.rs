@@ -125,15 +125,22 @@ impl Engine for LocalAdapter {
         self.inner.streams_partials()
     }
 
-    /// Provisional, and deliberately generous for the same reason as Groq's:
-    /// the Whisper finalizer runs entirely after key-up, here on the user's own
-    /// CPU, and no local finalise latency has been measured on real hardware in
-    /// this project. Streaming partials mean an expiry costs the tail rather
-    /// than the whole utterance, but cutting a batch pass off at a bound
-    /// measured from a streaming engine would still throw away words that were
-    /// seconds from arriving.
+    /// Provisional, and longer than the streaming default because the Whisper
+    /// finalizer runs entirely after key-up, here on the user's own CPU, and no
+    /// local finalise latency has been measured on real hardware in this
+    /// project.
+    ///
+    /// Unlike Groq's, this wait has no socket under it that could hang
+    /// half-open — the work is local and bounded by the machine — so there is
+    /// nothing to bound from underneath and this is the whole budget. It is
+    /// held well under Groq's for the reason that difference allows: the
+    /// layered engine streams partials, so an expiry costs the finalizer's
+    /// improvement on the tail rather than the utterance. It is still a bound
+    /// on how long the resident loop stops responding (see
+    /// `iris_core::engine::groq::FINAL_TIMEOUT`), which is why it is not simply
+    /// set to whatever the slowest imaginable CPU might need.
     fn final_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(60)
+        std::time::Duration::from_secs(20)
     }
 
     fn open(&self) -> Result<Box<dyn iris_core::engine::Session>> {

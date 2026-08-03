@@ -483,35 +483,47 @@ impl<A: AudioSource> App<A> {
         self.audio.arm().context("starting capture")?;
 
         let events = dictation.events();
-        // When the engine hangs up mid-hold we must *not* treat that as a key
-        // release: doing so finalises on a partial segment and injects truncated
-        // text while the user is still speaking. Keep capturing until the real
-        // key-up; `finish()` surfaces the engine failure or salvages partials.
+        // Nothing that fails mid-hold may end the hold: the key is still down,
+        // the user is still speaking, and finalising on a partial segment would
+        // type truncated text into whatever they are looking at. Whichever
+        // source dies — the engine's events, the microphone, the engine's
+        // appetite for frames — we note it and keep waiting for the real
+        // key-up, which is the only thing allowed to end an utterance.
         //
-        // crossbeam `select!` has no `if` guard on `recv`, so after disconnect
-        // we swap in a never-ready receiver and keep waiting on frames/keys.
+        // crossbeam `select!` has no `if` guard on `recv`, so a dead source is
+        // swapped for a never-ready receiver and the loop carries on.
         let never_events = crossbeam_channel::never();
+        let never_frames = crossbeam_channel::never();
         let mut engine_events_open = true;
+        let mut frames_open = true;
+        let mut mid_hold_failure: Option<anyhow::Error> = None;
 
-        // A mid-hold failure ends the loop the same way a key-up does, carrying
-        // the error out instead of `?`-ing it away: by this point the hold has
-        // real audio and real marks in it, and `abandoned` below is what keeps
-        // those in the session log rather than reporting an empty hold.
         let held = loop {
             let event_rx = if engine_events_open {
                 &events
             } else {
                 &never_events
             };
+            let frame_rx = if frames_open { frames } else { &never_frames };
             select! {
-                recv(frames) -> frame => {
-                    let frame = match frame.context("the audio thread stopped") {
-                        Ok(frame) => frame,
-                        Err(e) => break Err(e),
-                    };
-                    self.pill.update_level(audio::level(&frame));
-                    if let Err(e) = dictation.feed(&frame) {
-                        break Err(e);
+                recv(frame_rx) -> frame => {
+                    match frame.context("the audio thread stopped") {
+                        Ok(frame) => {
+                            self.pill.update_level(audio::level(&frame));
+                            if let Err(e) = dictation.feed(&frame) {
+                                // The engine will not take audio any more, so
+                                // there is nothing left to feed it; the words
+                                // it already produced are still the user's.
+                                eprintln!("  capture failed mid-hold: {e:#}");
+                                mid_hold_failure.get_or_insert(e);
+                                frames_open = false;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  capture failed mid-hold: {e:#}");
+                            mid_hold_failure.get_or_insert(e);
+                            frames_open = false;
+                        }
                     }
                 }
                 recv(event_rx) -> event => match event {
@@ -543,7 +555,14 @@ impl<A: AudioSource> App<A> {
 
         let released_at = match held {
             Ok(at) => at,
-            Err(e) => return Ok(self.abandoned(dictation, e)),
+            Err(e) => {
+                // The hotkey channel is the only source a key-up can ever come
+                // from, so this hold can never be confirmed as over. Salvaging
+                // into an injection here would type into a window whose user
+                // may still be mid-sentence; the words are reported, not typed.
+                let outcome = dictation.abandon(&mut |_| {});
+                return Ok(self.failed(outcome.timeline, format!("{e:#}")));
+            }
         };
 
         // Stamped before the tail is fed so a failure down there still logs a
@@ -552,14 +571,19 @@ impl<A: AudioSource> App<A> {
         dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
 
         // Whatever the device buffered but had not delivered is still the
-        // user's speech; dropping it would truncate the last word.
-        let mut tail = Vec::new();
-        while let Ok(frame) = frames.try_recv() {
-            tail.extend_from_slice(&frame);
-        }
-        if !tail.is_empty() {
-            if let Err(e) = dictation.feed(&tail) {
-                return Ok(self.abandoned(dictation, e));
+        // user's speech; dropping it would truncate the last word. Unless the
+        // hold already gave up on that source: a backlog the loop deliberately
+        // stopped reading is not a tail, and the thing that refused it will
+        // only refuse it again.
+        if frames_open {
+            let mut tail = Vec::new();
+            while let Ok(frame) = frames.try_recv() {
+                tail.extend_from_slice(&frame);
+            }
+            if !tail.is_empty() {
+                if let Err(e) = dictation.feed(&tail) {
+                    return Ok(self.abandoned(dictation, e));
+                }
             }
         }
 
@@ -573,8 +597,8 @@ impl<A: AudioSource> App<A> {
                 pill.set_partial_text(text);
             })
         };
-        let outcome = match finished {
-            Ok(outcome) => outcome,
+        let dictated = match finished {
+            Ok(outcome) => self.deliver(outcome),
             Err(e) => {
                 // The engine never produced a transcript, but real audio may
                 // have been captured and marks stamped before it gave up —
@@ -582,10 +606,19 @@ impl<A: AudioSource> App<A> {
                 // actually happened instead of reading as if the hold never
                 // captured anything.
                 let message = format!("{e:#}");
-                return Ok(self.failed(e.timeline, message));
+                self.failed(e.timeline, message)
             }
         };
-        Ok(self.deliver(outcome))
+        // The hold survived the mid-hold failure and produced words of its own,
+        // so it is reported as the dictation it turned out to be. The failure
+        // becomes the record's cause only where it is the story: a dictation
+        // that then failed, or one that came back with nothing.
+        Ok(match mid_hold_failure {
+            Some(cause) if dictated.record.text.is_empty() || dictated.record.error.is_some() => {
+                note_cause(dictated, cause)
+            }
+            _ => dictated,
+        })
     }
 
     /// Polish the transcript, put it on screen, and record what happened.
@@ -657,15 +690,15 @@ impl<A: AudioSource> App<A> {
         Dictated { record, timeline }
     }
 
-    /// A hold that ended before the engine was ever asked to finalise — the
-    /// audio or hotkey thread stopped, or a frame could not be fed.
+    /// The tail feed failed: the key is already up, so the utterance is over
+    /// and the engine will never be asked to finalise it.
     ///
-    /// [`Dictation::abandon`] hands over what the hold had captured up to that
-    /// point, and words already on the overlay are delivered exactly as a
-    /// clean dictation's would be: the failure that ended the hold does not get
-    /// to throw away text the user watched appear. Only a hold that never
-    /// transcribed anything is recorded as a failure — with its real timeline,
-    /// not [`App::dictate`]'s blank-timeline fallback.
+    /// This is the one path that delivers without [`Dictation::finish`], and it
+    /// is deliberately the only one: the key-up is confirmed, so injecting what
+    /// the overlay already showed cannot land mid-sentence. Words the user
+    /// watched appear are not thrown away by the failure that ended the hold —
+    /// but the record still names that failure, because a dictation that ended
+    /// this way is not an ordinary one and the log has to say so.
     fn abandoned(&mut self, dictation: Dictation, error: anyhow::Error) -> Dictated {
         let outcome = {
             let pill = &mut self.pill;
@@ -674,15 +707,14 @@ impl<A: AudioSource> App<A> {
                 pill.set_partial_text(text);
             })
         };
+        let cause = format!("{error:#}");
         if outcome.text.trim().is_empty() {
-            return self.failed(outcome.timeline, format!("{error:#}"));
+            return self.failed(outcome.timeline, cause);
         }
-        iris_core::vlog!(
-            "hold ended by {error:#}; salvaging {} chars already transcribed",
-            outcome.text.trim().chars().count()
-        );
+        eprintln!("  the hold ended early, delivering what was transcribed: {cause}");
         self.pill.processing();
-        self.deliver(outcome)
+        let dictated = self.deliver(outcome);
+        note_cause(dictated, error)
     }
 
     /// Clean up the transcript, falling back to the raw text on any failure.
@@ -709,6 +741,21 @@ impl<A: AudioSource> App<A> {
             }
         }
     }
+}
+
+/// Name why a hold ended abnormally on the record it produced anyway.
+///
+/// A dictation can be both: the words were recovered *and* something went
+/// wrong. Keeping only the words would log a dead microphone as an ordinary,
+/// unusually fast dictation — and a dead microphone is the single most useful
+/// thing in the file, because every hold after it will fail to arm capture.
+fn note_cause(mut dictated: Dictated, cause: anyhow::Error) -> Dictated {
+    let cause = format!("{cause:#}");
+    dictated.record.error = Some(match dictated.record.error.take() {
+        Some(existing) => format!("{cause}; {existing}"),
+        None => cause,
+    });
+    dictated
 }
 
 fn open_history(config: &Config, config_path: &std::path::Path) -> SessionLog {
