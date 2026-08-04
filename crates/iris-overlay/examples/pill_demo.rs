@@ -147,7 +147,7 @@ struct Args {
     #[arg(
         long,
         conflicts_with_all = [
-            "theme", "utterance", "live_text", "hold_level",
+            "theme", "utterance", "live_text", "hold_level", "engine",
             "cycles", "filmstrip", "filmstrip_step",
         ]
     )]

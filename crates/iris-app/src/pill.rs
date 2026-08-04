@@ -218,7 +218,7 @@ impl OverlayPill {
     }
 
     /// What [`PillSink::set_partial_text`] would hand to the overlay: the text
-    /// itself, or nothing at all while the live-text opt-out is on.
+    /// itself, or nothing at all while the live-text opt-in is off.
     ///
     /// The single place the gate is decided, so a test can exercise the real
     /// decision rather than a double's imitation of it — the overlay end of
@@ -543,7 +543,7 @@ mod tests {
         assert_eq!(
             pill.partial_for_overlay("the quarterly"),
             None,
-            "the opt-out did not reach the sink's own gate"
+            "turning the opt-in off did not reach the sink's own gate"
         );
         pill.show_listening();
         pill.set_partial_text("this must not reach the overlay");
@@ -552,7 +552,7 @@ mod tests {
         assert_eq!(
             pill.partial_for_overlay("the quarterly"),
             Some("the quarterly"),
-            "turning the opt-out back off left the ribbon mute"
+            "turning the opt-in back on left the ribbon mute"
         );
         pill.set_partial_text("the quarterly");
         overlay.shutdown();

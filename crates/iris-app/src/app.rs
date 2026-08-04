@@ -355,7 +355,7 @@ impl<A: AudioSource> App<A> {
                     self.history = open_history(&config, &self.config_path);
                     self.pill.set_theme(config.theme);
                     // Same treatment as the theme, and for a stronger reason:
-                    // this is the live transcript's opt-out, so "reloaded"
+                    // this is the live transcript's opt-in, so "reloaded"
                     // has to mean it is already in force.
                     self.pill.set_show_live_text(config.show_live_text);
                     self.config = config;

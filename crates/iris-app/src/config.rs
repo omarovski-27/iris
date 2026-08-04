@@ -536,7 +536,11 @@ impl Config {
     /// has to reach the disk or the reset repeats on every start and a user
     /// who then turns live text back on by hand loses it again. A failure to
     /// write is not fatal — the migration still holds for this run, and this
-    /// module's first rule is that Iris starts.
+    /// module's first rule is that Iris starts — but it is reported the same
+    /// way [`crate::app::App`] reports a failed save, unconditionally: a stamp
+    /// that never lands means the reset runs again at every start, and a
+    /// setting that keeps reverting with nothing on screen to explain it is
+    /// exactly the failure a quiet console must not hide.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if !path.exists() {
             let config = Self::default();
@@ -546,7 +550,7 @@ impl Config {
         let (config, migrated) = Self::load_reporting_migration(path)?;
         if migrated {
             if let Err(e) = config.save(path) {
-                iris_core::vlog!("could not stamp the migrated config: {e:#}");
+                eprintln!("cannot save {}: {e:#}", path.display());
             }
         }
         Ok(config)
