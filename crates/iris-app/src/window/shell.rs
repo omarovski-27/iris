@@ -13,7 +13,9 @@
 //! signal and turned into [`egui::ViewportCommand::Focus`] instead, since
 //! that drain is the only thing polling the channel while the window is up.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
@@ -22,23 +24,53 @@ use crate::app::{Command, CommandId, CommandOutcome};
 use crate::config::Config;
 
 use super::state::{Env, WindowState};
-use super::{ui, Startup, WindowSink};
+use super::{ui, EditorWindow, Startup, WindowSink};
+
+/// The live window's `egui` context, shared with [`WindowHandle`] so a reopen
+/// can wake the event loop. `None` between windows.
+type SharedContext = Arc<Mutex<Option<egui::Context>>>;
 
 /// Sends the `open` signal [`spawn`]'s thread waits on.
 pub struct WindowHandle {
     open_tx: Sender<()>,
+    /// The context of the window that is up, if one is. Set on its first
+    /// frame, cleared when it closes.
+    ctx: SharedContext,
+    /// Set once the window has proved it cannot run on this machine, by
+    /// whichever side found that out. From then on every click takes
+    /// `fallback` instead of waking a thread that would only fail again.
+    unusable: Arc<AtomicBool>,
+    /// Where the tray's `Settings` item goes when the window cannot.
+    fallback: Arc<EditorWindow>,
 }
 
 impl WindowSink for WindowHandle {
     fn open(&self) {
+        if self.unusable.load(Ordering::SeqCst) {
+            self.fallback.open();
+            return;
+        }
         // Unbounded and never awaited: a click that arrives while the window
         // is already mid-open queues harmlessly, per the module docs. A send
         // that fails is not that case — the only way it can fail is the
         // window thread being gone (an `egui` panic unwinds it alone, leaving
-        // the dictation loop running), which turns the tray's `Settings` item
-        // into a permanent no-op and is worth saying out loud.
+        // the dictation loop running).
         if self.open_tx.send(()).is_err() {
-            eprintln!("  settings window unavailable: its thread is no longer running");
+            if !self.unusable.swap(true, Ordering::SeqCst) {
+                eprintln!("  settings window unavailable: its thread is no longer running");
+            }
+            self.fallback.open();
+            return;
+        }
+        // The signal above is only read by `ui::draw_root`'s per-frame drain
+        // while a window is up, and that drain is paced by
+        // `request_repaint_after` — up to `REFRESH_INTERVAL` away when nothing
+        // else is asking for a frame (the window minimized, or behind
+        // another). Ask for the frame directly, so the click that raises an
+        // already-open window is answered now rather than seconds later.
+        let live = self.ctx.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(ctx) = live.as_ref() {
+            ctx.request_repaint();
         }
     }
 }
@@ -53,33 +85,63 @@ pub fn spawn(
     startup: Startup,
 ) -> Result<Box<dyn WindowSink>> {
     let (open_tx, open_rx) = crossbeam_channel::unbounded::<()>();
+    let ctx: SharedContext = Arc::new(Mutex::new(None));
+    let unusable = Arc::new(AtomicBool::new(false));
+    let fallback = Arc::new(EditorWindow::new(config_path.clone()));
 
+    let thread_ctx = Arc::clone(&ctx);
+    let thread_unusable = Arc::clone(&unusable);
+    let thread_fallback = Arc::clone(&fallback);
     std::thread::Builder::new()
         .name("iris-window".into())
         .spawn(move || {
             while open_rx.recv().is_ok() {
-                run_window(
+                // A click queued before the failure below was seen, or while
+                // this thread was busy failing: still owed the fallback.
+                if thread_unusable.load(Ordering::SeqCst) {
+                    thread_fallback.open();
+                    continue;
+                }
+                if let Err(e) = run_window(
                     open_rx.clone(),
                     config_path.clone(),
                     commands.clone(),
                     outcomes.clone(),
                     startup,
-                );
+                    &thread_ctx,
+                ) {
+                    // `eframe` fails for reasons that do not change between
+                    // clicks — no usable GL, no display — so the diagnosis is
+                    // said once and the item is routed elsewhere from here
+                    // on, rather than repeating into a console a resident
+                    // tray app never shows.
+                    if !thread_unusable.swap(true, Ordering::SeqCst) {
+                        eprintln!("  settings window error: {e:#}");
+                    }
+                    thread_fallback.open();
+                }
             }
         })
         .context("spawning the settings-window thread")?;
 
-    Ok(Box::new(WindowHandle { open_tx }))
+    Ok(Box::new(WindowHandle {
+        open_tx,
+        ctx,
+        unusable,
+        fallback,
+    }))
 }
 
-/// Build and run one window instance until it is closed.
+/// Build and run one window instance until it is closed. An error here is the
+/// window proving it cannot run on this machine at all.
 fn run_window(
     reopen_signal: Receiver<()>,
     config_path: PathBuf,
     commands: Sender<(CommandId, Command)>,
     outcomes: Receiver<(CommandId, CommandOutcome)>,
     startup: Startup,
-) {
+    ctx: &SharedContext,
+) -> Result<()> {
     // Best-effort: a config that fails to load just draws the default-theme
     // icon rather than blocking the window from opening at all.
     let theme = Config::load(&config_path).unwrap_or_default().theme;
@@ -118,16 +180,19 @@ fn run_window(
         // the window happens to be open is not worth a syscall every 16 ms,
         // and reopening the window picks up the new one.
         utc_offset_seconds: local_utc_offset_seconds(),
+        ctx: Arc::clone(ctx),
         state: None,
     };
 
-    if let Err(e) = eframe::run_native(
+    let result = eframe::run_native(
         "iris-settings",
         options,
         Box::new(move |_cc| Ok(Box::new(app))),
-    ) {
-        eprintln!("  settings window error: {e}");
-    }
+    );
+    // This window's context dies with it; a later reopen publishes the next
+    // one on its first frame.
+    *ctx.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    result.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// The `eframe::App`: owns the window's lifetime state and hands each frame
@@ -143,6 +208,9 @@ struct SettingsApp {
     reopen_signal: Receiver<()>,
     startup: Startup,
     utc_offset_seconds: i32,
+    /// Published on the first frame, for [`WindowHandle::open`] to wake this
+    /// window with.
+    ctx: SharedContext,
     /// Built lazily on the first frame — `Env` borrows the fields above, so
     /// it cannot be constructed until `self` exists.
     state: Option<WindowState>,
@@ -150,12 +218,15 @@ struct SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.state.is_none() {
+            *self.ctx.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx.clone());
+        }
         let env = Env {
             config_path: &self.config_path,
             commands: &self.commands,
             outcomes: &self.outcomes,
             list_devices: &list_devices,
-            open_config_file: &open_config_file,
+            open_config_file: &super::open_config_file,
             reopen_signal: &self.reopen_signal,
             utc_offset_seconds: self.utc_offset_seconds,
             hotkey: super::InForce {
@@ -181,23 +252,6 @@ fn list_devices() -> Vec<String> {
     iris_core::capture::list_devices()
         .map(|devices| devices.into_iter().map(|d| d.name).collect())
         .unwrap_or_default()
-}
-
-/// Hand `config.toml` to whatever the desktop opens it with — the Settings
-/// tab's one route to the API keys, which the window itself never renders.
-///
-/// The window is not a second config writer: this spawns and forgets, and
-/// `WindowState::refresh` picks up whatever the user saved a moment later,
-/// exactly as it picks up a hand edit made outside Iris.
-fn open_config_file(path: &Path) -> Result<()> {
-    // `start` is a cmd builtin, hence `cmd /C`. The empty argument is the
-    // window title, which `start` otherwise steals from the path.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(path)
-        .spawn()
-        .context("launching the editor")?;
-    Ok(())
 }
 
 /// The machine's current offset east of UTC, in seconds.

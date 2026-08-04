@@ -94,6 +94,97 @@ impl WindowSink for NoopWindow {
     fn open(&self) {}
 }
 
+/// The route into settings when the window itself cannot run here: hand
+/// `config.toml` to the desktop's editor, which is what the tray's `Settings`
+/// item did before this window existed.
+///
+/// A window that fails to start must not turn the item into a no-op — the file
+/// is still the source of truth for every setting, so there is always
+/// somewhere to send the user. Every click takes the route, and each one says
+/// so; the diagnosis of *why* the window is unavailable is logged once, by
+/// whoever discovered it.
+pub struct EditorWindow {
+    config_path: std::path::PathBuf,
+    open: OpenConfig,
+}
+
+/// How [`EditorWindow`] reaches the desktop's handler for `config.toml`.
+type OpenConfig = Box<dyn Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync>;
+
+impl std::fmt::Debug for EditorWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditorWindow")
+            .field("config_path", &self.config_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EditorWindow {
+    /// Open `config_path` with the desktop's own handler.
+    #[must_use]
+    pub fn new(config_path: std::path::PathBuf) -> Self {
+        Self::with_opener(config_path, open_config_file)
+    }
+
+    /// As [`EditorWindow::new`], with the opening left to `open` — the seam a
+    /// test uses, since launching the desktop's editor is not something a test
+    /// may do.
+    #[must_use]
+    pub fn with_opener(
+        config_path: std::path::PathBuf,
+        open: impl Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            config_path,
+            open: Box::new(open),
+        }
+    }
+}
+
+impl WindowSink for EditorWindow {
+    fn open(&self) {
+        eprintln!(
+            "  the settings window could not start on this machine; opening {} instead.",
+            self.config_path.display()
+        );
+        if let Err(e) = (self.open)(&self.config_path) {
+            eprintln!("  cannot open {}: {e:#}", self.config_path.display());
+        }
+    }
+}
+
+/// Hand a path to whatever the desktop uses to open it.
+///
+/// The window is not a second config writer: this spawns and forgets, and
+/// `WindowState::refresh` picks up whatever the user saved a moment later,
+/// exactly as it picks up a hand edit made outside Iris.
+///
+/// # Errors
+///
+/// If the handler cannot be launched.
+pub fn open_config_file(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    #[cfg(windows)]
+    {
+        // `start` is a cmd builtin, hence `cmd /C`. The empty argument is the
+        // window title, which `start` otherwise steals from the path.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+            .context("launching the editor")?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .context("launching xdg-open")?;
+    }
+    Ok(())
+}
+
 /// A test double that counts [`WindowSink::open`] calls.
 ///
 /// Cloneable and shared, because the loop takes ownership of its window sink
@@ -181,9 +272,98 @@ pub fn spawn(
     }
 }
 
+/// [`spawn`], with a window that cannot start falling back to the config file
+/// in the user's editor rather than to nothing.
+///
+/// The window is an accessory — dictation needs neither it nor the tray — so a
+/// thread that cannot start must not take the whole application down. It must
+/// not silently take the `Settings` item down either: every setting the window
+/// edits lives in `config.toml`, so that file is the fallback, and
+/// [`EditorWindow`] is the same route the tray offered before this window
+/// existed. The reason is logged once, here; the fallback runs on every click.
+pub fn spawn_or_editor(
+    config_path: std::path::PathBuf,
+    commands: crossbeam_channel::Sender<(crate::app::CommandId, crate::app::Command)>,
+    outcomes: crossbeam_channel::Receiver<(crate::app::CommandId, crate::app::CommandOutcome)>,
+    startup: Startup,
+) -> Box<dyn WindowSink> {
+    let spawned = spawn(config_path.clone(), commands, outcomes, startup);
+    or_editor(spawned, config_path, open_config_file)
+}
+
+/// The fallback decision on its own, so a test can hand it the failure that
+/// only a real machine with no usable GL/window stack produces.
+fn or_editor(
+    spawned: anyhow::Result<Box<dyn WindowSink>>,
+    config_path: std::path::PathBuf,
+    open: impl Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync + 'static,
+) -> Box<dyn WindowSink> {
+    match spawned {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("  settings window unavailable: {e:#}");
+            Box::new(EditorWindow::with_opener(config_path, open))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a [`recording_opener`] was asked to open.
+    type Opened = std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>;
+
+    /// An opener that records what it was asked to open instead of launching
+    /// the desktop's editor.
+    fn recording_opener() -> (
+        Opened,
+        impl Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) {
+        let opened: Opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&opened);
+        (opened, move |path: &std::path::Path| {
+            seen.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_window_that_cannot_start_falls_back_to_the_config_file() {
+        let (opened, open) = recording_opener();
+        let path = std::path::PathBuf::from("/tmp/iris/config.toml");
+
+        let window = or_editor(
+            Err(anyhow::anyhow!("no usable GL context")),
+            path.clone(),
+            open,
+        );
+        // Every click takes the route, not just the first: the item stays
+        // useful for the life of the process.
+        window.open();
+        window.open();
+
+        assert_eq!(*opened.lock().unwrap(), vec![path.clone(), path]);
+    }
+
+    #[test]
+    fn a_window_that_started_is_left_alone() {
+        let (opened, open) = recording_opener();
+        let spawned: Box<dyn WindowSink> = Box::new(RecordingWindow::new());
+
+        let window = or_editor(Ok(spawned), "/tmp/iris/config.toml".into(), open);
+        window.open();
+
+        assert!(opened.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn editor_window_reports_a_failure_to_open_rather_than_panicking() {
+        let window = EditorWindow::with_opener("/tmp/iris/config.toml".into(), |_| {
+            anyhow::bail!("no handler for .toml")
+        });
+        window.open();
+    }
 
     #[test]
     fn noop_window_open_does_not_panic() {

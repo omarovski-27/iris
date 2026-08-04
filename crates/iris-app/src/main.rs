@@ -215,27 +215,6 @@ struct Resident {
     _tray: iris_app::tray::Tray,
 }
 
-/// Start the settings-window thread, on the same terms as the overlay above:
-/// best-effort, because it is an accessory. Dictation is the product and it
-/// needs neither window, so a thread that cannot start costs the user the
-/// tray's `Settings` item — logged, and a no-op from then on — rather than the
-/// whole application.
-#[cfg(windows)]
-fn try_spawn_window(
-    config_path: &std::path::Path,
-    commands: crossbeam_channel::Sender<(iris_app::CommandId, iris_app::Command)>,
-    outcomes: crossbeam_channel::Receiver<(iris_app::CommandId, iris_app::CommandOutcome)>,
-    startup: iris_app::window::Startup,
-) -> Box<dyn iris_app::WindowSink> {
-    match iris_app::window::spawn(config_path.to_path_buf(), commands, outcomes, startup) {
-        Ok(window) => window,
-        Err(e) => {
-            eprintln!("  settings window unavailable: {e:#}");
-            Box::new(iris_app::NoopWindow)
-        }
-    }
-}
-
 /// The resident loop.
 #[cfg(windows)]
 fn run(
@@ -311,7 +290,16 @@ fn start_resident(
     };
     let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
     let (window_outcomes_tx, window_outcomes_rx) = crossbeam_channel::unbounded();
-    let window = try_spawn_window(config_path, window_commands_tx, window_outcomes_rx, startup);
+    // Best-effort, on the same terms as the overlay above: dictation needs no
+    // window, so one that cannot start costs the user the real Settings UI —
+    // and falls back to `config.toml` in their editor — rather than the whole
+    // application.
+    let window = iris_app::window::spawn_or_editor(
+        config_path.to_path_buf(),
+        window_commands_tx,
+        window_outcomes_rx,
+        startup,
+    );
 
     let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
