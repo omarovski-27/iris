@@ -153,22 +153,43 @@ its 6s is streaming evidence. An engine that works after key-up — Groq's uploa
 generous, provisional value, because there the expiry costs the whole
 utterance (`streams_partials` is false, so nothing can be salvaged). Every
 caller of `Dictation::finish` asks the engine; `App` re-asks per dictation, so
-switching engines switches the wait. Ranking the inner timeouts against the
-outer one was tried and reverted: `CONNECT_TIMEOUT` runs from key-down and the
-outer deadline from key-up, so no hold length makes the order stable. When the
-outer bound wins that race, `Dictation::finish` says the session never
-connected (from `Mark::StreamReady`, engine-agnostically) instead of the
-generic wording.
+switching engines switches the wait. That per-engine bound is also a bound on
+the whole UI: `finish` blocks the resident loop, so Groq (28s) or the local
+engine (20s) can leave the pill frozen and Quit unserviced for that long. The
+numbers are accepted, not trimmed — with `streams_partials` false an early
+expiry costs the whole utterance — and the exposure does not reach the default
+path, which is Deepgram at 6s. A non-blocking finalise is the real fix and is
+tracked elsewhere; do not approximate it by lowering a ceiling.
+
+**The outer bound may never end a session that is still legitimately
+connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)
+runs from key-down, the outer deadline from key-up — so no hold length makes
+the raw ordering stable, and ranking the constants against each other was
+tried and reverted. The relationship is enforced instead: `Engine::connect_budget`
+publishes the engine's connect ceiling and `Dictation::finish` extends its wait
+to cover it, but *only* while `Mark::StreamReady` is unstamped and there is
+nothing to salvage — the one case where giving up early costs the whole
+utterance rather than a tail. A partial or a `Connected` ends the grace at
+once, so the 6s win survives on every path with words to lose. A connect that
+fails on its own terms still reports as one (from `Mark::StreamReady`,
+engine-agnostically). `fm/iris-silent-and-instant` moves the same constant from
+another direction: keep the constant and the grace together or the data loss
+comes back.
 
 **A failed dictation keeps its words and its timeline.** `Dictation::finish`
 and `Dictation::abandon` — the latter for a hold that ended without `finish`
 ever running — share one salvage rule: a non-empty `latest_partial` becomes the
-transcript, and the timeline carries the real `audio_secs` and marks. So a
-socket dying while the tail is fed costs no more than the same socket dying one
-statement later: `App::capture` sends that salvaged text through `App::deliver`
-— polish, injection, a normal record — while `note_cause` keeps the failure on
-the record, so a salvage never reads as an ordinary dictation. A hold that
-transcribed nothing becomes an `App::failed` error record. `record.error` and
+transcript, and the timeline carries the real `audio_secs` and marks. Every arm
+obeys it, `session.finish()` failing included. So a socket dying while the tail
+is fed costs no more than the same socket dying one statement later:
+`App::capture` sends that salvaged text through `App::deliver` — polish,
+injection, a normal record. Each salvage names itself: `DictationOutcome::cause`
+is `None` only for a real `Final`, and `App` folds it into `record.error`
+alongside any mid-hold cause, so a salvage never reads as an ordinary
+dictation. A hold that transcribed nothing becomes an `App::failed` error
+record; a hold whose words exist but may never be injected — only the dead
+hotkey channel — becomes an `App::reported` one, which is `failed` with the
+text put back. `record.error` and
 the `Result` of `App::dictate` are deliberately allowed to disagree: the
 `Result` follows delivery (`record.injected`), because a dictation whose words
 reached the screen is not a failure however abnormally it got there, and the
@@ -185,7 +206,8 @@ whatever the user is looking at while they are still speaking. Only two paths
 may reach injection, both after key-up by construction: `Dictation::finish`'s
 own salvage, and the tail-feed failure in `App::capture`. A dead hotkey channel
 is the exception that proves it — no key-up can ever arrive, so that hold ends
-at once and is reported with its real timeline and no injection at all.
+at once and its words are recorded, with their real timeline and every cause
+the hold collected, but never typed.
 
 ## Sharp edges
 

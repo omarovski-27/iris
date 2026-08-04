@@ -513,23 +513,20 @@ impl<A: AudioSource> App<A> {
             let frame_rx = if frames_open { frames } else { &never_frames };
             select! {
                 recv(frame_rx) -> frame => {
-                    match frame.context("the audio thread stopped") {
-                        Ok(frame) => {
+                    // The microphone stopping and the engine refusing the frame
+                    // are the same event to this hold: there is nothing left to
+                    // feed, and the words already produced are still the user's.
+                    // One handler, so the two cannot drift.
+                    let fed = frame
+                        .context("the audio thread stopped")
+                        .and_then(|frame| {
                             self.pill.update_level(audio::level(&frame));
-                            if let Err(e) = dictation.feed(&frame) {
-                                // The engine will not take audio any more, so
-                                // there is nothing left to feed it; the words
-                                // it already produced are still the user's.
-                                eprintln!("  capture failed mid-hold: {e:#}");
-                                mid_hold_failure.get_or_insert(e);
-                                frames_open = false;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  capture failed mid-hold: {e:#}");
-                            mid_hold_failure.get_or_insert(e);
-                            frames_open = false;
-                        }
+                            dictation.feed(&frame)
+                        });
+                    if let Err(e) = fed {
+                        eprintln!("  capture failed mid-hold: {e:#}");
+                        mid_hold_failure.get_or_insert(e);
+                        frames_open = false;
                     }
                 }
                 recv(event_rx) -> event => match event {
@@ -544,6 +541,14 @@ impl<A: AudioSource> App<A> {
                         iris_core::vlog!(
                             "engine event channel closed mid-hold; waiting for key-up"
                         );
+                        // Recorded like any other mid-hold failure: everything
+                        // said from here on can only reach the transcript if
+                        // the engine happens to send it after `finish`, so a
+                        // dictation that ends this way is not an ordinary one
+                        // however complete its words look.
+                        mid_hold_failure.get_or_insert_with(|| {
+                            anyhow::anyhow!("the engine stopped sending events mid-hold")
+                        });
                         engine_events_open = false;
                     }
                 },
@@ -567,7 +572,8 @@ impl<A: AudioSource> App<A> {
                 // into an injection here would type into a window whose user
                 // may still be mid-sentence; the words are reported, not typed.
                 let outcome = dictation.abandon(&mut |_| {});
-                return Ok(self.failed(outcome.timeline, format!("{e:#}")));
+                let dictated = self.reported(outcome, format!("{e:#}"));
+                return Ok(note_mid_hold(dictated, mid_hold_failure));
             }
         };
 
@@ -620,10 +626,7 @@ impl<A: AudioSource> App<A> {
         // that does not say so reads as an ordinary dictation that happened to
         // be short. The words the microphone never captured are invisible here
         // by definition; the cause is the only trace they leave.
-        Ok(match mid_hold_failure {
-            Some(cause) => note_cause(dictated, cause),
-            None => dictated,
-        })
+        Ok(note_mid_hold(dictated, mid_hold_failure))
     }
 
     /// Polish the transcript, put it on screen, and record what happened.
@@ -632,55 +635,69 @@ impl<A: AudioSource> App<A> {
     /// partial salvaged from an engine that died, a partial salvaged from a
     /// hold [`App::abandoned`] before `finish` could run. What the user gets
     /// does not depend on which of those produced the text.
+    ///
+    /// [`DictationOutcome::cause`] is what keeps the *log* honest about the
+    /// difference: a salvage produced inside `finish` never reaches the
+    /// mid-hold bookkeeping in [`App::capture`], so without it an engine that
+    /// errored after two partials would record as a clean, unusually short
+    /// dictation.
     fn deliver(&mut self, outcome: DictationOutcome) -> Dictated {
-        let mut timeline = outcome.timeline;
-        let raw = outcome.text.trim().to_string();
+        let DictationOutcome {
+            text: raw,
+            mut timeline,
+            cause,
+        } = outcome;
+        let raw = raw.trim().to_string();
 
         let mut record = DictationRecord::now(self.engine.name(), &raw);
-        if raw.is_empty() {
+        let dictated = if raw.is_empty() {
             // Silence, or a key tapped by accident. Injecting nothing is right;
             // so is not pretending to the overlay that text appeared.
             record.latency = LatencyBreakdown::from_timeline(&timeline);
-            return Dictated { record, timeline };
-        }
+            Dictated { record, timeline }
+        } else {
+            let (text, polished_info, polish_ms) = self.polish(&raw);
+            record.text = text.clone();
+            record.raw = (text != raw).then(|| raw.clone());
+            record.polish = polished_info;
 
-        let (text, polished_info, polish_ms) = self.polish(&raw);
-        record.text = text.clone();
-        record.raw = (text != raw).then(|| raw.clone());
-        record.polish = polished_info;
-
-        let payload = text::prepare(&text, self.config.inject.trailing_space);
-        match self.injector.inject(&payload) {
-            Ok(()) => {
-                timeline.mark(Mark::Injected);
-                record.injected = true;
-                // Key-release → text on screen: the number the pill prints.
-                let latency_ms = timeline
-                    .perceived()
-                    .map(ms)
-                    .unwrap_or(0.0)
-                    .round()
-                    .clamp(0.0, f64::from(u32::MAX)) as u32;
-                self.pill.inserted(latency_ms);
-            }
-            Err(e) => {
-                // The transcript is good; only the delivery failed. Say so, and
-                // make sure the record below carries the text. With history off
-                // there is no file to point at, so the console gets the words
-                // themselves — they must be recoverable from somewhere.
-                eprintln!("  could not insert the text: {e:#}");
-                if self.history.enabled() {
-                    eprintln!("  it is in {}", self.history.path().display());
-                } else {
-                    eprintln!("  it was: {text}");
+            let payload = text::prepare(&text, self.config.inject.trailing_space);
+            match self.injector.inject(&payload) {
+                Ok(()) => {
+                    timeline.mark(Mark::Injected);
+                    record.injected = true;
+                    // Key-release → text on screen: the number the pill prints.
+                    let latency_ms = timeline
+                        .perceived()
+                        .map(ms)
+                        .unwrap_or(0.0)
+                        .round()
+                        .clamp(0.0, f64::from(u32::MAX))
+                        as u32;
+                    self.pill.inserted(latency_ms);
                 }
-                record.error = Some(format!("injection failed: {e:#}"));
+                Err(e) => {
+                    // The transcript is good; only the delivery failed. Say so,
+                    // and make sure the record below carries the text. With
+                    // history off there is no file to point at, so the console
+                    // gets the words themselves — they must be recoverable from
+                    // somewhere.
+                    eprintln!("  could not insert the text: {e:#}");
+                    if self.history.enabled() {
+                        eprintln!("  it is in {}", self.history.path().display());
+                    } else {
+                        eprintln!("  it was: {text}");
+                    }
+                    record.error = Some(format!("injection failed: {e:#}"));
+                }
             }
-        }
 
-        record.latency = LatencyBreakdown::from_timeline(&timeline);
-        record.latency.polish_ms = polish_ms;
-        Dictated { record, timeline }
+            record.latency = LatencyBreakdown::from_timeline(&timeline);
+            record.latency.polish_ms = polish_ms;
+            Dictated { record, timeline }
+        };
+
+        note_salvage(dictated, cause)
     }
 
     /// A hold that produced no transcript, recorded against the timeline as it
@@ -693,6 +710,27 @@ impl<A: AudioSource> App<A> {
         record.error = Some(message);
         record.latency = LatencyBreakdown::from_timeline(&timeline);
         Dictated { record, timeline }
+    }
+
+    /// A hold that has words but may never put them on screen: recorded in
+    /// full, injected never.
+    ///
+    /// The dead-hotkey channel is why this exists. No key-up can arrive there,
+    /// so the utterance cannot be confirmed over and [`App::deliver`] — which
+    /// injects — is not allowed to run; but the words the user watched the
+    /// overlay produce are real, and dropping them to an empty transcript the
+    /// way [`App::failed`] does leaves them nowhere at all. This is that record
+    /// with the text put back, sharing `failed`'s single place for building it
+    /// so the failure half cannot drift.
+    fn reported(&self, outcome: DictationOutcome, cause: String) -> Dictated {
+        let DictationOutcome {
+            text,
+            timeline,
+            cause: salvage_cause,
+        } = outcome;
+        let mut dictated = self.failed(timeline, cause);
+        dictated.record.text = text.trim().to_string();
+        note_salvage(dictated, salvage_cause)
     }
 
     /// The tail feed failed: the key is already up, so the utterance is over
@@ -714,7 +752,7 @@ impl<A: AudioSource> App<A> {
         };
         let cause = format!("{error:#}");
         if outcome.text.trim().is_empty() {
-            return self.failed(outcome.timeline, cause);
+            return self.reported(outcome, cause);
         }
         eprintln!("  the hold ended early, delivering what was transcribed: {cause}");
         self.pill.processing();
@@ -754,8 +792,29 @@ impl<A: AudioSource> App<A> {
 /// wrong. Keeping only the words would log a dead microphone as an ordinary,
 /// unusually fast dictation — and a dead microphone is the single most useful
 /// thing in the file, because every hold after it will fail to arm capture.
-fn note_cause(mut dictated: Dictated, cause: anyhow::Error) -> Dictated {
-    let cause = format!("{cause:#}");
+fn note_cause(dictated: Dictated, cause: anyhow::Error) -> Dictated {
+    note_reason(dictated, format!("{cause:#}"))
+}
+
+/// The mid-hold cause, when the hold had one. Every exit from [`App::capture`]
+/// goes through this, so none of them can quietly return without it.
+fn note_mid_hold(dictated: Dictated, cause: Option<anyhow::Error>) -> Dictated {
+    match cause {
+        Some(cause) => note_cause(dictated, cause),
+        None => dictated,
+    }
+}
+
+/// Why the words are a salvage rather than a transcript, when they are — see
+/// [`DictationOutcome::cause`].
+fn note_salvage(dictated: Dictated, cause: Option<String>) -> Dictated {
+    match cause {
+        Some(cause) => note_reason(dictated, cause),
+        None => dictated,
+    }
+}
+
+fn note_reason(mut dictated: Dictated, cause: String) -> Dictated {
     dictated.record.error = Some(match dictated.record.error.take() {
         Some(existing) => format!("{cause}; {existing}"),
         None => cause,

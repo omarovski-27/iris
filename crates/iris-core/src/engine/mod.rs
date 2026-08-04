@@ -111,6 +111,25 @@ pub trait Engine: Send + Sync {
         crate::dictation::DEFAULT_FINAL_TIMEOUT
     }
 
+    /// How long this engine allows itself to get its transport up, measured
+    /// from key-down. `None` for an engine with no connect step of its own.
+    ///
+    /// Publishing it is what stops [`Engine::final_timeout`] — measured from
+    /// key-up, so on a short hold it can expire first — from killing a connect
+    /// that is still inside the budget this engine set for it.
+    /// [`crate::dictation::Dictation::finish`] waits out this budget instead,
+    /// but only while the session has never reported
+    /// [`TranscriptEvent::Connected`] and has produced nothing to salvage:
+    /// that is the one case where giving up early costs the whole utterance
+    /// rather than a tail of it. It is not a second final timeout, and it is
+    /// not a place to buy an engine more room in general.
+    ///
+    /// An engine whose connect happens *inside* `finish` (a batch upload, say)
+    /// already has it covered by `final_timeout` and should leave this `None`.
+    fn connect_budget(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Open a streaming session. Must return without waiting on the network.
     fn open(&self) -> Result<Box<dyn Session>>;
 }

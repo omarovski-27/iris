@@ -10,9 +10,11 @@
 //! A continuous key-hold is one utterance. [`TranscriptEvent::Final`] before
 //! [`Dictation::finish`] is demoted to a partial so segment-oriented or buggy
 //! engines cannot truncate mid-hold; `finish` always calls [`Session::finish`]
-//! and waits. On timeout, close, or error, a non-empty `latest_partial` is
-//! salvaged so words already shown on the overlay are not discarded. Prefer the
-//! longer of Final vs latest partial when both exist.
+//! and waits. On timeout, close, error, or a `finish` that fails outright, a
+//! non-empty `latest_partial` is salvaged so words already shown on the overlay
+//! are not discarded, and [`DictationOutcome::cause`] says which of those
+//! produced the text. Prefer the longer of Final vs latest partial when both
+//! exist.
 
 use std::time::{Duration, Instant};
 
@@ -39,11 +41,30 @@ use crate::vlog;
 /// Both the value and that evidence are *streaming* evidence, so this is the
 /// default rather than the rule: an engine whose work happens after key-up
 /// overrides [`Engine::final_timeout`] instead of inheriting a budget measured
-/// from a different architecture. This bound also does not rank engine-internal
-/// timeouts. One of those can outrank it — Deepgram's `CONNECT_TIMEOUT` runs
-/// from key-down while this deadline runs from key-up, so on a short hold it
-/// simply loses the race — and the answer is not to squeeze the inner value
-/// but for the timeout arm below to name what the engine was still waiting on.
+/// from a different architecture.
+///
+/// **This must never be what ends a session that is still legitimately
+/// connecting.** Latency is not allowed to buy itself with the user's words,
+/// and a connect cut off before the engine's own budget expires loses the
+/// whole utterance: there is no partial to fall back on, because nothing has
+/// streamed yet. The raw numbers cannot express that on their own — this
+/// deadline runs from key-up and a connect budget from key-down (Deepgram's
+/// `CONNECT_TIMEOUT` is 8s), so no hold length makes the ordering stable and
+/// raising this above 8s would pay for it on every healthy dictation. The
+/// relationship is enforced instead of asserted: [`Engine::connect_budget`]
+/// publishes the ceiling and [`Dictation::finish`] extends its wait to cover
+/// it, but only while the stream has never reported `Connected` *and* there is
+/// nothing salvageable. As soon as either is true this value is the whole
+/// bound again, so the latency win survives on every path that has anything to
+/// lose.
+///
+/// Anyone changing this number changes that pairing too, and it is not
+/// optional. `fm/iris-silent-and-instant` is stacked on this work and moving
+/// the same constant from another direction; a rebase that keeps one side and
+/// drops the other reintroduces exactly the data loss the grace exists to
+/// prevent. `finish`'s wait loop and
+/// `a_still_connecting_engine_is_not_cut_off_by_the_outer_bound` are what to
+/// re-read before touching it.
 pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A completed dictation.
@@ -51,6 +72,15 @@ pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 pub struct DictationOutcome {
     pub text: String,
     pub timeline: Timeline,
+    /// Why this text is not a clean [`TranscriptEvent::Final`], when it is not.
+    ///
+    /// `None` only when the engine really did conclude. Every other way words
+    /// reach a caller — the engine erroring after a partial, the session
+    /// closing, the wait running out, [`Session::finish`] itself failing — is
+    /// a salvage, and the caller has to be able to say so: a truncated
+    /// dictation logged as an ordinary one is indistinguishable from the user
+    /// having said less, which is how a real engine failure hides.
+    pub cause: Option<String>,
 }
 
 /// [`Dictation::finish`] failed to produce a transcript, but real capture may
@@ -104,6 +134,10 @@ pub struct Dictation {
     session: Box<dyn Session>,
     timeline: Timeline,
     samples: usize,
+    /// Taken from the engine at `start`, because [`Dictation::finish`] is
+    /// handed a timeout rather than the engine and this must not depend on a
+    /// caller remembering to pass it. See [`Engine::connect_budget`].
+    connect_budget: Option<Duration>,
     latest_partial: String,
     /// Set when [`Dictation::finish`] starts. Premature terminal events before
     /// this are not allowed to end the utterance (see [`Dictation::absorb`]).
@@ -137,6 +171,7 @@ impl Dictation {
             session,
             timeline,
             samples: 0,
+            connect_budget: engine.connect_budget(),
             latest_partial: String::new(),
             finishing: false,
             ended: None,
@@ -196,10 +231,36 @@ impl Dictation {
         self.timeline.audio_secs = self.audio_secs();
         let text = self.salvage_partial().unwrap_or_default();
         self.timeline.transcript = text.clone();
+        // The reason the hold ended belongs to whoever called this — it is the
+        // one thing here the engine cannot know. An engine error seen on the
+        // way out is the exception, and it travels rather than being dropped
+        // in favour of the caller's account.
+        let cause = match &self.ended {
+            Some(Ending::Error(message)) => {
+                Some(format!("{} engine: {message}", self.timeline.engine))
+            }
+            _ => None,
+        };
         DictationOutcome {
             text,
             timeline: self.timeline,
+            cause,
         }
+    }
+
+    /// The instant the engine's own connect budget runs out, while that budget
+    /// is still the thing being waited on.
+    ///
+    /// `None` — no grace, [`Engine::final_timeout`] is the whole bound — as
+    /// soon as the stream has reported `Connected` or a partial exists to fall
+    /// back on. Both mean the wait is no longer about connecting, and both
+    /// mean expiry costs a tail rather than the utterance.
+    fn connect_grace(&self) -> Option<Instant> {
+        let budget = self.connect_budget?;
+        if self.timeline.at(Mark::StreamReady).is_some() || !self.latest_partial.trim().is_empty() {
+            return None;
+        }
+        Some(self.timeline.at(Mark::KeyDown)? + budget)
     }
 
     /// The best transcript still available without a `Final`: whatever the
@@ -296,6 +357,13 @@ impl Dictation {
     /// take, which is why a generous bound belongs under an engine-internal
     /// timeout that ends a dead request sooner rather than on its own.
     ///
+    /// The one thing that outlasts `timeout` is a session still inside its
+    /// [`Engine::connect_budget`] with nothing to salvage: giving up there
+    /// would trade the user's whole utterance for the difference between two
+    /// clocks that do not start together (see [`DEFAULT_FINAL_TIMEOUT`]). The
+    /// grace ends the instant a partial exists or the stream reports
+    /// `Connected`, so it costs nothing on any dictation that has words.
+    ///
     /// A terminal event that arrived *before* this call (a premature Final from
     /// a buggy or segment-oriented engine) does not short-circuit the wait:
     /// [`Session::finish`] is always invoked, and a later, richer Final or the
@@ -319,24 +387,46 @@ impl Dictation {
         if let Err(e) = self.session.finish() {
             self.timeline.audio_secs = self.audio_secs();
             let message = format!("{e:#}");
+            // The same rule as every arm below: a socket that dies as the
+            // Finalize goes out costs no more than the same socket dying one
+            // statement later, inside the wait.
+            if let Some(text) = self.salvage_partial() {
+                self.timeline.transcript = text.clone();
+                return Ok(DictationOutcome {
+                    text,
+                    timeline: self.timeline,
+                    cause: Some(message),
+                });
+            }
             return Err(DictationError::fail(self.timeline, message, Some(e.into())));
         }
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
-        let deadline = Instant::now() + timeout;
+        let waiting_since = Instant::now();
+        let deadline = waiting_since + timeout;
         while self.ended.is_none() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            // `timeout` is the bound, except while the only thing outstanding
+            // is the engine's own connect: cutting that off inside the budget
+            // the engine set loses the whole utterance rather than a tail of
+            // it. Recomputed every pass, so the first partial to arrive during
+            // the grace drops the wait straight back to `deadline`.
+            let limit = match self.connect_grace() {
+                Some(grace) if grace > deadline => grace,
+                _ => deadline,
+            };
+            let remaining = limit.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match self.session.events().recv_timeout(remaining) {
                 Ok(event) => self.absorb(event, on_partial),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     self.ended.get_or_insert(Ending::Closed);
                 }
             }
         }
+        let waited = waiting_since.elapsed();
 
         self.timeline.audio_secs = self.audio_secs();
 
@@ -344,69 +434,66 @@ impl Dictation {
         // discarding words the user already saw on the overlay.
         let salvaged = self.salvage_partial();
 
-        match self.ended {
-            Some(Ending::Final(text)) => {
+        // Everything but a Final is a salvage, and each one names itself the
+        // same way whether it ends up as the transcript or as the error: the
+        // caller decides what to do with the words, never what to call them.
+        let ended = self.ended.take();
+        let cause = match &ended {
+            Some(Ending::Final(_)) => None,
+            Some(Ending::Error(message)) => {
+                Some(format!("{} engine: {message}", self.timeline.engine))
+            }
+            Some(Ending::Closed) => Some(format!(
+                "{} engine closed without returning a transcript",
+                self.timeline.engine
+            )),
+            // An engine still opening its session at the deadline is a
+            // connection failure, and it reads as one in the log rather than as
+            // a silent engine. `Connected` — and so `Mark::StreamReady` — is
+            // the only signal needed for that, which keeps the diagnosis
+            // engine-agnostic: an inner connect timeout that loses the race to
+            // this one no longer takes the real cause down with it.
+            None if self.timeline.at(Mark::StreamReady).is_some() => Some(format!(
+                "{} engine did not return a transcript within {:.1}s",
+                self.timeline.engine,
+                waited.as_secs_f64()
+            )),
+            None => Some(format!(
+                "{} engine did not return a transcript within {:.1}s: it never connected — the \
+                 session was still opening when the wait ran out",
+                self.timeline.engine,
+                waited.as_secs_f64()
+            )),
+        };
+
+        match (ended, salvaged) {
+            (Some(Ending::Final(text)), salvaged) => {
                 let text = best_transcript(text, salvaged.as_deref().unwrap_or(""));
                 self.timeline.transcript = text.clone();
                 Ok(DictationOutcome {
                     text,
                     timeline: self.timeline,
+                    cause: None,
                 })
             }
-            Some(Ending::Error(message)) => {
-                if let Some(text) = salvaged {
-                    vlog!(
-                        "engine error after partial transcript; salvaging {} chars",
-                        text.chars().count()
-                    );
-                    self.timeline.transcript = text.clone();
-                    Ok(DictationOutcome {
-                        text,
-                        timeline: self.timeline,
-                    })
-                } else {
-                    let text = format!("{} engine: {message}", self.timeline.engine);
-                    Err(DictationError::fail(self.timeline, text, None))
-                }
+            (_, Some(text)) => {
+                vlog!(
+                    "no final transcript; salvaging {} chars ({})",
+                    text.chars().count(),
+                    cause.as_deref().unwrap_or("no cause")
+                );
+                self.timeline.transcript = text.clone();
+                Ok(DictationOutcome {
+                    text,
+                    timeline: self.timeline,
+                    cause,
+                })
             }
-            Some(Ending::Closed) | None => {
-                if let Some(text) = salvaged {
-                    self.timeline.transcript = text.clone();
-                    Ok(DictationOutcome {
-                        text,
-                        timeline: self.timeline,
-                    })
-                } else if matches!(self.ended, Some(Ending::Closed)) {
-                    let text = format!(
-                        "{} engine closed without returning a transcript",
-                        self.timeline.engine
-                    );
-                    Err(DictationError::fail(self.timeline, text, None))
-                } else {
-                    // An engine still opening its session at the deadline is a
-                    // connection failure, and it reads as one in the log rather
-                    // than as a silent engine. `Connected` — and so
-                    // `Mark::StreamReady` — is the only signal needed for that,
-                    // which keeps the diagnosis engine-agnostic: an inner
-                    // connect timeout that loses the race to this one no longer
-                    // takes the real cause down with it.
-                    let text = if self.timeline.at(Mark::StreamReady).is_some() {
-                        format!(
-                            "{} engine did not return a transcript within {:.1}s",
-                            self.timeline.engine,
-                            timeout.as_secs_f64()
-                        )
-                    } else {
-                        format!(
-                            "{} engine did not return a transcript within {:.1}s: it never \
-                             connected — the session was still opening when the wait ran out",
-                            self.timeline.engine,
-                            timeout.as_secs_f64()
-                        )
-                    };
-                    Err(DictationError::fail(self.timeline, text, None))
-                }
-            }
+            (_, None) => Err(DictationError::fail(
+                self.timeline,
+                cause.unwrap_or_default(),
+                None,
+            )),
         }
     }
 }
@@ -800,6 +887,231 @@ mod tests {
         assert!(source.contains("sending Finalize"), "{source}");
         let chain = anyhow::Error::from(err).chain().count();
         assert!(chain >= 2, "the cause chain was flattened: {chain} link(s)");
+    }
+
+    /// As [`FinishFails`], but words reached the overlay first — the socket
+    /// dying exactly as `Finalize` goes out, with a transcript already on
+    /// screen.
+    struct FinishFailsAfterPartial;
+
+    struct FinishFailsAfterPartialSession {
+        events: crossbeam_channel::Receiver<TranscriptEvent>,
+        _keep: crossbeam_channel::Sender<TranscriptEvent>,
+    }
+
+    impl Engine for FinishFailsAfterPartial {
+        fn name(&self) -> &'static str {
+            "finish-fails-after-partial"
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let _ = tx.send(TranscriptEvent::Connected);
+            let _ = tx.send(TranscriptEvent::Partial("hello there".into()));
+            Ok(Box::new(FinishFailsAfterPartialSession {
+                events: rx,
+                _keep: tx,
+            }))
+        }
+    }
+
+    impl Session for FinishFailsAfterPartialSession {
+        fn push(&mut self, _: &[i16]) -> Result<()> {
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.events
+        }
+        fn finish(&mut self) -> Result<()> {
+            Err(anyhow::anyhow!("the socket was already gone"))
+        }
+    }
+
+    #[test]
+    fn a_finish_that_fails_still_hands_back_the_words_already_shown() {
+        // The salvage rule cannot depend on which statement the socket died
+        // on. One line later — inside the wait — the same death delivers
+        // "hello there"; refusing to here would cost the user an utterance
+        // they watched appear, for no reason they could ever see.
+        let mut dictation = Dictation::start(&FinishFailsAfterPartial).unwrap();
+        dictation.feed(&tone(0.6)).unwrap();
+        dictation.poll(&mut |_| {});
+
+        let outcome = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .expect("the partial is still the user's text");
+
+        assert_eq!(outcome.text, "hello there");
+        assert_eq!(outcome.timeline.transcript, "hello there");
+        assert!(
+            outcome.timeline.at(Mark::FinalTranscript).is_some(),
+            "the salvaged partial is where the words landed for the user"
+        );
+        assert!(
+            outcome
+                .cause
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gone"),
+            "and it must not read as a clean dictation: {:?}",
+            outcome.cause
+        );
+    }
+
+    #[test]
+    fn every_salvage_inside_finish_says_why_it_is_one() {
+        // `cause` is the only thing separating a truncated dictation from a
+        // short one in the log. An engine that errors after streaming words
+        // returns them — and returns the error with them.
+        let engine = MockEngine::new(MockConfig::default());
+        let mut dictation = Dictation::start(&engine).unwrap();
+        dictation.feed(&tone(1.5)).unwrap();
+        dictation.poll(&mut |_| {});
+        dictation.absorb_event(
+            TranscriptEvent::Error("the socket died".into()),
+            &mut |_| {},
+        );
+
+        let outcome = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .expect("words were already transcribed");
+        assert!(!outcome.text.is_empty());
+        assert!(
+            outcome
+                .cause
+                .as_deref()
+                .unwrap_or_default()
+                .contains("the socket died"),
+            "{:?}",
+            outcome.cause
+        );
+    }
+
+    #[test]
+    fn a_clean_final_carries_no_cause() {
+        let engine = MockEngine::new(MockConfig::default());
+        let outcome = run_offline(&engine, &tone(1.0), Pace::Fast, &mut |_| {}).unwrap();
+        assert_eq!(outcome.cause, None);
+    }
+
+    /// Never connects and never says anything, but claims a connect budget far
+    /// longer than any `final_timeout` a test would pass — the shape of a
+    /// degraded-network connect that is still legitimately in progress when a
+    /// short hold's outer deadline expires.
+    struct SlowToConnect {
+        budget: Option<Duration>,
+        /// When true the session opens already up, with words on the channel.
+        up: bool,
+    }
+
+    struct SlowToConnectSession {
+        events: crossbeam_channel::Receiver<TranscriptEvent>,
+        _keep: crossbeam_channel::Sender<TranscriptEvent>,
+    }
+
+    impl Engine for SlowToConnect {
+        fn name(&self) -> &'static str {
+            "slow-to-connect"
+        }
+        fn connect_budget(&self) -> Option<Duration> {
+            self.budget
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            if self.up {
+                let _ = tx.send(TranscriptEvent::Connected);
+                let _ = tx.send(TranscriptEvent::Partial("hello there".into()));
+            }
+            Ok(Box::new(SlowToConnectSession {
+                events: rx,
+                _keep: tx,
+            }))
+        }
+    }
+
+    impl Session for SlowToConnectSession {
+        fn push(&mut self, _: &[i16]) -> Result<()> {
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.events
+        }
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_still_connecting_engine_is_not_cut_off_by_the_outer_bound() {
+        // The invariant behind `Engine::connect_budget`: the outer deadline
+        // runs from key-up and a connect budget from key-down, so a short hold
+        // can put the deadline first. Ending the session there kills a connect
+        // the engine was still entitled to finish, and with nothing streamed
+        // there is nothing to fall back on — the whole utterance goes. Latency
+        // is never allowed to buy itself that way.
+        let budget = Duration::from_millis(400);
+        let engine = SlowToConnect {
+            budget: Some(budget),
+            up: false,
+        };
+        let dictation = Dictation::start(&engine).unwrap();
+        let started = Instant::now();
+        let err = dictation
+            .finish(Duration::from_millis(20), &mut |_| {})
+            .unwrap_err();
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= budget - Duration::from_millis(80),
+            "the outer bound cut the connect off inside its own budget after {waited:?}"
+        );
+        assert!(
+            waited < budget * 3,
+            "and it must still end when that budget does: {waited:?}"
+        );
+        assert!(err.to_string().contains("never connected"), "{err}");
+    }
+
+    #[test]
+    fn the_connect_grace_ends_the_moment_there_is_something_to_lose() {
+        // The grace exists only because a connect-only failure has nothing to
+        // degrade to. Once words exist, expiry costs a tail rather than the
+        // utterance, and the fast bound is the whole bound again — otherwise
+        // the latency fix would be diluted on every dictation.
+        let engine = SlowToConnect {
+            budget: Some(Duration::from_secs(30)),
+            up: true,
+        };
+        let mut dictation = Dictation::start(&engine).unwrap();
+        dictation.feed(&tone(0.2)).unwrap();
+
+        let started = Instant::now();
+        let outcome = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .expect("the partial is salvaged");
+        let waited = started.elapsed();
+
+        assert_eq!(outcome.text, "hello there");
+        assert!(
+            waited < Duration::from_secs(2),
+            "a session with words to salvage waited out the connect budget: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn an_engine_with_no_connect_budget_keeps_the_plain_bound() {
+        // The default is `None`, and nothing may quietly extend a wait for an
+        // engine that never asked for one.
+        let engine = MockEngine::new(MockConfig::default());
+        assert_eq!(engine.connect_budget(), None);
+
+        let silent = SlowToConnect {
+            budget: None,
+            up: false,
+        };
+        let dictation = Dictation::start(&silent).unwrap();
+        let started = Instant::now();
+        let _ = dictation.finish(Duration::from_millis(50), &mut |_| {});
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

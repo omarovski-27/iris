@@ -238,8 +238,14 @@ const DEFAULT_BASE_URL: &str = "wss://api.deepgram.com/v1/listen";
 /// reverted — the two clocks start at different instants (this one at key-down,
 /// that deadline at key-up), so there is no length of hold at which the ordering
 /// is stable, and paying for it with connects that used to succeed bought
-/// nothing. When the outer bound does win the race, `Dictation::finish` reports
-/// that the session never connected, which is the diagnosability that mattered.
+/// nothing.
+///
+/// The outer bound is not allowed to win that race and lose the utterance
+/// either, so this value is published through [`Engine::connect_budget`] and
+/// `Dictation::finish` waits it out when a connect is all that is outstanding.
+/// A connect that fails on its own terms still reports as one — that
+/// diagnosability was the point of the earlier arrangement and it survives —
+/// but it now reports after the budget it was given, not before.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long `finish()` may take, once `CloseStream` has actually been sent,
 /// before we return whatever we have. Re-armed on every inbound message, so
@@ -316,6 +322,14 @@ impl DeepgramEngine {
 impl Engine for DeepgramEngine {
     fn name(&self) -> &'static str {
         "deepgram"
+    }
+
+    /// See [`CONNECT_TIMEOUT`]. Deepgram is the default engine and the one the
+    /// 6s outer bound was measured against, so this pairing is the one that
+    /// has to hold: without it, a hold shorter than the gap between the two
+    /// clocks ends a connect the engine was still entitled to finish.
+    fn connect_budget(&self) -> Option<Duration> {
+        Some(CONNECT_TIMEOUT)
     }
 
     fn open(&self) -> Result<Box<dyn Session>> {
@@ -818,6 +832,32 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_outer_wait_never_sits_below_the_connect_budget() {
+        // The invariant, not the arithmetic: latency may not be bought with
+        // the user's words, and a connect killed inside its own budget loses
+        // the whole utterance because nothing has streamed yet to salvage.
+        // Two shapes satisfy it — a final wait long enough to contain this
+        // engine's connect, or a published budget that `Dictation::finish`
+        // waits out on the connect-only path — and either is a legitimate
+        // answer. What is not legitimate is neither, which is what this
+        // catches. `fm/iris-silent-and-instant` moves the same constant from
+        // another direction; if this test is the conflict, read
+        // `DEFAULT_FINAL_TIMEOUT`'s doc comment before resolving it.
+        let engine = DeepgramEngine {
+            key: "x".into(),
+            url: DEFAULT_BASE_URL.into(),
+        };
+        assert!(
+            engine.connect_budget() == Some(CONNECT_TIMEOUT)
+                || engine.final_timeout() >= CONNECT_TIMEOUT,
+            "the outer bound ({:?}) undercuts the connect budget ({CONNECT_TIMEOUT:?}) and \
+             nothing covers the gap: connect_budget() = {:?}",
+            engine.final_timeout(),
+            engine.connect_budget(),
+        );
+    }
 
     fn results(text: &str, is_final: bool) -> String {
         serde_json::json!({

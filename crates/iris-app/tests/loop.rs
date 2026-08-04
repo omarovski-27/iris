@@ -649,11 +649,13 @@ fn a_mid_hold_failure_still_logs_the_real_audio_captured() {
 }
 
 #[test]
-fn a_dead_hotkey_thread_fails_without_ever_injecting() {
+fn a_dead_hotkey_thread_reports_the_words_without_ever_injecting() {
     // The hotkey channel is the only place a key-up can come from, so with it
     // gone the key can never be confirmed up — and text that cannot be proven
     // to belong at the cursor must not be typed there, however much of it the
-    // engine already produced.
+    // engine already produced. Not typed is not the same as not kept: the words
+    // the user watched appear go in the log, which is the only place left they
+    // can be recovered from.
     let mut rig = rig();
     rig.app.set_engine(Arc::new(PartialOnOpenEngine));
 
@@ -675,12 +677,112 @@ fn a_dead_hotkey_thread_fails_without_ever_injecting() {
     let records = rig.records();
     assert_eq!(records.len(), 1);
     assert!(!records[0].injected);
-    assert!(records[0].text.is_empty());
+    assert!(
+        records[0].text.to_ascii_lowercase().contains("hello there"),
+        "the words the engine produced must survive in the log: {:?}",
+        records[0].text
+    );
     assert!(records[0]
         .error
         .as_deref()
         .unwrap_or_default()
         .contains("hotkey thread stopped"));
+}
+
+#[test]
+fn a_dead_hotkey_thread_keeps_an_earlier_mid_hold_failure_too() {
+    // Two things went wrong in one hold: the microphone died, and then the
+    // hotkey thread did. The second is what ends the hold, but a log that
+    // reports only it hides the reason half the utterance is missing — and
+    // the early return that reports it must not skip the mid-hold bookkeeping
+    // the ordinary exit does.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(PartialThenPushFailsEngine));
+
+    let (keys_tx, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        // Not `while !frames.is_empty()`: the hold stops reading this channel
+        // the moment the push fails, so the backlog it leaves never drains.
+        std::thread::sleep(Duration::from_millis(150));
+        // The push failure has fired by now; the hotkey thread dies next.
+        drop(keys_tx);
+    });
+
+    let app_frames = rig.app.frames();
+    let err = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &keys_rx)
+        .expect_err("with no hotkey thread the hold cannot complete");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(
+        rig.injector.inserted().is_empty(),
+        "no key-up was ever confirmed; nothing may be typed"
+    );
+    assert!(err.to_string().contains("died mid-hold"), "{err}");
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    let error = records[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("died mid-hold"),
+        "the microphone failure is the only trace of the words it cost: {error}"
+    );
+    assert!(
+        error.contains("hotkey thread stopped"),
+        "and the failure that actually ended the hold belongs there too: {error}"
+    );
+    assert!(
+        records[0].text.to_ascii_lowercase().contains("hello there"),
+        "the words transcribed before either failure are still the user's: {:?}",
+        records[0].text
+    );
+}
+
+#[test]
+fn a_salvage_inside_finish_is_delivered_and_still_named_in_the_log() {
+    // Nothing failed on the app's side of this hold — the microphone, the
+    // frames and the key-up were all fine — so the mid-hold bookkeeping has
+    // nothing to report. The engine erred after streaming words, and
+    // `Dictation::finish` salvaged them. Delivered, therefore not a failure;
+    // salvaged, therefore not an ordinary dictation either, and a log that
+    // shows only a suspiciously short transcript is how a real engine failure
+    // hid during the 2026-08-02 investigation.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(ErrorsOnFinishEngine));
+
+    let dictated = rig
+        .dictate()
+        .expect("the words landed, so this is no failure");
+
+    assert!(dictated.record.injected);
+    assert!(
+        dictated
+            .record
+            .text
+            .to_ascii_lowercase()
+            .contains("hello there"),
+        "the streamed partial is what the user watched appear: {:?}",
+        dictated.record.text
+    );
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("the socket died finalising"),
+        "a salvage must carry the engine's own account of why it is one: {:?}",
+        records[0].error
+    );
 }
 
 #[test]
@@ -1344,6 +1446,43 @@ impl Session for TailFeedFailsSession {
         &self.events
     }
     fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams words, then answers the finalise with an error instead of a
+/// transcript — an engine failure with nothing wrong on the app's side of the
+/// hold, so `finish`'s own salvage is the only thing that can name it.
+struct ErrorsOnFinishEngine;
+
+struct ErrorsOnFinishSession {
+    tx: Sender<TranscriptEvent>,
+    rx: Receiver<TranscriptEvent>,
+}
+
+impl Engine for ErrorsOnFinishEngine {
+    fn name(&self) -> &'static str {
+        "errors-on-finish"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Partial("hello there".into()))
+            .unwrap();
+        Ok(Box::new(ErrorsOnFinishSession { tx, rx }))
+    }
+}
+
+impl Session for ErrorsOnFinishSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.rx
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.tx
+            .send(TranscriptEvent::Error("the socket died finalising".into()))?;
         Ok(())
     }
 }

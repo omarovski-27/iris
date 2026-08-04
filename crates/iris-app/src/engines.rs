@@ -138,7 +138,10 @@ impl Engine for LocalAdapter {
     /// improvement on the tail rather than the utterance. It is still a bound
     /// on how long the resident loop stops responding (see
     /// `iris_core::engine::groq::FINAL_TIMEOUT`), which is why it is not simply
-    /// set to whatever the slowest imaginable CPU might need.
+    /// set to whatever the slowest imaginable CPU might need: choosing the
+    /// local engine means a stuck finalise can hold the app — Quit included —
+    /// for the full 20s, against 6s for the default Deepgram path. That is
+    /// accepted rather than trimmed, for the same reason Groq's 28s is.
     fn final_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(20)
     }

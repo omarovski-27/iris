@@ -56,6 +56,15 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 /// frozen on "processing", and tray commands including Quit go unserviced —
 /// for as long as the engine's `final_timeout` allows. Any engine choosing that
 /// value is spending the user's whole UI, not just this dictation's latency.
+///
+/// The exposure is real and accepted: choosing Groq means a failing finalise
+/// can freeze the app, Quit included, for the full 28s here (the local engine's
+/// bound is 20s; `DEFAULT_FINAL_TIMEOUT`, which Deepgram inherits, is 6s). It
+/// is not bought down by lowering this number — with `streams_partials` false
+/// there is nothing to salvage, so a shorter bound pays for responsiveness
+/// with the user's whole utterance, which is the trade this project does not
+/// make. The fix is a non-blocking finalise path, tracked separately; do not
+/// approximate it by trimming this.
 const FINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(28);
 
 pub struct GroqEngine {
