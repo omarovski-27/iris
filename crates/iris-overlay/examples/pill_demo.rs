@@ -115,7 +115,8 @@ struct Args {
     filmstrip_step: u64,
 
     /// Hold the microphone level at this value (0.0–1.0) instead of running
-    /// the synthetic speech envelope. Applies in every mode.
+    /// the synthetic speech envelope. Live and filmstrip modes only;
+    /// `--evidence` holds its own levels and rejects this flag.
     ///
     /// The envelope oscillates, so two arbitrary frames of it say nothing
     /// about whether the wave row answers volume at all — every frame of a
@@ -138,7 +139,18 @@ struct Args {
 
     /// Write the committed round-3 review set — the exact files under
     /// `docs/round3-evidence/` — to this directory. Implies `--backdrop`.
-    #[arg(long)]
+    ///
+    /// The set is a fixed shot list: it picks its own themes, levels, phases
+    /// and utterance, and honours only `--scale`. Every flag it would
+    /// otherwise swallow is rejected rather than ignored, so a regeneration
+    /// run cannot silently produce something other than what was asked for.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "theme", "utterance", "live_text", "hold_level",
+            "cycles", "filmstrip", "filmstrip_step",
+        ]
+    )]
     evidence: Option<PathBuf>,
 }
 

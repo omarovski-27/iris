@@ -556,11 +556,12 @@ fn a_tray_save_never_persists_a_cli_override() {
     );
 }
 
-/// `show_live_text` is the privacy opt-out the live-text ribbon was shipped
-/// on, so editing it and reloading has to take effect there and then — the
-/// same treatment `theme` already gets. Before this, the flag was frozen into
-/// the overlay sink at startup and the reload said "reloaded" while the
-/// transcript kept appearing on screen until the process restarted.
+/// `show_live_text` is the opt-in the live-text ribbon is reached through
+/// (off by default since round 3), so editing it and reloading has to take
+/// effect there and then — the same treatment `theme` already gets. Before
+/// this, the flag was frozen into the overlay sink at startup and the reload
+/// said "reloaded" while the transcript kept appearing on screen until the
+/// process restarted.
 ///
 /// What the loop owes the sink is the pushed value, at startup and again on
 /// every reload, and that is exactly what this asserts. The other half — the
@@ -568,7 +569,7 @@ fn a_tray_save_never_persists_a_cli_override() {
 /// `OverlayPill` and is pinned there, against the real sink, by
 /// `set_show_live_text_moves_the_real_gate_both_ways`.
 #[test]
-fn reload_pushes_the_live_text_opt_out_down_without_a_restart() {
+fn reload_pushes_the_live_text_opt_in_down_without_a_restart() {
     let mut rig = rig_with(|c| c.show_live_text = true);
     rig.dictate().expect("first dictation");
     assert!(
@@ -601,7 +602,7 @@ fn reload_pushes_the_live_text_opt_out_down_without_a_restart() {
     assert_eq!(
         pushed(&rig.pill),
         [true, false],
-        "the reloaded opt-out never reached the sink: {:?}",
+        "the reloaded setting never reached the sink: {:?}",
         rig.pill.events()
     );
 
