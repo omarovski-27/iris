@@ -273,7 +273,7 @@ impl WindowState {
             Err(e) => (
                 Config::default(),
                 Some(format!(
-                    "Could not read config.toml — showing defaults: {e}"
+                    "Could not read config.toml — showing defaults: {e:#}"
                 )),
             ),
         };
@@ -409,7 +409,7 @@ impl WindowState {
     pub fn open_config_file(&mut self, env: &Env) {
         match (env.open_config_file)(env.config_path) {
             Ok(()) => self.flash("Opened config.toml"),
-            Err(e) => self.flash_failure(format!("Could not open config.toml: {e}")),
+            Err(e) => self.flash_failure(format!("Could not open config.toml: {e:#}")),
         }
     }
 
@@ -644,9 +644,12 @@ mod tests {
     use crate::history::DictationRecord;
 
     /// Never actually launches anything: no test may spawn a process onto the
-    /// user's desktop, the same rule injection lives under.
+    /// user's desktop, the same rule injection lives under. Fails in the shape
+    /// the real one does — a context over the underlying spawn error — so what
+    /// the status line makes of a chain is testable.
     fn refuse_to_open(_path: &Path) -> anyhow::Result<()> {
-        anyhow::bail!("no desktop in a test")
+        use anyhow::Context as _;
+        Err(anyhow::anyhow!("no desktop in a test")).context("launching the editor")
     }
 
     fn env_with<'a>(
@@ -750,6 +753,12 @@ mod tests {
         let (message, level) = state.status_flash().unwrap();
         assert!(message.contains("Could not read config.toml"), "{message}");
         assert_eq!(level, StatusLevel::Warn);
+        // The whole cause chain, not just `anyhow`'s outermost context: what
+        // is wrong with the file is the only part of this the user can act on.
+        assert!(
+            message.contains("parsing the Iris configuration"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1365,6 +1374,9 @@ mod tests {
         let mut state = WindowState::new(&env);
 
         state.open_config_file(&env);
-        assert!(state.status_text().unwrap().contains("Could not open"));
+        let message = state.status_text().unwrap();
+        assert!(message.contains("Could not open"), "{message}");
+        assert!(message.contains("launching the editor"), "{message}");
+        assert!(message.contains("no desktop in a test"), "{message}");
     }
 }
