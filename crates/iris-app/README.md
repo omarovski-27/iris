@@ -50,6 +50,7 @@ session, injection and the log. Nothing is shared behind a lock.
 `$XDG_CONFIG_HOME` on Unix). `--config <path>` or `IRIS_CONFIG` moves it.
 
 ```toml
+version = 1               # written by Iris, not a setting; see below
 engine = "mock"           # mock | deepgram | groq | local
 hotkey = "right-ctrl"     # rctrl, lctrl, rshift, ralt, rwin, capslock, ...
 suppress_hotkey = true    # stop the hotkey reaching the focused app
@@ -77,6 +78,17 @@ max_entries = 500
 [keys]                    # optional; the environment always wins
 groq = "gsk_..."
 ```
+
+**`version`, and the one thing it does.** A schema stamp Iris writes, not a
+setting to edit; a file without it predates the stamp. It exists for exactly
+one decision: `show_live_text` shipped as `true` and every install that ran an
+earlier build has that pinned on disk whether or not the user chose it, so the
+first start after upgrading resets an unstamped `true` to `false` (the round-3
+default — see [Overlay](#overlay)) and writes `version = 1`. That happens once
+per install: a `true` set after the stamp is a real choice and survives. If
+the rewrite fails, Iris says so on the console and keeps running — but the
+reset will repeat on the next start until the stamp lands. `Config::migrate`
+in `src/config.rs` is the implementation and carries the full reasoning.
 
 **Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
 `inject.rs` applies before every injection burst for the other choices, so they

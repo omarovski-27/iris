@@ -138,7 +138,7 @@ and the motion budget are not.
 | Colour | Prism dark / Porcelain light | Same two palettes, same tokens, no new colours needed |
 | Waveform | 28-bar spectrum (`spectrum.rs`) | A new, independently-tuned bar row in `render/mod.rs`'s `draw_wave` — see "Glass, and the wave came back", below. `spectrum.rs` itself is gone; nothing shares code with it. |
 | Shell | Opaque | Translucent glass at a constant `GLASS_FILL_ALPHA`; legibility is carried per-run — `theme.text_scrim` behind the live text, `theme.timer_edge` around the timer's digits — never a text-linked opacity ramp on the shell |
-| Transcript | Never held (`set_partial_len`, a count) | Held while on screen (`set_partial_text`, the string) |
+| Transcript | Never held (`set_partial_len`, a count) | Held while on screen (`set_partial_text`, the string) — only when live text is opted in, since round 3 |
 | Engine chip | Rendered below the pill | Carried on the model, not rendered — no room without competing with the words |
 
 Geometry and motion are **still single-sourced** and a `Theme` is still
