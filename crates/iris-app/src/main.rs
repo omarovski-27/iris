@@ -4,10 +4,10 @@
 //!
 //! 1. read the config, apply CLI overrides, **promote keys to the environment**
 //!    (safe only while the process is still single-threaded);
-//! 2. build the engine, which is the one step that can fail for a reason the
-//!    user must act on (a missing key);
-//! 3. open the microphone, install the hotkey hook, start the tray;
-//! 4. hand everything to [`iris_app::App`] and never touch it again.
+//! 2. open the microphone, install the hotkey hook, start the tray;
+//! 3. build [`iris_app::App`], and with it the engine — the one step that can
+//!    fail for a reason the user must act on (a missing key);
+//! 4. run the loop and never touch it again.
 
 use std::sync::Arc;
 

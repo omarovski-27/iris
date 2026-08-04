@@ -232,7 +232,11 @@ the tray leaves them up until a restart — see "Known limitations" below.
 The icon is the captain-locked **prism triangle** (spectrum wedge on a plate),
 drawn in code (`tray::icon_rgba`) from the same mark as
 `iris-overlay/assets/iris-prism.svg`. No binary `.ico` to keep in step with the
-theme and no file to fail to find next to the `.exe`.
+theme and no file to fail to find next to the `.exe`. The `.exe`'s own icon is
+the same mark, generated at build time by `build.rs` and embedded — still
+nothing committed, and a test in `tray` reads that generated `.ico` back and
+compares it pixel by pixel, so the build script's hand-synced copy of the
+geometry cannot drift.
 
 ### Known limitations
 
