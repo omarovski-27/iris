@@ -12,6 +12,10 @@
 //! picked up by [`super::ui::draw_root`]'s per-frame drain of the same
 //! signal and turned into [`egui::ViewportCommand::Focus`] instead, since
 //! that drain is the only thing polling the channel while the window is up.
+//! The handover between those two readers is closed at the other end too:
+//! a click landing after the window's last frame would otherwise be waiting
+//! for this thread's `recv` and reopen the window the user has just closed,
+//! so a closed window's leftover signals are dropped before it waits again.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,7 +106,7 @@ pub fn spawn(
                     thread_fallback.open();
                     continue;
                 }
-                if let Err(e) = run_window(
+                match run_window(
                     open_rx.clone(),
                     config_path.clone(),
                     commands.clone(),
@@ -110,15 +114,26 @@ pub fn spawn(
                     startup,
                     &thread_ctx,
                 ) {
-                    // `eframe` fails for reasons that do not change between
-                    // clicks — no usable GL, no display — so the diagnosis is
-                    // said once and the item is routed elsewhere from here
-                    // on, rather than repeating into a console a resident
-                    // tray app never shows.
-                    if !thread_unusable.swap(true, Ordering::SeqCst) {
-                        eprintln!("  settings window error: {e:#}");
+                    // The window this thread just ran was the other reader of
+                    // this channel. A click it never got to drain — one that
+                    // landed after its last frame — is a raise for a window
+                    // that no longer exists, and reopening the one the user
+                    // has just closed is worse than dropping it.
+                    Ok(()) => while open_rx.try_recv().is_ok() {},
+                    Err(e) => {
+                        // `eframe` fails for reasons that do not change between
+                        // clicks — no usable GL, no display — so the diagnosis is
+                        // said once and the item is routed elsewhere from here
+                        // on, rather than repeating into a console a resident
+                        // tray app never shows.
+                        if !thread_unusable.swap(true, Ordering::SeqCst) {
+                            eprintln!("  settings window error: {e:#}");
+                        }
+                        thread_fallback.open();
+                        // Nothing drained this channel while that failure ran:
+                        // every queued click is still owed the fallback, and
+                        // the `unusable` check above hands it to them.
                     }
-                    thread_fallback.open();
                 }
             }
         })

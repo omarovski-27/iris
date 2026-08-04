@@ -336,7 +336,9 @@ priority order:
   "not running this session" when the overlay was asked for and failed to
   start.
 - **Insights** — most repeated words/phrases (stopwords and filler stripped),
-  dictations today/all-time, total words, average/median perceived latency,
+  dictations today/all-time, total words, average/median perceived latency
+  (over the dictations that actually reached the screen — a record whose
+  injection failed carries a shorter span that stops at the transcript),
   success-vs-failure rate — all computed from the session log on the window's
   own thread, off the dictation critical path. Not the AI speech analyzer
   (`iris-ai-analyzer`, personality/speaking-style) — that is separate and later.

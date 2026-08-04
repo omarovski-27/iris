@@ -258,16 +258,32 @@ pub struct WindowState {
 
 impl WindowState {
     /// Load everything fresh: config, history, devices.
+    ///
+    /// A config that fails to parse is the one case [`WindowState::refresh`]
+    /// cannot be matched exactly: there is no last good snapshot yet to keep,
+    /// so the form has to fall back to defaults. It says so rather than
+    /// showing them as if they were the file's — a window opened on stock
+    /// values with nothing on screen to explain it reads as settings lost.
+    /// A missing file is not that case; [`Config::load`] reports it as the
+    /// defaults it is.
     #[must_use]
     pub fn new(env: &Env) -> Self {
-        let config = Config::load(env.config_path).unwrap_or_default();
+        let (config, unreadable) = match Config::load(env.config_path) {
+            Ok(config) => (config, None),
+            Err(e) => (
+                Config::default(),
+                Some(format!(
+                    "Could not read config.toml — showing defaults: {e}"
+                )),
+            ),
+        };
         let history_path = config.history_path(env.config_path);
         let history_stamp = history_stamp(&history_path);
         let history = load_history(&history_path);
         let insights_day = local_day(env.utc_offset_seconds);
         let insights = Insights::compute(&history, &insights_day);
         let devices = (env.list_devices)();
-        Self {
+        let mut state = Self {
             tab: Tab::History,
             search: String::new(),
             config,
@@ -282,7 +298,11 @@ impl WindowState {
             filtered: Vec::new(),
             filtered_for: None,
             visible: HISTORY_PAGE,
+        };
+        if let Some(message) = unreadable {
+            state.flash_failure(message);
         }
+        state
     }
 
     /// Re-read `config.toml` and the session log if `REFRESH_INTERVAL` has
@@ -702,6 +722,34 @@ mod tests {
         assert_eq!(state.config, Config::default());
         assert!(state.history.is_empty());
         assert_eq!(state.insights.total_dictations, 0);
+        assert_eq!(
+            state.status_flash(),
+            None,
+            "a file that is merely absent is the defaults, not a failure"
+        );
+    }
+
+    /// A `config.toml` that will not parse — a bad hand edit — cannot be
+    /// shown, so the form falls back to defaults. It may not do so in
+    /// silence: stock values on screen with nothing to explain them read as
+    /// settings lost. `refresh` answers the same question by keeping the last
+    /// good snapshot, which does not exist yet at this point.
+    #[test]
+    fn a_config_that_cannot_be_read_says_so_rather_than_defaulting_in_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "engine = \"deepgram").unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+
+        let state = WindowState::new(&env);
+        assert_eq!(state.config, Config::default());
+        let (message, level) = state.status_flash().unwrap();
+        assert!(message.contains("Could not read config.toml"), "{message}");
+        assert_eq!(level, StatusLevel::Warn);
     }
 
     #[test]

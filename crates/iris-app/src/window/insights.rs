@@ -87,9 +87,15 @@ pub struct Insights {
     pub successes: usize,
     /// Attempted dictations that did not.
     pub failures: usize,
-    /// Mean key-release-to-injected latency, milliseconds, over successful
-    /// dictations that carry a timing (only [`crate::history::LatencyBreakdown`]
-    /// entries with `perceived_ms` set — i.e. ones that were actually injected).
+    /// Mean key-release-to-injected latency, milliseconds, over the dictations
+    /// that reached the screen and carry a timing.
+    ///
+    /// A `perceived_ms` on its own is not that set: [`iris_core::latency::Timeline::perceived`]
+    /// falls back to key-release → final transcript when nothing was injected,
+    /// so a failed injection or a silent tap still carries a figure — a
+    /// strictly shorter one, measuring a shorter span. Averaging the two
+    /// together reads low exactly when injection is going wrong, so
+    /// [`crate::history::DictationRecord::injected`] picks the input set.
     pub avg_latency_ms: Option<f64>,
     /// Median of the same set.
     pub median_latency_ms: Option<f64>,
@@ -148,6 +154,7 @@ impl Insights {
 
         let mut latencies: Vec<f64> = records
             .iter()
+            .filter(|r| r.injected)
             .filter_map(|r| r.latency.perceived_ms)
             .collect();
         latencies.sort_by(|a, b| a.total_cmp(b));
@@ -531,6 +538,40 @@ mod tests {
         let insights = Insights::compute(&[a, b, c, untimed], &today());
         assert_eq!(insights.avg_latency_ms, Some(200.0));
         assert_eq!(insights.median_latency_ms, Some(200.0));
+    }
+
+    /// A record that never reached the screen still carries a `perceived_ms`
+    /// — the shorter key-release → final-transcript span, injection left out.
+    /// Averaging it in with the injected ones pulls the tiles down precisely
+    /// when delivery is failing, which is when they must be trusted.
+    #[test]
+    fn latency_is_measured_over_injected_dictations_only() {
+        let mut injected = ok("landed", "2026-08-01T09:00:00Z");
+        injected.latency.perceived_ms = Some(400.0);
+        let mut failed = record_at(
+            "never made it",
+            "2026-08-01T09:00:00Z",
+            false,
+            Some("injection failed: SendInput delivered 0 of 42 events"),
+        );
+        failed.latency.perceived_ms = Some(100.0);
+        let mut silent = record_at("", "2026-08-01T09:00:00Z", false, None);
+        silent.latency.perceived_ms = Some(50.0);
+
+        let insights = Insights::compute(&[injected, failed, silent], &today());
+        assert_eq!(insights.avg_latency_ms, Some(400.0));
+        assert_eq!(insights.median_latency_ms, Some(400.0));
+    }
+
+    /// And with nothing injected at all there is no measurement to report,
+    /// rather than the shorter one dressed up as the perceived latency.
+    #[test]
+    fn latency_is_none_when_nothing_was_injected() {
+        let mut failed = record_at("gone", "2026-08-01T09:00:00Z", false, Some("boom"));
+        failed.latency.perceived_ms = Some(100.0);
+        let insights = Insights::compute(&[failed], &today());
+        assert_eq!(insights.avg_latency_ms, None);
+        assert_eq!(insights.median_latency_ms, None);
     }
 
     #[test]
