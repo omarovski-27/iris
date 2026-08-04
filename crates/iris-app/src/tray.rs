@@ -198,34 +198,70 @@ fn spectrum_sample(t: f32) -> (u8, u8, u8) {
     (last.1, last.2, last.3)
 }
 
-/// The two lines the menu shows while Iris is still on the offline mock engine.
+/// What the menu shows while Iris is still on the offline mock engine.
 ///
 /// The installed shortcut launches `iris.exe` minimized
 /// (`packaging/windows/install.ps1`), so the startup banner's pointer at the
 /// config file is never read on the path a non-developer actually takes: they
 /// see stub transcripts and nothing at all saying why. The tray is the only
-/// surface left, so the state has to be legible there. Both lines are disabled
-/// labels — a signpost at the file the existing "Open settings…" item already
-/// opens, not a second place to configure anything.
+/// surface left, so the state has to be legible there — and, because this is
+/// the surface for someone who never opened the zip's README, it has to carry
+/// the *whole* instruction rather than half of it. Leaving the engine edit out
+/// sends a user who follows it literally back to this same menu, key pasted in
+/// and still in demo mode. Every line is a disabled label: a signpost at the
+/// file the existing "Open settings…" item already opens, not a second place
+/// to configure anything.
+///
+/// The wording is pinned to `packaging/windows/README.md` by
+/// `iris-app/tests/settings.rs`, which follows both documents against a config
+/// Iris generated and loads the result; the two can no longer drift.
 ///
 /// `None` for every real engine: this is a first-run signpost, not a status
-/// line, and a menu that always carries two extra rows would stop being read.
+/// line, and a menu that always carried these rows would stop being read.
 pub fn demo_notice(config: &Config, config_path: &Path) -> Option<DemoNotice> {
     (config.engine == EngineChoice::Mock).then(|| DemoNotice {
         headline: "⚠  Demo mode: transcripts are stubs, not what you said".to_string(),
-        pointer: format!("Add a key in {}, then restart Iris", config_path.display()),
+        steps: [
+            "1. Change the existing engine = \"mock\" line to engine = \"deepgram\"".to_string(),
+            "2. Add a [keys] block at the very end: deepgram = \"paste-your-key-here\"".to_string(),
+        ],
+        restart: format!(
+            "Both edits go in {}. Restart Iris after — Reload cannot apply a key.",
+            config_path.display()
+        ),
     })
 }
 
-/// What [`demo_notice`] says: the state, then where to fix it.
+/// What [`demo_notice`] says: the state, the two edits that leave it, and where
+/// they go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DemoNotice {
     /// The state, stated plainly enough that no one mistakes a stub transcript
     /// for a transcription failure.
     pub headline: String,
-    /// Where the key goes, and that a restart — not "Reload settings" — is what
-    /// puts it in force (`promote_keys` runs once, before any thread exists).
-    pub pointer: String,
+    /// Both edits, in the shape `packaging/windows/README.md` gives them: the
+    /// `engine` line changed where it already is, and `[keys]` appended as its
+    /// own block at the end. TOML puts every line after a `[keys]` header
+    /// inside that table, so the order and the placement are load-bearing —
+    /// the two pasted together as one block is a file Iris refuses to load.
+    pub steps: [String; 2],
+    /// Which file, and that a restart — not "Reload settings" — is what puts a
+    /// key in force (`promote_keys` runs once, before any thread exists).
+    pub restart: String,
+}
+
+impl DemoNotice {
+    /// Every line, in menu order. The one place that order is written down, so
+    /// the menu and the test that executes these instructions read the same
+    /// thing.
+    pub fn lines(&self) -> [&str; 4] {
+        [
+            &self.headline,
+            &self.steps[0],
+            &self.steps[1],
+            &self.restart,
+        ]
+    }
 }
 
 /// The tooltip: what a user hovering the icon needs to know.
@@ -451,10 +487,11 @@ mod win {
         // Disabled labels at the very top, where a menu is read first, and only
         // while the mock engine is in force. See `demo_notice`.
         let demo: Vec<MenuItem> = match demo_notice(config, config_path) {
-            Some(notice) => vec![
-                MenuItem::new(notice.headline, false, None),
-                MenuItem::new(notice.pointer, false, None),
-            ],
+            Some(notice) => notice
+                .lines()
+                .iter()
+                .map(|line| MenuItem::new(line, false, None))
+                .collect(),
             None => Vec::new(),
         };
 
@@ -714,16 +751,24 @@ mod tests {
             notice.headline.to_lowercase().contains("demo"),
             "{notice:?}"
         );
+        // Both edits, not just the key: a key alone leaves engine = "mock" in
+        // place and the user back at this same menu with nothing new to read.
         assert!(
-            notice.pointer.contains(&path.display().to_string()),
+            notice.steps[0].contains("engine = \"deepgram\""),
+            "{notice:?}"
+        );
+        assert!(notice.steps[1].contains("[keys]"), "{notice:?}");
+        assert!(
+            notice.restart.contains(&path.display().to_string()),
             "{notice:?}"
         );
         // A key only lands at startup (`Config::promote_keys`), so pointing at
         // "Reload settings" here would send the user somewhere that cannot work.
         assert!(
-            notice.pointer.to_lowercase().contains("restart"),
+            notice.restart.to_lowercase().contains("restart"),
             "{notice:?}"
         );
+        assert_eq!(notice.lines().len(), 4, "{notice:?}");
 
         let tip = tooltip(&Config::default());
         assert!(tip.to_lowercase().contains("demo mode"), "{tip}");

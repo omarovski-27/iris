@@ -213,13 +213,21 @@ reload settings, quit. "Open settings" opens `config.toml` in the user's editor
 — the file is already the source of truth and is commented; a bespoke settings
 window would be the same thing built twice.
 
-While the mock engine is in force the menu opens with two disabled labels above
+While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,
-and the config path a key goes in. They are there because the installed shortcut
-launches the exe minimized (`packaging/windows/install.ps1`), which is exactly
-the launch where the startup banner's pointer at the same file is never read —
-leaving a first-run user on stub transcripts with no explanation on screen. The
-tooltip says the same thing in one line, for the same reason.
+both edits that leave it — the `engine` line changed in place, a `[keys]` block
+appended at the end — and the config path they go in. They are there because the
+installed shortcut launches the exe minimized
+(`packaging/windows/install.ps1`), which is exactly the launch where the startup
+banner's pointer at the same file is never read — leaving a first-run user on
+stub transcripts with no explanation on screen. That also makes this the surface
+for someone who never opened the zip's README, so it carries the whole
+instruction rather than half of it; `iris-app/tests/settings.rs` executes both
+documents against a generated config and pins them to each other. The tooltip
+says the short version, for the same reason.
+
+The labels reflect startup state and are never rebuilt, so switching engine from
+the tray leaves them up until a restart — see "Known limitations" below.
 
 The icon is the captain-locked **prism triangle** (spectrum wedge on a plate),
 drawn in code (`tray::icon_rgba`) from the same mark as
@@ -233,10 +241,13 @@ toggle their own checked state on click and the engine / microphone / theme
 submenus are not radio groups, so after a switch the previously selected item
 stays checked; a rejected switch (e.g. deepgram with no key, which the loop
 rolls back) can leave the wrong item checked; and the tooltip shows the state
-at startup only. The config file and the loop remain the source of truth — the
-menu is a remote control, not a display. Reconciling it would need the item
-handles kept on the tray thread plus a state-update message from the loop, a
-deliberate non-goal for v1.
+at startup only. The demo notice above is the same story with a sharper edge:
+after a tray switch off mock it keeps saying transcripts are stubs while real
+ones are being injected, which understates a working app rather than hiding a
+broken one. The config file and the loop remain the source of truth — the menu
+is a remote control, not a display. Reconciling it would need the item handles
+kept on the tray thread plus a state-update message from the loop, a deliberate
+non-goal for v1.
 
 ## Overlay
 

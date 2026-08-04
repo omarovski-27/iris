@@ -65,17 +65,33 @@ on the machine you're actually going to use Iris on.
 - [ ] With no key configured, the app runs on the mock engine without
       crashing (dictation "works" but transcribes to a stub).
 - [ ] Launched from the Start Menu shortcut — minimized, so the startup banner
-      is never seen, which is the whole point — the tray menu opens with two
-      disabled lines above everything else: "Demo mode: transcripts are stubs,
-      not what you said" and "Add a key in %APPDATA%\iris\config.toml, then
-      restart Iris" (`tray::demo_notice`). Check the full path fits and reads
-      rather than being clipped, and that hovering the icon says the same in
-      one line. This is the only in-app explanation a first-run user gets on
-      that launch path.
-- [ ] Those two lines are gone once a real engine is configured and Iris has
-      been restarted. Note that switching engine *from the tray* does not
-      remove them until a restart — the menu is built once at startup, the
-      same limitation its check marks already have.
+      is never seen, which is the whole point — the tray menu opens with four
+      disabled lines above everything else (`tray::demo_notice`): the "Demo
+      mode: transcripts are stubs" headline, the two numbered edits (change
+      the existing `engine = "mock"` line; add a `[keys]` block at the very
+      end), and the line naming `%APPDATA%\iris\config.toml` and the restart.
+      Check they fit and read rather than being clipped — the path line is the
+      long one — and that hovering the icon says the short version. This is
+      the only in-app explanation a first-run user gets on that launch path,
+      so follow it *literally* on the real machine and confirm it lands you on
+      the real engine; the wording is executed by
+      `iris-app/tests/settings.rs`, but only against `Config::load`, never
+      against a live install.
+- [ ] Those lines are gone once a real engine is configured and Iris has been
+      restarted.
+- [ ] Known display defect, deliberately deferred — confirm it is still only
+      this: switching Engine → Deepgram *from the tray submenu* leaves the
+      "Demo mode" lines on screen for the rest of the session, and switching
+      back to mock shows no warning. The switch itself genuinely works — it
+      builds the engine, persists to `config.toml`, and injects real
+      transcripts from that moment on — so this understates what the app is
+      doing rather than hiding a failure. The menu is built once in
+      `win::run` and there is no app→tray channel to refresh it; adding one is
+      an app-behaviour change this packaging branch deliberately does not
+      make, the same call the project already made for Reload not applying a
+      new hotkey or key. A restart clears it. If instead the switch stops
+      working, or dictation still returns stubs afterwards, that is a
+      different bug and worth reporting.
 - [ ] Deliberately misconfigure `engine = "deepgram"` with no key: the error
       is a clear sentence naming the config path and telling you to start Iris
       again after editing it — not a Rust panic or stack trace.

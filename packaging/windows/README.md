@@ -95,12 +95,20 @@ that is not a bug. Removing it is deleting what `install.ps1` created:
 
 1. Quit Iris — right-click the tray icon → **Quit Iris**.
 2. Delete the folder `%LOCALAPPDATA%\Iris`. That is the whole app.
-3. Delete the shortcuts. The Start Menu one is `Iris.lnk` in
-   `%APPDATA%\Microsoft\Windows\Start Menu\Programs`; if you installed with
-   `-Desktop` there is one on your Desktop, and with `-RunAtLogin` one more in
-   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`. Deleting the
-   Startup one is also how you stop Iris starting at login without removing
-   the rest.
+3. Delete the shortcuts. Find the Start Menu one the way you launch it —
+   open the Start Menu, search for **Iris**, right-click the result →
+   **Open file location**, and delete the `Iris.lnk` that Explorer highlights.
+   If you installed with `-Desktop` there is one on your Desktop too, and with
+   `-RunAtLogin` one more in your Startup folder (press Win+R and run
+   `shell:startup` to open it). Deleting the Startup one is also how you stop
+   Iris starting at login without removing the rest.
+
+   Those folders are usually `%APPDATA%\Microsoft\Windows\Start Menu\Programs`
+   and `...\Programs\Startup` if you would rather check directly — but
+   Windows moves them on some machines (Group Policy folder redirection, some
+   work laptops, some OEM images), which is why the installer asks Windows
+   where they are rather than assuming, and why the search above is the
+   instruction that always finds them.
 4. Optional: delete `%APPDATA%\iris` as well. That folder holds your settings
    (including any key you pasted in) and your dictation history — leave it if
    you might reinstall, since a fresh install picks it straight back up.
