@@ -426,6 +426,33 @@ fn a_stalled_dictation_still_logs_the_real_audio_captured() {
 }
 
 #[test]
+fn a_short_hold_against_a_slow_connect_still_gets_its_words_typed() {
+    // The captain's two zero-audio dictations were connection failures. This
+    // is the same shape that *succeeds*, late: the socket comes up after the
+    // final-transcript deadline has already gone by but well inside the
+    // engine's own connect budget, flushes the audio it was holding, and
+    // answers. Every one of those words is recoverable, so every one of them
+    // has to reach the screen — a wait that gives up at the moment the
+    // connection starts working spends the whole budget and buys nothing.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(150));
+    rig.app.set_engine(Arc::new(ConnectsLateEngine));
+
+    let dictated = rig.dictate().expect("a late connect is not a failure");
+
+    assert!(
+        dictated
+            .record
+            .text
+            .to_ascii_lowercase()
+            .contains("hello there"),
+        "the transcript the late connect produced must be delivered: {:?}",
+        dictated.record.text
+    );
+    assert!(dictated.record.injected);
+    assert_eq!(rig.injector.inserted().len(), 1);
+}
+
+#[test]
 fn the_wait_for_the_final_transcript_comes_from_the_engine() {
     // The 6s default was measured against a streaming engine. An engine whose
     // work happens after key-up gets to say how long that takes, and the app
@@ -834,6 +861,58 @@ fn a_tail_feed_failure_injects_the_words_and_still_records_the_cause() {
             .contains("flushing the tail"),
         "a salvage-driven completion must not read as an ordinary dictation: {:?}",
         records[0].error
+    );
+}
+
+#[test]
+fn a_tail_feed_failure_still_reports_an_earlier_mid_hold_cause() {
+    // The engine went quiet mid-hold and the microphone stayed healthy, so the
+    // tail block still ran — and then failed. That exit delivers and returns on
+    // its own, so it has to fold in the cause the hold collected earlier or the
+    // engine going quiet leaves no trace at all. The two used to be coupled by
+    // accident (every mid-hold cause also closed the frame source); they are
+    // not any more.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app
+        .set_engine(Arc::new(GoesQuietThenTailFeedFailsEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        // First burst: the engine goes quiet on the opening frame and the loop
+        // has time to notice, with the key still down.
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // Second burst, released with the key: this is what the tail block
+        // picks up, and what the engine refuses.
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("the words landed, so this is a dictation and not a failure");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(dictated.record.injected);
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    let error = records[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("flushing the tail"),
+        "the failure that ended the hold: {error}"
+    );
+    assert!(
+        error.contains("stopped sending events"),
+        "and the one that cost the words nobody will ever see: {error}"
     );
 }
 
@@ -1440,6 +1519,97 @@ impl Session for TailFeedFailsSession {
         if pcm.len() > 320 {
             anyhow::bail!("the websocket died flushing the tail");
         }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// As [`TailFeedFailsEngine`], but it also drops its event sender on the first
+/// frame — the engine going quiet mid-hold while the microphone stays healthy,
+/// so the tail block still runs and then fails with a cause already recorded.
+struct GoesQuietThenTailFeedFailsEngine;
+
+struct GoesQuietThenTailFeedFailsSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Option<Sender<TranscriptEvent>>,
+}
+
+impl Engine for GoesQuietThenTailFeedFailsEngine {
+    fn name(&self) -> &'static str {
+        "goes-quiet-then-tail-feed-fails"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Partial("hello there".into()))
+            .unwrap();
+        Ok(Box::new(GoesQuietThenTailFeedFailsSession {
+            events: rx,
+            tx: Some(tx),
+        }))
+    }
+}
+
+impl Session for GoesQuietThenTailFeedFailsSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        if pcm.len() > 320 {
+            anyhow::bail!("the websocket died flushing the tail");
+        }
+        // Pump exit: the events channel disconnects, the frames keep flowing.
+        self.tx = None;
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Takes a connect budget of its own and comes up only after the app's
+/// final-transcript deadline has already passed, then answers the way a real
+/// socket does once it is up. The degraded-network connect that succeeds late.
+struct ConnectsLateEngine;
+
+struct ConnectsLateSession {
+    events: Receiver<TranscriptEvent>,
+    _worker: std::thread::JoinHandle<()>,
+}
+
+impl Engine for ConnectsLateEngine {
+    fn name(&self) -> &'static str {
+        "connects-late"
+    }
+    fn connect_budget(&self) -> Option<Duration> {
+        Some(Duration::from_secs(3))
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            // Past the 150ms the app is prepared to wait from key-up, inside
+            // the 3s the engine is allowed for its connect.
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = tx.send(TranscriptEvent::Connected);
+            // A short hold can have nothing but the post-`Finalize` flush, so
+            // the whole transcript arrives at once with no interim before it.
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = tx.send(TranscriptEvent::Final("hello there".into()));
+        });
+        Ok(Box::new(ConnectsLateSession {
+            events: rx,
+            _worker: worker,
+        }))
+    }
+}
+
+impl Session for ConnectsLateSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
         Ok(())
     }
     fn events(&self) -> &Receiver<TranscriptEvent> {

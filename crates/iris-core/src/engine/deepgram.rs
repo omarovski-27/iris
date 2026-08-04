@@ -242,7 +242,9 @@ const DEFAULT_BASE_URL: &str = "wss://api.deepgram.com/v1/listen";
 ///
 /// The outer bound is not allowed to win that race and lose the utterance
 /// either, so this value is published through [`Engine::connect_budget`] and
-/// `Dictation::finish` waits it out when a connect is all that is outstanding.
+/// `Dictation::finish` waits it out when a connect is all that is outstanding,
+/// then gives the socket that comes up late its ordinary finalise budget from
+/// there — the audio a late connect flushes is exactly what those seconds buy.
 /// A connect that fails on its own terms still reports as one — that
 /// diagnosability was the point of the earlier arrangement and it survives —
 /// but it now reports after the budget it was given, not before.

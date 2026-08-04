@@ -53,17 +53,27 @@ use crate::vlog;
 /// raising this above 8s would pay for it on every healthy dictation. The
 /// relationship is enforced instead of asserted: [`Engine::connect_budget`]
 /// publishes the ceiling and [`Dictation::finish`] extends its wait to cover
-/// it, but only while the stream has never reported `Connected` *and* there is
-/// nothing salvageable. As soon as either is true this value is the whole
-/// bound again, so the latency win survives on every path that has anything to
-/// lose.
+/// it — and, when that connect then succeeds late, re-bases the extension to
+/// this value from the instant the stream came up, because a connection that
+/// works is worth nothing if the wait ends at the moment it starts working.
+/// The grace only ends when a non-empty partial exists, which is the point at
+/// which expiry costs a tail instead of the utterance; that is where the
+/// latency win lives, and it is untouched.
+///
+/// The cost is that on a connect-only path this value is not the bound on how
+/// long `finish` blocks: for Deepgram the worst case is 8s of connect from
+/// key-down plus this 6s of finalise from the connect, ~14s, and every second
+/// of it is a second with nothing yet to show for the hold. That is deliberate
+/// — the alternative is losing the utterance — and it is the number to quote,
+/// not the 6s.
 ///
 /// Anyone changing this number changes that pairing too, and it is not
 /// optional. `fm/iris-silent-and-instant` is stacked on this work and moving
 /// the same constant from another direction; a rebase that keeps one side and
 /// drops the other reintroduces exactly the data loss the grace exists to
-/// prevent. `finish`'s wait loop and
-/// `a_still_connecting_engine_is_not_cut_off_by_the_outer_bound` are what to
+/// prevent. `finish`'s wait loop, [`Dictation::connect_grace`],
+/// `a_still_connecting_engine_is_not_cut_off_by_the_outer_bound` and
+/// `a_late_connect_still_delivers_the_words_it_goes_on_to_produce` are what to
 /// re-read before touching it.
 pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -248,19 +258,36 @@ impl Dictation {
         }
     }
 
-    /// The instant the engine's own connect budget runs out, while that budget
-    /// is still the thing being waited on.
+    /// How long a session with nothing to lose yet is allowed to run past the
+    /// plain deadline, given the engine's own budget for producing a
+    /// transcript after `finish` (`final_timeout`).
     ///
-    /// `None` — no grace, [`Engine::final_timeout`] is the whole bound — as
-    /// soon as the stream has reported `Connected` or a partial exists to fall
-    /// back on. Both mean the wait is no longer about connecting, and both
-    /// mean expiry costs a tail rather than the utterance.
-    fn connect_grace(&self) -> Option<Instant> {
+    /// Connecting was never the goal — getting the words was — so this covers
+    /// the whole path rather than its first step. While nothing is
+    /// salvageable there are two states, and the grace re-bases from one to
+    /// the other rather than collapsing:
+    ///
+    /// - *still connecting*: the engine's [`Engine::connect_budget`] measured
+    ///   from key-down, which is the clock that budget was written against.
+    /// - *connected, nothing streamed yet*: `finalise` from the instant the
+    ///   stream came up. A connect that lands after the plain deadline has to
+    ///   be given the same budget to answer as one that landed before it,
+    ///   otherwise the wait ends at the exact moment it starts being useful
+    ///   and the whole utterance is lost to a connection that worked.
+    ///
+    /// `None` — no grace, the plain deadline is the whole bound — the moment a
+    /// non-empty partial exists. Expiry then costs a tail rather than the
+    /// utterance, which is a degrade, not a loss, and is where the latency win
+    /// lives.
+    fn connect_grace(&self, finalise: Duration) -> Option<Instant> {
         let budget = self.connect_budget?;
-        if self.timeline.at(Mark::StreamReady).is_some() || !self.latest_partial.trim().is_empty() {
+        if !self.latest_partial.trim().is_empty() {
             return None;
         }
-        Some(self.timeline.at(Mark::KeyDown)? + budget)
+        match self.timeline.at(Mark::StreamReady) {
+            Some(ready) => Some(ready + finalise),
+            None => Some(self.timeline.at(Mark::KeyDown)? + budget),
+        }
     }
 
     /// The best transcript still available without a `Final`: whatever the
@@ -357,12 +384,15 @@ impl Dictation {
     /// take, which is why a generous bound belongs under an engine-internal
     /// timeout that ends a dead request sooner rather than on its own.
     ///
-    /// The one thing that outlasts `timeout` is a session still inside its
-    /// [`Engine::connect_budget`] with nothing to salvage: giving up there
-    /// would trade the user's whole utterance for the difference between two
-    /// clocks that do not start together (see [`DEFAULT_FINAL_TIMEOUT`]). The
-    /// grace ends the instant a partial exists or the stream reports
-    /// `Connected`, so it costs nothing on any dictation that has words.
+    /// The one thing that outlasts `timeout` is a session with nothing to
+    /// salvage that is still inside its [`Engine::connect_budget`], or has
+    /// just come up and been given `timeout` from there to answer: giving up
+    /// at either point would trade the user's whole utterance for the
+    /// difference between two clocks that do not start together (see
+    /// [`DEFAULT_FINAL_TIMEOUT`] and [`Dictation::connect_grace`]). The grace
+    /// ends the instant a partial exists, so it costs nothing on any dictation
+    /// that has words — and on a connect-only path it is what the caller's
+    /// loop actually blocks for, not `timeout`.
     ///
     /// A terminal event that arrived *before* this call (a premature Final from
     /// a buggy or segment-oriented engine) does not short-circuit the wait:
@@ -405,12 +435,13 @@ impl Dictation {
         let waiting_since = Instant::now();
         let deadline = waiting_since + timeout;
         while self.ended.is_none() {
-            // `timeout` is the bound, except while the only thing outstanding
-            // is the engine's own connect: cutting that off inside the budget
-            // the engine set loses the whole utterance rather than a tail of
-            // it. Recomputed every pass, so the first partial to arrive during
-            // the grace drops the wait straight back to `deadline`.
-            let limit = match self.connect_grace() {
+            // `timeout` is the bound, except while the session has produced
+            // nothing that could be salvaged: cutting a connect off inside the
+            // budget the engine set, or the instant it succeeds, loses the
+            // whole utterance rather than a tail of it. Recomputed every pass,
+            // so the connect coming up re-bases the grace and the first partial
+            // drops the wait straight back to `deadline`.
+            let limit = match self.connect_grace(timeout) {
                 Some(grace) if grace > deadline => grace,
                 _ => deadline,
             };
@@ -1069,6 +1100,130 @@ mod tests {
             "and it must still end when that budget does: {waited:?}"
         );
         assert!(err.to_string().contains("never connected"), "{err}");
+    }
+
+    /// Connects only after the plain deadline has already gone by — inside the
+    /// connect budget, but late — and then does exactly what a real socket
+    /// does once it is up: flushes the audio it was holding and answers. The
+    /// shape a short hold against a degraded network produces, and the one the
+    /// whole grace exists for.
+    struct ConnectsLate {
+        budget: Duration,
+        after: Duration,
+        /// What the flush produces. A short hold really can have nothing but
+        /// the post-`Finalize` `Final` (see `engine/deepgram.rs`), and an
+        /// interim on the way is the other real shape.
+        streams_first: bool,
+    }
+
+    struct ConnectsLateSession {
+        events: crossbeam_channel::Receiver<TranscriptEvent>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl Engine for ConnectsLate {
+        fn name(&self) -> &'static str {
+            "connects-late"
+        }
+        fn connect_budget(&self) -> Option<Duration> {
+            Some(self.budget)
+        }
+        fn open(&self) -> Result<Box<dyn Session>> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let after = self.after;
+            let streams_first = self.streams_first;
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(after);
+                let _ = tx.send(TranscriptEvent::Connected);
+                std::thread::sleep(Duration::from_millis(50));
+                if streams_first {
+                    let _ = tx.send(TranscriptEvent::Partial("hello".into()));
+                } else {
+                    let _ = tx.send(TranscriptEvent::Final("hello there".into()));
+                }
+            });
+            Ok(Box::new(ConnectsLateSession {
+                events: rx,
+                _worker: worker,
+            }))
+        }
+    }
+
+    impl Session for ConnectsLateSession {
+        fn push(&mut self, _: &[i16]) -> Result<()> {
+            Ok(())
+        }
+        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+            &self.events
+        }
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_late_connect_still_delivers_the_words_it_goes_on_to_produce() {
+        // Connecting was never the goal; the words were. A grace that expires
+        // at the instant the socket comes up spends the whole connect budget
+        // and then throws away everything it bought — the utterance is lost to
+        // a connection that *worked*. So the wait re-bases: a stream that
+        // reports `Connected` after the deadline has passed gets the engine's
+        // own finalise budget from there to produce something.
+        //
+        // A short hold (no audio fed, `finish` immediately) against a connect
+        // that lands at 300ms — well past the 100ms deadline, well inside the
+        // 3s budget — and a transcript 50ms later.
+        let engine = ConnectsLate {
+            budget: Duration::from_secs(3),
+            after: Duration::from_millis(300),
+            streams_first: false,
+        };
+        let dictation = Dictation::start(&engine).unwrap();
+        let started = Instant::now();
+        let outcome = dictation
+            .finish(Duration::from_millis(100), &mut |_| {})
+            .expect("a connect that succeeded must not lose the utterance");
+        let waited = started.elapsed();
+
+        assert_eq!(outcome.text, "hello there");
+        assert!(
+            waited < Duration::from_secs(2),
+            "the re-based grace must still be bounded: {waited:?}"
+        );
+        assert!(
+            outcome.timeline.at(Mark::StreamReady).is_some(),
+            "the connect that saved it belongs on the timeline"
+        );
+    }
+
+    #[test]
+    fn a_late_connect_that_streams_first_hands_back_what_it_streamed() {
+        // The other half of the rule, on the same late connect: the moment a
+        // partial exists the wait stops being extended, because from there
+        // expiry costs a tail instead of the utterance. So the words the
+        // stream produced come back — as a salvage, named as one — rather than
+        // the wait running on for a `Final` that may never come.
+        let engine = ConnectsLate {
+            budget: Duration::from_secs(3),
+            after: Duration::from_millis(300),
+            streams_first: true,
+        };
+        let dictation = Dictation::start(&engine).unwrap();
+        let started = Instant::now();
+        let outcome = dictation
+            .finish(Duration::from_millis(100), &mut |_| {})
+            .expect("what the stream produced is still the user's");
+        let waited = started.elapsed();
+
+        assert_eq!(outcome.text, "hello");
+        assert!(
+            outcome.cause.is_some(),
+            "a salvage must not read as a clean dictation"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the grace must end with the partial, not run to the budget: {waited:?}"
+        );
     }
 
     #[test]

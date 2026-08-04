@@ -157,9 +157,13 @@ switching engines switches the wait. That per-engine bound is also a bound on
 the whole UI: `finish` blocks the resident loop, so Groq (28s) or the local
 engine (20s) can leave the pill frozen and Quit unserviced for that long. The
 numbers are accepted, not trimmed — with `streams_partials` false an early
-expiry costs the whole utterance — and the exposure does not reach the default
-path, which is Deepgram at 6s. A non-blocking finalise is the real fix and is
-tracked elsewhere; do not approximate it by lowering a ceiling.
+expiry costs the whole utterance — and on the default path, Deepgram, the
+ordinary bound is 6s. Deepgram's worst case is not 6s: on a hold with nothing
+salvageable the connect grace below can hold the loop for the connect budget
+(8s from key-down) *plus* a re-based 6s finalise from the moment the socket
+comes up, ~14s. Quote that number, not the 6s, whenever this exposure is
+weighed. A non-blocking finalise is the real fix and is tracked elsewhere; do
+not approximate it by lowering a ceiling.
 
 **The outer bound may never end a session that is still legitimately
 connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)
@@ -167,14 +171,20 @@ runs from key-down, the outer deadline from key-up — so no hold length makes
 the raw ordering stable, and ranking the constants against each other was
 tried and reverted. The relationship is enforced instead: `Engine::connect_budget`
 publishes the engine's connect ceiling and `Dictation::finish` extends its wait
-to cover it, but *only* while `Mark::StreamReady` is unstamped and there is
-nothing to salvage — the one case where giving up early costs the whole
-utterance rather than a tail. A partial or a `Connected` ends the grace at
-once, so the 6s win survives on every path with words to lose. A connect that
-fails on its own terms still reports as one (from `Mark::StreamReady`,
-engine-agnostically). `fm/iris-silent-and-instant` moves the same constant from
-another direction: keep the constant and the grace together or the data loss
-comes back.
+to cover it while there is nothing to salvage — the one case where giving up
+early costs the whole utterance rather than a tail. **Connecting is not the
+goal; the words are.** A grace that ended on `Connected` was built and rejected
+for exactly that reason: it spent the whole connect budget and then stopped
+waiting at the instant the connection became useful, losing the utterance to a
+socket that *worked*. So `Dictation::connect_grace` re-bases instead of
+collapsing — still connecting is key-down + connect budget, just connected is
+`Mark::StreamReady` + the engine's own `final_timeout`, and only a non-empty
+partial drops the wait back to the plain deadline, because from there expiry
+costs a tail. That is where the 6s win lives and it is untouched; the price is
+the ~14s worst case named above. A connect that fails on its own terms still
+reports as one (from `Mark::StreamReady`, engine-agnostically).
+`fm/iris-silent-and-instant` moves the same constant from another direction:
+keep the constant and the grace together or the data loss comes back.
 
 **A failed dictation keeps its words and its timeline.** `Dictation::finish`
 and `Dictation::abandon` — the latter for a hold that ended without `finish`

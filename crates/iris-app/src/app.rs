@@ -594,7 +594,8 @@ impl<A: AudioSource> App<A> {
             }
             if !tail.is_empty() {
                 if let Err(e) = dictation.feed(&tail) {
-                    return Ok(self.abandoned(dictation, e));
+                    let dictated = self.abandoned(dictation, e);
+                    return Ok(note_mid_hold(dictated, mid_hold_failure));
                 }
             }
         }
