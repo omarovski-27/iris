@@ -50,11 +50,12 @@ session, injection and the log. Nothing is shared behind a lock.
 `$XDG_CONFIG_HOME` on Unix). `--config <path>` or `IRIS_CONFIG` moves it.
 
 ```toml
+version = 1               # written by Iris, not a setting; see below
 engine = "mock"           # mock | deepgram | groq | local
 hotkey = "right-ctrl"     # rctrl, lctrl, rshift, ralt, rwin, capslock, ...
 suppress_hotkey = true    # stop the hotkey reaching the focused app
 theme = "dark"            # dark | light
-show_live_text = true     # false keeps the overlay a quiet orb, no transcript
+show_live_text = false    # true opens a live-text ribbon showing dictated words
 
 [polish]
 enabled = true
@@ -77,6 +78,17 @@ max_entries = 500
 [keys]                    # optional; the environment always wins
 groq = "gsk_..."
 ```
+
+**`version`, and the one thing it does.** A schema stamp Iris writes, not a
+setting to edit; a file without it predates the stamp. It exists for exactly
+one decision: `show_live_text` shipped as `true` and every install that ran an
+earlier build has that pinned on disk whether or not the user chose it, so the
+first start after upgrading resets an unstamped `true` to `false` (the round-3
+default — see [Overlay](#overlay)) and writes `version = 1`. That happens once
+per install: a `true` set after the stamp is a real choice and survives. If
+the rewrite fails, Iris says so on the console and keeps running — but the
+reset will repeat on the next start until the stamp lands. `Config::migrate`
+in `src/config.rs` is the implementation and carries the full reasoning.
 
 **Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
 `inject.rs` applies before every injection burst for the other choices, so they
@@ -186,8 +198,9 @@ recoverably rather than silently:
 Note that "delivered" here only ever means the keystrokes or the paste
 shortcut reached Windows' input queue. Neither Windows nor Iris can confirm
 that the app on the other end rendered them correctly — that gap is exactly
-what the original bug was — so the timing shown on the pill is a delivery
-time, not a receipt.
+what the original bug was — so the latency Iris records for a dictation is a
+delivery time, not a receipt. (The overlay shows no latency figure; its
+readout is the elapsed recording time — see `crates/iris-overlay/README.md`.)
 
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at
@@ -270,9 +283,10 @@ insert the overlay holds the confirmation then exits itself — the loop does
 **not** call `hide()` immediately, or the hold would be cancelled.
 
 `set_partial_text` is what opens the overlay's live-transcript ribbon.
-`show_live_text = false` in the config makes `OverlayPill` swallow it, so the
-overlay never sees a partial and stays the quiet orb — the opt-out for anyone
-who does not want dictated words on screen. It is pushed through
+`show_live_text = false` (the default) makes `OverlayPill` swallow it, so the
+overlay never sees a partial and stays its resting capsule — the presentation
+most users see, not a fallback. `show_live_text = true` is the opt-in for
+anyone who wants dictated words on screen. It is pushed through
 `PillSink::set_show_live_text` at startup and again on every "reload
 settings", the same way the theme is, so editing it takes effect without a
 restart.

@@ -87,6 +87,29 @@ running on the engine Iris started with.
 Then hold **Right-Ctrl**, speak, release. Your words appear in whatever window
 had focus.
 
+## Downgrading to an older Iris
+
+Going *back* to a release older than this one needs one edit first. Iris stamps
+`config.toml` with a `version` line the first time a newer build reads it, and
+older builds reject any setting they do not recognise — so an older Iris opens
+an **Iris could not start** dialog naming an unknown `version` field instead of
+starting.
+
+Fix it in one step: open `%APPDATA%\iris\config.toml` and delete the line
+
+```toml
+version = 1
+```
+
+Then launch the older Iris. Nothing else in the file needs changing.
+
+One related thing worth knowing. The newer build turns off the overlay's live
+transcript text once, on the first start after you upgrade — the capsule still
+pulses and times your recording, it just no longer shows words as you speak.
+Setting `show_live_text = true` turns it back on, and the stamp is what stops
+it being turned off again. The older build never writes a `version` line, so
+upgrading again later repeats that one-time reset.
+
 ## Uninstall
 
 Iris does not register itself with Windows, so it does **not** appear in

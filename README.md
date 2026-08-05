@@ -62,7 +62,7 @@ First dictation:
 
 1. A tray icon appears (prism triangle). Right-click for engine / theme / polish.
 2. Hold **Right-Ctrl**, speak, release.
-3. The Prism pill appears bottom-centre while you talk — a quiet orb that opens into a ribbon showing your words as they are heard (set `show_live_text = false` to keep it orb-only); text is polished and injected into the focused window.
+3. The Prism pill appears bottom-centre while you talk — a quiet glass capsule that pulses with your voice (set `show_live_text = true` to also open a ribbon showing your words as they are heard); text is polished and injected into the focused window.
 4. Session history lands in `history.jsonl` beside the config.
 
 ### Config location

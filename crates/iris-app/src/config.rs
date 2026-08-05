@@ -65,7 +65,29 @@ const HEADER: &str = "\
 # IRIS_LLM_KEY) instead of this file; an environment variable takes precedence
 # over anything set here. Either way, Iris never prints a key back — see
 # --print-config.
+#
+# `version` records which Iris schema last wrote this file. Leave it alone;
+# it exists so a changed default can reach a file that predates it.
 ";
+
+/// The schema version Iris writes today.
+///
+/// This is a stamp, not a migration framework: it exists for exactly one
+/// decision — the `show_live_text` reset in [`Config::migrate`] — and must not
+/// grow a registry, per-field versioning or a generic engine. If a second
+/// default ever has to reach existing files, that is the moment to decide
+/// whether real migration machinery is warranted; do not build it here on
+/// speculation.
+const CURRENT_VERSION: u32 = 1;
+
+/// What a file written before [`CURRENT_VERSION`] existed reads as.
+///
+/// The container-level `#[serde(default)]` would otherwise fill an absent
+/// `version` from [`Config::default`] — which is the *current* stamp — and
+/// every pre-stamp file would claim to be up to date.
+fn legacy_version() -> u32 {
+    0
+}
 
 /// Which transcription backend to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -353,6 +375,13 @@ impl Keys {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Which Iris schema last wrote this file. See [`CURRENT_VERSION`].
+    ///
+    /// Not a user setting, and first in the struct because
+    /// `toml::to_string_pretty` writes fields in declaration order and a
+    /// scalar emitted after `[polish]` would land inside that table.
+    #[serde(default = "legacy_version")]
+    pub version: u32,
     /// Which transcription backend to run.
     pub engine: EngineChoice,
     /// The push-to-talk key. Held, not tapped.
@@ -369,15 +398,21 @@ pub struct Config {
     /// Show the live partial transcript in the overlay's ribbon while
     /// listening.
     ///
-    /// On by default — this is the reason the current overlay design was
-    /// chosen over its alternatives, not an incidental feature (see
+    /// Off by default (captain feedback, round 3: "maybe we could remove
+    /// that feature" — ambivalent, not certain, so the toggle stays and the
+    /// feature stays reachable, but it no longer opts a user in by surprise).
+    /// The overlay design that made live text the reason to ship (see
     /// `crates/iris-overlay/README.md` "The contract changed, and here is
-    /// why"). Off leaves the overlay in its orb-only presentation: a quiet
-    /// dot that pulses with the microphone and never shows any transcript
-    /// text, which is a complete design on its own, not a degraded one. This
-    /// authorises *displaying* the transcript; it does not change what is
-    /// persisted or logged — the history file's own `enabled` setting is the
-    /// control for that.
+    /// why") is still there behind this flag. Off leaves the overlay in its
+    /// resting capsule presentation: a quiet shape that pulses with the
+    /// microphone and never shows any transcript text, which is the default
+    /// most users will ever see, not a degraded fallback. This authorises
+    /// *displaying* the transcript; it does not change what is persisted or
+    /// logged — the history file's own `enabled` setting is the control for
+    /// that.
+    ///
+    /// Flipping this default is the one thing [`CURRENT_VERSION`] exists for;
+    /// see [`Config::migrate`].
     pub show_live_text: bool,
     /// Transcript cleanup.
     pub polish: PolishConfig,
@@ -398,11 +433,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            version: CURRENT_VERSION,
             engine: EngineChoice::default(),
             hotkey: Key::default(),
             suppress_hotkey: true,
             theme: Theme::default(),
-            show_live_text: true,
+            show_live_text: false,
             polish: PolishConfig::default(),
             audio: AudioConfig::default(),
             inject: InjectConfig::default(),
@@ -452,24 +488,85 @@ impl Config {
     /// back to defaults would look exactly like Iris ignoring the user's
     /// settings, which is worse than a message that names the problem.
     pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::load_reporting_migration(path)?.0)
+    }
+
+    /// [`Config::load`], also saying whether [`Config::migrate`] changed
+    /// anything — which is what decides whether the file is worth rewriting.
+    fn load_reporting_migration(path: &Path) -> Result<(Self, bool)> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                Self::from_toml(&text).with_context(|| format!("reading {}", path.display()))
+                let mut config = Self::from_toml(&text)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let migrated = config.migrate();
+                Ok((config, migrated))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Self::default(), false)),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
 
+    /// Bring a file written by an older schema up to [`CURRENT_VERSION`].
+    /// Returns whether anything changed.
+    ///
+    /// One decision lives here and no more. **This deliberately overrides a
+    /// value the file states explicitly**, which nothing else in this module
+    /// does: `show_live_text` shipped as `true` and every install that ever
+    /// ran a previous build has `show_live_text = true` pinned on disk by
+    /// [`Config::save`], whether or not the user ever wanted it. A `true` from
+    /// before the stamp existed is therefore evidence of the old default, not
+    /// of a choice, and leaving it would mean the captain's round-3 decision —
+    /// live text is opt-in — never reached a single existing user. A `true`
+    /// written at [`CURRENT_VERSION`] *is* a choice and is left alone; so the
+    /// reset happens once per install and never again, because the stamp that
+    /// this run writes is what makes the next load a no-op.
+    fn migrate(&mut self) -> bool {
+        if self.version >= CURRENT_VERSION {
+            return false;
+        }
+        self.show_live_text = false;
+        self.version = CURRENT_VERSION;
+        true
+    }
+
     /// Load from `path`, writing a documented default file first if it is
     /// missing, so that "open settings" always has something to open.
+    ///
+    /// This is also where a [`Config::migrate`] result is persisted: the stamp
+    /// has to reach the disk or the reset repeats on every start and a user
+    /// who then turns live text back on by hand loses it again. A failure to
+    /// write is not fatal — the migration still holds for this run, and this
+    /// module's first rule is that Iris starts — but it is reported the same
+    /// way [`crate::app::App`] reports a failed save, unconditionally: a stamp
+    /// that never lands means the reset runs again at every start, and a
+    /// setting that keeps reverting with nothing on screen to explain it is
+    /// exactly the failure a quiet console must not hide.
+    ///
+    /// A *successful* migration stays behind `--verbose`. It rewrites the
+    /// user's file and overrides a value that file stated, which is worth a
+    /// record; it is also a once-per-install event on a healthy path, and the
+    /// console is quiet by product decision, so it is a diagnostic rather than
+    /// a greeting. `iris --verbose` is what turns the one-time override into
+    /// something a user who noticed live text disappear can find.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if !path.exists() {
             let config = Self::default();
             config.save(path)?;
             return Ok(config);
         }
-        Self::load(path)
+        let (config, migrated) = Self::load_reporting_migration(path)?;
+        if migrated {
+            match config.save(path) {
+                Ok(()) => iris_core::vlog!(
+                    "migrated {} to version {CURRENT_VERSION}: live text is now \
+                     opt-in and was turned off; set show_live_text = true to \
+                     restore it",
+                    path.display()
+                ),
+                Err(e) => eprintln!("cannot save {}: {e:#}", path.display()),
+            }
+        }
+        Ok(config)
     }
 
     /// Write to `path`, creating the directory if needed.
@@ -624,8 +721,8 @@ mod tests {
         assert!(config.suppress_hotkey);
         assert_eq!(config.theme, Theme::Dark);
         assert!(
-            config.show_live_text,
-            "live text ships on by default per the design decision"
+            !config.show_live_text,
+            "live text is off by default per captain feedback round 3"
         );
         assert!(config.polish.enabled);
         assert_eq!(config.inject.method, Method::SendInput);
@@ -637,7 +734,7 @@ mod tests {
             engine: EngineChoice::Deepgram,
             hotkey: Key::F9,
             theme: Theme::Light,
-            show_live_text: false,
+            show_live_text: true,
             ..Config::default()
         };
         config.polish.budget_ms = 220;
@@ -651,9 +748,20 @@ mod tests {
         assert_eq!(Config::from_toml(&text).unwrap(), config);
     }
 
+    /// Every *setting* defaults; the `version` stamp deliberately does not,
+    /// because an empty file is a file that predates the stamp and has to be
+    /// seen as one — see [`Config::migrate`].
     #[test]
     fn an_empty_file_is_the_default_config() {
-        assert_eq!(Config::from_toml("").unwrap(), Config::default());
+        let empty = Config::from_toml("").unwrap();
+        assert_eq!(empty.version, 0);
+        assert_eq!(
+            Config {
+                version: CURRENT_VERSION,
+                ..empty
+            },
+            Config::default()
+        );
     }
 
     #[test]
@@ -664,13 +772,13 @@ mod tests {
         // Untouched by the file, so still the default.
         assert!(config.polish.llm);
         assert_eq!(config.hotkey, Key::RightCtrl);
-        assert!(config.show_live_text);
+        assert!(!config.show_live_text);
     }
 
     #[test]
-    fn show_live_text_can_be_turned_off_from_the_file() {
-        let config = Config::from_toml("show_live_text = false\n").unwrap();
-        assert!(!config.show_live_text);
+    fn show_live_text_can_be_turned_on_from_the_file() {
+        let config = Config::from_toml("show_live_text = true\n").unwrap();
+        assert!(config.show_live_text);
         // Nothing else moves.
         assert_eq!(config.engine, EngineChoice::Mock);
     }
@@ -739,6 +847,43 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .starts_with("# Iris configuration."));
+    }
+
+    /// The round-3 default flip has to reach machines that already have
+    /// `show_live_text = true` written to disk by an earlier build, and it has
+    /// to stop there: a `true` written since the stamp is a real choice.
+    #[test]
+    fn the_live_text_default_flip_reaches_a_pre_stamp_file_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // What a previous build left behind: no version key, live text on.
+        std::fs::write(&path, "engine = \"groq\"\nshow_live_text = true\n").unwrap();
+        let migrated = Config::load_or_create(&path).unwrap();
+        assert!(!migrated.show_live_text, "the flip never reached the file");
+        assert_eq!(migrated.version, CURRENT_VERSION);
+        assert_eq!(
+            migrated.engine,
+            EngineChoice::Groq,
+            "the rest was disturbed"
+        );
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains(&format!("version = {CURRENT_VERSION}")),
+            "the stamp was not written: {on_disk}"
+        );
+
+        // Stamped now, so a later hand-edited `true` is a choice and survives
+        // — the reset must not run a second time.
+        let mut chosen = Config::load(&path).unwrap();
+        chosen.show_live_text = true;
+        chosen.save(&path).unwrap();
+        assert!(
+            Config::load_or_create(&path).unwrap().show_live_text,
+            "the migration repeated and ate a deliberate setting"
+        );
+        assert!(Config::load(&path).unwrap().show_live_text);
     }
 
     #[test]

@@ -13,11 +13,14 @@
 //! Cost is per *rebuild*, not per frame: `render::ensure_masks` caches the
 //! blurred masks and only rebuilds when the shape moves or its width crosses a
 //! 4 device-px bucket. Under the fixed-width pill this module predates that
-//! meant the enter and exit transforms only. The orb-to-ribbon shape widens
-//! while the transcript grows, so rebuilds now recur for as long as words keep
-//! arriving — two blurred masks over the full window each time. Coarsening the
-//! bucket would trade that against visible shadow lag during the morph; it is
-//! a deliberate follow-up, not an oversight.
+//! meant the enter and exit transforms only. The shape widens while the
+//! transcript grows, so rebuilds recur for as long as words keep arriving —
+//! two blurred masks over the full window each time. That only applies when
+//! live text is opted in; in the default presentation the shape sits at
+//! `layout::REST_W` for the whole session, so this is back to the enter and
+//! exit transforms only. Coarsening the bucket would trade the growing case
+//! against visible shadow lag during the morph; it is a deliberate follow-up,
+//! not an oversight.
 
 use tiny_skia::Mask;
 

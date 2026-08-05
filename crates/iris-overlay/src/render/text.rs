@@ -23,7 +23,8 @@ const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-Regula
 #[derive(Clone, Copy, Debug)]
 pub enum TextPaint {
     /// One flat colour. The only variant the shipping design currently uses
-    /// — the live ribbon text.
+    /// — the elapsed-recording timer (both its outline and its ink) and the
+    /// opt-in live ribbon text.
     Solid(Rgba),
     /// A left-to-right ramp across the whole run. Unused by the product
     /// since the latency caption that used it was removed (captain's second

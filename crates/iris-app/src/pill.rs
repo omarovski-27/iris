@@ -194,9 +194,9 @@ pub struct OverlayPill {
 impl OverlayPill {
     /// Drive `handle` from the dictation loop.
     ///
-    /// `show_live_text` gates [`PillSink::set_partial_text`]: when `false`,
-    /// partial text is never forwarded to the overlay, which then never
-    /// leaves its orb-only presentation — see
+    /// `show_live_text` gates [`PillSink::set_partial_text`]: when `false`
+    /// (the default), partial text is never forwarded to the overlay, which
+    /// then never leaves its resting-capsule presentation — see
     /// [`crate::config::Config::show_live_text`] for why this exists.
     ///
     /// This is the value the process started with;
@@ -218,7 +218,7 @@ impl OverlayPill {
     }
 
     /// What [`PillSink::set_partial_text`] would hand to the overlay: the text
-    /// itself, or nothing at all while the live-text opt-out is on.
+    /// itself, or nothing at all while the live-text opt-in is off.
     ///
     /// The single place the gate is decided, so a test can exercise the real
     /// decision rather than a double's imitation of it — the overlay end of
@@ -248,9 +248,10 @@ impl PillSink for OverlayPill {
         self.show_live_text = on;
         if !on {
             // Whatever the ribbon is holding right now goes with the toggle:
-            // an empty partial collapses it back to the orb on the next
-            // frame, so turning the opt-out on never leaves transcript text
-            // on screen waiting for the next state change to clear it.
+            // an empty partial collapses it back to the resting capsule on
+            // the next frame, so turning live text off never leaves
+            // transcript text on screen waiting for the next state change to
+            // clear it.
             self.handle.set_partial_text("");
         }
     }
@@ -503,10 +504,10 @@ mod tests {
     }
 
     /// The config toggle this adapter exists to serve: with `show_live_text`
-    /// off, partial text must never reach the real overlay, so the ribbon it
-    /// would open never has anything to open with — the orb-only fallback the
-    /// design report calls "a complete and coherent design on its own", not a
-    /// degraded one.
+    /// off (the shipped default), partial text must never reach the real
+    /// overlay, so the ribbon it would open never has anything to open with —
+    /// the resting-capsule presentation the design report calls "a complete
+    /// and coherent design on its own", not a degraded one.
     #[test]
     fn show_live_text_off_never_forwards_partial_text() {
         let overlay =
@@ -542,7 +543,7 @@ mod tests {
         assert_eq!(
             pill.partial_for_overlay("the quarterly"),
             None,
-            "the opt-out did not reach the sink's own gate"
+            "turning the opt-in off did not reach the sink's own gate"
         );
         pill.show_listening();
         pill.set_partial_text("this must not reach the overlay");
@@ -551,7 +552,7 @@ mod tests {
         assert_eq!(
             pill.partial_for_overlay("the quarterly"),
             Some("the quarterly"),
-            "turning the opt-out back off left the ribbon mute"
+            "turning the opt-in back on left the ribbon mute"
         );
         pill.set_partial_text("the quarterly");
         overlay.shutdown();

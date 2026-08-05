@@ -9,11 +9,16 @@
 //!
 //! # The shape
 //!
-//! A capsule whose corner radius is always exactly half its height, so at
-//! minimum width it is a perfect circle (the quiet "orb") and at any wider
-//! width it is a true capsule — there is no separate "orb shape" and "ribbon
-//! shape", only one shape whose width animates. Height never changes.
-//! [`ORB_D`] is both the orb's diameter and the ribbon's height.
+//! A capsule whose corner radius is always exactly half its height — there is
+//! no separate "orb shape" and "ribbon shape", only one shape whose width
+//! animates. Height never changes. [`ORB_D`] is the height, at every width.
+//!
+//! At rest — no live text on screen, which is the default and what most
+//! users ever see — the shape sits at [`REST_W`], a capsule holding the wave
+//! row and an elapsed-recording timer side by side (captain feedback, round
+//! 3: "not just a dot or a circle, more like the pipe thing", and a follow-up
+//! asking for a timer beside the waves). Live text, when the config opts back
+//! in, still widens the same shape further, up to [`RIBBON_MAX_W`].
 //!
 //! The **window is fixed-size**, sized for the *widest* state
 //! ([`RIBBON_MAX_W`]) up front — see `window/win32.rs`'s `Surface::present`,
@@ -23,7 +28,7 @@
 //! monitor change already causes today. This is deliberate: it was the
 //! lower-risk of two options considered (the other being a window that
 //! resizes live with the ribbon), and the fixed transparent margin around a
-//! narrow orb costs nothing extra to composite.
+//! narrow capsule costs nothing extra to composite.
 //!
 //! Geometry is deliberately *not* a theme property — see [`crate::theme`].
 
@@ -31,9 +36,20 @@
 // Logical constants (100 % scale)
 // ---------------------------------------------------------------------------
 
-/// Orb diameter, and the ribbon's constant height. Equal on purpose — see the
-/// module doc's "The shape".
+/// The shape's constant height, at every width. Unchanged across all three
+/// rounds of feedback on this surface — see the module doc's "The shape".
 pub const ORB_D: f32 = 34.0;
+/// Width of the shape at rest: no live text on screen, just the wave row and
+/// the elapsed-recording timer sharing the surface. Noticeably narrower than
+/// the previous signed-off pill's 168×34 (captain, round 3: "it was really
+/// wide, we need to narrow it down"), but wide enough relative to [`ORB_D`]'s
+/// height to read unmistakably as a capsule, and wide enough to give the
+/// timer its own zone beside the wave row without crowding either — see
+/// `render/mod.rs`'s `draw_wave` (`right_reserve`) and `draw_timer` for how
+/// the width splits between the two. Treated as a direction, not a number to
+/// hit exactly (round-3 addendum): a composition that needs a few more pixels
+/// to read well is worth more than a cramped one at a rounder number.
+pub const REST_W: f32 = 128.0;
 /// Widest the ribbon grows before new words start scrolling the oldest ones
 /// off the leading edge instead of growing further.
 pub const RIBBON_MAX_W: f32 = 460.0;
@@ -203,8 +219,10 @@ pub struct Layout {
     pub center_x: f32,
     /// Vertical centre of the shape.
     pub center_y: f32,
-    /// Orb diameter / ribbon height, in device pixels.
+    /// The shape's constant height, in device pixels.
     pub shape_h: f32,
+    /// Width of the shape at rest (no live text), in device pixels.
+    pub rest_w: f32,
     /// Widest the ribbon grows, in device pixels.
     pub ribbon_max_w: f32,
     /// Inner padding each side of the live-text run.
@@ -230,6 +248,7 @@ impl Layout {
             center_x: window_w as f32 * 0.5,
             center_y: px(MARGIN) + px(ORB_D) * 0.5,
             shape_h: px(ORB_D),
+            rest_w: px(REST_W),
             ribbon_max_w: px(RIBBON_MAX_W),
             text_pad_x: px(RIBBON_PAD_X),
             text_font: px(TEXT_FONT),
@@ -248,6 +267,17 @@ mod tests {
         assert_eq!(WORK_AREA_GAP, 58.0, "placement anchor stays unchanged");
     }
 
+    /// The captain's complaint was specifically about width ("it was really
+    /// wide, we need to narrow it down"), not about the shape reading as a
+    /// circle instead of a capsule — the rest width has to sit strictly
+    /// between those two failure modes.
+    #[test]
+    fn rest_width_is_a_capsule_narrower_than_the_old_signed_off_pill() {
+        const OLD_SIGNED_OFF_PILL_W: f32 = 168.0;
+        const { assert!(REST_W < OLD_SIGNED_OFF_PILL_W) };
+        const { assert!(REST_W > ORB_D * 1.5) };
+    }
+
     #[test]
     fn window_is_bigger_than_the_widest_shape() {
         let l = Layout::new(1.0);
@@ -255,6 +285,10 @@ mod tests {
         assert!(l.center_x > 0.0 && l.center_y > 0.0);
         assert!(l.center_x < l.window_w as f32);
         assert!(l.ribbon_max_w + 2.0 * MARGIN <= l.window_w as f32 + 0.5);
+        assert!(
+            l.rest_w < l.ribbon_max_w,
+            "rest width must fit inside the window too"
+        );
     }
 
     /// No caption means no reason for the shape to sit off-centre vertically
@@ -275,6 +309,7 @@ mod tests {
         assert_eq!(two.window_w, one.window_w * 2);
         assert_eq!(two.window_h, one.window_h * 2);
         assert!((two.shape_h - one.shape_h * 2.0).abs() < 0.01);
+        assert!((two.rest_w - one.rest_w * 2.0).abs() < 0.01);
         assert!((two.ribbon_max_w - one.ribbon_max_w * 2.0).abs() < 0.01);
         assert!((two.text_font - one.text_font * 2.0).abs() < 0.01);
     }

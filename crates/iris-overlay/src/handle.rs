@@ -199,7 +199,7 @@ impl OverlayHandle {
     /// previous "never holds transcript content" rule, and under what
     /// condition. Call it as often as the transcript updates; each call
     /// replaces the previous text outright; an empty string collapses the
-    /// ribbon back to the quiet orb.
+    /// ribbon back to the resting capsule.
     pub fn set_partial_text(&self, text: impl Into<String>) {
         self.send(Command::PartialText(text.into()));
     }
