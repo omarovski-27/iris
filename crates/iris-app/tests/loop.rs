@@ -1410,6 +1410,68 @@ fn a_tray_save_never_persists_a_cli_override() {
     );
 }
 
+/// The other half of the same rule: what is *running* is not what the file
+/// holds, so "you already have that" has to be asked of the file too. Under
+/// `--engine` the two diverge for the whole session, and the window shows the
+/// file — so picking the engine that happens to already be running is a real
+/// change to the file, and answering `Applied` without writing it would flash
+/// "Saved" over a picker that snaps back on the next refresh.
+#[test]
+fn choosing_the_running_engine_still_writes_it_over_a_divergent_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.engine = EngineChoice::Groq;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    // What main's apply_overrides would produce for `--engine mock`.
+    let mut run_config = file_config.clone();
+    run_config.engine = EngineChoice::Mock;
+
+    let app = App::new(
+        run_config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app")
+    .with_file_config(file_config);
+
+    let (tray_commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app.with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetEngine(EngineChoice::Mock)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(answered, id);
+    assert_eq!(outcome, CommandOutcome::Applied);
+    assert_eq!(app.config().engine, EngineChoice::Mock);
+
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.engine,
+        EngineChoice::Mock,
+        "the choice was reported saved but never written"
+    );
+}
+
 /// `show_live_text` is the opt-in the live-text ribbon is reached through
 /// (off by default since round 3), so editing it and reloading has to take
 /// effect there and then — the same treatment `theme` already gets. Before

@@ -352,15 +352,19 @@ impl WindowState {
             return;
         }
         if reload {
-            self.history_stamp = stamp;
             // A log that cannot be read keeps the records already on screen —
             // the same last-good-snapshot rule the config gets above — and
             // says why, because a silently frozen recovery path is worse than
-            // a stale one the user knows about.
+            // a stale one the user knows about. The stamp moves only on a read
+            // that produced records: a failure is not a state this window has
+            // seen, so keeping the last good one is what makes the next
+            // refresh try again instead of going quietly stale once the
+            // warning has expired.
             match load_history(&history_path) {
                 Ok(history) => {
                     self.history = history;
                     self.filtered_for = None;
+                    self.history_stamp = stamp;
                 }
                 Err(e) => self.flash_failure(unreadable_log(&e)),
             }
@@ -891,6 +895,65 @@ mod tests {
             "{message}"
         );
         assert_eq!(level, StatusLevel::Warn);
+    }
+
+    /// ...and it keeps trying. The stamp is "what the records on screen were
+    /// read from", so a failed read must not advance it: a failure that leaves
+    /// the log's fingerprint sitting still would otherwise be seen once, and
+    /// never looked at again once its warning expired — a History frozen on
+    /// old records with nothing on screen to say so.
+    #[test]
+    fn a_refresh_that_cannot_read_the_log_tries_again_on_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let nest = dir.path().join("nest");
+        let log_path = nest.join("history.jsonl");
+        let mut config = Config::default();
+        config.history.path = Some(log_path.clone());
+        config.save(&config_path).unwrap();
+        let mut log = SessionLog::open(log_path.clone(), 10);
+        log.append(&DictationRecord::now("mock", "first")).unwrap();
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        assert_eq!(state.history.len(), 1);
+        let read_from = state.history_stamp;
+
+        // The log's own directory becomes a file, as above — a failure that
+        // then stays exactly as it is, which is the case this is about.
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::remove_dir(&nest).unwrap();
+        std::fs::write(&nest, "").unwrap();
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        assert_eq!(
+            state.history_stamp, read_from,
+            "a read that failed is not the read the records came from"
+        );
+
+        // The warning has expired and the user is looking at History again.
+        state.status = None;
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        let (message, level) = state.status_flash().expect("the failure went silent");
+        assert!(
+            message.contains("Could not read the session log"),
+            "{message}"
+        );
+        assert_eq!(level, StatusLevel::Warn);
+
+        // And the moment the log opens again, an ordinary refresh has it.
+        std::fs::remove_file(&nest).unwrap();
+        let mut log = SessionLog::open(log_path, 10);
+        log.append(&DictationRecord::now("mock", "second")).unwrap();
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "second");
     }
 
     /// `App::run` drains commands between dictations, so an answer can be

@@ -403,7 +403,13 @@ impl<A: AudioSource> App<A> {
             Command::Quit => return Ok(std::ops::ControlFlow::Break(())),
             Command::SetEngine(choice) => {
                 let choice = *choice;
-                if choice == self.config.engine {
+                // Nothing to do only when the choice is *both* what is running
+                // and what the file holds. Under `--engine` those diverge for
+                // the whole session, and the window renders the file: comparing
+                // against the running engine alone would answer `Applied`
+                // without writing anything, and the next refresh would snap the
+                // picker back.
+                if choice == self.config.engine && choice == self.saved.engine {
                     self.report(from_window, outcome);
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
