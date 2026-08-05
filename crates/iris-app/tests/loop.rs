@@ -1279,6 +1279,81 @@ fn a_change_that_cannot_be_written_to_disk_is_not_reported_as_saved() {
     assert!(!config_path.exists());
 }
 
+/// A change reported `Rejected` because its write failed must not silently
+/// ride along on a *later*, unrelated command's successful write. `saved`
+/// only ever advances on the write that actually happened, never on every
+/// command that merely asked for one.
+#[test]
+fn a_rejected_save_does_not_ride_along_on_the_next_successful_save() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The parent is a file, so every write under it fails — deterministically
+    // and on any platform, unlike a permission bit.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "").expect("seeding the blocker");
+    let config_path = blocker.join("config.toml");
+
+    let config = Config::default();
+    assert_eq!(config.theme, Theme::Dark, "test assumes the default theme");
+
+    let app = App::new(
+        config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app");
+
+    let (tray_commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app.with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    // First command: the write fails, and the window is told so.
+    let first = CommandId::next();
+    window_commands_tx
+        .send((first, Command::SetTheme(Theme::Light)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    assert_eq!(answered, first);
+    assert!(
+        matches!(outcome, CommandOutcome::Rejected(_)),
+        "the write is still blocked: {outcome:?}"
+    );
+
+    // Unblock the path — same location, now a real directory — without
+    // touching the running app, then send an unrelated command that writes.
+    std::fs::remove_file(&blocker).expect("removing the blocker");
+    std::fs::create_dir(&blocker).expect("making it a real directory");
+
+    let second = CommandId::next();
+    window_commands_tx
+        .send((second, Command::SetPolish(false)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    assert_eq!(answered, second);
+    assert_eq!(outcome, CommandOutcome::Applied);
+
+    tray_commands.send(Command::Quit).unwrap();
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    let on_disk = Config::load(&config_path).expect("reading the config back");
+    assert_eq!(
+        on_disk.theme,
+        Theme::Dark,
+        "the rejected theme change must not have ridden along on the later save"
+    );
+    assert!(
+        !on_disk.polish.enabled,
+        "the later, successful change must be on disk"
+    );
+}
+
 #[test]
 fn a_tray_save_never_persists_a_cli_override() {
     // --no-polish and --device are documented as run-only. A tray change that

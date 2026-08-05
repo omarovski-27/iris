@@ -413,10 +413,11 @@ impl<A: AudioSource> App<A> {
                     Ok(engine) => {
                         self.pill.set_engine(engine.name());
                         self.engine = engine;
-                        command.apply_to(&mut self.saved);
-                        println!("  engine: {choice}");
-                        if let Err(e) = self.persist() {
-                            outcome = Self::persist_failed(&e);
+                        let mut candidate = self.saved.clone();
+                        command.apply_to(&mut candidate);
+                        match self.persist(candidate) {
+                            Ok(()) => println!("  engine: {choice}"),
+                            Err(e) => outcome = Self::persist_failed(&e),
                         }
                     }
                     Err(e) => {
@@ -432,10 +433,12 @@ impl<A: AudioSource> App<A> {
             Command::SetDevice(device) => match self.audio.set_device(device.clone()) {
                 Ok(()) => {
                     command.apply_to(&mut self.config);
-                    command.apply_to(&mut self.saved);
-                    println!("  microphone: {}", self.audio.describe());
-                    if let Err(e) = self.persist() {
-                        outcome = Self::persist_failed(&e);
+                    let mut candidate = self.saved.clone();
+                    command.apply_to(&mut candidate);
+                    let description = self.audio.describe();
+                    match self.persist(candidate) {
+                        Ok(()) => println!("  microphone: {description}"),
+                        Err(e) => outcome = Self::persist_failed(&e),
                     }
                 }
                 Err(e) => {
@@ -446,19 +449,21 @@ impl<A: AudioSource> App<A> {
             Command::SetPolish(enabled) => {
                 let enabled = *enabled;
                 command.apply_to(&mut self.config);
-                command.apply_to(&mut self.saved);
                 self.polisher = polish::build(&self.config);
-                println!("  polish: {}", if enabled { "on" } else { "off" });
-                if let Err(e) = self.persist() {
-                    outcome = Self::persist_failed(&e);
+                let mut candidate = self.saved.clone();
+                command.apply_to(&mut candidate);
+                match self.persist(candidate) {
+                    Ok(()) => println!("  polish: {}", if enabled { "on" } else { "off" }),
+                    Err(e) => outcome = Self::persist_failed(&e),
                 }
             }
             Command::SetTheme(theme) => {
                 let theme = *theme;
                 command.apply_to(&mut self.config);
-                command.apply_to(&mut self.saved);
                 self.pill.set_theme(theme);
-                if let Err(e) = self.persist() {
+                let mut candidate = self.saved.clone();
+                command.apply_to(&mut candidate);
+                if let Err(e) = self.persist(candidate) {
                     outcome = Self::persist_failed(&e);
                 }
             }
@@ -470,10 +475,13 @@ impl<A: AudioSource> App<A> {
                 // *next* launch will read — takes the new value.
                 let key = *key;
                 if key != self.saved.hotkey {
-                    command.apply_to(&mut self.saved);
-                    println!("  hotkey: {key} (restart Iris for this to take effect)");
-                    if let Err(e) = self.persist() {
-                        outcome = Self::persist_failed(&e);
+                    let mut candidate = self.saved.clone();
+                    command.apply_to(&mut candidate);
+                    match self.persist(candidate) {
+                        Ok(()) => {
+                            println!("  hotkey: {key} (restart Iris for this to take effect)");
+                        }
+                        Err(e) => outcome = Self::persist_failed(&e),
                     }
                 }
             }
@@ -483,13 +491,14 @@ impl<A: AudioSource> App<A> {
                 // as it was until a restart.
                 let enabled = *enabled;
                 if enabled != self.saved.overlay_enabled {
-                    command.apply_to(&mut self.saved);
-                    println!(
-                        "  overlay: {} (restart Iris for this to take effect)",
-                        if enabled { "on" } else { "off" }
-                    );
-                    if let Err(e) = self.persist() {
-                        outcome = Self::persist_failed(&e);
+                    let mut candidate = self.saved.clone();
+                    command.apply_to(&mut candidate);
+                    match self.persist(candidate) {
+                        Ok(()) => println!(
+                            "  overlay: {} (restart Iris for this to take effect)",
+                            if enabled { "on" } else { "off" }
+                        ),
+                        Err(e) => outcome = Self::persist_failed(&e),
                     }
                 }
             }
@@ -592,17 +601,24 @@ impl<A: AudioSource> App<A> {
         }
     }
 
-    /// Write [`App::saved`] to the config file.
+    /// Write `candidate` to the config file and, only on success, make it
+    /// [`App::saved`].
     ///
-    /// The failure is the caller's to answer for: a change the loop took in
-    /// memory but could not write is not saved, and the UI that asked has to
-    /// hear that rather than "Saved" over a value the next launch will not
-    /// see. See [`App::persist_failed`], which every `Set*` arm routes it
-    /// through.
-    fn persist(&self) -> Result<()> {
-        self.saved
+    /// Every `Set*` arm builds `candidate` as a clone of `saved` with its one
+    /// field changed, rather than mutating `saved` directly, so a write
+    /// failure leaves `saved` exactly where it was instead of stranding the
+    /// rejected value in memory to be smuggled onto disk by the *next*
+    /// command's successful save. The failure is the caller's to answer for:
+    /// a change the loop took in memory but could not write is not saved, and
+    /// the UI that asked has to hear that rather than "Saved" over a value
+    /// the next launch will not see. See [`App::persist_failed`], which every
+    /// `Set*` arm routes it through.
+    fn persist(&mut self, candidate: Config) -> Result<()> {
+        candidate
             .save(&self.config_path)
-            .with_context(|| format!("cannot save {}", self.config_path.display()))
+            .with_context(|| format!("cannot save {}", self.config_path.display()))?;
+        self.saved = candidate;
+        Ok(())
     }
 
     /// Report a failed [`App::persist`] on the console and to the window.
