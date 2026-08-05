@@ -56,9 +56,10 @@ use crate::vlog;
 /// it — and, when that connect then succeeds late, re-bases the extension to
 /// this value from the instant the stream came up, because a connection that
 /// works is worth nothing if the wait ends at the moment it starts working.
-/// The grace only ends when a non-empty partial exists, which is the point at
-/// which expiry costs a tail instead of the utterance; that is where the
-/// latency win lives, and it is untouched.
+/// A non-empty partial stops the extending, which is the point at which expiry
+/// costs a tail instead of the utterance; that is where the latency win lives,
+/// and it is untouched. What a partial must never do is shorten a wait already
+/// bought — see [`WaitBound`].
 ///
 /// The cost is that on a connect-only path this value is not the bound on how
 /// long `finish` blocks: for Deepgram the worst case is 8s of connect from
@@ -71,9 +72,11 @@ use crate::vlog;
 /// optional. `fm/iris-silent-and-instant` is stacked on this work and moving
 /// the same constant from another direction; a rebase that keeps one side and
 /// drops the other reintroduces exactly the data loss the grace exists to
-/// prevent. `finish`'s wait loop, [`Dictation::connect_grace`],
-/// `a_still_connecting_engine_is_not_cut_off_by_the_outer_bound` and
-/// `a_late_connect_still_delivers_the_words_it_goes_on_to_produce` are what to
+/// prevent. `finish`'s wait loop, [`WaitBound`],
+/// [`Dictation::extend_while_nothing_to_salvage`],
+/// `a_still_connecting_engine_is_not_cut_off_by_the_outer_bound`,
+/// `a_late_connect_still_delivers_the_words_it_goes_on_to_produce` and
+/// `a_late_connect_that_streams_first_still_waits_for_the_final` are what to
 /// re-read before touching it.
 pub const DEFAULT_FINAL_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -100,6 +103,10 @@ pub struct DictationOutcome {
 /// failed dictation as if nothing had been captured at all.
 #[derive(Debug)]
 pub struct DictationError {
+    /// What *this* layer knows, and only that: when there is a `source`, its
+    /// text is the source's to supply, never restated here. A cause stored on
+    /// both levels is printed on both levels by any caller that walks the
+    /// chain.
     message: String,
     /// The engine's own error, when there was one, kept structured so a caller
     /// converting back into `anyhow::Error` still has the chain rather than
@@ -125,9 +132,25 @@ impl DictationError {
     }
 }
 
+/// `{}` is this layer alone; `{:#}` is the whole story, the way `anyhow`
+/// spells it.
+///
+/// Both are needed because the two callers ask differently: `iris-app` prints
+/// the error itself and never walks a chain, so its `{e:#}` has to reach the
+/// engine's own words; `run_offline` converts back into `anyhow::Error`, which
+/// walks the chain and prints each link with `{}` — so a link that flattened
+/// its own source would print every cause under it twice.
 impl std::fmt::Display for DictationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.message)?;
+        if f.alternate() {
+            let mut cause = std::error::Error::source(self);
+            while let Some(e) = cause {
+                write!(f, ": {e}")?;
+                cause = e.source();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -159,6 +182,48 @@ enum Ending {
     Final(String),
     Error(String),
     Closed,
+}
+
+/// The single bound on [`Dictation::finish`]'s wait, and the one rule that
+/// three separate regressions all turned out to be: **it only ever moves
+/// forward.**
+///
+/// The wait used to be recomputed from scratch on every pass, which let a bound
+/// that had already been extended silently drop back — sometimes to an instant
+/// already in the past, ending the wait immediately. Each time the trigger
+/// looked different and each time the fix was another special case:
+///
+/// - the outer deadline (from key-up) undercutting a connect budget (from
+///   key-down), cutting off a session still legitimately connecting;
+/// - `Connected` collapsing the extended bound back to the already-past plain
+///   deadline, at the exact moment the connection became useful;
+/// - the first partial doing the same, so a `Final` arriving milliseconds
+///   behind an interim was never waited for and the less accurate text won.
+///
+/// They are one defect, so this is one type. An event may buy the session more
+/// time; nothing can take time away. That makes the failure structurally
+/// impossible rather than absent by inspection, and it is why [`WaitBound::0`]
+/// is private and [`WaitBound::extend_to`] is the only mutator — a future event
+/// wired in here cannot reintroduce the bug without deleting that method.
+struct WaitBound(Instant);
+
+impl WaitBound {
+    fn new(limit: Instant) -> Self {
+        Self(limit)
+    }
+
+    /// Push the bound out to `at`, if that is later than where it already
+    /// stands. The only way to change it.
+    fn extend_to(&mut self, at: Instant) {
+        if at > self.0 {
+            self.0 = at;
+        }
+    }
+
+    /// How much of the wait is left. Zero means expired.
+    fn remaining(&self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
 }
 
 impl Dictation {
@@ -258,14 +323,14 @@ impl Dictation {
         }
     }
 
-    /// How long a session with nothing to lose yet is allowed to run past the
-    /// plain deadline, given the engine's own budget for producing a
-    /// transcript after `finish` (`final_timeout`).
+    /// Buy a session that has nothing to lose yet more time than the plain
+    /// deadline, given the engine's own budget for producing a transcript
+    /// after `finish` (`finalise`, i.e. `final_timeout`).
     ///
     /// Connecting was never the goal — getting the words was — so this covers
-    /// the whole path rather than its first step. While nothing is
-    /// salvageable there are two states, and the grace re-bases from one to
-    /// the other rather than collapsing:
+    /// the whole path rather than its first step. While nothing is salvageable
+    /// there are two states, and the bound is extended to cover whichever
+    /// applies:
     ///
     /// - *still connecting*: the engine's [`Engine::connect_budget`] measured
     ///   from key-down, which is the clock that budget was written against.
@@ -275,18 +340,29 @@ impl Dictation {
     ///   otherwise the wait ends at the exact moment it starts being useful
     ///   and the whole utterance is lost to a connection that worked.
     ///
-    /// `None` — no grace, the plain deadline is the whole bound — the moment a
-    /// non-empty partial exists. Expiry then costs a tail rather than the
-    /// utterance, which is a degrade, not a loss, and is where the latency win
-    /// lives.
-    fn connect_grace(&self, finalise: Duration) -> Option<Instant> {
-        let budget = self.connect_budget?;
+    /// The moment a non-empty partial exists this stops buying time: expiry
+    /// then costs a tail rather than the utterance, which is a degrade, not a
+    /// loss, and is where the latency win lives. It stops *buying*, and that is
+    /// all it does — the wait already bought stands, because the `Final` that
+    /// would replace that partial with the accurate text is usually
+    /// milliseconds behind it, and this method has no way to tell "there is now
+    /// something to fall back on" from "there is nothing better coming". See
+    /// [`WaitBound`], which is what makes the distinction impossible to get
+    /// wrong from here.
+    fn extend_while_nothing_to_salvage(&self, bound: &mut WaitBound, finalise: Duration) {
+        let Some(budget) = self.connect_budget else {
+            return;
+        };
         if !self.latest_partial.trim().is_empty() {
-            return None;
+            return;
         }
         match self.timeline.at(Mark::StreamReady) {
-            Some(ready) => Some(ready + finalise),
-            None => Some(self.timeline.at(Mark::KeyDown)? + budget),
+            Some(ready) => bound.extend_to(ready + finalise),
+            None => {
+                if let Some(down) = self.timeline.at(Mark::KeyDown) {
+                    bound.extend_to(down + budget);
+                }
+            }
         }
     }
 
@@ -389,10 +465,14 @@ impl Dictation {
     /// just come up and been given `timeout` from there to answer: giving up
     /// at either point would trade the user's whole utterance for the
     /// difference between two clocks that do not start together (see
-    /// [`DEFAULT_FINAL_TIMEOUT`] and [`Dictation::connect_grace`]). The grace
-    /// ends the instant a partial exists, so it costs nothing on any dictation
-    /// that has words — and on a connect-only path it is what the caller's
-    /// loop actually blocks for, not `timeout`.
+    /// [`DEFAULT_FINAL_TIMEOUT`] and
+    /// [`Dictation::extend_while_nothing_to_salvage`]). Nothing extends the
+    /// wait once a partial exists, so it costs nothing on any dictation that
+    /// has words — and on a connect-only path it is what the caller's loop
+    /// actually blocks for, not `timeout`. The wait only ever grows
+    /// ([`WaitBound`]): the loop already returns the instant a real `Final`
+    /// lands, so extending it costs latency only where the `Final` never comes,
+    /// which is exactly where waiting is the correct answer.
     ///
     /// A terminal event that arrived *before* this call (a premature Final from
     /// a buggy or segment-oriented engine) does not short-circuit the wait:
@@ -416,7 +496,6 @@ impl Dictation {
         self.finishing = true;
         if let Err(e) = self.session.finish() {
             self.timeline.audio_secs = self.audio_secs();
-            let message = format!("{e:#}");
             // The same rule as every arm below: a socket that dies as the
             // Finalize goes out costs no more than the same socket dying one
             // statement later, inside the wait.
@@ -425,27 +504,29 @@ impl Dictation {
                 return Ok(DictationOutcome {
                     text,
                     timeline: self.timeline,
-                    cause: Some(message),
+                    // Flattened, because a cause is a leaf: it is one string in
+                    // the log with no chain behind it to supply the context.
+                    cause: Some(format!("{e:#}")),
                 });
             }
+            // Says what this layer knows and stops there; the engine's account
+            // travels as the source, so a caller walking the chain reads each
+            // cause once.
+            let message = format!("{} engine failed to finalise", self.timeline.engine);
             return Err(DictationError::fail(self.timeline, message, Some(e.into())));
         }
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
         let waiting_since = Instant::now();
-        let deadline = waiting_since + timeout;
+        // `timeout` is the bound, except while the session has produced nothing
+        // that could be salvaged: cutting a connect off inside the budget the
+        // engine set, or the instant it succeeds, loses the whole utterance
+        // rather than a tail of it. Extended in place every pass and never
+        // recomputed, so no event can hand back time an earlier one bought.
+        let mut bound = WaitBound::new(waiting_since + timeout);
         while self.ended.is_none() {
-            // `timeout` is the bound, except while the session has produced
-            // nothing that could be salvaged: cutting a connect off inside the
-            // budget the engine set, or the instant it succeeds, loses the
-            // whole utterance rather than a tail of it. Recomputed every pass,
-            // so the connect coming up re-bases the grace and the first partial
-            // drops the wait straight back to `deadline`.
-            let limit = match self.connect_grace(timeout) {
-                Some(grace) if grace > deadline => grace,
-                _ => deadline,
-            };
-            let remaining = limit.saturating_duration_since(Instant::now());
+            self.extend_while_nothing_to_salvage(&mut bound, timeout);
+            let remaining = bound.remaining();
             if remaining.is_zero() {
                 break;
             }
@@ -916,8 +997,23 @@ mod tests {
             .expect("the engine error must survive")
             .to_string();
         assert!(source.contains("sending Finalize"), "{source}");
-        let chain = anyhow::Error::from(err).chain().count();
+        // Whoever prints this reads each cause once, whichever way they ask:
+        // `{:#}` here walks the chain itself, and `iris-app` — which never
+        // walks one — gets the same story out of `Display`.
+        let flattened = format!("{err:#}");
+        let as_anyhow = anyhow::Error::from(err);
+        let chain = as_anyhow.chain().count();
         assert!(chain >= 2, "the cause chain was flattened: {chain} link(s)");
+        let full = format!("{as_anyhow:#}");
+        for story in [&flattened, &full] {
+            assert_eq!(
+                story.matches("sending Finalize").count(),
+                1,
+                "the cause is printed more than once: {story}"
+            );
+            assert!(story.contains("the socket was already gone"), "{story}");
+        }
+        assert_eq!(flattened, full, "the two spellings must agree");
     }
 
     /// As [`FinishFails`], but words reached the overlay first — the socket
@@ -1112,7 +1208,7 @@ mod tests {
         after: Duration,
         /// What the flush produces. A short hold really can have nothing but
         /// the post-`Finalize` `Final` (see `engine/deepgram.rs`), and an
-        /// interim on the way is the other real shape.
+        /// interim landing just ahead of that `Final` is the other real shape.
         streams_first: bool,
     }
 
@@ -1137,7 +1233,12 @@ mod tests {
                 let _ = tx.send(TranscriptEvent::Connected);
                 std::thread::sleep(Duration::from_millis(50));
                 if streams_first {
-                    let _ = tx.send(TranscriptEvent::Partial("hello".into()));
+                    // The interim is a rough draft: the punctuated, capitalised
+                    // text is milliseconds behind it, the way a real flush
+                    // sends them.
+                    let _ = tx.send(TranscriptEvent::Partial("no".into()));
+                    std::thread::sleep(Duration::from_millis(30));
+                    let _ = tx.send(TranscriptEvent::Final("No. No.".into()));
                 } else {
                     let _ = tx.send(TranscriptEvent::Final("hello there".into()));
                 }
@@ -1197,12 +1298,14 @@ mod tests {
     }
 
     #[test]
-    fn a_late_connect_that_streams_first_hands_back_what_it_streamed() {
-        // The other half of the rule, on the same late connect: the moment a
-        // partial exists the wait stops being extended, because from there
-        // expiry costs a tail instead of the utterance. So the words the
-        // stream produced come back — as a salvage, named as one — rather than
-        // the wait running on for a `Final` that may never come.
+    fn a_late_connect_that_streams_first_still_waits_for_the_final() {
+        // The other half of the rule, on the same late connect. A partial
+        // arriving means the wait is no longer *extended* — from there expiry
+        // costs a tail instead of the utterance. It does not mean the wait is
+        // over: an interim is a rough draft, the accurate text is milliseconds
+        // behind it, and ending on the partial hands the user "no" where the
+        // engine said "No. No.". The loop returns the instant the `Final`
+        // lands, so waiting for it costs nothing anyone can perceive.
         let engine = ConnectsLate {
             budget: Duration::from_secs(3),
             after: Duration::from_millis(300),
@@ -1215,23 +1318,29 @@ mod tests {
             .expect("what the stream produced is still the user's");
         let waited = started.elapsed();
 
-        assert_eq!(outcome.text, "hello");
-        assert!(
-            outcome.cause.is_some(),
-            "a salvage must not read as a clean dictation"
+        assert_eq!(
+            outcome.text, "No. No.",
+            "the partial truncated the wait that remained and the interim won"
+        );
+        assert_eq!(
+            outcome.cause, None,
+            "the engine concluded; this is not a salvage"
         );
         assert!(
             waited < Duration::from_secs(2),
-            "the grace must end with the partial, not run to the budget: {waited:?}"
+            "and the wait is still bounded: {waited:?}"
         );
     }
 
     #[test]
-    fn the_connect_grace_ends_the_moment_there_is_something_to_lose() {
+    fn the_connect_grace_stops_extending_once_there_is_something_to_lose() {
         // The grace exists only because a connect-only failure has nothing to
         // degrade to. Once words exist, expiry costs a tail rather than the
-        // utterance, and the fast bound is the whole bound again — otherwise
-        // the latency fix would be diluted on every dictation.
+        // utterance, so nothing buys the wait more time and the fast bound is
+        // the whole bound — otherwise the latency fix would be diluted on
+        // every dictation. Here the partial is on the channel before the wait
+        // even starts, so the 30s budget is never bought in the first place;
+        // a partial arriving later cannot give back time already bought.
         let engine = SlowToConnect {
             budget: Some(Duration::from_secs(30)),
             up: true,
@@ -1249,6 +1358,25 @@ mod tests {
         assert!(
             waited < Duration::from_secs(2),
             "a session with words to salvage waited out the connect budget: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn the_wait_bound_only_ever_moves_forward() {
+        // The rule three regressions were all violations of, pinned on its own
+        // rather than only through the paths that happen to exercise it: an
+        // event may buy the session more time, and nothing may take time away.
+        let start = Instant::now();
+        let mut bound = WaitBound::new(start + Duration::from_secs(10));
+
+        bound.extend_to(start + Duration::from_secs(30));
+        bound.extend_to(start + Duration::from_secs(20));
+        bound.extend_to(start - Duration::from_secs(5));
+
+        let remaining = bound.remaining();
+        assert!(
+            remaining > Duration::from_secs(28),
+            "a later event clawed back a wait an earlier one had bought: {remaining:?}"
         );
     }
 

@@ -435,7 +435,9 @@ fn a_short_hold_against_a_slow_connect_still_gets_its_words_typed() {
     // has to reach the screen — a wait that gives up at the moment the
     // connection starts working spends the whole budget and buys nothing.
     let mut rig = rig().with_final_timeout(Duration::from_millis(150));
-    rig.app.set_engine(Arc::new(ConnectsLateEngine));
+    rig.app.set_engine(Arc::new(ConnectsLateEngine {
+        streams_first: false,
+    }));
 
     let dictated = rig.dictate().expect("a late connect is not a failure");
 
@@ -450,6 +452,39 @@ fn a_short_hold_against_a_slow_connect_still_gets_its_words_typed() {
     );
     assert!(dictated.record.injected);
     assert_eq!(rig.injector.inserted().len(), 1);
+}
+
+#[test]
+fn a_slow_connect_that_streams_an_interim_still_types_the_final() {
+    // The same late connect, in the shape that streams a rough interim just
+    // ahead of the real transcript. Words existing means the wait is no longer
+    // extended — expiry from here costs a tail, not the utterance — but it
+    // must not mean the wait is *over*: the accurate text is milliseconds
+    // behind the interim, and ending on the interim types the wrong words into
+    // the user's document while the right ones are already on the wire.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(150));
+    rig.app.set_engine(Arc::new(ConnectsLateEngine {
+        streams_first: true,
+    }));
+
+    let dictated = rig.dictate().expect("a late connect is not a failure");
+
+    assert!(
+        dictated
+            .record
+            .text
+            .to_ascii_lowercase()
+            .contains("hello there"),
+        "the interim was typed instead of the final that followed it: {:?}",
+        dictated.record.text
+    );
+    assert!(dictated.record.injected);
+    assert_eq!(rig.injector.inserted().len(), 1);
+    assert!(
+        dictated.record.error.is_none(),
+        "the engine concluded; this is not a salvage: {:?}",
+        dictated.record.error
+    );
 }
 
 #[test]
@@ -1575,7 +1610,12 @@ impl Session for GoesQuietThenTailFeedFailsSession {
 /// Takes a connect budget of its own and comes up only after the app's
 /// final-transcript deadline has already passed, then answers the way a real
 /// socket does once it is up. The degraded-network connect that succeeds late.
-struct ConnectsLateEngine;
+struct ConnectsLateEngine {
+    /// Whether the flush puts a rough interim on the wire just ahead of the
+    /// real transcript. Both shapes are real (see `engine/deepgram.rs`), and
+    /// the one with an interim is the one that can hand back the wrong words.
+    streams_first: bool,
+}
 
 struct ConnectsLateSession {
     events: Receiver<TranscriptEvent>,
@@ -1591,14 +1631,19 @@ impl Engine for ConnectsLateEngine {
     }
     fn open(&self) -> anyhow::Result<Box<dyn Session>> {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let streams_first = self.streams_first;
         let worker = std::thread::spawn(move || {
             // Past the 150ms the app is prepared to wait from key-up, inside
             // the 3s the engine is allowed for its connect.
             std::thread::sleep(Duration::from_millis(400));
             let _ = tx.send(TranscriptEvent::Connected);
-            // A short hold can have nothing but the post-`Finalize` flush, so
-            // the whole transcript arrives at once with no interim before it.
             std::thread::sleep(Duration::from_millis(50));
+            if streams_first {
+                let _ = tx.send(TranscriptEvent::Partial("hello ther".into()));
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            // A short hold can have nothing but the post-`Finalize` flush, in
+            // which case the whole transcript arrives at once.
             let _ = tx.send(TranscriptEvent::Final("hello there".into()));
         });
         Ok(Box::new(ConnectsLateSession {

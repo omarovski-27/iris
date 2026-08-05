@@ -176,15 +176,27 @@ early costs the whole utterance rather than a tail. **Connecting is not the
 goal; the words are.** A grace that ended on `Connected` was built and rejected
 for exactly that reason: it spent the whole connect budget and then stopped
 waiting at the instant the connection became useful, losing the utterance to a
-socket that *worked*. So `Dictation::connect_grace` re-bases instead of
-collapsing — still connecting is key-down + connect budget, just connected is
-`Mark::StreamReady` + the engine's own `final_timeout`, and only a non-empty
-partial drops the wait back to the plain deadline, because from there expiry
-costs a tail. That is where the 6s win lives and it is untouched; the price is
-the ~14s worst case named above. A connect that fails on its own terms still
-reports as one (from `Mark::StreamReady`, engine-agnostically).
+socket that *worked*. So `Dictation::extend_while_nothing_to_salvage` extends
+rather than re-computing — still connecting buys key-down + connect budget,
+just connected buys `Mark::StreamReady` + the engine's own `final_timeout`, and
+a non-empty partial stops the buying, because from there expiry costs a tail.
+That is where the 6s win lives and it is untouched; the price is the ~14s worst
+case named above. A connect that fails on its own terms still reports as one
+(from `Mark::StreamReady`, engine-agnostically).
 `fm/iris-silent-and-instant` moves the same constant from another direction:
 keep the constant and the grace together or the data loss comes back.
+
+**Three regressions here were one defect: a wait bound that could move
+backwards.** The outer deadline undercutting the connect budget, `Connected`
+collapsing an extended bound to an already-past deadline, and the first partial
+doing the same — each looked like its own special case, and the third one cost
+the user accurate words (an interim typed while the engine's real `Final` was
+milliseconds behind it on the wire). They are now structurally impossible
+rather than absent by inspection: `WaitBound` (`dictation.rs`) is the single
+bound on `finish`'s wait and `WaitBound::extend_to` is its only mutator, so an
+event can buy the session more time and nothing can take time away. Stopping a
+*trigger* from shortening the wait is not the fix and never was; if a fourth
+one shows up, it belongs in the same monotonic bound, not in a fourth branch.
 
 **A failed dictation keeps its words and its timeline.** `Dictation::finish`
 and `Dictation::abandon` — the latter for a hold that ended without `finish`
