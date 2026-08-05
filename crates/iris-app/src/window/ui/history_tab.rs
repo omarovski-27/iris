@@ -64,15 +64,23 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
 
     let mut copy_action = None;
     if matched == 0 {
+        // An empty log has two quite different causes, and only one of them
+        // is waiting to be filled: with `history.enabled = false` nothing
+        // will ever be written, so telling the user to speak would leave
+        // them waiting on the recovery path for entries that cannot come.
+        let empty = match (state.history.is_empty(), state.config.history.enabled) {
+            (false, _) => "No dictations match that search.",
+            (true, true) => {
+                "No dictations recorded yet. Hold the hotkey and speak, and it will show up here."
+            }
+            (true, false) => {
+                "History logging is off, so nothing is being recorded. \
+                 Set history.enabled = true in config.toml (Settings → Open config file), \
+                 then pick “Reload settings” in the tray to start keeping dictations."
+            }
+        };
         chrome::card(theme).show(ui, |ui| {
-            ui.label(
-                RichText::new(if state.history.is_empty() {
-                    "No dictations recorded yet. Hold the hotkey and speak, and it will show up here."
-                } else {
-                    "No dictations match that search."
-                })
-                .color(chrome::ink_dim(theme)),
-            );
+            ui.label(RichText::new(empty).color(chrome::ink_dim(theme)));
         });
     } else {
         // Only the cards asked for are built: `egui` lays out every widget it

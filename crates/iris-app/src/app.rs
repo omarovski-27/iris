@@ -415,7 +415,9 @@ impl<A: AudioSource> App<A> {
                         self.engine = engine;
                         command.apply_to(&mut self.saved);
                         println!("  engine: {choice}");
-                        self.persist();
+                        if let Err(e) = self.persist() {
+                            outcome = Self::persist_failed(&e);
+                        }
                     }
                     Err(e) => {
                         // Keep dictating with what works rather than leaving the
@@ -432,7 +434,9 @@ impl<A: AudioSource> App<A> {
                     command.apply_to(&mut self.config);
                     command.apply_to(&mut self.saved);
                     println!("  microphone: {}", self.audio.describe());
-                    self.persist();
+                    if let Err(e) = self.persist() {
+                        outcome = Self::persist_failed(&e);
+                    }
                 }
                 Err(e) => {
                     eprintln!("  cannot switch microphone: {e:#}");
@@ -445,14 +449,18 @@ impl<A: AudioSource> App<A> {
                 command.apply_to(&mut self.saved);
                 self.polisher = polish::build(&self.config);
                 println!("  polish: {}", if enabled { "on" } else { "off" });
-                self.persist();
+                if let Err(e) = self.persist() {
+                    outcome = Self::persist_failed(&e);
+                }
             }
             Command::SetTheme(theme) => {
                 let theme = *theme;
                 command.apply_to(&mut self.config);
                 command.apply_to(&mut self.saved);
                 self.pill.set_theme(theme);
-                self.persist();
+                if let Err(e) = self.persist() {
+                    outcome = Self::persist_failed(&e);
+                }
             }
             Command::SetHotkey(key) => {
                 // `self.config.hotkey` is deliberately left alone: the hook
@@ -464,7 +472,9 @@ impl<A: AudioSource> App<A> {
                 if key != self.saved.hotkey {
                     command.apply_to(&mut self.saved);
                     println!("  hotkey: {key} (restart Iris for this to take effect)");
-                    self.persist();
+                    if let Err(e) = self.persist() {
+                        outcome = Self::persist_failed(&e);
+                    }
                 }
             }
             Command::SetOverlayEnabled(enabled) => {
@@ -478,7 +488,9 @@ impl<A: AudioSource> App<A> {
                         "  overlay: {} (restart Iris for this to take effect)",
                         if enabled { "on" } else { "off" }
                     );
-                    self.persist();
+                    if let Err(e) = self.persist() {
+                        outcome = Self::persist_failed(&e);
+                    }
                 }
             }
             Command::OpenSettings => self.window.open(),
@@ -580,10 +592,26 @@ impl<A: AudioSource> App<A> {
         }
     }
 
-    fn persist(&self) {
-        if let Err(e) = self.saved.save(&self.config_path) {
-            eprintln!("  cannot save {}: {e:#}", self.config_path.display());
-        }
+    /// Write [`App::saved`] to the config file.
+    ///
+    /// The failure is the caller's to answer for: a change the loop took in
+    /// memory but could not write is not saved, and the UI that asked has to
+    /// hear that rather than "Saved" over a value the next launch will not
+    /// see. See [`App::persist_failed`], which every `Set*` arm routes it
+    /// through.
+    fn persist(&self) -> Result<()> {
+        self.saved
+            .save(&self.config_path)
+            .with_context(|| format!("cannot save {}", self.config_path.display()))
+    }
+
+    /// Report a failed [`App::persist`] on the console and to the window.
+    ///
+    /// Unconditional, like every other delivery failure: the tray sends the
+    /// same commands and has no status line to read.
+    fn persist_failed(e: &anyhow::Error) -> CommandOutcome {
+        eprintln!("  {e:#}");
+        CommandOutcome::Rejected(format!("{e:#}"))
     }
 
     /// One dictation, from key-press to text on screen.

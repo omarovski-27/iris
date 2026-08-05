@@ -1220,6 +1220,65 @@ fn a_window_command_the_loop_declines_comes_back_with_the_reason() {
     }
 }
 
+/// `Applied` means the loop took the change *and wrote it*. A config file it
+/// cannot write is the one way a change the loop had no objection to still
+/// will not survive a restart, and the window must not show "Saved" over it.
+#[test]
+fn a_change_that_cannot_be_written_to_disk_is_not_reported_as_saved() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The parent is a file, so every write under it fails — deterministically
+    // and on any platform, unlike a permission bit.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "").expect("seeding the blocker");
+    let config_path = blocker.join("config.toml");
+
+    let mut config = Config::default();
+    config.polish.llm = false;
+
+    let app = App::new(
+        config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app");
+
+    let (tray_commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app.with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetTheme(Theme::Light)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(answered, id);
+    match outcome {
+        CommandOutcome::Rejected(reason) => {
+            assert!(reason.contains("cannot save"), "{reason}");
+            // The whole cause chain: which file, and what the OS said.
+            assert!(reason.contains("config.toml"), "{reason}");
+        }
+        CommandOutcome::Applied => panic!("a change that was never written is not saved"),
+    }
+    assert_eq!(
+        app.config().theme,
+        Theme::Light,
+        "the loop still runs on it; only the file is missing it"
+    );
+    assert!(!config_path.exists());
+}
+
 #[test]
 fn a_tray_save_never_persists_a_cli_override() {
     // --no-polish and --device are documented as run-only. A tray change that

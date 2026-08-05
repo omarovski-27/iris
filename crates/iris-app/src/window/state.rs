@@ -266,6 +266,10 @@ impl WindowState {
     /// values with nothing on screen to explain it reads as settings lost.
     /// A missing file is not that case; [`Config::load`] reports it as the
     /// defaults it is.
+    ///
+    /// A session log that cannot be read is the same story on the tab that
+    /// opens first: an empty History is what "nothing recorded yet" looks
+    /// like too, so a read failure has to say so rather than pass for one.
     #[must_use]
     pub fn new(env: &Env) -> Self {
         let (config, unreadable) = match Config::load(env.config_path) {
@@ -279,7 +283,10 @@ impl WindowState {
         };
         let history_path = config.history_path(env.config_path);
         let history_stamp = history_stamp(&history_path);
-        let history = load_history(&history_path);
+        let (history, unreadable_history) = match load_history(&history_path) {
+            Ok(history) => (history, None),
+            Err(e) => (Vec::new(), Some(unreadable_log(&e))),
+        };
         let insights_day = local_day(env.utc_offset_seconds);
         let insights = Insights::compute(&history, &insights_day);
         let devices = (env.list_devices)();
@@ -299,7 +306,12 @@ impl WindowState {
             filtered_for: None,
             visible: HISTORY_PAGE,
         };
+        // History last: it is the tab that opens, so when both files are
+        // unreadable its failure is the one the user needs on screen.
         if let Some(message) = unreadable {
+            state.flash_failure(message);
+        }
+        if let Some(message) = unreadable_history {
             state.flash_failure(message);
         }
         state
@@ -341,8 +353,17 @@ impl WindowState {
         }
         if reload {
             self.history_stamp = stamp;
-            self.history = load_history(&history_path);
-            self.filtered_for = None;
+            // A log that cannot be read keeps the records already on screen —
+            // the same last-good-snapshot rule the config gets above — and
+            // says why, because a silently frozen recovery path is worse than
+            // a stale one the user knows about.
+            match load_history(&history_path) {
+                Ok(history) => {
+                    self.history = history;
+                    self.filtered_for = None;
+                }
+                Err(e) => self.flash_failure(unreadable_log(&e)),
+            }
         }
         self.insights_day = day;
         self.insights = Insights::compute(&self.history, &self.insights_day);
@@ -432,11 +453,17 @@ impl WindowState {
     }
 
     /// The status message and how to paint it, if it has not yet expired.
+    ///
+    /// `STATUS_HOLD` does not run while the loop still owes an answer
+    /// ([`WindowState::awaiting_loop`]). `App::run` drains commands between
+    /// dictations, so a change clicked during one can wait longer than the
+    /// hold; dropping "Saving…" while the control has not moved either would
+    /// leave nothing on screen saying the click landed.
     #[must_use]
     pub fn status_flash(&self) -> Option<(&str, StatusLevel)> {
         self.status
             .as_ref()
-            .filter(|status| status.at.elapsed() < STATUS_HOLD)
+            .filter(|status| self.awaiting_loop() || status.at.elapsed() < STATUS_HOLD)
             .map(|status| (status.message.as_str(), status.level))
     }
 
@@ -590,10 +617,22 @@ impl WindowState {
 /// outlive it by a moment, and nothing it asks for will be saved after that.
 const NOT_RUNNING: &str = "Not saved — Iris is no longer running. Restart Iris.";
 
-fn load_history(path: &Path) -> Vec<DictationRecord> {
-    let mut records = SessionLog::read_all(path).unwrap_or_default();
+/// The session log, newest first.
+///
+/// The error is passed on rather than flattened to an empty log: a log that
+/// is simply not there yet already reads as `Ok(vec![])`
+/// (`crate::history::read_lines` maps `NotFound` to no lines), so anything
+/// that reaches here as an `Err` is a real failure to read the one file this
+/// window exists to show.
+fn load_history(path: &Path) -> anyhow::Result<Vec<DictationRecord>> {
+    let mut records = SessionLog::read_all(path)?;
     records.reverse(); // newest first: the recovery path reads top-down
-    records
+    Ok(records)
+}
+
+/// What the status line says when the session log will not open.
+fn unreadable_log(e: &anyhow::Error) -> String {
+    format!("Could not read the session log: {e:#}")
 }
 
 /// A cheap fingerprint of the session log: its size and, where the platform
@@ -780,6 +819,110 @@ mod tests {
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.history[0].text, "second");
         assert_eq!(state.history[1].text, "first");
+    }
+
+    /// An empty History is exactly what a log that has never been written
+    /// looks like, so a log that cannot be *read* must not pass for one: the
+    /// tab the window opens on would otherwise say the user has never
+    /// dictated.
+    #[test]
+    fn a_session_log_that_cannot_be_read_says_so_rather_than_looking_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        // The parent is a file, so opening the log fails with something other
+        // than "not found" — which `SessionLog::read_all` reports as an empty
+        // log, and rightly.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        config.history.path = Some(blocker.join("history.jsonl"));
+        config.save(&config_path).unwrap();
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let state = WindowState::new(&env);
+
+        assert!(state.history.is_empty());
+        let (message, level) = state.status_flash().unwrap();
+        assert!(
+            message.contains("Could not read the session log"),
+            "{message}"
+        );
+        assert_eq!(level, StatusLevel::Warn);
+    }
+
+    /// The same failure on a refresh keeps what is already on screen: a
+    /// recovery path that empties itself because one read failed is worse
+    /// than a stale one the user is told about.
+    #[test]
+    fn a_refresh_that_cannot_read_the_log_keeps_the_records_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let nest = dir.path().join("nest");
+        let log_path = nest.join("history.jsonl");
+        let mut config = Config::default();
+        config.history.path = Some(log_path.clone());
+        config.save(&config_path).unwrap();
+        let mut log = SessionLog::open(log_path.clone(), 10);
+        log.append(&DictationRecord::now("mock", "first")).unwrap();
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        assert_eq!(state.history.len(), 1);
+
+        // The log's own directory becomes a file, so the next read of the
+        // same path fails with something other than "not found".
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::remove_dir(&nest).unwrap();
+        std::fs::write(&nest, "").unwrap();
+        state.refresh(&env, true);
+
+        assert_eq!(state.history.len(), 1, "the last good log stays on screen");
+        let (message, level) = state.status_flash().unwrap();
+        assert!(
+            message.contains("Could not read the session log"),
+            "{message}"
+        );
+        assert_eq!(level, StatusLevel::Warn);
+    }
+
+    /// `App::run` drains commands between dictations, so an answer can be
+    /// minutes away. Expiring "Saving…" while the control it belongs to has
+    /// not moved either would leave the click looking like it did nothing.
+    #[test]
+    fn a_status_waiting_on_the_loop_does_not_expire_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.set_theme(&env, Theme::Light);
+        state.status.as_mut().unwrap().at = Instant::now() - STATUS_HOLD - Duration::from_secs(1);
+        assert_eq!(
+            state.status_text(),
+            Some("Saving…"),
+            "the loop still owes an answer"
+        );
+
+        take_everything(&mut state, &env, &outcomes_tx);
+        assert_eq!(state.status_text(), Some("Saved"));
+        state.status.as_mut().unwrap().at = Instant::now() - STATUS_HOLD - Duration::from_secs(1);
+        assert_eq!(
+            state.status_text(),
+            None,
+            "an answered change goes back to the normal hold"
+        );
     }
 
     #[test]
