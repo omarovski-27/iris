@@ -351,16 +351,43 @@ the hold collected, but never typed.
   by timestamp correlation against the merge time, not by re-deriving the
   mechanism — if a similar cluster resurfaces, check the build actually
   includes that commit before assuming a new regression.
-- That same audit left two "almost no audio reached the transcription engine"
-  failures unexplained (`sent_secs` genuinely near zero, both right after a
-  36-minute idle gap, 1.3s apart — a retry pattern, not an accidental tap).
-  Suspected but *not established*: `MicAudio` (`iris-app/src/audio.rs`) opens
-  its WASAPI stream once and never revalidates or reopens it. `capture.rs`'s
-  cpal `on_error` callback stays unconditional `eprintln!` (not `vlog!`) so
-  a recurrence is at least visible without `--verbose` — see the console rule
-  above — but that alone does not confirm or fix a root cause, which needs
-  live telemetry from a real Windows session to pin down (device staleness
-  after sleep/idle vs. some other cause). Do not assume it is fixed.
+- **"Almost no audio reached the transcription engine" is still a live,
+  recurring failure as of 2026-08-04 — the dominant remaining silent-dictation
+  cause, not a closed one.** The original 2026-08 audit left two such
+  failures unexplained (right after a 36-minute idle gap, 1.3s apart — a
+  retry pattern, not an accidental tap). A third landed 2026-08-04T18:17:23Z,
+  28.8 minutes after the prior dictation — same signature, well after
+  `5e53f96` (2026-08-01) — so this is not the already-fixed pre-`5e53f96`
+  mechanism recurring; it is a distinct, still-open one. In the 17 real
+  dictations since `5e53f96` landed (`history.jsonl`), 6 failed (35%); 3 of
+  those 6 are this exact message and a 4th ("heard the audio but returned no
+  words") is the same `conclude()` branch shape from `sent_secs` (the bytes
+  `pump_inner` actually forwarded), not the pre-fix mechanism either. All
+  three confirmed "almost no audio" occurrences follow a gap well past
+  `MAX_WARM_IDLE` (3 min) — consistent with, but not proof of, a connect-speed
+  contribution — see `WarmPool`'s entry above.
+  `audio_secs: 0.0` on these rows is the real value, not a masked one: this
+  error only fires from inside `Dictation::finish()` after a live session
+  ran `conclude()`, which always stamps `self.timeline.audio_secs =
+  self.audio_secs()` from `self.samples` (populated by `feed()`) before
+  returning — so zero here means capture genuinely produced zero samples,
+  not that a real capture got lost in translation on the way to the log.
+  That rules out the connect-latency theory (real samples captured but not
+  flushed in time) as the explanation for *these* rows and points back at
+  capture itself. Suspected but *not established*: `MicAudio`
+  (`iris-app/src/audio.rs`) opens its WASAPI stream once and never
+  revalidates or reopens it, so a stream gone stale after a long idle gap
+  (sleep, a Bluetooth mic, Windows audio power management) could produce a
+  session with a live socket but no real samples. `capture.rs`'s cpal
+  `on_error` callback is unconditional `eprintln!` so a stream-level failure
+  is now visible without `--verbose` — see the console rule above — but a
+  *stale-but-not-erroring* stream would never trip `on_error` at all, so its
+  absence in the log does not clear this theory. Confirming it needs live
+  telemetry from a real Windows session (frame counts and real amplitude on
+  the first hold after a long idle gap) that this repo cannot gather; do not
+  assume it is fixed, and do not read the pre-`5e53f96` root-cause finding
+  above as covering this failure mode too — they are different mechanisms
+  that happen to share an error family.
 - **`WarmPool`'s stale-handoff replay can still lose data on a short hold —
   a known, unfixed gap, not a theoretical one.** `TranscriptEvent::Connected`
   fires the instant a warm spare is handed over (`pump_inner`,
