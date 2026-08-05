@@ -159,26 +159,25 @@ session prewarming (open one connection ahead of the key press and hope it is
 still there) was tried and dropped: a live idle probe found Deepgram closes an
 unused connection in roughly 12-15s, far short of real gaps between
 dictations, so it protected against a race that barely occurred in practice.
-That finding does not rule out *actively* holding a connection open —
-`WarmPool` in the same file does exactly that with Deepgram's documented
-`KeepAlive` control frame, bounded to `MAX_WARM_IDLE` (3 minutes, chosen from
-the captain's own session log: 61% of real gaps between dictations were under
-that, versus 29-37% under Deepgram's raw idle-close window alone) measured
-from the last `open()`, after which the maintenance loop stops rather than
-cycling a connection forever; dropping the engine stops it too. A handed-in
-warm connection is never trusted blindly — see `already_closed` and
-`replay_on_fresh_connection` in the same file, and its module-doc section
-"The warm spare", for the read-before-handoff check and the unproven-session
-replay that make a stale handoff cost latency, never data — including the
-outer wait bound itself, which the replay explicitly extends to cover its
-own cost (see the `TranscriptEvent::Reconnecting` entry in Sharp edges). A
-shared
-`rustls::ClientConfig` (`engine/net.rs::tls_connector`) was also tried for TLS
-session resumption on every cold connect: it works (live-verified against the
-real endpoint), but live-measured wall-clock impact was negligible, because
-TLS 1.3's full handshake is already 1-RTT and resumption without 0-RTT saves
-crypto compute, not a round trip — kept as a harmless, real-but-modest win, not
-mistaken for the fix.
+That finding does not rule out *actively* holding a connection open — an
+actively-kept-alive spare (`WarmPool`, Deepgram's `KeepAlive` control frame,
+bounded to a few minutes' idle window) was built, shipped no further than
+this repo's history, and withdrawn before ever reaching the captain: three
+review rounds kept surfacing data-loss-class lifecycle defects in the same
+abstraction (a stale-handoff replay that could still outrun the outer wait
+bound, an ack window sized for the wrong traffic shape, a "fixed" spare-
+replacement promptness bug that turned out not to be fixed), and a component
+where fixes keep silently failing to hold does not get well from being
+patched again — see `docs/spike-findings.md` §6 for the decision and the
+redesign task it points to. Do not resurrect it piecemeal; a redesign starts
+from measured latency on real Windows hardware, not from reintroducing the
+same shape. A shared `rustls::ClientConfig` (`engine/net.rs::tls_connector`)
+was also tried for TLS session resumption on every cold connect, independent
+of the pool and kept: it works (live-verified against the real endpoint), but
+live-measured wall-clock impact was negligible, because TLS 1.3's full
+handshake is already 1-RTT and resumption without 0-RTT saves crypto compute,
+not a round trip — kept as a harmless, real-but-modest win, not mistaken for
+the fix.
 
 **A re-emitted final segment is discriminated by the audio span it covers, never
 by when it arrived.** A guard keyed on arrival — anything landing after the
@@ -221,16 +220,8 @@ for the connect budget (8s from key-down) *plus* a re-based 6s finalise from the
 moment the socket comes up, ~14s — and a partial arriving after that grace was
 bought stops it growing without giving any of it back, so a dictation that ends
 up with words can pay it too. Quote that number, not the 6s, whenever this
-exposure is weighed. On the common stale-warm-handoff path this is now ~16s,
-not ~14s: `TranscriptEvent::Reconnecting` (see the Sharp-edges entry) buys a
-*second* connect budget + finalise from the reconnect instant, which for a
-detection that fires at roughly key-up + `FINALIZE_ACK_TIMEOUT` (2s) pushes
-the worst case to key-up + 2s + 14s. `finalize_ack_timeout`'s own re-arming
-inside `pump_inner` (the `replay_ack_grace` mechanism, same entry) is a
-*different*, inner clock — it can only spend budget this outer one already
-grants, never extend past it, so it does not change this number. A
-non-blocking finalise is the real fix and is tracked elsewhere; do not
-approximate it by lowering a ceiling.
+exposure is weighed. A non-blocking finalise is the real fix and is tracked
+elsewhere; do not approximate it by lowering a ceiling.
 
 **The outer bound may never end a session that is still legitimately
 connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)
@@ -254,8 +245,6 @@ never needed an extension; one that bought the grace and streamed its first
 partial afterwards still pays the worst case named above. A connect that
 fails on its own terms still reports as one (from `Mark::StreamReady`,
 engine-agnostically).
-`fm/iris-silent-and-instant` moves the same constant from another direction:
-keep the constant and the grace together or the data loss comes back.
 
 **Three regressions here were one defect: a wait bound that could move
 backwards.** The outer deadline undercutting the connect budget, `Connected`
@@ -350,9 +339,10 @@ the hold collected, but never typed.
   sanctioned way to cover `RightAlt`/`RightWin` — never widen the correction
   in `modifier_to_release`.
 - Deepgram closes an idle websocket connection (no audio sent) in roughly
-  12-15s, live-measured — this is what `WarmPool`'s `KeepAlive` frames
-  (`engine/deepgram.rs`) exist to hold off, actively, rather than something a
-  passive reused connection can rely on.
+  12-15s, live-measured. Relevant to any future connection-reuse idea: it
+  only pays off within that window of the last dictation, not across the
+  minutes-apart gaps typical of real desktop use — see the withdrawn
+  `WarmPool` note above.
 - The 24-of-31 "Deepgram returned no transcript" failures a 2026-08 session
   log audit set out to explain were not a live bug: every one predated the
   `from_finalize` gate (`5e53f96`, 2026-08-01T18:03:56Z) merging to `main`,
@@ -372,9 +362,11 @@ the hold collected, but never typed.
   those 6 are this exact message and a 4th ("heard the audio but returned no
   words") is the same `conclude()` branch shape from `sent_secs` (the bytes
   `pump_inner` actually forwarded), not the pre-fix mechanism either. All
-  three confirmed "almost no audio" occurrences follow a gap well past
-  `MAX_WARM_IDLE` (3 min) — consistent with, but not proof of, a connect-speed
-  contribution — see `WarmPool`'s entry above.
+  three confirmed "almost no audio" occurrences follow a gap of at least
+  ~29 minutes since the prior dictation (36.3min, then a 1.3s retry, then
+  28.8min) — well past any plausible warm-connection window, so a kept-alive
+  spare (see the withdrawn `WarmPool` note above) would not have been
+  available for any of them regardless.
   `audio_secs: 0.0` on these rows is the real value, not a masked one: this
   error only fires from inside `Dictation::finish()` after a live session
   ran `conclude()`, which always stamps `self.timeline.audio_secs =
@@ -397,62 +389,6 @@ the hold collected, but never typed.
   assume it is fixed, and do not read the pre-`5e53f96` root-cause finding
   above as covering this failure mode too — they are different mechanisms
   that happen to share an error family.
-- **A mid-session reconnect (a stale warm handoff being replayed) extends the
-  outer wait bound explicitly — it does not fall out of the ordinary connect
-  accounting for free.** `TranscriptEvent::Connected` fires the instant a
-  warm spare is handed over (`pump_inner`, `engine/deepgram.rs`), before its
-  liveness is proven, so `Mark::StreamReady` is stamped immediately and
-  `Dictation::extend_while_nothing_to_salvage` (`dictation.rs`) switches from
-  the connect-budget floor to the short `finalise` budget right away — before
-  a possible `replay_on_fresh_connection` (a fresh cold connect, up to
-  `CONNECT_TIMEOUT`) even starts. `TranscriptEvent::Reconnecting`
-  (`engine/mod.rs`), emitted by `replay_on_fresh_connection` before it pays
-  for the connect, is what closes that gap: `Dictation` records
-  `reconnecting_since` and `extend_while_nothing_to_salvage` extends the
-  bound to `reconnecting_since + connect_budget + finalise`, composing with
-  (not replacing) the ordinary two-phase logic because `WaitBound::extend_to`
-  only ever grows the bound. Regression-tested by
-  `finish_extends_the_deadline_for_a_mid_session_reconnect`
-  (`dictation.rs`), confirmed failing without the `Reconnecting` arm in
-  `extend_while_nothing_to_salvage` before it was added. If a future change
-  moves *when* `Connected` fires relative to proof of liveness, re-check this
-  composition rather than assuming it still holds.
-
-  That outer bound is not the only clock a replay has to answer to.
-  `finalize_ack_timeout` (`pump_inner`, `engine/deepgram.rs`) is calibrated
-  against incremental streaming — `from_finalize` observed at 200-550ms on a
-  connection that has been receiving audio in real time — but a replay hands
-  a fresh connection the *entire* buffered utterance in one burst, which it
-  has to ingest before it can answer. Left as a plain fixed deadline, the
-  same class of bug reappears one layer down: the safety net can fire and
-  send `CloseStream` mid-flush on a long hold's bulk reingest, exactly the
-  "pull the socket out from under the flush" failure this module exists to
-  avoid. `replay_ack_grace`, set once any replay has happened (on any of its
-  three trigger paths — `send_tracked`'s own send failure, reported through
-  its `bool` return; the ack-timeout arm; the closed-before-answering arm),
-  is what closes it: while set, any inbound message before the ack re-arms
-  `finalize_ack_deadline` to `now + finalize_ack_timeout`, so the safety net
-  only fires on genuine silence, never merely because a fixed number of
-  seconds elapsed while the reconnect was still visibly working. This is
-  deliberately *not* the same shape as `Reconnecting`/`WaitBound`: it is
-  scoped to `replay_ack_grace` rather than applied to the ordinary
-  (non-replay) ack wait, because re-arming *that* one on every message would
-  reopen the "stall detector" design the module doc already rejected — the
-  ordinary case has an authoritative signal to wait for and no reason to
-  guess from silence instead. Regression-tested by
-  `a_replay_ack_window_extends_while_the_reconnect_keeps_answering`
-  (`engine/deepgram.rs`) against a real (loopback) socket, confirmed failing
-  — truncated to the interim fragment — without the `replay_ack_grace`
-  re-arm. This inner clock spends only the budget the outer `Reconnecting`
-  bound already grants; it does not extend past it (see that bound's ~16s
-  worst case above).
-
-  **This was the fourth WarmPool-lifecycle finding in this family
-  (`Reconnecting`, `unbounded-send-await-on-half-open-socket`,
-  `warm-spare-not-replaced-promptly`, this one) and the last one authorised
-  on this branch.** If a fifth surfaces, that is a signal the shape needs a
-  redesign, not another individually-reasonable patch — scope that as
-  separate work rather than extending this list again.
 
 ## Maintaining this file
 

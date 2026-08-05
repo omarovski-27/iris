@@ -188,27 +188,30 @@ In priority order:
    above to settle it.
 3. **Real microphone end-to-end**, via the checklist in the spike README.
 
-*Resolved since:* **connection reuse.** A *static* pre-warmed spare connection
-was built and then measured out — Deepgram closes an idle socket far short of
-the gaps between real dictations; see `AGENTS.md` (Sharp edges) for the
-measured window. The short-utterance case it was meant to help is covered
-instead by the `from_finalize` wait. A 2026-08 follow-up shipped a different
-shape of the same idea — `WarmPool` (`crates/iris-core/src/engine/deepgram.rs`)
-actively holds one spare connection alive with Deepgram's `KeepAlive` control
-frame rather than passively hoping a prewarmed one survived, bounded to a
-3-minute idle window chosen from live gap data rather than held indefinitely.
-A stale-handoff safety net (`already_closed` plus the unproven-session replay
-in `pump_inner`, same file) means a spare that died anyway costs a reconnect's
-worth of latency, never a lost transcript.
+*Resolved since:* **connection reuse.** A pre-warmed spare connection was built
+and then measured out — Deepgram closes an idle socket far short of the gaps
+between real dictations; see `AGENTS.md` (Sharp edges) for the measured window.
+The short-utterance case it was meant to help is covered instead by the
+`from_finalize` wait.
 
-*Also resolved:* **TLS session resumption** (`engine/net.rs::tls_connector`,
-sharing one `rustls::ClientConfig` across connects) was tried for the same
-`stream_ready_ms` cost. It works — live-verified against the real Deepgram TLS
-endpoint, `handshake_kind()` reports `Resumed` on the second connect — but
-moved wall-clock time by nothing measurable, because TLS 1.3's full handshake
-is already 1-RTT and resumption without 0-RTT saves crypto compute, not a
-round trip. Shipped anyway as a harmless, real-but-modest win; not the answer
-to this section's open question.
+*Tried and withdrawn (2026-08):* an *actively* kept-alive spare connection
+(`WarmPool`, Deepgram's `KeepAlive` control frame, rather than a passive
+prewarmed one) was built, reviewed, and pulled back out before ever shipping
+to the captain. Three separate review rounds kept surfacing data-loss-class
+lifecycle defects in the same abstraction — a stale-handoff replay that could
+outrun the outer wait bound, an ack window sized for the wrong traffic shape,
+a "fixed" spare-replacement-promptness bug that turned out not to be fixed —
+and its measured benefit (~1.1-1.7s of connect time, from a localhost harness,
+never confirmed against the real endpoint in production) did not apply to the
+failure actually hurting the captain: every observed "almost no audio" case
+followed a gap well past any plausible warm-connection window, so a spare
+would not have been there regardless (see `AGENTS.md`, "almost no audio").
+A component whose fixes keep silently failing to hold is a signal to redesign
+before patching again, not a reason to keep patching — that redesign is
+tracked as its own follow-up task, to start from latency measured on real
+Windows hardware rather than from this localhost harness. Its code is
+preserved in `fm/iris-silent-and-instant`'s git history if it is useful
+groundwork for that redesign.
 
 ## 7. Architecture recommendation
 

@@ -32,9 +32,9 @@
 //! *full* handshake is already 1-RTT, so resumption without 0-RTT (early
 //! data — not implemented here) saves the server-side certificate
 //! verification and asymmetric key exchange compute, not a round trip. This
-//! is a real but modest win, not the fix for `stream_ready_ms`'s dominant
-//! cost — see [`super::deepgram`]'s `WarmPool` for that. It changes nothing
-//! about *when* or *how often* Iris connects — every dictation still opens a
+//! is a real but modest win, not a fix for `stream_ready_ms`'s dominant cost
+//! (still open — see `docs/spike-findings.md`). It changes nothing about
+//! *when* or *how often* Iris connects — every dictation still opens a
 //! fresh session exactly as before — only how much a fresh connect costs, so
 //! it carries none of the staleness/data-loss risk a reused *connection*
 //! would.

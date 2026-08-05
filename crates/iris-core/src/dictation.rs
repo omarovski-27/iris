@@ -174,15 +174,6 @@ pub struct Dictation {
     /// caller remembering to pass it. See [`Engine::connect_budget`].
     connect_budget: Option<Duration>,
     latest_partial: String,
-    /// Set on [`TranscriptEvent::Reconnecting`]: the engine is mid-session
-    /// and about to spend another [`Engine::connect_budget`] — a stale warm
-    /// handoff being replayed, or a dropped socket. Read by
-    /// [`Dictation::extend_while_nothing_to_salvage`], which extends the wait
-    /// bound to cover it the same way it covers the original connect; unlike
-    /// [`Mark::StreamReady`] this is not a [`Timeline`] mark because it is
-    /// input to the wait bound, not a record of what happened, and nothing
-    /// else needs to read it back.
-    reconnecting_since: Option<Instant>,
     /// Set when [`Dictation::finish`] starts. Premature terminal events before
     /// this are not allowed to end the utterance (see [`Dictation::absorb`]).
     finishing: bool,
@@ -259,7 +250,6 @@ impl Dictation {
             samples: 0,
             connect_budget: engine.connect_budget(),
             latest_partial: String::new(),
-            reconnecting_since: None,
             finishing: false,
             ended: None,
         })
@@ -352,19 +342,6 @@ impl Dictation {
     ///   otherwise the wait ends at the exact moment it starts being useful
     ///   and the whole utterance is lost to a connection that worked.
     ///
-    /// A third state composes with either of the above rather than replacing
-    /// it: [`TranscriptEvent::Reconnecting`] means the engine is mid-session
-    /// and about to spend a *second* connect budget — a warm handoff proven
-    /// stale, replayed onto a fresh connection. `StreamReady` was already
-    /// stamped when the (optimistic) handoff was taken, so without this the
-    /// bound above would already have collapsed to the short `finalise`
-    /// budget before the reconnect even starts, and a slow one could blow
-    /// through it with nothing to fall back on. Extended to
-    /// `reconnecting_since + budget + finalise` — one lump sum rather than a
-    /// second `Connected` re-arming the two-phase logic above, because
-    /// nothing signals when the replay's own connect resolves the way the
-    /// original `Connected` does.
-    ///
     /// The moment a non-empty partial exists this stops buying time: expiry
     /// then costs a tail rather than the utterance, which is a degrade, not a
     /// loss. That is where the latency win lives, but only for a session whose
@@ -390,9 +367,6 @@ impl Dictation {
                     bound.extend_to(down + budget);
                 }
             }
-        }
-        if let Some(since) = self.reconnecting_since {
-            bound.extend_to(since + budget + finalise);
         }
     }
 
@@ -440,9 +414,6 @@ impl Dictation {
     fn absorb(&mut self, event: TranscriptEvent, on_partial: &mut dyn FnMut(&str)) {
         match event {
             TranscriptEvent::Connected => self.timeline.mark(Mark::StreamReady),
-            TranscriptEvent::Reconnecting => {
-                self.reconnecting_since = Some(Instant::now());
-            }
             TranscriptEvent::Partial(text) => {
                 self.note_partial(text, on_partial);
             }
@@ -926,16 +897,13 @@ mod tests {
 
     #[test]
     fn a_stalled_engine_error_still_carries_the_real_timeline() {
-        // Regression: the captain's session log carried several successful
-        // dictations whose `perceived_ms` spiked to 6-10s (e.g. 6484ms,
-        // 10128ms on 2026-08-02) with no engine-reported error at all — the
-        // session simply never sent a close sign-off, so only
-        // `DEFAULT_FINAL_TIMEOUT` ended the wait (see its doc comment). Had
-        // that stall instead outlasted the timeout on a *failed* attempt, the
-        // old code path would have logged `audio_secs: 0.0` regardless of how
-        // much real audio was captured — an artifact of the caller
-        // (iris-app's `capture()`) building a blank Timeline on any `finish()`
-        // error instead of keeping the one `Dictation` had already stamped.
+        // Regression: the captain's two zero-audio failures on 2026-08-02
+        // logged `audio_secs: 0.0` even though real audio had almost
+        // certainly been captured — an artifact of the caller (iris-app's
+        // `capture()`) building a blank Timeline on any error instead of
+        // keeping the one Dictation had already stamped. That is what made
+        // "did the previous session leave capture in a bad state" look
+        // plausible when the real cause was a Deepgram connection failure.
         // This drives an engine that connects, receives real audio, and then
         // never concludes — the shape of a session stalled by a network
         // failure — and checks the error still carries what actually
@@ -1402,81 +1370,6 @@ mod tests {
             waited < Duration::from_secs(2),
             "a session with words to salvage waited out the connect budget: {waited:?}"
         );
-    }
-
-    /// Connects once (so `StreamReady` is stamped up front, the way an
-    /// optimistic warm handoff reports itself before its liveness is
-    /// proven), then reports `Reconnecting` and takes `reconnect_delay` to
-    /// produce a transcript — the shape of `deepgram.rs`'s
-    /// `replay_on_fresh_connection` after a stale spare.
-    struct ReconnectsOnce {
-        budget: Duration,
-        reconnect_delay: Duration,
-    }
-
-    struct ReconnectsOnceSession {
-        events: crossbeam_channel::Receiver<TranscriptEvent>,
-    }
-
-    impl Engine for ReconnectsOnce {
-        fn name(&self) -> &'static str {
-            "reconnects-once"
-        }
-        fn connect_budget(&self) -> Option<Duration> {
-            Some(self.budget)
-        }
-        fn open(&self) -> Result<Box<dyn Session>> {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            tx.send(TranscriptEvent::Connected).unwrap();
-            let delay = self.reconnect_delay;
-            std::thread::spawn(move || {
-                // Emitted before the reconnect's own cost is paid, mirroring
-                // replay_on_fresh_connection.
-                let _ = tx.send(TranscriptEvent::Reconnecting);
-                std::thread::sleep(delay);
-                let _ = tx.send(TranscriptEvent::Final("recovered after reconnect".into()));
-            });
-            Ok(Box::new(ReconnectsOnceSession { events: rx }))
-        }
-    }
-
-    impl Session for ReconnectsOnceSession {
-        fn push(&mut self, _: &[i16]) -> Result<()> {
-            Ok(())
-        }
-        fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
-            &self.events
-        }
-        fn finish(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn finish_extends_the_deadline_for_a_mid_session_reconnect() {
-        // The bug this guards (`warm-replay-exceeds-outer-bound`): a session
-        // that already connected once (`StreamReady` is stamped, so the
-        // plain connect-budget floor above never engages — the match on it
-        // in `extend_while_nothing_to_salvage` already took the `Some(ready)`
-        // arm) can still need to spend a *second* connect budget mid-session
-        // — a stale warm handoff or a dropped socket forcing a reconnect.
-        // Without `Reconnecting` extending the bound before that cost is
-        // paid, `finish()` would give up at the ordinary short `timeout`
-        // (20ms) while the reconnect (150ms) was still legitimately within
-        // its own budget (300ms) — losing a transcript the module doc
-        // promises never to lose. Fails against the code before this event
-        // existed (verified by temporarily removing the `Reconnecting` arm
-        // from `extend_while_nothing_to_salvage` and re-running: the wait
-        // ends at ~20ms and the transcript is lost).
-        let engine = ReconnectsOnce {
-            budget: Duration::from_millis(300),
-            reconnect_delay: Duration::from_millis(150),
-        };
-        let dictation = Dictation::start(&engine).unwrap();
-        let outcome = dictation
-            .finish(Duration::from_millis(20), &mut |_| {})
-            .expect("a mid-session reconnect still inside its own budget must not be cut off");
-        assert_eq!(outcome.text, "recovered after reconnect");
     }
 
     #[test]
