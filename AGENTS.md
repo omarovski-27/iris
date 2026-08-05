@@ -167,7 +167,9 @@ cycling a connection forever; dropping the engine stops it too. A handed-in
 warm connection is never trusted blindly — see `already_closed` and
 `replay_on_fresh_connection` in the same file, and its module-doc section
 "The warm spare", for the read-before-handoff check and the unproven-session
-replay that together make a stale handoff cost latency, never data. A shared
+replay that are *meant* to make a stale handoff cost latency, never data —
+see the open `warm-replay-exceeds-outer-bound` risk below for the case
+where that intent is not yet backed by the outer wait bound. A shared
 `rustls::ClientConfig` (`engine/net.rs::tls_connector`) was also tried for TLS
 session resumption on every cold connect: it works (live-verified against the
 real endpoint), but live-measured wall-clock impact was negligible, because
@@ -344,13 +346,34 @@ the hold collected, but never typed.
   failures unexplained (`sent_secs` genuinely near zero, both right after a
   36-minute idle gap, 1.3s apart — a retry pattern, not an accidental tap).
   Suspected but *not established*: `MicAudio` (`iris-app/src/audio.rs`) opens
-  its WASAPI stream once and never revalidates or reopens it, and
-  `capture.rs`'s cpal `on_error` callback only reached `eprintln!` — invisible
-  on a windowless tray app — until this task routed it through `vlog!`. That
-  fix makes a future recurrence diagnosable under `--verbose`; it does not by
-  itself confirm or fix a root cause, which needs live telemetry from a real
-  Windows session to pin down (device staleness after sleep/idle vs. some
-  other cause). Do not assume it is fixed.
+  its WASAPI stream once and never revalidates or reopens it. `capture.rs`'s
+  cpal `on_error` callback stays unconditional `eprintln!` (not `vlog!`) so
+  a recurrence is at least visible without `--verbose` — see the console rule
+  above — but that alone does not confirm or fix a root cause, which needs
+  live telemetry from a real Windows session to pin down (device staleness
+  after sleep/idle vs. some other cause). Do not assume it is fixed.
+- **`WarmPool`'s stale-handoff replay can still lose data on a short hold —
+  a known, unfixed gap, not a theoretical one.** `TranscriptEvent::Connected`
+  fires the instant a warm spare is handed over (`pump_inner`,
+  `engine/deepgram.rs`), before its liveness is proven, so `Mark::StreamReady`
+  is stamped immediately and `Dictation::extend_while_nothing_to_salvage`
+  (`dictation.rs`) switches from the connect-budget floor to the short
+  `finalise` budget right away. If that spare then turns out to be dead,
+  `replay_on_fresh_connection` pays a fresh cold connect (up to
+  `CONNECT_TIMEOUT`, 8s) plus another `FINALIZE_ACK_TIMEOUT` — all *after*
+  the outer wait bound was already computed from the premature `StreamReady`
+  mark, with nothing to re-extend it for the replay. A short hold against a
+  warm spare that dies can therefore time out and lose the transcript despite
+  the module doc's "never a dropped word" framing. A prior pass on this
+  branch sketched a fix (an `Engine::connect_budget`-extending
+  `TranscriptEvent::Reconnecting`, emitted before `replay_on_fresh_connection`
+  spends its cost, feeding `WaitBound::extend_to` — safe to compose because
+  `extend_to` only ever grows the bound) but did not wire it in; see
+  `fm/iris-silent-and-instant`'s history for the abandoned attempt
+  (`finish_extends_the_deadline_for_a_mid_session_reconnect` in an earlier
+  commit shows the shape). Establish this is still true before assuming it —
+  it depends on exactly when `Connected` fires relative to proof of liveness,
+  which is easy to change by accident.
 
 ## Maintaining this file
 
