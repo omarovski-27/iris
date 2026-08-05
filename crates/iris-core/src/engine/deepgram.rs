@@ -535,6 +535,10 @@ async fn connect(url: &str, key: &str) -> Result<WsStream> {
 /// see the module doc's "The warm spare" section. Exactly one such recovery
 /// happens per session: [`replay_on_fresh_connection`] clears `unproven`, so
 /// a second failure is a real failure and is reported as one.
+///
+/// Returns whether this call was the one that replayed, so a caller who
+/// needs to know (`pump_inner`, to arm `replay_ack_grace`) does not have to
+/// infer it from `unproven`'s state before and after.
 async fn send_tracked(
     socket: &mut WsStream,
     unproven: &mut Option<Vec<Message>>,
@@ -543,16 +547,18 @@ async fn send_tracked(
     events: &Sender<TranscriptEvent>,
     msg: Message,
     context_msg: &'static str,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(sent) = unproven.as_mut() else {
-        return socket.send(msg).await.context(context_msg);
+        return socket.send(msg).await.context(context_msg).map(|()| false);
     };
     sent.push(msg.clone());
     match socket.send(msg).await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(false),
         Err(e) => {
             vlog!("deepgram: a send on the unproven warm spare failed ({e}); reconnecting cold");
-            replay_on_fresh_connection(socket, unproven, url, key, events).await
+            replay_on_fresh_connection(socket, unproven, url, key, events)
+                .await
+                .map(|()| true)
         }
     }
 }
@@ -583,6 +589,38 @@ async fn replay_on_fresh_connection(
             .send(msg)
             .await
             .context("replaying audio onto a fresh Deepgram connection")?;
+    }
+    Ok(())
+}
+
+/// [`replay_on_fresh_connection`], plus the bookkeeping both of
+/// `pump_inner`'s replay sites need on success: an ack wait already in
+/// progress is discarded and re-armed against the fresh connection, and
+/// `replay_ack_grace` is set so later messages can keep re-arming it too —
+/// see the module doc's "The warm spare" section and the `replay_ack_grace`
+/// entry in `AGENTS.md`. Whether an ack wait is running is checked rather
+/// than assumed, because one caller guarantees it (a timeout already
+/// required `finalize_ack_deadline` to be `Some`) and the other does not (a
+/// spare can close before `Finalize` is ever sent) — folding both into one
+/// check keeps that difference in one place instead of two near-identical
+/// call sites drifting apart.
+#[allow(clippy::too_many_arguments)]
+async fn replay_and_rearm_ack(
+    socket: &mut WsStream,
+    unproven: &mut Option<Vec<Message>>,
+    url: &str,
+    key: &str,
+    events: &Sender<TranscriptEvent>,
+    acc: &mut Transcript,
+    finalize_ack_deadline: &mut Option<Instant>,
+    finalize_ack_timeout: Duration,
+    replay_ack_grace: &mut bool,
+) -> Result<()> {
+    replay_on_fresh_connection(socket, unproven, url, key, events).await?;
+    if finalize_ack_deadline.is_some() {
+        acc.finalize_acked = false;
+        *finalize_ack_deadline = Some(Instant::now() + finalize_ack_timeout);
+        *replay_ack_grace = true;
     }
     Ok(())
 }
@@ -865,9 +903,28 @@ async fn pump_inner(
     // `CloseStream` was ever sent.
     let mut closed_stream = false;
     // Some(deadline) while waiting specifically for `from_finalize` — see the
-    // module doc. Absolute, not renewed by intervening messages: it is a
-    // safety net for protocol failure, not a progress heuristic.
+    // module doc. Absolute, not renewed by intervening messages, *except*
+    // when `replay_ack_grace` says otherwise — see that flag's doc for why.
     let mut finalize_ack_deadline: Option<Instant> = None;
+    // Set for the rest of the session once a replay has happened — on any of
+    // the three paths that can trigger one (`send_tracked`'s own send
+    // failure, reported through its `bool` return; the ack-timeout arm
+    // below; the closed-before-answering arm below) — so the ack wait it
+    // arms afterward can be told apart from the ordinary one below. The
+    // ordinary wait stays absolute on purpose — the module doc's
+    // rejected "stall detector" design is exactly what re-arming on any
+    // message would be, for a case that already has an authoritative
+    // from_finalize signal to wait for. But `finalize_ack_timeout` is
+    // calibrated against incremental streaming (200-550ms observed) and a
+    // replay hands a fresh connection the *entire* buffered utterance at
+    // once, which it has to ingest before it can answer — a long hold can
+    // legitimately need longer than that to be ready to answer, and every
+    // message received while this is set (a partial, a stray Metadata frame)
+    // is itself the evidence that distinguishes "still working" from "went
+    // quiet", so re-arming on it does not reopen that guesswork. Silence
+    // still expires the deadline on schedule: nothing extends it without a
+    // message to justify the extension.
+    let mut replay_ack_grace = false;
     // A socket failure mid-session ends the loop rather than the function:
     // the segments already finalised are the user's words, and `conclude`
     // still gets to return them.
@@ -897,6 +954,13 @@ async fn pump_inner(
                             Message::Binary(bytes.into()),
                             "sending audio to Deepgram",
                         ).await
+                        // A replay here still leaves audio to come — the
+                        // eventual Finalize send below is what starts the ack
+                        // wait — but the buffered burst it just resent is the
+                        // same bulk-reingest cost, so the grace applies from
+                        // here rather than only from a replay that happens to
+                        // land on the Finalize send itself.
+                        .map(|replayed| replay_ack_grace |= replayed)
                     }
                     // `finish()` or a dropped session: flush then close.
                     // Finalize asks Deepgram to emit a from_finalize-tagged
@@ -916,7 +980,8 @@ async fn pump_inner(
                         ).await;
                         match fin {
                             Err(e) => Err(e),
-                            Ok(()) => {
+                            Ok(replayed) => {
+                                replay_ack_grace |= replayed;
                                 // Only a tag absorbed strictly after the
                                 // Finalize is on the wire can be *this*
                                 // Finalize's ack. Anything seen before it
@@ -966,13 +1031,20 @@ async fn pump_inner(
                         // silent dictation, which is the failure this whole
                         // mechanism exists not to introduce.
                         vlog!("deepgram: the warm spare never answered; replaying it cold");
-                        match replay_on_fresh_connection(
-                            &mut socket, &mut unproven, &url, &key, &events,
-                        ).await {
+                        match replay_and_rearm_ack(
+                            &mut socket,
+                            &mut unproven,
+                            &url,
+                            &key,
+                            &events,
+                            &mut acc,
+                            &mut finalize_ack_deadline,
+                            finalize_ack_timeout,
+                            &mut replay_ack_grace,
+                        )
+                        .await
+                        {
                             Ok(()) => {
-                                acc.finalize_acked = false;
-                                finalize_ack_deadline =
-                                    Some(Instant::now() + finalize_ack_timeout);
                                 continue;
                             }
                             Err(e) => {
@@ -1016,15 +1088,20 @@ async fn pump_inner(
                     && matches!(&msg, None | Some(Ok(Message::Close(_))) | Some(Err(_)))
                 {
                     vlog!("deepgram: the warm spare closed before answering; replaying it cold");
-                    match replay_on_fresh_connection(&mut socket, &mut unproven, &url, &key, &events)
-                        .await
+                    match replay_and_rearm_ack(
+                        &mut socket,
+                        &mut unproven,
+                        &url,
+                        &key,
+                        &events,
+                        &mut acc,
+                        &mut finalize_ack_deadline,
+                        finalize_ack_timeout,
+                        &mut replay_ack_grace,
+                    )
+                    .await
                     {
                         Ok(()) => {
-                            if finalize_ack_deadline.is_some() {
-                                acc.finalize_acked = false;
-                                finalize_ack_deadline =
-                                    Some(Instant::now() + finalize_ack_timeout);
-                            }
                             continue;
                         }
                         Err(e) => {
@@ -1045,6 +1122,15 @@ async fn pump_inner(
                         let was_closed_stream = closed_stream;
                         if let Some(update) = acc.absorb(&text) {
                             let _ = events.send(TranscriptEvent::Partial(update));
+                        }
+                        if replay_ack_grace && finalize_ack_deadline.is_some() && !acc.finalize_acked
+                        {
+                            // Evidence the replayed connection is actively
+                            // working through the reingest burst, not gone
+                            // quiet — see `replay_ack_grace`'s doc. Silence
+                            // still expires the deadline on schedule; only a
+                            // message this connection actually sent moves it.
+                            finalize_ack_deadline = Some(Instant::now() + finalize_ack_timeout);
                         }
                         if finalize_ack_deadline.is_some() && acc.finalize_acked {
                             finalize_ack_deadline = None;
@@ -2395,6 +2481,131 @@ mod tests {
             !seen.iter().any(|e| matches!(e, TranscriptEvent::Error(_))),
             "the reconnect must be invisible to the caller, not surfaced as \
              an error: {seen:?}"
+        );
+    }
+
+    /// A warm spare that never answers a single frame — not even a
+    /// `from_finalize` — so `already_closed`'s upfront check (which can only
+    /// see frames already delivered) hands it over as live, and the
+    /// eventual `finalize_ack_deadline` timeout is what forces the "warm
+    /// spare never answered" replay, exactly the path `replay_ack_grace` is
+    /// set from. The replayed connection then answers slowly and in two
+    /// parts, crossed with [`spawn_withhold_then_flush_server`]'s "rushed"
+    /// check: a plain interim first (the shape a fresh connection ingesting
+    /// a bulk-replayed burst produces while still working through it), then
+    /// the real `from_finalize`-tagged result — but only if the client did
+    /// *not* send anything (i.e. `CloseStream`) before `total_delay` is up.
+    /// A client that gives up and closes early loses the flush for real
+    /// here, the same way a real Deepgram pulling the socket out from under
+    /// an in-progress one would — a server that answered unconditionally
+    /// could not tell a correctly-extended wait apart from one that merely
+    /// raced a background timer and won by luck.
+    fn spawn_silent_then_slow_flush_server(
+        listener: tokio::net::TcpListener,
+        interim_text: &'static str,
+        final_text: &'static str,
+        first_delay: Duration,
+        total_delay: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _held_silent = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            if !wait_for(&mut ws, "Finalize").await {
+                return;
+            }
+            let metadata = serde_json::json!({ "type": "Metadata", "duration": 1.0 }).to_string();
+
+            tokio::time::sleep(first_delay).await;
+            ws.send(Message::Text(results(interim_text, false).into()))
+                .await
+                .unwrap();
+
+            // Did the client give up and rush to close before the real
+            // answer was ready? If so it loses the flush.
+            let remaining = total_delay.saturating_sub(first_delay);
+            let rushed = tokio::time::timeout(remaining, ws.next()).await.is_ok();
+            if rushed {
+                let _ = ws.send(Message::Text(metadata.into())).await;
+                return;
+            }
+
+            ws.send(Message::Text(
+                results_from_finalize(final_text, true).into(),
+            ))
+            .await
+            .unwrap();
+            if !wait_for(&mut ws, "CloseStream").await {
+                return;
+            }
+            let _ = ws.send(Message::Text(metadata.into())).await;
+        })
+    }
+
+    /// Pins `replay-ack-window-not-sized-for-bulk-reingest`: a replayed
+    /// connection has to ingest the whole buffered utterance before it can
+    /// answer `Finalize`, so the fixed `finalize_ack_timeout` calibrated
+    /// against incremental streaming (200-550ms) is not necessarily enough —
+    /// but the interim this server sends while still working is exactly the
+    /// evidence that should buy more time rather than let the safety net cut
+    /// the flush short.
+    #[tokio::test]
+    async fn a_replay_ack_window_extends_while_the_reconnect_keeps_answering() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let ack_timeout = Duration::from_millis(200);
+
+        // Two constraints, not one: the interim has to land *inside* the
+        // base window (60ms < 200ms) or there is nothing left to re-arm —
+        // the safety net has already fired by the time it would arrive. The
+        // real answer then has to land *outside* the base window but
+        // *inside* the re-armed one (200ms < 230ms < 60ms + 200ms = 260ms),
+        // so the assertion only passes if the interim actually bought more
+        // time rather than the fixed window quietly covering both anyway.
+        // Both windows are measured from the *replayed* Finalize, which the
+        // silent first connection's own ack_timeout delays by ack_timeout
+        // relative to the original one — irrelevant here since nothing in
+        // the client is timed against wall-clock start, only against events.
+        let server = spawn_silent_then_slow_flush_server(
+            listener,
+            "partial fragment",
+            "the complete sentence recovered after a slow reingest",
+            Duration::from_millis(60),
+            Duration::from_millis(230),
+        );
+
+        let warm = connect(&url, "test-key").await.unwrap();
+        let (audio_tx, audio_rx) = unbounded_channel::<Command>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let one_second = vec![0u8; crate::audio::SAMPLE_RATE as usize * 2];
+        audio_tx.send(Command::Audio(one_second)).unwrap();
+        audio_tx.send(Command::Finish).unwrap();
+        drop(audio_tx);
+
+        pump_inner(
+            url,
+            "test-key".into(),
+            audio_rx,
+            event_tx,
+            ack_timeout,
+            Some(warm),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let mut seen = Vec::new();
+        drain(&event_rx, &mut seen);
+        assert_eq!(
+            finals(&seen),
+            ["the complete sentence recovered after a slow reingest"],
+            "the ack window must extend on evidence of progress and wait for \
+             the real from_finalize result, not cut the flush short at the \
+             base timeout and settle for the interim fragment: {seen:?}"
         );
     }
 
