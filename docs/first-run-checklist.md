@@ -104,13 +104,17 @@ on the machine you're actually going to use Iris on.
       rewrites it, adding `version = 1` and turning `show_live_text` off once.
       Everything else in the file survives, and a `show_live_text = true` set
       by hand afterwards sticks across restarts. `iris --verbose` from an open
-      PowerShell prompt is where that one-time rewrite is reported; a failed
-      rewrite prints unconditionally, but on a Start-Menu launch that lands in
-      Iris's own minimized console rather than a dialog, so the reset quietly
-      repeats on every start until the stamp reaches disk. Going back to an
-      older build needs the `version` line deleted first — the zip README's
-      "Downgrading to an older Iris" (`packaging/windows/README.md`) is the
-      copy of that path to keep accurate.
+      PowerShell prompt is where that one-time rewrite is reported. If the
+      rewrite fails, the cause is `%APPDATA%\iris` not being writable —
+      permissions, a read-only location, or a full disk — and the symptom is
+      wider than a missed stamp: *every* settings change goes through the same
+      write, so a tray → Engine switch or anything else Iris persists silently
+      fails too, and the `show_live_text` reset runs again on every launch.
+      If settings will not stick, check that `%APPDATA%\iris` is writable.
+      Going back to an older build needs the `version` line deleted first —
+      the zip README's "Downgrading to an older Iris"
+      (`packaging/windows/README.md`) is the copy of that path to keep
+      accurate.
 - [ ] Tray → Settings opens `config.toml` in the default editor.
 - [ ] After adding a real key and saving, a full restart is what puts it in
       force — not tray → Reload settings. Launched from an open PowerShell
