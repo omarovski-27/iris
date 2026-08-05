@@ -368,10 +368,13 @@ the hold collected, but never typed.
   28.8min) — well past any plausible warm-connection window, so a kept-alive
   spare (see the withdrawn `WarmPool` note above) would not have been
   available for any of them regardless.
-  `audio_secs: 0.0` on these rows is the real value, not a masked one: this
-  error only fires from inside `Dictation::finish()` after a live session
-  ran `conclude()`, which always stamps `self.timeline.audio_secs =
-  self.audio_secs()` from `self.samples` (populated by `feed()`) before
+  `audio_secs: 0.0` on these rows is the real value, not a masked one: the
+  message itself comes from `deepgram.rs`'s `conclude()`, which sees only a
+  `Transcript` and `sent_secs` and never touches the timeline — the stamp is
+  in `Dictation::finish` and `Dictation::abandon`
+  (`iris-core/src/dictation.rs`), and those are the only paths that can carry
+  this error into the log. Every exit of both sets `self.timeline.audio_secs
+  = self.audio_secs()` from `self.samples` (populated by `feed()`) before
   returning — so zero here means capture genuinely produced zero samples,
   not that a real capture got lost in translation on the way to the log.
   That rules out the connect-latency theory (real samples captured but not
