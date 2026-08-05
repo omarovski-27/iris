@@ -234,30 +234,15 @@ impl Dictation {
     ///
     /// Call this the instant the hotkey goes down — for streaming engines the
     /// connection then sets itself up while the user is drawing breath.
-    pub fn start(engine: &dyn Engine) -> Result<Self, Box<DictationError>> {
+    pub fn start(engine: &dyn Engine) -> Result<Self> {
         Self::start_at(engine, Instant::now())
     }
 
     /// As [`Dictation::start`], but with the key-press instant supplied by the
     /// hotkey hook rather than measured on arrival.
-    ///
-    /// A connect failure (a dead network, DNS, an unreachable engine) still
-    /// carries the timeline it managed to stamp — just [`Mark::KeyDown`] at
-    /// this point — for the same reason [`Dictation::finish`]'s error does:
-    /// a caller logging diagnostics should see that a session was actually
-    /// attempted rather than a blank record indistinguishable from "nothing
-    /// happened".
-    pub fn start_at(engine: &dyn Engine, key_down: Instant) -> Result<Self, Box<DictationError>> {
+    pub fn start_at(engine: &dyn Engine, key_down: Instant) -> Result<Self> {
         let mut timeline = Timeline::start_at(engine.name(), key_down);
-        let session = match engine.open() {
-            Ok(session) => session,
-            Err(e) => {
-                return Err(Box::new(DictationError {
-                    message: format!("{e:#}"),
-                    timeline,
-                }))
-            }
-        };
+        let session = engine.open()?;
         timeline.mark(Mark::SessionOpen);
         Ok(Self {
             session,
