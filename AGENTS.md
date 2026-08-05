@@ -221,8 +221,16 @@ for the connect budget (8s from key-down) *plus* a re-based 6s finalise from the
 moment the socket comes up, ~14s — and a partial arriving after that grace was
 bought stops it growing without giving any of it back, so a dictation that ends
 up with words can pay it too. Quote that number, not the 6s, whenever this
-exposure is weighed. A non-blocking finalise is the real fix and is tracked
-elsewhere; do not approximate it by lowering a ceiling.
+exposure is weighed. On the common stale-warm-handoff path this is now ~16s,
+not ~14s: `TranscriptEvent::Reconnecting` (see the Sharp-edges entry) buys a
+*second* connect budget + finalise from the reconnect instant, which for a
+detection that fires at roughly key-up + `FINALIZE_ACK_TIMEOUT` (2s) pushes
+the worst case to key-up + 2s + 14s. `finalize_ack_timeout`'s own re-arming
+inside `pump_inner` (the `replay_ack_grace` mechanism, same entry) is a
+*different*, inner clock — it can only spend budget this outer one already
+grants, never extend past it, so it does not change this number. A
+non-blocking finalise is the real fix and is tracked elsewhere; do not
+approximate it by lowering a ceiling.
 
 **The outer bound may never end a session that is still legitimately
 connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)
@@ -243,7 +251,7 @@ It stops the buying and nothing more: what an earlier pass bought stands, since
 the `Final` that would replace that interim with the accurate text is usually
 milliseconds behind it. So the 6s win is real but belongs to the dictation that
 never needed an extension; one that bought the grace and streamed its first
-partial afterwards still pays the ~14s worst case named above. A connect that
+partial afterwards still pays the worst case named above. A connect that
 fails on its own terms still reports as one (from `Mark::StreamReady`,
 engine-agnostically).
 `fm/iris-silent-and-instant` moves the same constant from another direction:
@@ -409,6 +417,42 @@ the hold collected, but never typed.
   `extend_while_nothing_to_salvage` before it was added. If a future change
   moves *when* `Connected` fires relative to proof of liveness, re-check this
   composition rather than assuming it still holds.
+
+  That outer bound is not the only clock a replay has to answer to.
+  `finalize_ack_timeout` (`pump_inner`, `engine/deepgram.rs`) is calibrated
+  against incremental streaming — `from_finalize` observed at 200-550ms on a
+  connection that has been receiving audio in real time — but a replay hands
+  a fresh connection the *entire* buffered utterance in one burst, which it
+  has to ingest before it can answer. Left as a plain fixed deadline, the
+  same class of bug reappears one layer down: the safety net can fire and
+  send `CloseStream` mid-flush on a long hold's bulk reingest, exactly the
+  "pull the socket out from under the flush" failure this module exists to
+  avoid. `replay_ack_grace`, set once any replay has happened (on any of its
+  three trigger paths — `send_tracked`'s own send failure, reported through
+  its `bool` return; the ack-timeout arm; the closed-before-answering arm),
+  is what closes it: while set, any inbound message before the ack re-arms
+  `finalize_ack_deadline` to `now + finalize_ack_timeout`, so the safety net
+  only fires on genuine silence, never merely because a fixed number of
+  seconds elapsed while the reconnect was still visibly working. This is
+  deliberately *not* the same shape as `Reconnecting`/`WaitBound`: it is
+  scoped to `replay_ack_grace` rather than applied to the ordinary
+  (non-replay) ack wait, because re-arming *that* one on every message would
+  reopen the "stall detector" design the module doc already rejected — the
+  ordinary case has an authoritative signal to wait for and no reason to
+  guess from silence instead. Regression-tested by
+  `a_replay_ack_window_extends_while_the_reconnect_keeps_answering`
+  (`engine/deepgram.rs`) against a real (loopback) socket, confirmed failing
+  — truncated to the interim fragment — without the `replay_ack_grace`
+  re-arm. This inner clock spends only the budget the outer `Reconnecting`
+  bound already grants; it does not extend past it (see that bound's ~16s
+  worst case above).
+
+  **This was the fourth WarmPool-lifecycle finding in this family
+  (`Reconnecting`, `unbounded-send-await-on-half-open-socket`,
+  `warm-spare-not-replaced-promptly`, this one) and the last one authorised
+  on this branch.** If a fifth surfaces, that is a signal the shape needs a
+  redesign, not another individually-reasonable patch — scope that as
+  separate work rather than extending this list again.
 
 ## Maintaining this file
 
