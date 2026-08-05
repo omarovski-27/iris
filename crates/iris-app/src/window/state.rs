@@ -370,7 +370,10 @@ impl WindowState {
             // The retry is every refresh; the warning is once per episode.
             // Saying it again every two seconds would leave no other status —
             // "Copied", "Saved" — on screen for longer than that, and this is
-            // the same failure the user was already told about.
+            // the same failure the user was already told about. `force` is the
+            // exception the rate-limit is not for: the Refresh button is the
+            // user asking for this read, and a click that changes nothing on
+            // screen and says nothing is a dead control.
             match load_history(&history_path) {
                 Ok(history) => {
                     self.history = history;
@@ -379,7 +382,7 @@ impl WindowState {
                     self.history_read_failing = false;
                 }
                 Err(e) => {
-                    if !self.history_read_failing {
+                    if force || !self.history_read_failing {
                         self.flash_failure(unreadable_log(&e));
                     }
                     self.history_read_failing = true;
@@ -979,6 +982,20 @@ mod tests {
             state.history_stamp, read_from,
             "the retry that failed moved the stamp"
         );
+
+        // The Refresh button, mid-episode, is not the tick the rate-limit is
+        // for: the user asked for this read, and a click that leaves the list
+        // where it was and says nothing is a dead control.
+        state.status = None;
+        state.refresh(&env, true);
+        let (message, level) = state
+            .status_flash()
+            .expect("the Refresh button said nothing at all");
+        assert!(
+            message.contains("Could not read the session log"),
+            "{message}"
+        );
+        assert_eq!(level, StatusLevel::Warn);
 
         // And the moment the log opens again, an ordinary refresh has it.
         std::fs::remove_file(&nest).unwrap();
