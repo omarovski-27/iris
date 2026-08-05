@@ -541,6 +541,13 @@ impl Config {
     /// that never lands means the reset runs again at every start, and a
     /// setting that keeps reverting with nothing on screen to explain it is
     /// exactly the failure a quiet console must not hide.
+    ///
+    /// A *successful* migration stays behind `--verbose`. It rewrites the
+    /// user's file and overrides a value that file stated, which is worth a
+    /// record; it is also a once-per-install event on a healthy path, and the
+    /// console is quiet by product decision, so it is a diagnostic rather than
+    /// a greeting. `iris --verbose` is what turns the one-time override into
+    /// something a user who noticed live text disappear can find.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if !path.exists() {
             let config = Self::default();
@@ -549,8 +556,14 @@ impl Config {
         }
         let (config, migrated) = Self::load_reporting_migration(path)?;
         if migrated {
-            if let Err(e) = config.save(path) {
-                eprintln!("cannot save {}: {e:#}", path.display());
+            match config.save(path) {
+                Ok(()) => iris_core::vlog!(
+                    "migrated {} to version {CURRENT_VERSION}: live text is now \
+                     opt-in and was turned off; set show_live_text = true to \
+                     restore it",
+                    path.display()
+                ),
+                Err(e) => eprintln!("cannot save {}: {e:#}", path.display()),
             }
         }
         Ok(config)

@@ -399,6 +399,14 @@ const TIMER_CEILING_S: u64 = 9 * 60 + 59;
 /// surface is for — the number stops being informative long before it stops
 /// being true, and `format_timer(0)`'s four characters are what the geometry
 /// is built around.
+///
+/// Reviewed and kept: the alternative is reserving a fifth character for a
+/// reading nobody will reach, which spends about 9 logical pixels of wave row
+/// out of a capsule that is narrow by decision, on every dictation, forever.
+/// A readout that stops climbing in the tenth minute is the accepted cost of
+/// that trade, not an oversight — if the ceiling ever has to move, widen
+/// `render::timer_right_edge`'s reservation in the same change or the leading
+/// digit lands on the centred glyph.
 #[must_use]
 pub fn format_timer(ms: u64) -> String {
     let total = (ms / 1000).min(TIMER_CEILING_S);
