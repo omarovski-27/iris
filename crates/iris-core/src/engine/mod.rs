@@ -125,7 +125,9 @@ pub trait Engine: Send + Sync {
     /// connection starts being useful. That whole window is the one case where
     /// giving up early costs the whole utterance rather than a tail of it. It
     /// is not a second final timeout, and it is not a place to buy an engine
-    /// more room in general: a single partial ends it.
+    /// more room in general: a single partial stops any further extending. It
+    /// does not shorten the window already bought, so a late connect that
+    /// streams its first partial after that point still blocks for it.
     ///
     /// An engine whose connect happens *inside* `finish` (a batch upload, say)
     /// already has it covered by `final_timeout` and should leave this `None`.

@@ -158,12 +158,14 @@ the whole UI: `finish` blocks the resident loop, so Groq (28s) or the local
 engine (20s) can leave the pill frozen and Quit unserviced for that long. The
 numbers are accepted, not trimmed — with `streams_partials` false an early
 expiry costs the whole utterance — and on the default path, Deepgram, the
-ordinary bound is 6s. Deepgram's worst case is not 6s: on a hold with nothing
-salvageable the connect grace below can hold the loop for the connect budget
-(8s from key-down) *plus* a re-based 6s finalise from the moment the socket
-comes up, ~14s. Quote that number, not the 6s, whenever this exposure is
-weighed. A non-blocking finalise is the real fix and is tracked elsewhere; do
-not approximate it by lowering a ceiling.
+ordinary bound is 6s. Deepgram's worst case is not 6s: on a hold that was still
+connecting with nothing salvageable, the connect grace below can hold the loop
+for the connect budget (8s from key-down) *plus* a re-based 6s finalise from the
+moment the socket comes up, ~14s — and a partial arriving after that grace was
+bought stops it growing without giving any of it back, so a dictation that ends
+up with words can pay it too. Quote that number, not the 6s, whenever this
+exposure is weighed. A non-blocking finalise is the real fix and is tracked
+elsewhere; do not approximate it by lowering a ceiling.
 
 **The outer bound may never end a session that is still legitimately
 connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)
@@ -180,9 +182,13 @@ socket that *worked*. So `Dictation::extend_while_nothing_to_salvage` extends
 rather than re-computing — still connecting buys key-down + connect budget,
 just connected buys `Mark::StreamReady` + the engine's own `final_timeout`, and
 a non-empty partial stops the buying, because from there expiry costs a tail.
-That is where the 6s win lives and it is untouched; the price is the ~14s worst
-case named above. A connect that fails on its own terms still reports as one
-(from `Mark::StreamReady`, engine-agnostically).
+It stops the buying and nothing more: what an earlier pass bought stands, since
+the `Final` that would replace that interim with the accurate text is usually
+milliseconds behind it. So the 6s win is real but belongs to the dictation that
+never needed an extension; one that bought the grace and streamed its first
+partial afterwards still pays the ~14s worst case named above. A connect that
+fails on its own terms still reports as one (from `Mark::StreamReady`,
+engine-agnostically).
 `fm/iris-silent-and-instant` moves the same constant from another direction:
 keep the constant and the grace together or the data loss comes back.
 

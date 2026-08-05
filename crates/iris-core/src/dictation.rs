@@ -57,16 +57,18 @@ use crate::vlog;
 /// this value from the instant the stream came up, because a connection that
 /// works is worth nothing if the wait ends at the moment it starts working.
 /// A non-empty partial stops the extending, which is the point at which expiry
-/// costs a tail instead of the utterance; that is where the latency win lives,
-/// and it is untouched. What a partial must never do is shorten a wait already
-/// bought — see [`WaitBound`].
+/// costs a tail instead of the utterance; a dictation that never had to buy an
+/// extension therefore pays exactly this value, and that is where the latency
+/// win lives. What a partial must never do is shorten a wait already bought —
+/// see [`WaitBound`].
 ///
-/// The cost is that on a connect-only path this value is not the bound on how
-/// long `finish` blocks: for Deepgram the worst case is 8s of connect from
-/// key-down plus this 6s of finalise from the connect, ~14s, and every second
-/// of it is a second with nothing yet to show for the hold. That is deliberate
-/// — the alternative is losing the utterance — and it is the number to quote,
-/// not the 6s.
+/// The cost is that once an extension has been bought this value is no longer
+/// the bound on how long `finish` blocks, and a partial arriving afterwards
+/// does not restore it: for Deepgram the worst case is 8s of connect from
+/// key-down plus this 6s of finalise from the connect, ~14s, most of it with
+/// nothing yet to show for the hold. That is deliberate — the alternative is
+/// losing the utterance, or handing back an interim while the real `Final` is
+/// milliseconds behind it — and it is the number to quote, not the 6s.
 ///
 /// Anyone changing this number changes that pairing too, and it is not
 /// optional. `fm/iris-silent-and-instant` is stacked on this work and moving
@@ -342,8 +344,10 @@ impl Dictation {
     ///
     /// The moment a non-empty partial exists this stops buying time: expiry
     /// then costs a tail rather than the utterance, which is a degrade, not a
-    /// loss, and is where the latency win lives. It stops *buying*, and that is
-    /// all it does — the wait already bought stands, because the `Final` that
+    /// loss. That is where the latency win lives, but only for a session whose
+    /// connect was prompt enough that nothing was ever bought — this stops
+    /// *buying*, and that is all it does. The wait already bought stands,
+    /// even once there are words to fall back on, because the `Final` that
     /// would replace that partial with the accurate text is usually
     /// milliseconds behind it, and this method has no way to tell "there is now
     /// something to fall back on" from "there is nothing better coming". See
@@ -466,13 +470,19 @@ impl Dictation {
     /// at either point would trade the user's whole utterance for the
     /// difference between two clocks that do not start together (see
     /// [`DEFAULT_FINAL_TIMEOUT`] and
-    /// [`Dictation::extend_while_nothing_to_salvage`]). Nothing extends the
-    /// wait once a partial exists, so it costs nothing on any dictation that
-    /// has words — and on a connect-only path it is what the caller's loop
-    /// actually blocks for, not `timeout`. The wait only ever grows
-    /// ([`WaitBound`]): the loop already returns the instant a real `Final`
-    /// lands, so extending it costs latency only where the `Final` never comes,
-    /// which is exactly where waiting is the correct answer.
+    /// [`Dictation::extend_while_nothing_to_salvage`]). A partial stops the
+    /// wait being extended any further; it does not hand back time already
+    /// bought, because [`WaitBound`] only ever grows. So a dictation whose
+    /// connect was prompt enough never to need an extension pays nothing
+    /// beyond `timeout`, while one that bought the extension first and
+    /// streamed its first partial afterwards can still block for the whole
+    /// extended ceiling — for Deepgram the ~14s of connect budget plus
+    /// finalise, and on that path that ceiling, not `timeout`, is what the
+    /// caller's loop actually blocks for. That is the deliberate price: the
+    /// loop returns the instant a real `Final` lands, so the extra wait is
+    /// only ever spent where the `Final` never comes, which is exactly where
+    /// waiting is the correct answer — and giving it back the moment an
+    /// interim arrived is what handed the user the less accurate text.
     ///
     /// A terminal event that arrived *before* this call (a premature Final from
     /// a buggy or segment-oriented engine) does not short-circuit the wait:
@@ -518,11 +528,12 @@ impl Dictation {
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
         let waiting_since = Instant::now();
-        // `timeout` is the bound, except while the session has produced nothing
-        // that could be salvaged: cutting a connect off inside the budget the
-        // engine set, or the instant it succeeds, loses the whole utterance
-        // rather than a tail of it. Extended in place every pass and never
-        // recomputed, so no event can hand back time an earlier one bought.
+        // `timeout` is the bound until a pass with nothing salvageable extends
+        // it: cutting a connect off inside the budget the engine set, or the
+        // instant it succeeds, loses the whole utterance rather than a tail of
+        // it. Extended in place every pass and never recomputed, so a partial
+        // arriving later stops the extending without handing back what an
+        // earlier pass already bought.
         let mut bound = WaitBound::new(waiting_since + timeout);
         while self.ended.is_none() {
             self.extend_while_nothing_to_salvage(&mut bound, timeout);

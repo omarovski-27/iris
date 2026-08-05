@@ -305,8 +305,9 @@ mid-hold — and the `error` is the only trace of the part that was lost.
 key comes up Iris waits for the final transcript on the main loop, so until
 that wait ends the pill stays on "processing" and the tray — Quit included —
 does not respond. Deepgram waits 6 s, or up to ~14 s when the socket was still
-connecting and nothing had streamed back yet; `local` waits 20 s and `groq`
-28 s. Those two get the longer waits on purpose: both do their real work after
+connecting at key-release with nothing streamed back yet — live text arriving
+after that stops the longer wait growing but does not shorten it; `local` waits
+20 s and `groq` 28 s. Those two get the longer waits on purpose: both do their real work after
 the key comes up, and `groq` has no partial to fall back on at all, so cutting
 the wait short would cost the whole utterance rather than its tail. The
 constants and the reasoning behind each live in `AGENTS.md` and the engine
