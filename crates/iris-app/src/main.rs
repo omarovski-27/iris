@@ -18,7 +18,7 @@ use iris_app::audio::AudioSource;
 use iris_app::config::{self, Config, EngineChoice};
 use iris_app::inject::{DryRunInjector, Injector};
 use iris_app::pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillSink};
-use iris_app::{App, SessionLog};
+use iris_app::{App, DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
 use iris_core::inject::Method;
 
@@ -93,6 +93,14 @@ struct Args {
     /// inject so the session log records a mock insert safely.
     #[arg(long)]
     demo_dictation: bool,
+
+    /// Open the Settings window against a seeded demo config and session
+    /// log, isolated under the system temp directory, then keep running
+    /// long enough to inspect or screenshot it. Never touches the hotkey,
+    /// the microphone or injection — the manual verification path for the
+    /// window, the same role `--demo-dictation` plays for the loop.
+    #[arg(long)]
+    demo_window: bool,
 }
 
 fn main() -> Result<()> {
@@ -126,6 +134,9 @@ fn main() -> Result<()> {
     }
     if args.demo_dictation {
         return demo_dictation(config, &config_path, &args);
+    }
+    if args.demo_window {
+        return demo_window();
     }
     if let Some(wav) = args.speak_wav.clone() {
         return speak_wav(config, &config_path, &args, &wav);
@@ -253,12 +264,48 @@ fn start_resident(
         .context("installing the push-to-talk hook")?;
 
     // Overlay owns its thread for process life; App drives it via OverlayPill.
-    let overlay = try_spawn_overlay(&config);
+    let overlay = if config.overlay_enabled {
+        try_spawn_overlay(&config)
+    } else {
+        None
+    };
     let pill = pill_for(args, &config, overlay.as_ref());
+
+    // The settings window's own thread, mirroring the tray and the overlay.
+    // Its commands travel on a channel separate from the tray's `commands`
+    // (App::run selects on both), so a window write can never race a tray
+    // write to persist() — see `iris_app::window::state`'s module docs.
+    //
+    // `Startup` is what this process is *actually* doing — the hook above was
+    // installed with `config.hotkey` and the overlay was spawned (or not)
+    // just now, neither changing again without a restart — paired with what
+    // the file said before `apply_overrides` ran. `file_config` is the
+    // pre-override copy, so a run-only `--hotkey` reads as already in force
+    // rather than as an edit waiting to be restarted into.
+    let startup = iris_app::window::Startup {
+        hotkey: config.hotkey,
+        overlay_enabled: overlay.is_some(),
+        saved_hotkey: file_config.hotkey,
+        saved_overlay_enabled: file_config.overlay_enabled,
+    };
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (window_outcomes_tx, window_outcomes_rx) = crossbeam_channel::unbounded();
+    // Best-effort, on the same terms as the overlay above: dictation needs no
+    // window, so one that cannot start costs the user the real Settings UI —
+    // and falls back to `config.toml` in their editor — rather than the whole
+    // application.
+    let window = iris_app::window::spawn_or_editor(
+        config_path.to_path_buf(),
+        window_commands_tx,
+        window_outcomes_rx,
+        startup,
+    );
 
     let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
-        .with_file_config(file_config);
+        .with_file_config(file_config)
+        .with_window(window)
+        .with_window_commands(window_commands_rx, window_outcomes_tx);
 
     Ok(Resident {
         app,
@@ -436,6 +483,216 @@ fn demo_dictation(mut config: Config, config_path: &std::path::Path, args: &Args
         overlay.shutdown();
     }
     Ok(())
+}
+
+/// Open the Settings window against a seeded, isolated demo config and
+/// session log. Never constructs a hotkey listener, an audio source or an
+/// injector — this is a window-only demo, the counterpart `--demo-dictation`
+/// is for the loop.
+fn demo_window() -> Result<()> {
+    use iris_app::window;
+
+    let dir = std::env::temp_dir().join("iris-window-demo");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let config_path = dir.join("config.toml");
+    let history_path = dir.join("history.jsonl");
+
+    let config = Config::default();
+    config
+        .save(&config_path)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
+    // The path is fixed, so without this the ten demo records append to the
+    // ten from the last run and the Insights figures — and any screenshot of
+    // them — drift a little further every time.
+    if history_path.exists() {
+        std::fs::remove_file(&history_path)
+            .with_context(|| format!("clearing {}", history_path.display()))?;
+    }
+    let mut log = SessionLog::open(&history_path, 500);
+    // A real session log is appended to as dictations happen, so it is oldest
+    // first on disk and the window reverses it. Seed it the same way round, or
+    // the demo — the screenshot path — shows History backwards.
+    for record in demo_records().into_iter().rev() {
+        log.append(&record)?;
+    }
+
+    // The window reports "Saved" only once the loop says a change landed, and
+    // `App` — absent here — is what turns that into a file *and* answers. With
+    // no stand-in the demo would sit on "Saving…" forever and write nothing,
+    // which is exactly the failure a screenshot of this path is supposed to
+    // catch. So the demo plays the loop: it applies each command to the seeded
+    // file and reports the same accept/reject `App::apply` would.
+    let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+    let demo_config_path = config_path.clone();
+    std::thread::spawn(move || {
+        for (id, command) in commands_rx {
+            let outcome = match apply_demo_command(&demo_config_path, &command) {
+                Ok(()) => iris_app::CommandOutcome::Applied,
+                Err(e) => {
+                    eprintln!("  demo: {command:?} not saved: {e:#}");
+                    iris_app::CommandOutcome::Rejected(format!("{e:#}"))
+                }
+            };
+            if outcomes_tx.send((id, outcome)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let handle = window::spawn(
+        config_path.clone(),
+        commands_tx,
+        outcomes_rx,
+        window::Startup {
+            hotkey: config.hotkey,
+            // No overlay process in the demo, whatever the seeded file says.
+            overlay_enabled: false,
+            saved_hotkey: config.hotkey,
+            saved_overlay_enabled: config.overlay_enabled,
+        },
+    )?;
+    handle.open();
+
+    println!("iris --demo-window");
+    println!(
+        "  config   {} (settings changed in the window are written here)",
+        config_path.display()
+    );
+    println!("  history  {}", history_path.display());
+    if !cfg!(windows) {
+        println!("  no window on this platform (Windows-only); the seeded files above are real.");
+        return Ok(());
+    }
+    println!("  Settings window opened; exiting in 120s (Ctrl+C to stop sooner).");
+    std::thread::sleep(std::time::Duration::from_secs(120));
+    Ok(())
+}
+
+/// `--demo-window`'s stand-in for `App`'s command handling: persist one
+/// setting change to the seeded config file.
+///
+/// Only the settings the window can change are handled — which is exactly
+/// what [`Command::apply_to`](iris_app::app::Command::apply_to) writes, and
+/// why the demo asks it rather than repeating the mapping. The rest of
+/// [`Command`](iris_app::app::Command) belongs to the dictation loop, which
+/// this demo deliberately
+/// does not run — there is no engine to switch, no microphone to reopen and
+/// nothing to quit.
+fn apply_demo_command(
+    config_path: &std::path::Path,
+    command: &iris_app::app::Command,
+) -> Result<()> {
+    let mut config =
+        Config::load(config_path).with_context(|| format!("reading {}", config_path.display()))?;
+    if !command.apply_to(&mut config) {
+        return Ok(());
+    }
+    config
+        .save(config_path)
+        .with_context(|| format!("writing {}", config_path.display()))
+}
+
+/// A handful of realistic-looking dictations spanning today and yesterday,
+/// several engines, a failed injection and a silent tap, with enough
+/// repeated words and phrases for the Insights tab to have something to show.
+fn demo_records() -> Vec<DictationRecord> {
+    let now = time::OffsetDateTime::now_utc();
+    let stamp = |offset_hours: i64| {
+        (now - time::Duration::hours(offset_hours))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    };
+    let record = |engine: &str,
+                  hours_ago: i64,
+                  text: &str,
+                  injected: bool,
+                  error: Option<&str>,
+                  ms: Option<f64>| {
+        let mut r = DictationRecord::now(engine, text);
+        r.timestamp = stamp(hours_ago);
+        r.injected = injected;
+        r.error = error.map(str::to_string);
+        r.latency.perceived_ms = ms;
+        r
+    };
+
+    vec![
+        record(
+            "deepgram",
+            0,
+            "let me know if the deploy looks good on your end",
+            true,
+            None,
+            Some(210.0),
+        ),
+        record(
+            "deepgram",
+            1,
+            "thanks so much for the quick review",
+            true,
+            None,
+            Some(180.0),
+        ),
+        record(
+            "groq",
+            2,
+            "the project timeline moved up a week, let me know if that works for the team",
+            false,
+            Some("injection failed: SendInput delivered 0 of 42 events"),
+            None,
+        ),
+        record("deepgram", 3, "", false, None, None),
+        record(
+            "mock",
+            5,
+            "quick note to self, follow up on the deploy tomorrow",
+            true,
+            None,
+            Some(90.0),
+        ),
+        record(
+            "deepgram",
+            20,
+            "thanks so much, talk soon",
+            true,
+            None,
+            Some(240.0),
+        ),
+        record(
+            "groq",
+            22,
+            "let me know when the project is ready for review",
+            true,
+            None,
+            Some(310.0),
+        ),
+        record(
+            "deepgram",
+            25,
+            "the deploy went out clean, no rollbacks needed",
+            false,
+            Some("injection failed: the focused window rejected input"),
+            None,
+        ),
+        record(
+            "mock",
+            30,
+            "let me know if you need anything else from me",
+            true,
+            None,
+            Some(120.0),
+        ),
+        record(
+            "deepgram",
+            48,
+            "thanks so much for covering the project this week",
+            true,
+            None,
+            Some(200.0),
+        ),
+    ]
 }
 
 /// About one second of a 220 Hz tone — enough for the mock engine to stream

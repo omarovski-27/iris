@@ -25,7 +25,20 @@ use anyhow::{bail, Result};
 /// Modifier keys are the good choices: they are on every keyboard, they are
 /// comfortable to hold, and the right-hand ones are nearly unused as bare
 /// keypresses. Right-Ctrl is the default for that reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// # The bar for adding a key
+///
+/// This list is curated, not merely short. `suppress_hotkey` (on by default)
+/// makes the hook swallow the configured key *globally and unconditionally* —
+/// `is_hotkey_event` matches the virtual-key alone, with no modifier check —
+/// for as long as Iris runs. So a key only belongs here if losing it
+/// system-wide is harmless: bare modifiers and the handful of function keys
+/// with no standing shell, browser or editor binding. "It is a function key"
+/// is not the criterion. F1 (help), F4 (Alt+F4 closes a window), F5
+/// (refresh), F11 (fullscreen) and F12 (devtools) are all deliberately absent
+/// for that reason — binding one of them would silently break it everywhere,
+/// with nothing on screen to connect the breakage to Iris.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Key {
     /// The default: on every keyboard, comfortable to hold, and almost never
     /// used as a bare keypress.
@@ -44,6 +57,23 @@ pub enum Key {
 }
 
 impl Key {
+    /// Every supported hotkey, in the order offered to the user (a settings
+    /// picker, `--help` text). Mirrors [`Key::NAMES`] one-to-one; a test pins
+    /// that down. See the type's docs before adding to it.
+    pub const ALL: &'static [Key] = &[
+        Key::RightCtrl,
+        Key::LeftCtrl,
+        Key::RightShift,
+        Key::RightAlt,
+        Key::RightWin,
+        Key::CapsLock,
+        Key::ScrollLock,
+        Key::Pause,
+        Key::F8,
+        Key::F9,
+        Key::F10,
+    ];
+
     /// The Win32 virtual-key code. A low-level hook reports the *specific*
     /// side (`VK_RCONTROL`, not `VK_CONTROL`), which is what makes
     /// right-modifier hotkeys possible.
@@ -407,7 +437,8 @@ mod hook {
     /// `HELD` stops being driven by real key transitions the moment the hook
     /// goes away, so "was a hook ever installed" is the wrong question: it
     /// would keep vouching for a frozen value. Reading a dedicated flag that
-    /// [`Listener::shutdown`] clears covers the case Iris controls — a
+    /// `Listener::shutdown` (private, so named rather than linked) clears
+    /// covers the case Iris controls — a
     /// deliberate stop, including the implicit one when a `Listener` is
     /// dropped.
     ///
@@ -472,6 +503,16 @@ mod tests {
     }
 
     #[test]
+    fn all_lists_every_key_exactly_once_matching_names() {
+        assert_eq!(Key::ALL.len(), Key::NAMES.len());
+        for key in Key::ALL {
+            assert_eq!(key.to_string().parse::<Key>().unwrap(), *key);
+        }
+        let unique: std::collections::HashSet<_> = Key::ALL.iter().collect();
+        assert_eq!(unique.len(), Key::ALL.len(), "Key::ALL has a duplicate");
+    }
+
+    #[test]
     fn parses_the_documented_spellings() {
         for name in Key::NAMES {
             name.parse::<Key>()
@@ -519,19 +560,7 @@ mod tests {
         // hook sees vkCode == VK_PACKET, not the character, with LLKHF_INJECTED
         // set. Proves the burst that types a transcript can never retrigger or
         // otherwise be treated as a hotkey press, for every configured hotkey.
-        for key in [
-            Key::RightCtrl,
-            Key::LeftCtrl,
-            Key::RightShift,
-            Key::RightAlt,
-            Key::RightWin,
-            Key::CapsLock,
-            Key::ScrollLock,
-            Key::Pause,
-            Key::F8,
-            Key::F9,
-            Key::F10,
-        ] {
+        for key in Key::ALL {
             assert!(!is_hotkey_event(VK_PACKET, key.vk(), true));
         }
     }

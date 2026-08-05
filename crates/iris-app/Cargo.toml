@@ -39,12 +39,21 @@ crossbeam-channel.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 toml = "0.9"
-# Only used to stamp session-log entries with a wall-clock RFC 3339 timestamp;
-# `Instant` is monotonic and cannot be written to a file.
+# Stamps session-log entries with a wall-clock RFC 3339 timestamp (`Instant`
+# is monotonic and cannot be written to a file), and reads them back in the
+# settings window to show them in local time. Deliberately no `local-offset`
+# feature: that lookup is unsound in a multi-threaded process, which is why
+# the offset comes from `GetTimeZoneInformation` in `window::shell` instead.
 time = { version = "0.3", default-features = false, features = [
     "std",
     "formatting",
+    "parsing",
 ] }
+# The settings window's view layer (crate::window::ui and friends) is built on
+# plain egui — no windowing, no GL — so it type-checks and can be exercised
+# headlessly on every platform. Only `eframe` (the native window/GL backend)
+# is Windows-only; see crate::window's docs.
+egui = "0.32"
 
 [target.'cfg(windows)'.dependencies]
 # Tray: `tray-icon` is the maintained extraction of Tauri's tray implementation
@@ -56,7 +65,24 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
+    # GetTimeZoneInformation: the settings window's "Dictations today" needs
+    # the local calendar day, and `time`'s own local-offset lookup is unsound
+    # in a multi-threaded process. See `window::shell`.
+    "Win32_System_Time",
 ] }
+# Settings window: immediate-mode, pure Rust over WGL (the `glow` backend) —
+# no MSVC, no WebView2 runtime to bundle. Proved to cross-compile+link on
+# x86_64-pc-windows-gnu with nothing beyond the mingw linker already required
+# for this target; see crate::window's module docs for the alternatives
+# considered (wry/tao also cross-compiles, but needs the WebView2 runtime and
+# a loader DLL alongside iris.exe, and would put HTML/CSS in an all-Rust repo).
+eframe = "0.32"
+# Only for `EventLoopBuilderExtWindows::with_any_thread` in `window::shell`:
+# winit refuses to create an event loop off the main thread by default (a
+# cross-platform footgun guard), but the settings window — like the tray and
+# the overlay — has to live on its own thread. Version pinned to what eframe
+# 0.32 itself depends on so the `EventLoopBuilder` types match.
+winit = { version = "0.30", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -206,6 +206,17 @@ pub struct Theme {
     pub rec: Rgba,
     /// Success accent — the inserted check.
     pub ok: Rgba,
+    /// Failure accent — a failed injection, an error line.
+    ///
+    /// The only warm token in either palette, and deliberately so: every
+    /// other solid accent here is cool mint/sky, which makes "something went
+    /// wrong" indistinguishable from "it worked" at a glance wherever the two
+    /// sit side by side (the settings window's History list, most of all).
+    /// Amber rather than red — the "no rec-red" rule is about the *live*
+    /// cues ([`Theme::rec`], the listening ring and glow) reading as a
+    /// recording light, which a failure marker never does; it is still held
+    /// well clear of red by a test.
+    pub warn: Rgba,
     /// The single non-spectrum accent this skin is allowed.
     pub accent: Rgba,
     /// Capsule ring while hidden.
@@ -282,6 +293,9 @@ pub const PRISM_DARK: Theme = Theme {
     // Live core: mint spectrum tip — never solid rec-red.
     rec: Rgba::hex(0x5C_E6A8),
     ok: Rgba::hex(0x5C_E6A8),
+    // Warm amber — the one break from the cool palette, so a failure cannot
+    // be mistaken for the mint `ok` beside it.
+    warn: Rgba::hex(0xFF_B8_6B),
     accent: Rgba::hex(0x6B_CBFF),
     ring_idle: Rgba::hex_a(0xFF_FFFF, 0.12),
     ring_listening: Rgba::hex_a(0x5C_E6A8, 0.28),
@@ -337,6 +351,8 @@ pub const PORCELAIN_LIGHT: Theme = Theme {
     // Live core: mint — never rose/rec-red.
     rec: Rgba::hex(0x3D_BF8A),
     ok: Rgba::hex(0x3D_BF8A),
+    // Darker gold than Prism's: the same warm hue has to carry on white.
+    warn: Rgba::hex(0xB5_7A_1F),
     accent: Rgba::hex(0x6E_9F_C8),
     ring_idle: Rgba::hex_a(0x1C_2430, 0.10),
     ring_listening: Rgba::hex_a(0x3D_BF8A, 0.26),
@@ -425,6 +441,7 @@ mod tests {
                 theme.timer_edge,
                 theme.rec,
                 theme.ok,
+                theme.warn,
                 theme.accent,
                 theme.ring_idle,
                 theme.ring_listening,
@@ -643,6 +660,68 @@ mod tests {
             not_red(theme.rec, "rec", theme.name);
             not_red(theme.glow_listening, "glow_listening", theme.name);
             not_red(theme.ring_listening, "ring_listening", theme.name);
+        }
+    }
+
+    /// `warn` is the one warm token, and it only earns its keep if it is
+    /// separable from `ok`/`accent` at a glance and still reads as amber
+    /// rather than the rec-red the desk rule bans. Amber is red-dominant by
+    /// construction, so the test is on the *hue*: green has to stay high
+    /// against red (a rose or a crimson collapses it) and above blue.
+    #[test]
+    fn warn_is_amber_and_separable_from_the_cool_accents() {
+        for theme in THEMES {
+            let w = theme.warn;
+            assert!(
+                f32::from(w.g) >= f32::from(w.r) * 0.6,
+                "{} warn #{:02X}{:02X}{:02X} has slid towards red",
+                theme.name,
+                w.r,
+                w.g,
+                w.b
+            );
+            assert!(w.g > w.b, "{} warn is not warm", theme.name);
+            for (label, cool) in [("ok", theme.ok), ("accent", theme.accent)] {
+                let distance = w.r.abs_diff(cool.r) as u32
+                    + w.g.abs_diff(cool.g) as u32
+                    + w.b.abs_diff(cool.b) as u32;
+                assert!(
+                    distance > 120,
+                    "{} warn is too close to {label} to tell apart",
+                    theme.name
+                );
+            }
+        }
+    }
+
+    /// A failure reason is body text on the settings window's own surface, so
+    /// unlike the pill's accents it has a contrast floor to meet — the same
+    /// one `ink_contrasts_with_its_own_text_scrim` holds the ink to.
+    ///
+    /// Scored against an opaque `text_scrim`, because that is the token the
+    /// window builds its page from (`iris-app::window::egui_theme::surface`):
+    /// the shell itself is a glass ramp over an unknown desktop and has no
+    /// opaque colour a window can borrow.
+    #[test]
+    fn warn_contrasts_with_the_surface_it_is_read_on() {
+        for theme in THEMES {
+            let surface = Rgba {
+                a: 1.0,
+                ..theme.text_scrim
+            }
+            .relative_luminance();
+            let l = theme.warn.relative_luminance();
+            let (hi, lo) = if l > surface {
+                (l, surface)
+            } else {
+                (surface, l)
+            };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 2.5,
+                "{}: warn contrast ratio {ratio:.2} is too low to read",
+                theme.name
+            );
         }
     }
 }

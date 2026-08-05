@@ -8,7 +8,7 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 
 - **Fast** — streaming transcription; target well under 300 ms from key-release to text.
 - **Smooth** — instant visual feedback, fluid overlay, zero jank.
-- **Minimal** — a pill, a tray icon, a settings file. Nothing else.
+- **Minimal** — a pill, a tray icon, one small settings window over a plain config file. Nothing else.
 - **Yours** — pluggable engines: bring a cloud API key for maximum speed, or run a local model for full privacy. Open source, MIT.
 
 ## Install (Windows)
@@ -60,7 +60,7 @@ cargo build --release --target x86_64-pc-windows-gnu -p iris-app
 
 First dictation:
 
-1. A tray icon appears (prism triangle). Right-click for engine / theme / polish.
+1. A tray icon appears (prism triangle). Right-click for engine / theme / polish, or "Open settings…" for the settings window (history, settings, insights).
 2. Hold **Right-Ctrl**, speak, release.
 3. The Prism pill appears bottom-centre while you talk — a quiet glass capsule that pulses with your voice (set `show_live_text = true` to also open a ribbon showing your words as they are heard); text is polished and injected into the focused window.
 4. Session history lands in `history.jsonl` beside the config.
@@ -120,14 +120,15 @@ Windows first; macOS and Linux planned for the resident hotkey / mic / inject pa
 | `crates/iris-spike` | latency spike (`iris-spike`) and harness (`iris-harness`) |
 | `crates/iris-overlay` | the Prism/Porcelain pill HUD |
 
-Everything except microphone capture, the hotkey hook, text injection, and the
-overlay window is platform-independent, so the tests and the latency harness
-run anywhere.
+Only the OS-bound layer is Windows-only — see
+[`docs/dev-windows.md`](docs/dev-windows.md) for exactly which parts. The rest is
+platform-independent, so the tests and the latency harness run anywhere.
 
 ## Docs
 
 - [`crates/iris-app/README.md`](crates/iris-app/README.md) — the app: the
-  dictation loop, configuration, tray, overlay adapter, session log
+  dictation loop, configuration, tray, overlay adapter, settings window,
+  session log
 - [`crates/iris-spike/README.md`](crates/iris-spike/README.md) — running the
   spike, and how to read the latency report
 - [`crates/iris-overlay/README.md`](crates/iris-overlay/README.md) — the pill

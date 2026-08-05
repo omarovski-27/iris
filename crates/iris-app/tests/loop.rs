@@ -19,12 +19,19 @@ use iris_app::app::Command;
 use iris_app::audio::ChannelAudio;
 use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
-use iris_app::{App, Injector, RecordingInjector, RecordingPill, SessionLog};
+use iris_app::{
+    App, CommandId, CommandOutcome, Injector, RecordingInjector, RecordingPill, RecordingWindow,
+    SessionLog,
+};
 use iris_core::engine::{Engine, Session, TranscriptEvent};
 use iris_core::hotkey::{HotkeyEvent, Key};
 
 /// What the mock engine transcribes, before polish.
 const TRANSCRIPT: &str = iris_core::engine::mock::DEFAULT_TRANSCRIPT;
+
+/// How long a test waits for the loop to answer a window command. Generous:
+/// it only has to be longer than a channel round-trip on a loaded machine.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A test rig: an app plus every handle needed to drive and observe it.
 struct Rig {
@@ -37,6 +44,7 @@ struct Rig {
     commands_rx: Receiver<Command>,
     injector: Arc<RecordingInjector>,
     pill: RecordingPill,
+    window: RecordingWindow,
     config_path: std::path::PathBuf,
     history_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
@@ -61,6 +69,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     let frames = audio.sender();
     let armed = audio.armed();
     let pill = RecordingPill::new();
+    let window = RecordingWindow::new();
 
     let app = App::new(
         config,
@@ -71,7 +80,8 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     )
     .expect("building the app")
     // Keep a failing test from hanging for ten seconds per dictation.
-    .with_final_timeout(Duration::from_secs(5));
+    .with_final_timeout(Duration::from_secs(5))
+    .with_window(Box::new(window.clone()));
 
     let (keys, keys_rx) = crossbeam_channel::unbounded();
     let (commands, commands_rx) = crossbeam_channel::unbounded();
@@ -86,6 +96,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
         commands_rx,
         injector,
         pill,
+        window,
         config_path,
         history_path,
         _dir: dir,
@@ -1067,6 +1078,282 @@ fn a_tray_command_changes_and_persists_the_setting() {
     assert!(!saved.polish.enabled);
 }
 
+/// `SetHotkey` and `SetOverlayEnabled` are the two settings this window adds
+/// beyond what the tray already exposed. Both are restart-gated (the hook
+/// and the overlay are both set up once in `main`), so the acceptance bar
+/// for them is narrower than a live setting: persisted, and the running
+/// process's in-force config deliberately left alone until restart — proven
+/// here the same way `reload_keeps_in_force_settings_that_need_a_restart`
+/// proves it for a hand-edited file.
+#[test]
+fn hotkey_and_overlay_changes_persist_but_wait_for_a_restart() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    commands.send(Command::SetHotkey(Key::F9)).unwrap();
+    commands.send(Command::SetOverlayEnabled(false)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    // In force: unchanged, because a restart is what applies these.
+    assert_eq!(app.config().hotkey, Key::RightCtrl);
+    assert!(app.config().overlay_enabled);
+
+    // On disk: changed, so the next launch picks them up.
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(saved.hotkey, Key::F9);
+    assert!(!saved.overlay_enabled);
+}
+
+/// The tray's `Settings` item (`Command::OpenSettings`) must reach the
+/// window, not shell out to an editor — the whole point of this crate having
+/// a real settings window at all.
+#[test]
+fn open_settings_opens_the_window() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let window = rig.window.clone();
+
+    commands.send(Command::OpenSettings).unwrap();
+    commands.send(Command::OpenSettings).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(window.opens(), 2);
+}
+
+/// The window sends `Command`s on its own channel, distinct from the tray's,
+/// and `App::run` must drain both — this is what lets a setting changed in
+/// the window take effect without a second, window-owned copy of `App::apply`.
+/// It must also answer, because the window shows the user what happened.
+#[test]
+fn a_window_command_is_applied_the_same_as_a_tray_command() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let tray_commands = rig.commands.clone();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig
+            .app
+            .with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    // `Quit` goes out only once the answer is in hand. Sent up front it would
+    // be racing the window command through `select!`, which picks between two
+    // ready channels at random — the loop can end before the change it is
+    // being tested on is ever drained.
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetTheme(Theme::Light)))
+        .unwrap();
+    let answer = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(app.config().theme, Theme::Light);
+    assert_eq!(answer, (id, CommandOutcome::Applied));
+}
+
+/// The loop declines an engine it cannot build and keeps dictating on the one
+/// that works — and the window that asked has to hear *why*, or it flashes
+/// "Saved" over a picker that snaps back on its own a moment later.
+#[test]
+fn a_window_command_the_loop_declines_comes_back_with_the_reason() {
+    // The rejection under test is a missing key, so a machine that has one
+    // cannot produce it. Skipped rather than mutating the environment: keys
+    // are read from it, and `App` runs on another thread here.
+    if std::env::var("IRIS_DEEPGRAM_KEY").is_ok() {
+        return;
+    }
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let tray_commands = rig.commands.clone();
+    let before = rig.app.config().engine;
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig
+            .app
+            .with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    // Deepgram with no key in the environment: `engines::build` fails, so
+    // `App::apply` rolls the choice back rather than leaving every hotkey
+    // press failing. `Quit` waits for the answer, as above.
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetEngine(EngineChoice::Deepgram)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(app.config().engine, before, "the loop kept what works");
+    assert_eq!(answered, id, "the answer names the command it answers");
+    match outcome {
+        CommandOutcome::Rejected(reason) => {
+            assert!(reason.contains("IRIS_DEEPGRAM_KEY"), "{reason}");
+        }
+        CommandOutcome::Applied => panic!("an engine with no key must not report success"),
+    }
+}
+
+/// `Applied` means the loop took the change *and wrote it*. A config file it
+/// cannot write is the one way a change the loop had no objection to still
+/// will not survive a restart, and the window must not show "Saved" over it.
+#[test]
+fn a_change_that_cannot_be_written_to_disk_is_not_reported_as_saved() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The parent is a file, so every write under it fails — deterministically
+    // and on any platform, unlike a permission bit.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "").expect("seeding the blocker");
+    let config_path = blocker.join("config.toml");
+
+    let mut config = Config::default();
+    config.polish.llm = false;
+
+    let app = App::new(
+        config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app");
+
+    let (tray_commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app.with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetTheme(Theme::Light)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(answered, id);
+    match outcome {
+        CommandOutcome::Rejected(reason) => {
+            assert!(reason.contains("cannot save"), "{reason}");
+            // The whole cause chain: which file, and what the OS said.
+            assert!(reason.contains("config.toml"), "{reason}");
+        }
+        CommandOutcome::Applied => panic!("a change that was never written is not saved"),
+    }
+    assert_eq!(
+        app.config().theme,
+        Theme::Light,
+        "the loop still runs on it; only the file is missing it"
+    );
+    assert!(!config_path.exists());
+}
+
+/// A change reported `Rejected` because its write failed must not silently
+/// ride along on a *later*, unrelated command's successful write. `saved`
+/// only ever advances on the write that actually happened, never on every
+/// command that merely asked for one.
+#[test]
+fn a_rejected_save_does_not_ride_along_on_the_next_successful_save() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The parent is a file, so every write under it fails — deterministically
+    // and on any platform, unlike a permission bit.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "").expect("seeding the blocker");
+    let config_path = blocker.join("config.toml");
+
+    let config = Config::default();
+    assert_eq!(config.theme, Theme::Dark, "test assumes the default theme");
+
+    let app = App::new(
+        config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app");
+
+    let (tray_commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app.with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    // First command: the write fails, and the window is told so.
+    let first = CommandId::next();
+    window_commands_tx
+        .send((first, Command::SetTheme(Theme::Light)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    assert_eq!(answered, first);
+    assert!(
+        matches!(outcome, CommandOutcome::Rejected(_)),
+        "the write is still blocked: {outcome:?}"
+    );
+
+    // Unblock the path — same location, now a real directory — without
+    // touching the running app, then send an unrelated command that writes.
+    std::fs::remove_file(&blocker).expect("removing the blocker");
+    std::fs::create_dir(&blocker).expect("making it a real directory");
+
+    let second = CommandId::next();
+    window_commands_tx
+        .send((second, Command::SetPolish(false)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    assert_eq!(answered, second);
+    assert_eq!(outcome, CommandOutcome::Applied);
+
+    tray_commands.send(Command::Quit).unwrap();
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    let on_disk = Config::load(&config_path).expect("reading the config back");
+    assert_eq!(
+        on_disk.theme,
+        Theme::Dark,
+        "the rejected theme change must not have ridden along on the later save"
+    );
+    assert!(
+        !on_disk.polish.enabled,
+        "the later, successful change must be on disk"
+    );
+}
+
 #[test]
 fn a_tray_save_never_persists_a_cli_override() {
     // --no-polish and --device are documented as run-only. A tray change that
@@ -1120,6 +1407,157 @@ fn a_tray_save_never_persists_a_cli_override() {
         saved.audio.device.as_deref(),
         Some("Yeti"),
         "--device leaked into the file"
+    );
+}
+
+/// The other half of the same rule: what is *running* is not what the file
+/// holds, so "you already have that" has to be asked of the file too. Under
+/// `--engine` the two diverge for the whole session, and the window shows the
+/// file — so picking the engine that happens to already be running is a real
+/// change to the file, and answering `Applied` without writing it would flash
+/// "Saved" over a picker that snaps back on the next refresh.
+#[test]
+fn choosing_the_running_engine_still_writes_it_over_a_divergent_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.engine = EngineChoice::Groq;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    // What main's apply_overrides would produce for `--engine mock`.
+    let mut run_config = file_config.clone();
+    run_config.engine = EngineChoice::Mock;
+
+    let app = App::new(
+        run_config,
+        &config_path,
+        ChannelAudio::new(),
+        Arc::new(RecordingInjector::new()) as Arc<dyn Injector>,
+        Box::new(RecordingPill::new()),
+    )
+    .expect("building the app")
+    .with_file_config(file_config);
+
+    let (tray_commands, commands_rx) = crossbeam_channel::unbounded();
+    let (_keys, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = app.with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    let id = CommandId::next();
+    window_commands_tx
+        .send((id, Command::SetEngine(EngineChoice::Mock)))
+        .unwrap();
+    let (answered, outcome) = outcomes_rx.recv_timeout(ANSWER_TIMEOUT).expect("an answer");
+    tray_commands.send(Command::Quit).unwrap();
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(answered, id);
+    assert_eq!(outcome, CommandOutcome::Applied);
+    assert_eq!(app.config().engine, EngineChoice::Mock);
+
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.engine,
+        EngineChoice::Mock,
+        "the choice was reported saved but never written"
+    );
+}
+
+/// The settings window's "Open config file" button sends the user to
+/// `config.toml` by hand for everything the window does not show — the API
+/// keys above all — and promises the window picks the edit up within a couple
+/// of seconds. So the next setting change must not write the file back from a
+/// snapshot taken before that edit: pasting a key and then toggling Polish is
+/// the documented workflow, and it cannot be what deletes the key.
+#[test]
+fn a_hand_edited_config_survives_the_next_setting_change() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    // `main` writes the file before the loop starts (`Config::load_or_create`)
+    // — the rig does not, so stand it in here.
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    // The hand edit, made while the loop is already running.
+    let mut edited = Config::load(&config_path).expect("reading the config file");
+    edited.keys.deepgram = Some("hand-edited-key".into());
+    edited.save(&config_path).expect("hand-editing the config");
+
+    commands.send(Command::SetPolish(false)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.keys.deepgram.as_deref(),
+        Some("hand-edited-key"),
+        "a setting change reverted the hand-edited key"
+    );
+    assert!(!saved.polish.enabled, "the change itself was not written");
+}
+
+/// The same staleness, seen from the no-op guard rather than the write: a
+/// setting whose in-memory snapshot already holds the chosen value, over a
+/// file that does not, is still a real change to the file. Skipping the write
+/// there would flash "Saved" over a picker the next refresh snaps back.
+#[test]
+fn choosing_a_setting_the_file_diverged_from_still_writes_it() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    // The file, hand-edited after launch, no longer holds what the loop last
+    // wrote — for either of the two restart-gated settings.
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.hotkey = Key::F8;
+    file_config.overlay_enabled = false;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    commands.send(Command::SetHotkey(Key::RightCtrl)).unwrap();
+    commands.send(Command::SetOverlayEnabled(true)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.hotkey,
+        Key::RightCtrl,
+        "the hotkey was reported saved but never written"
+    );
+    assert!(
+        saved.overlay_enabled,
+        "the overlay toggle was reported saved but never written"
     );
 }
 
@@ -1249,8 +1687,11 @@ fn reload_keeps_in_force_settings_that_need_a_restart() {
 #[cfg(not(feature = "local-native"))]
 #[test]
 fn reload_does_not_persist_a_failed_engine_choice() {
-    // A file that asks for an engine we cannot build must not poison `saved`:
-    // the next tray persist would otherwise write a cold-start failure.
+    // A file that asks for an engine we cannot build must not poison what the
+    // loop is running or what it writes of its own accord. The line itself is
+    // the user's — a later persist merges onto the file as it stands, so an
+    // unrelated tray change neither adopts the failed engine nor silently
+    // deletes the line the user typed and was told about on the console.
     let dir = tempfile::tempdir().expect("temp dir");
     let config_path = dir.path().join("config.toml");
 
@@ -1297,7 +1738,11 @@ fn reload_does_not_persist_a_failed_engine_choice() {
 
     assert_eq!(app.config().engine, EngineChoice::Mock);
     let saved = Config::load(&config_path).expect("the config was written");
-    assert_eq!(saved.engine, EngineChoice::Mock);
+    assert_eq!(
+        saved.engine,
+        EngineChoice::Local,
+        "the tray change rewrote the engine line the user wrote by hand"
+    );
     assert_eq!(saved.theme, Theme::Light);
 }
 

@@ -62,7 +62,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 Most of the codebase is portable on purpose — only microphone capture, the
-hotkey hook, text injection, and the overlay window are `#[cfg(windows)]`. So
+hotkey hook, text injection, the overlay window, and the settings window's
+`eframe` shell (`iris-app::window::shell`) are `#[cfg(windows)]`. So
 the inner loop (`cargo test`, `cargo clippy`, the harness) runs natively on
 Linux in seconds, and you only cross-compile when you need to touch the OS
 layer.

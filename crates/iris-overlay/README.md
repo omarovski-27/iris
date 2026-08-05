@@ -578,7 +578,7 @@ work area and real z-order. Run it by path — `cmd.exe` cannot use a
 
 | File | What |
 |---|---|
-| `theme.rs` | Colour tokens. Two `const` palettes, and nothing but colour. |
+| `theme.rs` | Colour tokens. Two `const` palettes, and nothing but colour. One token, `warn`, is painted by the app's settings window rather than the pill; its own doc comment says why it is the palettes' single warm colour. |
 | `motion.rs` | Timing constants and the two cubic-bezier curves. |
 | `layout.rs` | Logical geometry, DPI scaling, window placement. |
 | `state.rs` | States, commands, and the animated model. No clock, no window, no shape. |

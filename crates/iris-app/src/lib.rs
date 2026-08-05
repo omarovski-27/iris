@@ -33,6 +33,7 @@
 //! | audio | WASAPI via cpal | never blocks; hands 16 kHz frames to a channel |
 //! | tray | [`tray`] | pumps messages, sends [`Command`]s |
 //! | overlay | [`iris_overlay`] via [`pill::OverlayPill`] | paints the pill; never blocks the loop |
+//! | settings window | [`window`] | `eframe`; sends [`Command`]s, never writes the config itself |
 //! | main | [`App`] | owns the engine, the timeline, injection and the log |
 //!
 //! Nothing is shared behind a lock, so no part of the latency budget is spent
@@ -47,9 +48,10 @@
 //! project's `CLAUDE.md`), so [`inject::SystemInjector`] is constructed by
 //! `main` and nowhere else.
 
-// Deny rather than forbid: the tray has to pump a Win32 message loop, which is
-// `unsafe` by construction. That one module opts back in explicitly; nothing
-// else in the crate may.
+// Deny rather than forbid: a couple of Win32 calls have no safe wrapper — the
+// tray's message pump, and `window::shell`'s one timezone query. Each opts
+// back in explicitly, at the smallest scope that compiles, with the reason
+// written above it; nothing else in the crate may.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -63,9 +65,11 @@ pub mod inject;
 pub mod pill;
 pub mod polish;
 pub mod tray;
+pub mod window;
 
-pub use app::{App, Command, Dictated};
+pub use app::{App, Command, CommandId, CommandOutcome, Dictated};
 pub use config::{Config, EngineChoice, Theme};
 pub use history::{DictationRecord, LatencyBreakdown, SessionLog};
 pub use inject::{Injector, RecordingInjector};
 pub use pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillEvent, PillSink, RecordingPill};
+pub use window::{EditorWindow, NoopWindow, RecordingWindow, WindowSink};

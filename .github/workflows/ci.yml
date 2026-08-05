@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Everything except the three OS-bound modules is portable, so the real test
+  # Everything except the OS-bound modules is portable, so the real test
   # suite and the latency harness run here — no Windows runner, no microphone,
   # no API key.
   test:
@@ -36,7 +36,8 @@ jobs:
         run: cargo run --release --bin iris-harness -- --engine mock --runs 3 --simulate 120,160
 
   # The Windows-only code (WASAPI capture, keyboard hook, SendInput, overlay
-  # window) is type-checked and linted by cross-compiling. It is not *run*:
+  # window, settings-window shell) is type-checked and linted by
+  # cross-compiling. It is not *run*:
   # see below.
   windows-cross:
     name: cross-compile (windows-gnu)

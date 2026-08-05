@@ -8,8 +8,10 @@
 //! this project builds from WSL, and it does not drag in a windowing framework.
 //! The alternatives were `systray` (unmaintained since 2021), `trayicon`
 //! (Windows-only and thinner, no submenus) and pulling in `tao`/`winit` purely
-//! for their event loop, which would be a UI framework in a crate whose brief
-//! says the tray is the only UI.
+//! for their event loop, which is a whole windowing framework for something
+//! that never needs a window. The crate does now carry one — the settings
+//! window's `eframe` shell — but it is confined to `window::shell` and its own
+//! thread, and the tray does not depend on it.
 //!
 //! # Threading
 //!
@@ -209,8 +211,9 @@ fn spectrum_sample(t: f32) -> (u8, u8, u8) {
 /// the *whole* instruction rather than half of it. Leaving the engine edit out
 /// sends a user who follows it literally back to this same menu, key pasted in
 /// and still in demo mode. Every line is a disabled label: a signpost at the
-/// file the existing "Open settings…" item already opens, not a second place
-/// to configure anything.
+/// file the "Open settings…" item reaches — that item opens the settings
+/// window, whose Settings tab has the "Open config file" button — not a second
+/// place to configure anything.
 ///
 /// The wording is pinned to `packaging/windows/README.md` by
 /// `iris-app/tests/settings.rs`, which follows both documents against a config

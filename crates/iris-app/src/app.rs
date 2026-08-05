@@ -30,10 +30,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{select, Receiver};
+use crossbeam_channel::{select, Receiver, Sender};
 use iris_core::dictation::{Dictation, DictationOutcome};
 use iris_core::engine::Engine;
-use iris_core::hotkey::HotkeyEvent;
+use iris_core::hotkey::{HotkeyEvent, Key};
 use iris_core::latency::{ms, Mark, Timeline};
 use iris_core::text;
 use iris_polish::{PolishRequest, Polisher};
@@ -43,6 +43,7 @@ use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, LatencyBreakdown, PolishInfo, SessionLog};
 use crate::inject::Injector;
 use crate::pill::PillSink;
+use crate::window::{NoopWindow, WindowSink};
 use crate::{engines, polish};
 
 /// Something the tray (or any other UI) asks the loop to do.
@@ -61,12 +62,78 @@ pub enum Command {
     SetPolish(bool),
     /// Switch theme (Dark → Prism, Light → Porcelain on the overlay).
     SetTheme(Theme),
-    /// Open `config.toml` in the user's editor.
+    /// Rebind the push-to-talk key. Persisted immediately; needs a restart to
+    /// take effect, because the hook is installed once in `main`.
+    SetHotkey(Key),
+    /// Show or hide the pill overlay. Persisted immediately; needs
+    /// a restart, because the overlay is spawned once in `main`.
+    SetOverlayEnabled(bool),
+    /// Open the settings window, or focus it if already open.
     OpenSettings,
     /// Re-read the config file, applying anything edited by hand.
     Reload,
     /// Leave the loop and exit.
     Quit,
+}
+
+impl Command {
+    /// Write this command's change into `config`, and say whether it wrote
+    /// anything: `OpenSettings`, `Reload` and `Quit` set no field.
+    ///
+    /// This is the only place that knows which [`Config`] field each command
+    /// stands for. Three callers need that mapping — the loop itself, the
+    /// settings window moving its controls onto a confirmed change, and
+    /// `--demo-window`'s stand-in for the loop — and a seventh settable field
+    /// added to only two of them is a silently half-wired setting.
+    pub fn apply_to(&self, config: &mut Config) -> bool {
+        match self {
+            Command::SetEngine(choice) => config.engine = *choice,
+            Command::SetDevice(device) => config.audio.device = device.clone(),
+            Command::SetPolish(enabled) => config.polish.enabled = *enabled,
+            Command::SetTheme(theme) => config.theme = *theme,
+            Command::SetHotkey(key) => config.hotkey = *key,
+            Command::SetOverlayEnabled(enabled) => config.overlay_enabled = *enabled,
+            Command::OpenSettings | Command::Reload | Command::Quit => return false,
+        }
+        true
+    }
+}
+
+/// Names one command the settings window sent, so the answer to it can be
+/// matched to the question rather than to whatever is at the head of a queue.
+///
+/// Ordering alone is not enough: the command channel outlives any one window,
+/// and a change still in flight when the user closes the window is answered
+/// after the next window has opened with an empty queue of its own. Pairing on
+/// this id lets that answer be recognised as belonging to nobody and dropped —
+/// see [`crate::window::WindowState::poll_outcomes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommandId(u64);
+
+impl CommandId {
+    /// The next id, unique for the life of the process — which is the span
+    /// that matters, because the window is rebuilt many times inside it.
+    #[must_use]
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// What the loop did with a [`Command`] the settings window sent.
+///
+/// The window shows the user what happened, so a queued command is not yet an
+/// answer: `App::apply` can decline a change and keep what works (a missing
+/// API key, a microphone that will not open). One of these goes back for every
+/// command the window sends, tagged with that command's [`CommandId`], so the
+/// window can say "Saved" only for the ones that were, and say why for the
+/// ones that were not — see `crate::window::state`'s `dispatch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// The loop took the change (and persisted it, where it persists).
+    Applied,
+    /// The loop declined it and kept what it had, for this reason.
+    Rejected(String),
 }
 
 /// What one dictation produced.
@@ -95,6 +162,19 @@ pub struct App<A: AudioSource> {
     polisher: Option<Arc<dyn Polisher>>,
     injector: Arc<dyn Injector>,
     pill: Box<dyn PillSink>,
+    /// Opens/focuses the settings window on [`Command::OpenSettings`].
+    /// [`NoopWindow`] by default — only the real resident loop wires a live
+    /// one; see [`App::with_window`].
+    window: Box<dyn WindowSink>,
+    /// A second command source the window sends on directly, so its changes
+    /// reach [`App::apply`] the same way tray commands do. `never()` by
+    /// default, which simply never becomes ready; see [`App::with_window_commands`].
+    window_commands: Receiver<(CommandId, Command)>,
+    /// Where the result of each of those commands goes back, tagged with the
+    /// id it came in with. `None` until [`App::with_window_commands`] wires
+    /// one, and only ever fed for commands that arrived on `window_commands`:
+    /// the tray has no status line to put an answer in.
+    window_outcomes: Option<Sender<(CommandId, CommandOutcome)>>,
     history: SessionLog,
     audio: A,
     count: usize,
@@ -145,12 +225,42 @@ impl<A: AudioSource> App<A> {
             polisher,
             injector,
             pill,
+            window: Box::new(NoopWindow),
+            window_commands: crossbeam_channel::never(),
+            window_outcomes: None,
             history,
             audio,
             count: 0,
             report: false,
             final_timeout: None,
         })
+    }
+
+    /// Give the loop a live settings window to open on [`Command::OpenSettings`].
+    #[must_use]
+    pub fn with_window(mut self, window: Box<dyn WindowSink>) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Drain [`Command`]s the settings window sends directly, alongside the
+    /// tray's `control` channel passed to [`App::run`], and answer each one on
+    /// `outcomes`.
+    ///
+    /// The two are one wiring step because they are one conversation: the
+    /// window has to be told whether the change it asked for happened. Each
+    /// answer carries the [`CommandId`] of the command it answers, so a window
+    /// that has been closed and reopened in between cannot read someone else's
+    /// answer as its own.
+    #[must_use]
+    pub fn with_window_commands(
+        mut self,
+        commands: Receiver<(CommandId, Command)>,
+        outcomes: Sender<(CommandId, CommandOutcome)>,
+    ) -> Self {
+        self.window_commands = commands;
+        self.window_outcomes = Some(outcomes);
+        self
     }
 
     /// Print a latency breakdown after every dictation.
@@ -224,6 +334,14 @@ impl<A: AudioSource> App<A> {
     /// the process and the loop never has to borrow `self` while dictating.
     pub fn run(&mut self, keys: &Receiver<HotkeyEvent>, control: &Receiver<Command>) -> Result<()> {
         let frames = self.audio.frames().clone();
+        // A clone, not `&self.window_commands`, for the same reason `frames`
+        // is cloned out above: `select!` would otherwise need to hold a
+        // borrow of `self` for the arm body's `self.apply(..)` call too.
+        // Swapped for a never-ready receiver on disconnect (mirroring
+        // `capture`'s `engine_events_open`) so a window that has gone away
+        // cannot turn this into a busy loop — unlike `control`, losing the
+        // window must not end the whole dictation loop.
+        let mut window_commands = self.window_commands.clone();
         loop {
             let pressed_at = select! {
                 recv(keys) -> event => match event {
@@ -234,12 +352,24 @@ impl<A: AudioSource> App<A> {
                 },
                 recv(control) -> command => match command {
                     Ok(command) => {
-                        if self.apply(command)?.is_break() {
+                        if self.apply(command, None)?.is_break() {
                             return Ok(());
                         }
                         continue;
                     }
                     Err(_) => return Ok(()),
+                },
+                recv(window_commands) -> command => match command {
+                    Ok((id, command)) => {
+                        if self.apply(command, Some(id))?.is_break() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        window_commands = crossbeam_channel::never();
+                        continue;
+                    }
                 },
                 // Idle audio from a warm microphone. Dropped on purpose.
                 recv(frames) -> _ => continue,
@@ -251,60 +381,118 @@ impl<A: AudioSource> App<A> {
         }
     }
 
-    /// Apply a tray command, persisting anything the user would expect to
-    /// survive a restart.
-    fn apply(&mut self, command: Command) -> Result<std::ops::ControlFlow<()>> {
-        match command {
+    /// Apply a tray or window command, persisting anything the user would
+    /// expect to survive a restart.
+    ///
+    /// `from_window` — the [`CommandId`] the window sent it under, `None` for
+    /// the tray — decides whether the result is reported back on
+    /// [`App::with_window_commands`]' channel, and under which id. Two of
+    /// these commands can be declined — an engine that will not build, a
+    /// microphone that will not open — and the loop keeping what works is only
+    /// half the answer: the UI that asked has to be able to say so instead of
+    /// showing "Saved" over a change that never happened.
+    fn apply(
+        &mut self,
+        command: Command,
+        from_window: Option<CommandId>,
+    ) -> Result<std::ops::ControlFlow<()>> {
+        let mut outcome = CommandOutcome::Applied;
+        // Matched by reference so every arm that touches the config can go
+        // through `Command::apply_to` rather than naming the field itself.
+        match &command {
             Command::Quit => return Ok(std::ops::ControlFlow::Break(())),
             Command::SetEngine(choice) => {
-                if choice == self.config.engine {
+                let choice = *choice;
+                // Nothing to do only when the choice is *both* what is running
+                // and what the file holds. Under `--engine` those diverge for
+                // the whole session, and the window renders the file: comparing
+                // against the running engine alone would answer `Applied`
+                // without writing anything, and the next refresh would snap the
+                // picker back.
+                if choice == self.config.engine && choice == self.on_disk().engine {
+                    self.report(from_window, outcome);
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
                 let previous = self.config.engine;
-                self.config.engine = choice;
+                command.apply_to(&mut self.config);
                 match engines::build(&self.config) {
                     Ok(engine) => {
                         self.pill.set_engine(engine.name());
                         self.engine = engine;
-                        self.saved.engine = choice;
-                        println!("  engine: {choice}");
-                        self.persist();
+                        match self.persist(&command) {
+                            Ok(()) => println!("  engine: {choice}"),
+                            Err(e) => outcome = Self::persist_failed(&e),
+                        }
                     }
                     Err(e) => {
                         // Keep dictating with what works rather than leaving the
                         // app in a state where every hotkey press fails.
                         self.config.engine = previous;
                         eprintln!("  cannot switch to {choice}: {e:#}");
+                        outcome =
+                            CommandOutcome::Rejected(format!("cannot switch to {choice}: {e:#}"));
                     }
                 }
             }
             Command::SetDevice(device) => match self.audio.set_device(device.clone()) {
                 Ok(()) => {
-                    self.config.audio.device = device.clone();
-                    self.saved.audio.device = device;
-                    println!("  microphone: {}", self.audio.describe());
-                    self.persist();
+                    command.apply_to(&mut self.config);
+                    let description = self.audio.describe();
+                    match self.persist(&command) {
+                        Ok(()) => println!("  microphone: {description}"),
+                        Err(e) => outcome = Self::persist_failed(&e),
+                    }
                 }
-                Err(e) => eprintln!("  cannot switch microphone: {e:#}"),
+                Err(e) => {
+                    eprintln!("  cannot switch microphone: {e:#}");
+                    outcome = CommandOutcome::Rejected(format!("cannot switch microphone: {e:#}"));
+                }
             },
             Command::SetPolish(enabled) => {
-                self.config.polish.enabled = enabled;
-                self.saved.polish.enabled = enabled;
+                let enabled = *enabled;
+                command.apply_to(&mut self.config);
                 self.polisher = polish::build(&self.config);
-                println!("  polish: {}", if enabled { "on" } else { "off" });
-                self.persist();
-            }
-            Command::SetTheme(theme) => {
-                self.config.theme = theme;
-                self.saved.theme = theme;
-                self.pill.set_theme(theme);
-                self.persist();
-            }
-            Command::OpenSettings => {
-                if let Err(e) = open_in_editor(&self.config_path) {
-                    eprintln!("  cannot open {}: {e:#}", self.config_path.display());
+                match self.persist(&command) {
+                    Ok(()) => println!("  polish: {}", if enabled { "on" } else { "off" }),
+                    Err(e) => outcome = Self::persist_failed(&e),
                 }
             }
+            Command::SetTheme(theme) => {
+                let theme = *theme;
+                command.apply_to(&mut self.config);
+                self.pill.set_theme(theme);
+                if let Err(e) = self.persist(&command) {
+                    outcome = Self::persist_failed(&e);
+                }
+            }
+            Command::SetHotkey(key) => {
+                // `self.config.hotkey` is deliberately left alone: the hook
+                // was installed with the old key in `main` and stays that
+                // way until a restart, exactly like a hand-edited hotkey
+                // does through `Command::Reload`. Only `saved` — what the
+                // *next* launch will read — takes the new value.
+                let key = *key;
+                match self.persist(&command) {
+                    Ok(()) => {
+                        println!("  hotkey: {key} (restart Iris for this to take effect)");
+                    }
+                    Err(e) => outcome = Self::persist_failed(&e),
+                }
+            }
+            Command::SetOverlayEnabled(enabled) => {
+                // Same reasoning as `SetHotkey`: the overlay is spawned (or
+                // not) once in `main`, so `self.config.overlay_enabled` stays
+                // as it was until a restart.
+                let enabled = *enabled;
+                match self.persist(&command) {
+                    Ok(()) => println!(
+                        "  overlay: {} (restart Iris for this to take effect)",
+                        if enabled { "on" } else { "off" }
+                    ),
+                    Err(e) => outcome = Self::persist_failed(&e),
+                }
+            }
+            Command::OpenSettings => self.window.open(),
             Command::Reload => match Config::load(&self.config_path) {
                 Ok(loaded) => {
                     // The hotkey hook was installed in `main` and the audio
@@ -321,6 +509,9 @@ impl<A: AudioSource> App<A> {
                     }
                     if loaded.suppress_hotkey != self.config.suppress_hotkey {
                         needs_restart.push("suppress_hotkey");
+                    }
+                    if loaded.overlay_enabled != self.config.overlay_enabled {
+                        needs_restart.push("overlay_enabled");
                     }
                     if loaded.audio.device != self.config.audio.device {
                         needs_restart.push("audio.device");
@@ -344,6 +535,7 @@ impl<A: AudioSource> App<A> {
                     let mut config = loaded;
                     config.hotkey = self.config.hotkey;
                     config.suppress_hotkey = self.config.suppress_hotkey;
+                    config.overlay_enabled = self.config.overlay_enabled;
                     config.audio = self.config.audio.clone();
                     config.keys = self.config.keys.clone();
                     config.inject.method = self.config.inject.method;
@@ -382,13 +574,80 @@ impl<A: AudioSource> App<A> {
                 Err(e) => eprintln!("  cannot reload the configuration: {e:#}"),
             },
         }
+        self.report(from_window, outcome);
         Ok(std::ops::ControlFlow::Continue(()))
     }
 
-    fn persist(&self) {
-        if let Err(e) = self.saved.save(&self.config_path) {
-            eprintln!("  cannot save {}: {e:#}", self.config_path.display());
+    /// Tell the settings window what became of the command it sent.
+    ///
+    /// Best-effort: a window that has closed between sending and now is not a
+    /// dictation-loop problem, and the change stands either way.
+    fn report(&self, from_window: Option<CommandId>, outcome: CommandOutcome) {
+        let Some(id) = from_window else {
+            return;
+        };
+        if let Some(outcomes) = &self.window_outcomes {
+            let _ = outcomes.send((id, outcome));
         }
+    }
+
+    /// Write the file with `command`'s one field changed and, only on
+    /// success, make what was written [`App::saved`].
+    ///
+    /// The candidate is built on [`App::on_disk`] — the file as it stands
+    /// *now* — with only this command's field applied on top, so a change
+    /// made to `config.toml` by hand while Iris is running survives the next
+    /// setting change instead of being overwritten by a snapshot taken before
+    /// it. The settings window points the user straight at that file for the
+    /// API keys, so the hand edit is the documented workflow, not an edge
+    /// case. Nothing else in the candidate comes from memory, and in
+    /// particular nothing comes from [`App::config`], which carries the CLI
+    /// overrides this file must never learn about.
+    ///
+    /// `saved` moves only on a successful write, so a write failure leaves it
+    /// exactly where it was instead of stranding the rejected value in memory
+    /// to be smuggled onto disk by the *next* command's successful save. The
+    /// failure is the caller's to answer for: a change the loop took in
+    /// memory but could not write is not saved, and the UI that asked has to
+    /// hear that rather than "Saved" over a value the next launch will not
+    /// see. See [`App::persist_failed`], which every `Set*` arm routes it
+    /// through.
+    fn persist(&mut self, command: &Command) -> Result<()> {
+        let mut candidate = self.on_disk();
+        command.apply_to(&mut candidate);
+        candidate
+            .save(&self.config_path)
+            .with_context(|| format!("cannot save {}", self.config_path.display()))?;
+        self.saved = candidate;
+        Ok(())
+    }
+
+    /// The configuration as the file holds it now, falling back to
+    /// [`App::saved`] when there is nothing readable to merge with.
+    ///
+    /// The same last-good-snapshot rule the settings window applies to its own
+    /// re-reads: a file that is unreadable for a moment — mid-write, or
+    /// hand-edited into a parse error — must not turn a setting change into a
+    /// reset to defaults. A *missing* file gets the same treatment for a
+    /// stronger reason: [`Config::load`] reports it as the defaults it is, so
+    /// merging onto that reading would quietly rewrite every setting — API
+    /// keys included — out of a file someone deleted or a drive that dropped
+    /// out. `main` creates the file before the loop starts, so the last
+    /// snapshot is the better answer in both cases.
+    fn on_disk(&self) -> Config {
+        if !self.config_path.exists() {
+            return self.saved.clone();
+        }
+        Config::load(&self.config_path).unwrap_or_else(|_| self.saved.clone())
+    }
+
+    /// Report a failed [`App::persist`] on the console and to the window.
+    ///
+    /// Unconditional, like every other delivery failure: the tray sends the
+    /// same commands and has no status line to read.
+    fn persist_failed(e: &anyhow::Error) -> CommandOutcome {
+        eprintln!("  {e:#}");
+        CommandOutcome::Rejected(format!("{e:#}"))
     }
 
     /// One dictation, from key-press to text on screen.
@@ -836,31 +1095,4 @@ fn open_history(config: &Config, config_path: &std::path::Path) -> SessionLog {
     } else {
         SessionLog::disabled()
     }
-}
-
-/// Hand a path to whatever the desktop uses to open it.
-///
-/// v1's "settings window" is the config file in the user's editor: the file is
-/// already the source of truth, it is commented, and a bespoke settings UI in a
-/// crate whose brief says "no UI beyond the tray" would be the wrong thing to
-/// build twice.
-fn open_in_editor(path: &std::path::Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        // `start` is a cmd builtin, hence `cmd /C`. The empty argument is the
-        // window title, which `start` otherwise steals from the path.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(path)
-            .spawn()
-            .context("launching the editor")?;
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(path)
-            .spawn()
-            .context("launching xdg-open")?;
-    }
-    Ok(())
 }

@@ -14,10 +14,9 @@ cargo build --release --target x86_64-pc-windows-gnu    # produces runnable .exe
 ./target/x86_64-pc-windows-gnu/release/iris.exe         # WSL runs it as a real Windows process
 ```
 
-Everything except microphone capture, the hotkey hook, text injection, and the
-overlay window is portable and `#[cfg(windows)]`-free, so tests and the latency
-harness run natively on Linux. Keep it that way — it is what makes the project
-CI-testable at all.
+Only the OS-bound layer is `#[cfg(windows)]` — `docs/dev-windows.md` keeps the
+list. Everything else is portable, so tests and the latency harness run natively
+on Linux. Keep it that way — it is what makes the project CI-testable at all.
 
 ## Packaging and release
 
@@ -58,7 +57,7 @@ executed here; only compiled, cross-compiled, and been reviewed.
 
 `crates/iris-app/` is the product — the resident tray app that wires the other
 crates into a working dictation loop. Its README is the map: the loop, the
-config file, the tray, the overlay, the session log.
+config file, the tray, the overlay, the settings window, the session log.
 
 Load-bearing beyond that crate:
 
@@ -85,10 +84,13 @@ Load-bearing beyond that crate:
   injection-failure path in `App::capture`, `app.rs`, which points at the
   session log or echoes the text back when the log is off).
   `crates/iris-app/tests/console.rs` drives the real binary and holds this.
+- **The settings window** (`iris-app::window`) is the History/Settings/Insights
+  UI opened from the tray's `Settings` item. See "Settings window" below.
 
 ```bash
 cargo run -p iris-app -- --demo-dictation                 # mock + dry-run + pill
 cargo run -p iris-app -- --speak-wav assets/speech-16k.wav
+cargo run -p iris-app -- --demo-window                    # seeded Settings window, isolated temp config
 ```
 
 ## iris-polish layout
@@ -281,6 +283,13 @@ the hold collected, but never typed.
   and nasm to cross-compile.
 - The hotkey thread must only pump messages: Windows silently uninstalls a
   low-level hook whose callback exceeds ~300 ms.
+- `winit` (via `eframe`) panics if its event loop is built off the main
+  thread — a deliberate cross-platform guard, not a bug. The settings window
+  runs on its own thread like the tray and the overlay, so `window::shell`
+  opts out with `NativeOptions.event_loop_builder` +
+  `EventLoopBuilderExtWindows::with_any_thread(true)`. Sound here specifically
+  because this process only ever runs one `eframe` window at a time; a second
+  window on a second thread would need more thought.
 - `inject.rs` corrects the configured hotkey — and *only* the configured
   hotkey, never a broader modifier sweep — before every `SendInput` burst,
   per `SendInput`'s own warning that an already-pressed key can corrupt the
@@ -376,3 +385,50 @@ When updating this file, preserve this bar for all agents and keep entries conci
   original "never holds transcript text" rule. See
   `crates/iris-overlay/README.md` "The contract changed, and here is why"
   before touching this again.
+
+## Settings window (`iris-app::window`)
+
+- Opened from the tray's `Settings` item (`Command::OpenSettings`); one
+  `iris-window` thread for process life, mirroring `tray`/`iris-overlay`. The
+  toolkit choice (`egui`/`eframe` over a WebView shell, a retained Win32
+  toolkit, or extending `iris-overlay`'s renderer) and the evidence for it are
+  in `window/mod.rs`'s module docs — read that before reconsidering it.
+- **Portable view, `cfg(windows)` shell.** `window::ui` and everything it
+  calls (`state`, `insights`, `search`, `egui_theme`) depend on plain `egui`
+  only and type-check on Linux; only `window::shell` depends on `eframe` and
+  is Windows-only, so `eframe`/`winit`/`glow` never enter a non-Windows build.
+  Keep new window code on the `egui`-only side unless it genuinely needs a
+  native window/GL call.
+- **The window never writes `config.toml`.** Every setting change sends a
+  `Command` — the same ones the tray sends (`SetEngine`/`SetDevice`/
+  `SetTheme`/`SetPolish`) plus two new ones this window introduced
+  (`SetHotkey`, `SetOverlayEnabled`) — on a channel `App::run` selects on
+  alongside the tray's. `App` stays the sole writer; see `window::state`'s
+  module docs for why a second writer would race it. `App` answers each of
+  those commands with a `CommandOutcome`, and the window moves the control
+  and says "Saved" only on that answer — `App::apply` can decline `SetEngine`
+  and `SetDevice`, so a queued command is not an applied one.
+- `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
+  like `hotkey`, changing it needs a restart (both are read once at startup).
+  `main` therefore hands `window::spawn` a `Startup` snapshot: what the
+  process is really running on *and* what the file held before CLI overrides.
+  Both halves live in one `state::InForce<T>` (`running`, `at_startup`), and
+  every claim the view makes comes from its two comparisons — do not answer
+  either question anywhere else:
+  - `InForce::pending` — "a restart is owed": the file moved since launch
+    **and** what it now holds is not already running. Both conditions are
+    load-bearing. `--hotkey f9` over a `right-ctrl` file diverges by design
+    and must not read as an unsaved edit; picking `f9` in the picker moves
+    the file *onto the running value*, where a restart would change nothing.
+  - `InForce::diverged` — "asked for but not running": the saved value is not
+    what is in force, whatever moved. This is what stops a ticked overlay
+    checkbox from reading as a live overlay after `try_spawn_overlay` failed.
+- Anything the window cannot reach the OS for crosses through `Env` as a
+  callback or a plain value (`list_devices`, `open_config_file`, the local UTC
+  offset from `GetTimeZoneInformation`), so `window::ui` stays `egui`-only.
+  Note the offset: `time`'s `current_local_offset` is unsound in a
+  multi-threaded process — that is why `history.rs` stamps UTC — so
+  `window::shell` asks Windows and `insights::DayWindow` does the arithmetic.
+- `cargo run -p iris-app -- --demo-window` opens the real window against a
+  seeded config/session log under the system temp dir — no hotkey, no
+  microphone, no injector — the manual verification and screenshot path.
