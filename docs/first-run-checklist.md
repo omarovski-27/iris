@@ -115,7 +115,9 @@ on the machine you're actually going to use Iris on.
       the zip README's "Downgrading to an older Iris"
       (`packaging/windows/README.md`) is the copy of that path to keep
       accurate.
-- [ ] Tray → Settings opens `config.toml` in the default editor.
+- [ ] Tray → Settings opens the settings window (see below), and its Settings
+      tab's **Open config file** button is what opens `config.toml` in the
+      default editor.
 - [ ] After adding a real key and saving, a full restart is what puts it in
       force — not tray → Reload settings. Launched from an open PowerShell
       prompt so the console output is visible, Reload prints "keys changed:
@@ -128,15 +130,15 @@ on the machine you're actually going to use Iris on.
       start.
 - [ ] The tray menu's top line reads "Hold right-ctrl to dictate" (lower-case
       — it is `Key::label()` verbatim, not a prettified name). It is a
-      disabled label, not a menu — there is no rebinding from the tray on this
-      build, and its absence is not a broken build.
-- [ ] Rebinding works the way it actually ships: set `hotkey` in
-      `config.toml` (tray → Settings), save, then quit from the tray and
-      launch Iris again. The low-level hook is installed once at startup, so
-      tray → Reload settings only reports "hotkey changed: restart Iris for
-      that to take effect" and keeps the old binding (`suppress_hotkey` is
-      the same story). `iris.exe --hotkey f9` does the rebind for one run
-      without touching the file.
+      disabled label, not a menu — rebinding lives in the settings window, not
+      the tray, and its absence here is not a broken build.
+- [ ] Rebinding works the way it actually ships: pick the key in the settings
+      window's Settings tab (or set `hotkey` in `config.toml` by hand), then
+      quit from the tray and launch Iris again. The low-level hook is
+      installed once at startup, so tray → Reload settings only reports
+      "hotkey changed: restart Iris for that to take effect" and keeps the old
+      binding (`suppress_hotkey` is the same story). `iris.exe --hotkey f9`
+      does the rebind for one run without touching the file.
 - [ ] Each accepted key binds and fires: `rctrl`, `lctrl`,
       `rshift`, `ralt`, `rwin`, `capslock`, `scrolllock`, `pause`, `f8`,
       `f9`, `f10`. That is the whole set (`iris_core::hotkey::Key`); anything
@@ -173,6 +175,37 @@ on the machine you're actually going to use Iris on.
 - [ ] The confirmation hold and self-dismiss after a successful insert look
       right, not truncated or stuck.
 
+## Settings window
+
+Everything here runs through `window::shell` (`eframe`/`winit`/`glow`), the
+one `#[cfg(windows)]` half of the window and the half no test touches;
+`iris.exe --demo-window` is the same window against seeded demo data if you
+want it without dictating first.
+
+- [ ] Tray → **Open settings…** opens it, and doing it again focuses (and
+      un-minimizes) that same window rather than opening a second one.
+      Closing the window never stops dictation — the hotkey still works.
+- [ ] It opens at a usable size and stays legible on a high-DPI / scaled
+      display, in both Dark and Light: no clipped controls, no boxed "tofu"
+      characters where a glyph should be.
+- [ ] History lists real dictations newest first, the search box filters
+      them, **Copy** puts the exact text on the clipboard, and a dictation
+      whose injection failed shows its reason in place. With
+      `history.enabled = false` it says logging is off and names that
+      setting, rather than telling you to speak.
+- [ ] Changing engine, microphone, theme and polish from the Settings tab
+      says "Saved", is visible in `config.toml`, and is still in force after
+      a restart. A change the loop refuses — Deepgram with no key, a
+      microphone that will not open — says why instead of "Saved", and the
+      control does not move.
+- [ ] Editing an unrelated setting in `config.toml` by hand while Iris is
+      running and then changing something in the window keeps the hand edit.
+- [ ] Rebinding the hotkey or toggling the overlay is marked "until restart",
+      and picking the key that is already running is not.
+- [ ] Insights numbers are plausible against the same log (`iris --history`),
+      and the latency figures cover only the dictations that reached the
+      screen.
+
 ## Dictation quality
 
 - [ ] Latency "feels" fast — the budget in `docs/spike-findings.md` was
@@ -186,9 +219,9 @@ on the machine you're actually going to use Iris on.
 
 ## What this build does not include
 
-The round-3 overlay capsule (PR #15) is in the tree now, and the Overlay and
-First-run config items above are written for it — repackage with
-`scripts/package-windows.sh` before working through this list, or the zip you
-verify predates it. One branch is still in flight: the Settings window (PR
-#13). If it has since merged, this checklist and the packaged zip are stale —
-repackage and re-run this list.
+The round-3 overlay capsule (PR #15) and the settings window (PR #13) are both
+in the tree now, and the Overlay, First-run config and Settings window items
+above are written for them — repackage with `scripts/package-windows.sh`
+before working through this list, or the zip you verify predates them. No
+branch is still in flight; if one lands after this, this checklist and the
+packaged zip are stale — repackage and re-run this list.

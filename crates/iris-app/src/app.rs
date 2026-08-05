@@ -106,7 +106,7 @@ impl Command {
 /// and a change still in flight when the user closes the window is answered
 /// after the next window has opened with an empty queue of its own. Pairing on
 /// this id lets that answer be recognised as belonging to nobody and dropped —
-/// see [`crate::window::state::WindowState::poll_outcomes`].
+/// see [`crate::window::WindowState::poll_outcomes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CommandId(u64);
 
@@ -123,7 +123,7 @@ impl CommandId {
 /// What the loop did with a [`Command`] the settings window sent.
 ///
 /// The window shows the user what happened, so a queued command is not yet an
-/// answer: [`App::apply`] can decline a change and keep what works (a missing
+/// answer: `App::apply` can decline a change and keep what works (a missing
 /// API key, a microphone that will not open). One of these goes back for every
 /// command the window sends, tagged with that command's [`CommandId`], so the
 /// window can say "Saved" only for the ones that were, and say why for the

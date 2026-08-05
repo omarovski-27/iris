@@ -4,11 +4,13 @@
 //! `cfg(windows)` piece, and it does nothing but bootstrap `eframe` and call
 //! [`draw_root`] once a frame.
 //!
-//! The view has no independent unit tests: it is exercised by
+//! The view has essentially no independent unit tests: it is exercised by
 //! `crate::window::state`'s tests (the data it renders) and by eye — rendered
 //! evidence lives in the PR, and `iris --demo-window` (see `main.rs`) is the
 //! manual verification path, the same split `iris-overlay` uses for its own
-//! window shell.
+//! window shell. The one exception is
+//! `tests::every_glyph_in_the_view_is_covered_by_the_embedded_fonts`, which
+//! catches the single thing eyeballing the source reliably misses.
 
 pub mod chrome;
 mod history_tab;
@@ -182,4 +184,66 @@ fn nav(ui: &mut egui::Ui, state: &mut WindowState, env: &Env, theme: &iris_overl
                 .color(chrome::ink_faint(theme)),
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every non-ASCII character this window can paint has to exist in the
+    /// fonts `egui` embeds.
+    ///
+    /// There is no safety net under this one. The fonts are compiled into
+    /// `iris.exe` (`egui` ships Ubuntu-Light plus two emoji faces and Iris
+    /// installs none of its own), so there is no system font to fall back to
+    /// and no substitution step: a codepoint none of the three covers is
+    /// painted as a tofu box, identically on every machine. It also survives
+    /// every kind of review that reads the *source*, where the character
+    /// looks perfectly ordinary — a `→` in the History empty-state message
+    /// shipped exactly that way, and only a rendered screenshot caught it.
+    ///
+    /// Whole source files rather than a hand-listed set of strings, so this
+    /// keeps holding as copy is added: anything outside a comment is a
+    /// candidate for the screen. A comment is skipped because none of it is.
+    #[test]
+    fn every_glyph_in_the_view_is_covered_by_the_embedded_fonts() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("window/ui/mod.rs", include_str!("mod.rs")),
+            ("window/ui/chrome.rs", include_str!("chrome.rs")),
+            ("window/ui/history_tab.rs", include_str!("history_tab.rs")),
+            ("window/ui/settings_tab.rs", include_str!("settings_tab.rs")),
+            ("window/ui/insights_tab.rs", include_str!("insights_tab.rs")),
+            // Not a tab, but where the status-line messages are written.
+            ("window/state.rs", include_str!("../state.rs")),
+        ];
+
+        let ctx = egui::Context::default();
+        // Fonts do not exist until a frame has run.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        // Every size/family the window can ask for, since coverage is per
+        // font family and the fallback chain differs between them.
+        let fonts: Vec<egui::FontId> = ctx.style().text_styles.values().cloned().collect();
+
+        let mut missing = Vec::new();
+        for (file, source) in SOURCES {
+            for (line, text) in source.lines().enumerate() {
+                if text.trim_start().starts_with("//") {
+                    continue;
+                }
+                for c in text.chars().filter(|c| !c.is_ascii()) {
+                    if fonts
+                        .iter()
+                        .any(|font| !ctx.fonts(|f| f.has_glyph(font, c)))
+                    {
+                        missing.push(format!("{file}:{} '{c}' (U+{:04X})", line + 1, c as u32));
+                    }
+                }
+            }
+        }
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "these would render as tofu boxes; use a covered character instead \
+             (·, ×, —, …, the curly quotes and the whole Latin-1 range are covered):\n  {}",
+            missing.join("\n  ")
+        );
+    }
 }

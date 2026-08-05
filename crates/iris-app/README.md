@@ -233,7 +233,10 @@ reload settings, quit. "Open settings" opens the settings window (below) —
 opening it twice focuses the existing window rather than making a second one,
 and closing it never stops dictation, which owns its own thread throughout.
 The config file is still one click away, from that window's Settings tab, so
-"Reload settings" keeps meaning what it always did.
+"Reload settings" keeps meaning what it always did. A window that cannot start
+at all does not turn the item into a no-op: `window::EditorWindow` takes over
+and every click opens `config.toml` in the editor instead — what the item did
+before this window existed — saying so each time.
 
 While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,

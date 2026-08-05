@@ -47,10 +47,12 @@ First launch writes `%APPDATA%\iris\config.toml` — commented defaults, no key
 needed yet. Out of the box Iris runs the offline **mock** engine, so dictation
 "works" but the transcript is a stub, not what you said.
 
-To dictate for real, right-click the tray icon → **Open settings…**, which
-opens `config.toml` in your editor. Its header comment says the same as what
-follows. There are two separate edits, and they go in two different places —
-pasting them together as one block leaves a file Iris refuses to load.
+To dictate for real, right-click the tray icon → **Open settings…**. That opens
+the Iris window (History, Settings, Insights); its **Settings** tab has an
+**Open config file** button, which hands `config.toml` to your editor — the key
+goes in the file, never in the window. The file's header comment says the same
+as what follows. There are two separate edits, and they go in two different
+places — pasting them together as one block leaves a file Iris refuses to load.
 
 **1. Change the engine, in place.** Near the top of the file, among the other
 settings, is a line reading `engine = "mock"`. Edit that line — do not add a
