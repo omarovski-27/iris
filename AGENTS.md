@@ -381,10 +381,16 @@ the hold collected, but never typed.
   revalidates or reopens it, so a stream gone stale after a long idle gap
   (sleep, a Bluetooth mic, Windows audio power management) could produce a
   session with a live socket but no real samples. `capture.rs`'s cpal
-  `on_error` callback is unconditional `eprintln!` so a stream-level failure
-  is now visible without `--verbose` — see the console rule above — but a
-  *stale-but-not-erroring* stream would never trip `on_error` at all, so its
-  absence in the log does not clear this theory. Confirming it needs live
+  `on_error` callback is unconditional `eprintln!`, unchanged from `main` —
+  see the console rule above for why that matters — so a stream-level
+  failure is at least visible without `--verbose`. (An earlier pass on this
+  branch regressed it to `vlog!`, gated behind `--verbose`; caught and
+  reverted before reaching `main`, so nothing shipped from that detour — do
+  not describe this as a fix this branch delivers.) A *stale-but-not-erroring*
+  stream would never trip `on_error` at all, so its absence in the log does
+  not clear this theory, and the callback firing only to stderr never reaches
+  the session log either — `on_error` and `history.jsonl` are two disconnected
+  diagnostics today. Confirming the theory needs live
   telemetry from a real Windows session (frame counts and real amplitude on
   the first hold after a long idle gap) that this repo cannot gather; do not
   assume it is fixed, and do not read the pre-`5e53f96` root-cause finding
