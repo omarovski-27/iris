@@ -73,6 +73,16 @@ pub enum TranscriptEvent {
     /// The session failed. After `finish()`, [`crate::dictation::Dictation`]
     /// may still salvage a non-empty partial instead of surfacing the error.
     Error(String),
+    /// The engine is about to spend up to another [`Engine::connect_budget`]
+    /// reconnecting *mid-session* — a warm handoff proven stale, or a socket
+    /// dropped after the original connect already succeeded. Distinct from
+    /// the original [`TranscriptEvent::Connected`]: that one marks the wait
+    /// bound safe to shrink to the ordinary `finalise` budget, and without
+    /// this one nothing tells [`crate::dictation::Dictation::finish`] that a
+    /// second connect budget is about to be spent, so it never re-extends
+    /// past the first. Emit *before* the reconnect attempt begins, not after
+    /// it resolves — the whole point is covering the cost about to be paid.
+    Reconnecting,
 }
 
 /// A transcription backend.

@@ -540,6 +540,7 @@ async fn send_tracked(
     unproven: &mut Option<Vec<Message>>,
     url: &str,
     key: &str,
+    events: &Sender<TranscriptEvent>,
     msg: Message,
     context_msg: &'static str,
 ) -> Result<()> {
@@ -551,7 +552,7 @@ async fn send_tracked(
         Ok(()) => Ok(()),
         Err(e) => {
             vlog!("deepgram: a send on the unproven warm spare failed ({e}); reconnecting cold");
-            replay_on_fresh_connection(socket, unproven, url, key).await
+            replay_on_fresh_connection(socket, unproven, url, key, events).await
         }
     }
 }
@@ -562,13 +563,19 @@ async fn send_tracked(
 ///
 /// Clearing `unproven` is what bounds this to a single attempt per session
 /// and what makes the replayed connection behave exactly like a cold-started
-/// one from here on.
+/// one from here on. Emits [`TranscriptEvent::Reconnecting`] before paying
+/// for the connect, not after: [`crate::dictation::Dictation::finish`] has to
+/// know the cost is coming in order to extend its wait to cover it, and
+/// telling it only once the connect has already succeeded (or failed) is too
+/// late to help the wait that is running concurrently.
 async fn replay_on_fresh_connection(
     socket: &mut WsStream,
     unproven: &mut Option<Vec<Message>>,
     url: &str,
     key: &str,
+    events: &Sender<TranscriptEvent>,
 ) -> Result<()> {
+    let _ = events.send(TranscriptEvent::Reconnecting);
     let sent = unproven.take().unwrap_or_default();
     *socket = connect(url, key).await?;
     for msg in sent {
@@ -886,6 +893,7 @@ async fn pump_inner(
                             &mut unproven,
                             &url,
                             &key,
+                            &events,
                             Message::Binary(bytes.into()),
                             "sending audio to Deepgram",
                         ).await
@@ -902,6 +910,7 @@ async fn pump_inner(
                             &mut unproven,
                             &url,
                             &key,
+                            &events,
                             Message::Text(r#"{"type":"Finalize"}"#.into()),
                             "finalising the Deepgram stream",
                         ).await;
@@ -958,7 +967,7 @@ async fn pump_inner(
                         // mechanism exists not to introduce.
                         vlog!("deepgram: the warm spare never answered; replaying it cold");
                         match replay_on_fresh_connection(
-                            &mut socket, &mut unproven, &url, &key,
+                            &mut socket, &mut unproven, &url, &key, &events,
                         ).await {
                             Ok(()) => {
                                 acc.finalize_acked = false;
@@ -1007,7 +1016,9 @@ async fn pump_inner(
                     && matches!(&msg, None | Some(Ok(Message::Close(_))) | Some(Err(_)))
                 {
                     vlog!("deepgram: the warm spare closed before answering; replaying it cold");
-                    match replay_on_fresh_connection(&mut socket, &mut unproven, &url, &key).await {
+                    match replay_on_fresh_connection(&mut socket, &mut unproven, &url, &key, &events)
+                        .await
+                    {
                         Ok(()) => {
                             if finalize_ack_deadline.is_some() {
                                 acc.finalize_acked = false;
