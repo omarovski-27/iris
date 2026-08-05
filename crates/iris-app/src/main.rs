@@ -4,10 +4,10 @@
 //!
 //! 1. read the config, apply CLI overrides, **promote keys to the environment**
 //!    (safe only while the process is still single-threaded);
-//! 2. build the engine, which is the one step that can fail for a reason the
-//!    user must act on (a missing key);
-//! 3. open the microphone, install the hotkey hook, start the tray;
-//! 4. hand everything to [`iris_app::App`] and never touch it again.
+//! 2. open the microphone, install the hotkey hook, start the tray;
+//! 3. build [`iris_app::App`], and with it the engine — the one step that can
+//!    fail for a reason the user must act on (a missing key);
+//! 4. run the loop and never touch it again.
 
 use std::sync::Arc;
 
@@ -103,7 +103,8 @@ fn main() -> Result<()> {
     // Kept as loaded: `config` below takes the CLI overrides, which are
     // run-only and must never be written back to the file.
     let file_config = Config::load_or_create(&config_path)
-        .with_context(|| format!("loading {}", config_path.display()))?;
+        .with_context(|| format!("loading {}", config_path.display()))
+        .inspect_err(report_startup_failure)?;
     let mut config = file_config.clone();
     apply_overrides(&mut config, &args);
 
@@ -185,6 +186,24 @@ fn try_spawn_overlay(config: &Config) -> Option<iris_overlay::Overlay> {
     }
 }
 
+/// Everything the resident loop needs, built and ready to run.
+///
+/// The point of the struct is that [`start_resident`] is the single fallible
+/// startup step `run` sees: every way starting up can fail leaves through one
+/// `Result`, so [`report_startup_failure`] covers all of them and a step added
+/// later is covered by construction.
+#[cfg(windows)]
+struct Resident {
+    app: App<iris_app::audio::MicAudio>,
+    keys: crossbeam_channel::Receiver<iris_core::hotkey::HotkeyEvent>,
+    commands: crossbeam_channel::Receiver<iris_app::Command>,
+    overlay: Option<iris_overlay::Overlay>,
+    // Guards: dropping the listener uninstalls the hook, dropping the tray
+    // stops its thread. Declared after `app` so they outlive it.
+    _listener: iris_core::hotkey::Listener,
+    _tray: iris_app::tray::Tray,
+}
+
 /// The resident loop.
 #[cfg(windows)]
 fn run(
@@ -193,6 +212,27 @@ fn run(
     config_path: &std::path::Path,
     args: &Args,
 ) -> Result<()> {
+    let mut resident = start_resident(config, file_config, config_path, args)
+        .inspect_err(report_startup_failure)?;
+
+    banner(&resident.app, config_path);
+    let result = resident.app.run(&resident.keys, &resident.commands);
+    // Explicit shutdown so the window is gone before we exit — and before the
+    // dialog below, which is modal.
+    if let Some(overlay) = resident.overlay.take() {
+        overlay.shutdown();
+    }
+    result.inspect_err(report_run_failure)
+}
+
+/// Open the microphone, start the tray, install the hook and build the app.
+#[cfg(windows)]
+fn start_resident(
+    config: Config,
+    file_config: Config,
+    config_path: &std::path::Path,
+    args: &Args,
+) -> Result<Resident> {
     use iris_app::audio::MicAudio;
     use iris_app::inject::SystemInjector;
     use iris_app::tray;
@@ -207,26 +247,27 @@ fn run(
     let devices = iris_core::capture::list_devices()
         .map(|d| d.into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
-    let (_tray, commands) = tray::spawn(&config, devices)?;
+    let (tray, commands) = tray::spawn(&config, config_path, devices)?;
 
-    // Held for the life of the loop; dropping it uninstalls the hook.
-    let (_listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
+    let (listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
         .context("installing the push-to-talk hook")?;
 
     // Overlay owns its thread for process life; App drives it via OverlayPill.
     let overlay = try_spawn_overlay(&config);
     let pill = pill_for(args, &config, overlay.as_ref());
 
-    let mut app = App::new(config, config_path, audio, injector, pill)?
+    let app = App::new(config, config_path, audio, injector, pill)?
         .with_report(args.report)
         .with_file_config(file_config);
-    banner(&app, config_path);
-    let result = app.run(&keys, &commands);
-    // Explicit shutdown so the window is gone before we exit.
-    if let Some(overlay) = overlay {
-        overlay.shutdown();
-    }
-    result
+
+    Ok(Resident {
+        app,
+        keys,
+        commands,
+        overlay,
+        _listener: listener,
+        _tray: tray,
+    })
 }
 
 /// There is no hotkey, no microphone and no injection off Windows, so the
@@ -458,6 +499,83 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
     println!("\n  {} ({} entries)", path.display(), records.len());
     Ok(())
 }
+
+/// Put a failed startup in front of the user when stderr has nowhere to land.
+///
+/// Covers the whole of starting up, in two calls that are each a whole phase
+/// rather than a single fallible step: `Config::load_or_create` in `main`, and
+/// [`start_resident`]. See [`report_failure`] for why a console binary needs a
+/// dialog at all, and [`report_run_failure`] for the one way the loop itself
+/// can end that needs the same treatment.
+#[cfg(windows)]
+fn report_startup_failure(err: &anyhow::Error) {
+    report_failure("Iris could not start", err);
+}
+
+/// The same dialog for the resident loop giving up.
+///
+/// [`App::run`] returns `Err` in exactly one case — the hotkey channel closing,
+/// which means the low-level hook is gone and there is no way left to dictate.
+/// Windows uninstalls that hook itself if a callback ever runs long, so this is
+/// a real end state and not only a bug path. Without the dialog it reads as Iris
+/// silently disappearing partway through a session, which is precisely what
+/// [`report_startup_failure`] exists to prevent one screen earlier.
+#[cfg(windows)]
+fn report_run_failure(err: &anyhow::Error) {
+    report_failure("Iris has stopped", err);
+}
+
+/// Show `err` in a message box, unless someone is watching a console that will
+/// outlive the process.
+///
+/// `iris` is a console binary, so launching it from the Start Menu or the
+/// Startup folder gives it a console window all of its own — one that closes
+/// with the process. A missing key, an unparseable config file, a microphone
+/// that is not there, a hook Windows took away: each is an actionable sentence,
+/// and in that launch path each would be a black rectangle that flashes and
+/// vanishes. When another process shares this console (a shell the user typed
+/// in), the message survives on stderr and there is nothing to do;
+/// `GetConsoleProcessList` is what tells the two apart.
+#[cfg(windows)]
+fn report_failure(caption: &str, err: &anyhow::Error) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::System::Console::GetConsoleProcessList;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
+
+    let mut pids = [0u32; 2];
+    // SAFETY: `pids` is a valid, writable buffer of the length passed in;
+    // the call only fills it and returns the count.
+    let sharing_console = unsafe { GetConsoleProcessList(&mut pids) } > 1;
+    if sharing_console {
+        return;
+    }
+
+    let text = HSTRING::from(format!("{err:#}"));
+    let caption = HSTRING::from(caption);
+    // MB_SETFOREGROUND and MB_TOPMOST are what make this visible at all in the
+    // launch it exists for: a process started from the Startup folder has
+    // never held the foreground, so Windows' foreground lock would otherwise
+    // leave the box behind the active window with only a flashing taskbar
+    // button — and the installed shortcut minimizes the console, so there is
+    // no second cue.
+    //
+    // SAFETY: both strings are NUL-terminated and outlive the modal call.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+/// Off Windows there is no console-less launch path and no dialog to show, so
+/// the caller in `main` keeps its unconditional shape and this does nothing.
+#[cfg(not(windows))]
+fn report_startup_failure(_err: &anyhow::Error) {}
 
 #[cfg(windows)]
 fn banner<A: AudioSource>(app: &App<A>, config_path: &std::path::Path) {

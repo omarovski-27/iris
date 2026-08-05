@@ -11,7 +11,42 @@ Iris is built around one obsession: **latency and smoothness**. Audio is transcr
 - **Minimal** — a pill, a tray icon, a settings file. Nothing else.
 - **Yours** — pluggable engines: bring a cloud API key for maximum speed, or run a local model for full privacy. Open source, MIT.
 
-## Quickstart
+## Install (Windows)
+
+For someone who just wants to run Iris — no Rust, no build tools: get
+`iris-<version>-windows-x64.zip` (build one yourself with
+`scripts/package-windows.sh`, or take one someone already built), extract it,
+and follow the `README.md` inside.
+
+That document —
+[`packaging/windows/README.md`](packaging/windows/README.md), staged into the
+zip — is the single source of truth for the end-user path: the SmartScreen
+"Windows protected your PC" prompt, running `install.ps1` (and its `-Desktop`
+/ `-RunAtLogin` flags), where `%APPDATA%\iris\config.toml` lives, and how to
+switch off the mock engine and add a Deepgram or Groq key. A recipient never
+needs this repository. The rest of this README is the developer path.
+
+### Why a zip and not an installer
+
+Building an MSI/EXE installer needs either MSVC or the WiX toolset, both of
+which pull in tooling this project deliberately avoids (see
+[`docs/dev-windows.md`](docs/dev-windows.md) "Why gnu and not msvc") — the
+whole point of the `x86_64-pc-windows-gnu` target is a cross-compile that
+needs nothing but `mingw-w64`. A portable zip plus a per-user PowerShell
+installer gets a Start Menu entry and a real `%LOCALAPPDATA%` install without
+trading that away. A native Windows build (real MSVC on the machine, not
+cross-compiled) would unlock a proper MSI if that's ever wanted.
+
+### Building the zip yourself
+
+```bash
+scripts/package-windows.sh              # writes dist/iris-<version>-windows-x64.zip
+scripts/package-windows.sh /some/dir     # or pick the output directory
+```
+
+Same toolchain as building from source below — nothing extra to install.
+
+## Quickstart (build from source)
 
 Windows first. From WSL2 (or native Windows with the MSVC/gnu toolchain — see [`docs/dev-windows.md`](docs/dev-windows.md)):
 
@@ -100,6 +135,8 @@ run anywhere.
 - [`docs/spike-findings.md`](docs/spike-findings.md) — measured latency, where
   the budget goes, architecture recommendation
 - [`docs/dev-windows.md`](docs/dev-windows.md) — building for Windows from WSL2
+- [`docs/first-run-checklist.md`](docs/first-run-checklist.md) — what to
+  verify by eye on a real Windows machine after installing a new build
 
 ## License
 

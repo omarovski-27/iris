@@ -40,8 +40,31 @@ const HEADER: &str = "\
 #   hotkey   rctrl, lctrl, rshift, ralt, rwin, capslock, scrolllock, pause, f8, f9, f10
 #   theme    dark | light
 #
+# Iris starts on the mock engine (offline, no key needed) until you configure
+# a real one. To use Deepgram:
+#
+#   1. Get a key at https://console.deepgram.com
+#   2. In the settings below this comment, change engine = \"mock\" to
+#      engine = \"deepgram\"
+#   3. Add these two lines at the very END of this file, below every other
+#      setting:
+#
+#        [keys]
+#        deepgram = \"paste-your-key-here\"
+#
+#      TOML puts every line after a [keys] header inside that table, so a
+#      [keys] block placed anywhere but the end swallows the settings that
+#      follow it and Iris will refuse to start.
+#   4. Save this file, then quit Iris from the tray and launch it again. A key
+#      is read once at startup, so \"Reload settings\" does not apply one.
+#
+# Groq works the same way with engine = \"groq\" and a groq entry in that same
+# [keys] table, from https://console.groq.com/keys.
+#
 # Keys may also come from the environment (IRIS_DEEPGRAM_KEY, IRIS_GROQ_KEY,
-# IRIS_LLM_KEY), which takes precedence over anything set here.
+# IRIS_LLM_KEY) instead of this file; an environment variable takes precedence
+# over anything set here. Either way, Iris never prints a key back — see
+# --print-config.
 ";
 
 /// Which transcription backend to run.

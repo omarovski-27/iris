@@ -117,7 +117,14 @@ impl<A: AudioSource> App<A> {
         pill: Box<dyn PillSink>,
     ) -> Result<Self> {
         let config_path = config_path.into();
-        let engine = engines::build(&config)?;
+        let engine = engines::build(&config).with_context(|| {
+            format!(
+                "starting the {} engine (edit {} to add a key or pick a different engine, \
+                 then start Iris again)",
+                config.engine,
+                config_path.display()
+            )
+        })?;
         let polisher = polish::build(&config);
         let history = open_history(&config, &config_path);
         let mut pill = pill;

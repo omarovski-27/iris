@@ -19,6 +19,41 @@ overlay window is portable and `#[cfg(windows)]`-free, so tests and the latency
 harness run natively on Linux. Keep it that way — it is what makes the project
 CI-testable at all.
 
+## Packaging and release
+
+`scripts/package-windows.sh [output-dir]` builds the release `.exe` and zips it
+with `packaging/windows/install.ps1`, `packaging/windows/README.md` (staged as
+the zip's `README.md`) and `LICENSE` into `dist/iris-<version>-windows-x64.zip`
+— the repeatable path from source to something a non-developer installs.
+`packaging/windows/README.md` is the *only* copy of the end-user walkthrough
+(SmartScreen, install, config, keys); the repo README links to it rather than
+restating it, so change the install flow there and nowhere else. See the repo
+README's "Why a zip and not an installer" for why this stops at a zip + per-user
+PowerShell script rather than an MSI: a real installer needs MSVC or the WiX
+toolset, both of which trade away the no-C-toolchain / no-MSVC cross-compile
+this project is built around (`docs/dev-windows.md`).
+
+`crates/iris-app/build.rs` embeds the prism icon and version metadata into the
+`.exe` via `winresource` (drives the mingw `windres` already required to link
+this target — no new host dependency); an embed failure panics the build rather
+than warning, because a warning ships a generic-icon exe. The icon geometry is a deliberate,
+hand-synced duplicate of `tray::icon_rgba`'s dark plate — a build script cannot
+depend on the crate it builds. The `.ico` is generated into `OUT_DIR` for
+every target — not only Windows — so that
+`tray::tests::the_embedded_exe_icon_still_matches_the_tray_mark` reads it back
+in the portable `cargo test` loop and fails on drift; re-sync `build.rs` by
+hand when that test goes red. The end-user install walkthrough is documented
+in `packaging/windows/README.md`, and
+`iris-app/tests/settings.rs` executes that file's TOML instructions, so an
+edit there that would not load is a test failure rather than a bricked
+config.
+
+After packaging a new build, work through
+`docs/first-run-checklist.md` on a real Windows machine — this repo has no WSL
+Windows-interop in most sandboxes, so nothing Windows-specific (`#[cfg(windows)]`
+paths: the banner, the hotkey hook, the overlay, injection) has ever actually
+executed here; only compiled, cross-compiled, and been reviewed.
+
 ## The application
 
 `crates/iris-app/` is the product — the resident tray app that wires the other
