@@ -161,8 +161,9 @@ unused connection in roughly 12-15s, far short of real gaps between
 dictations, so it protected against a race that barely occurred in practice.
 That finding does not rule out *actively* holding a connection open — an
 actively-kept-alive spare (`WarmPool`, Deepgram's `KeepAlive` control frame,
-bounded to a few minutes' idle window) was built, shipped no further than
-this repo's history, and withdrawn before ever reaching the captain: three
+bounded to a few minutes' idle window) was built, tagged `warmpool-v1-withdrawn`
+(pushed to origin, so it survives a squash-merge or branch deletion), and
+withdrawn before ever reaching the captain: three
 review rounds kept surfacing data-loss-class lifecycle defects in the same
 abstraction (a stale-handoff replay that could still outrun the outer wait
 bound, an ack window sized for the wrong traffic shape, a "fixed" spare-

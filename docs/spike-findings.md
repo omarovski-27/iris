@@ -210,7 +210,8 @@ A component whose fixes keep silently failing to hold is a signal to redesign
 before patching again, not a reason to keep patching — that redesign is
 tracked as its own follow-up task, to start from latency measured on real
 Windows hardware rather than from this localhost harness. Its code is
-preserved in `fm/iris-silent-and-instant`'s git history if it is useful
+preserved at the `warmpool-v1-withdrawn` tag (pushed to origin, so it
+survives a squash-merge or the branch's deletion) if it is useful
 groundwork for that redesign.
 
 ## 7. Architecture recommendation
