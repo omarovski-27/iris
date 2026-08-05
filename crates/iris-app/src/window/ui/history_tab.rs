@@ -75,7 +75,7 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
             }
             (true, false) => {
                 "History logging is off, so nothing is being recorded. \
-                 Set history.enabled = true in config.toml (Settings → Open config file), \
+                 Set history.enabled = true in config.toml (Settings — Open config file), \
                  then pick “Reload settings” in the tray to start keeping dictations."
             }
         };
