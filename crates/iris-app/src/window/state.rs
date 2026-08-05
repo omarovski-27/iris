@@ -238,6 +238,11 @@ pub struct WindowState {
     /// Size and mtime of the session log as `history` was last read from it.
     /// See [`WindowState::refresh`].
     history_stamp: Option<(u64, Option<SystemTime>)>,
+    /// Whether the last attempt to read the session log failed, and so whether
+    /// the user has already been told about the failure now in progress. The
+    /// read is retried every refresh; the warning is one per episode. See
+    /// [`WindowState::refresh`].
+    history_read_failing: bool,
     /// The local calendar day `insights` counts "today" as. Held because it
     /// moves on its own clock: a window left open across local midnight has
     /// to recount, with the log untouched. See [`WindowState::refresh`].
@@ -300,6 +305,7 @@ impl WindowState {
             status: None,
             last_refresh: Instant::now(),
             history_stamp,
+            history_read_failing: unreadable_history.is_some(),
             insights_day,
             inflight: VecDeque::new(),
             filtered: Vec::new(),
@@ -360,13 +366,24 @@ impl WindowState {
             // seen, so keeping the last good one is what makes the next
             // refresh try again instead of going quietly stale once the
             // warning has expired.
+            //
+            // The retry is every refresh; the warning is once per episode.
+            // Saying it again every two seconds would leave no other status —
+            // "Copied", "Saved" — on screen for longer than that, and this is
+            // the same failure the user was already told about.
             match load_history(&history_path) {
                 Ok(history) => {
                     self.history = history;
                     self.filtered_for = None;
                     self.history_stamp = stamp;
+                    self.history_read_failing = false;
                 }
-                Err(e) => self.flash_failure(unreadable_log(&e)),
+                Err(e) => {
+                    if !self.history_read_failing {
+                        self.flash_failure(unreadable_log(&e));
+                    }
+                    self.history_read_failing = true;
+                }
             }
         }
         self.insights_day = day;
@@ -897,11 +914,17 @@ mod tests {
         assert_eq!(level, StatusLevel::Warn);
     }
 
-    /// ...and it keeps trying. The stamp is "what the records on screen were
-    /// read from", so a failed read must not advance it: a failure that leaves
-    /// the log's fingerprint sitting still would otherwise be seen once, and
-    /// never looked at again once its warning expired — a History frozen on
-    /// old records with nothing on screen to say so.
+    /// ...and it keeps trying, quietly. The stamp is "what the records on
+    /// screen were read from", so a failed read must not advance it: a failure
+    /// that leaves the log's fingerprint sitting still would otherwise be seen
+    /// once and never looked at again once its warning expired — a History
+    /// frozen on old records with nothing on screen to say so.
+    ///
+    /// The warning that goes with it is one per episode, not one per retry:
+    /// every two seconds it would be the only thing this window could ever
+    /// show, overwriting a "Copied" or a "Saved" the moment either appeared.
+    /// A failure that clears and later returns is a new episode and says so
+    /// again.
     #[test]
     fn a_refresh_that_cannot_read_the_log_tries_again_on_the_next_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -934,26 +957,55 @@ mod tests {
             state.history_stamp, read_from,
             "a read that failed is not the read the records came from"
         );
+        assert!(
+            state.status_flash().is_some(),
+            "the first failure went silent"
+        );
 
-        // The warning has expired and the user is looking at History again.
-        state.status = None;
+        // The next tick, with something else on screen — a "Copied" the user
+        // is reading. The read is retried (the `Err` arm ran, which is what
+        // `history_read_failing` records) and says nothing: it is the same
+        // failure they were told about a moment ago.
+        state.flash("Copied to clipboard");
         state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
         state.refresh(&env, false);
-        let (message, level) = state.status_flash().expect("the failure went silent");
-        assert!(
-            message.contains("Could not read the session log"),
-            "{message}"
+        assert!(state.history_read_failing, "the read was not retried");
+        assert_eq!(
+            state.status_text(),
+            Some("Copied to clipboard"),
+            "the same failure took the status line back over"
         );
-        assert_eq!(level, StatusLevel::Warn);
+        assert_eq!(
+            state.history_stamp, read_from,
+            "the retry that failed moved the stamp"
+        );
 
         // And the moment the log opens again, an ordinary refresh has it.
         std::fs::remove_file(&nest).unwrap();
-        let mut log = SessionLog::open(log_path, 10);
+        let mut log = SessionLog::open(log_path.clone(), 10);
         log.append(&DictationRecord::now("mock", "second")).unwrap();
         state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
         state.refresh(&env, false);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].text, "second");
+        assert!(!state.history_read_failing);
+
+        // A second episode is not the first one still going: it is news, and
+        // has to reach the user the same way.
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::remove_dir(&nest).unwrap();
+        std::fs::write(&nest, "").unwrap();
+        state.status = None;
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        let (message, level) = state
+            .status_flash()
+            .expect("a failure that came back went unsaid");
+        assert!(
+            message.contains("Could not read the session log"),
+            "{message}"
+        );
+        assert_eq!(level, StatusLevel::Warn);
     }
 
     /// `App::run` drains commands between dictations, so an answer can be
