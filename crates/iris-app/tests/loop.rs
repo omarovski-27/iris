@@ -133,6 +133,14 @@ impl Rig {
         })
     }
 
+    /// Shorten the wait for a final transcript. For a test whose engine is
+    /// never going to conclude, the default 5s is 5s of wall clock spent
+    /// proving nothing the assertion depends on.
+    fn with_final_timeout(mut self, timeout: Duration) -> Self {
+        self.app = self.app.with_final_timeout(timeout);
+        self
+    }
+
     /// Run one dictation to completion.
     fn dictate(&mut self) -> anyhow::Result<iris_app::Dictated> {
         let speaker = self.speak();
@@ -382,6 +390,565 @@ fn an_engine_failure_is_reported_and_recorded() {
     assert!(rig.injector.inserted().is_empty());
     // The overlay must come down even when everything went wrong.
     assert_eq!(*rig.pill.events().last().unwrap(), PillEvent::Hide);
+}
+
+#[test]
+fn a_stalled_dictation_still_logs_the_real_audio_captured() {
+    // Regression: the captain's session log on 2026-08-02 showed two
+    // consecutive dictations with `audio_secs: 0.0` right after a pathological
+    // 10-second one, which read as if capture itself had broken. The real
+    // errors on those two entries were a Deepgram connect timeout and a DNS
+    // failure — the audio_secs: 0.0 was an artifact of `App::capture`
+    // building a blank Timeline for the log whenever `finish()` errored,
+    // discarding whatever real audio and marks it had already stamped. This
+    // drives a dictation through the real `App::dictate` path with an engine
+    // that connects and captures normally but then never concludes, and
+    // checks the logged record still shows the audio that was actually
+    // captured instead of reading as an empty hold.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(NeverConcludesEngine));
+
+    let err = rig.dictate().expect_err("the engine never concludes");
+    assert!(
+        err.to_string().contains("did not return a transcript"),
+        "{err}"
+    );
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].injected);
+    assert!(
+        records[0].latency.audio_secs > 0.5,
+        "the log must show the real captured audio, not read as an empty \
+         hold: {:.2}s",
+        records[0].latency.audio_secs
+    );
+}
+
+#[test]
+fn a_short_hold_against_a_slow_connect_still_gets_its_words_typed() {
+    // The captain's two zero-audio dictations were connection failures. This
+    // is the same shape that *succeeds*, late: the socket comes up after the
+    // final-transcript deadline has already gone by but well inside the
+    // engine's own connect budget, flushes the audio it was holding, and
+    // answers. Every one of those words is recoverable, so every one of them
+    // has to reach the screen — a wait that gives up at the moment the
+    // connection starts working spends the whole budget and buys nothing.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(150));
+    rig.app.set_engine(Arc::new(ConnectsLateEngine {
+        streams_first: false,
+    }));
+
+    let dictated = rig.dictate().expect("a late connect is not a failure");
+
+    assert!(
+        dictated
+            .record
+            .text
+            .to_ascii_lowercase()
+            .contains("hello there"),
+        "the transcript the late connect produced must be delivered: {:?}",
+        dictated.record.text
+    );
+    assert!(dictated.record.injected);
+    assert_eq!(rig.injector.inserted().len(), 1);
+}
+
+#[test]
+fn a_slow_connect_that_streams_an_interim_still_types_the_final() {
+    // The same late connect, in the shape that streams a rough interim just
+    // ahead of the real transcript. Words existing means the wait is no longer
+    // extended — expiry from here costs a tail, not the utterance — but it
+    // must not mean the wait is *over*: the accurate text is milliseconds
+    // behind the interim, and ending on the interim types the wrong words into
+    // the user's document while the right ones are already on the wire.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(150));
+    rig.app.set_engine(Arc::new(ConnectsLateEngine {
+        streams_first: true,
+    }));
+
+    let dictated = rig.dictate().expect("a late connect is not a failure");
+
+    assert!(
+        dictated
+            .record
+            .text
+            .to_ascii_lowercase()
+            .contains("hello there"),
+        "the interim was typed instead of the final that followed it: {:?}",
+        dictated.record.text
+    );
+    assert!(dictated.record.injected);
+    assert_eq!(rig.injector.inserted().len(), 1);
+    assert!(
+        dictated.record.error.is_none(),
+        "the engine concluded; this is not a salvage: {:?}",
+        dictated.record.error
+    );
+}
+
+#[test]
+fn the_wait_for_the_final_transcript_comes_from_the_engine() {
+    // The 6s default was measured against a streaming engine. An engine whose
+    // work happens after key-up gets to say how long that takes, and the app
+    // must ask it rather than applying one architecture's budget to another —
+    // built without `with_final_timeout`, so only the engine's own bound can
+    // end this wait.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.polish.llm = false;
+    let audio = ChannelAudio::new();
+    let frames = audio.sender();
+    let armed = audio.armed();
+    let injector = Arc::new(RecordingInjector::new());
+    let pill = RecordingPill::new();
+    let mut app = App::new(
+        config,
+        &config_path,
+        audio,
+        injector as Arc<dyn Injector>,
+        Box::new(pill),
+    )
+    .expect("app");
+    app.set_engine(Arc::new(ImpatientEngine));
+
+    let (keys_tx, keys_rx) = crossbeam_channel::unbounded();
+    let app_frames = app.frames();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("arm");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        while !frames.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        keys_tx
+            .send(HotkeyEvent::Up(Instant::now()))
+            .expect("key up");
+    });
+
+    let started = Instant::now();
+    let err = app
+        .dictate(Instant::now(), &app_frames, &keys_rx)
+        .expect_err("the engine never concludes");
+    let waited = started.elapsed();
+    speaker.join().expect("speaker");
+
+    assert!(
+        err.to_string().contains("did not return a transcript"),
+        "{err}"
+    );
+    assert!(
+        waited < Duration::from_secs(3),
+        "the app waited out its own default instead of the engine's bound: {waited:?}"
+    );
+}
+
+#[test]
+fn a_mid_hold_failure_never_injects_while_the_key_is_still_held() {
+    // The user is still speaking. Whatever died — the microphone, the engine's
+    // appetite for frames — recovery must not fire yet: typing a mid-sentence
+    // fragment into whatever they are looking at is worse than any delay, and
+    // only the real key-up may end an utterance. Once it arrives the hold ends
+    // normally, and the words already transcribed are delivered then.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(PartialThenPushFailsEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let injector = rig.injector.clone();
+    let pill = rig.pill.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        // Long past the failure (it fires at 0.5 s of the 1 s sent), with the
+        // key still down.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            injector.inserted().is_empty(),
+            "a hold that is still running must never inject"
+        );
+        assert!(
+            !pill.events().contains(&PillEvent::Processing),
+            "the hold must still be waiting for the key-up, not finalising"
+        );
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("the hold produced words of its own after the key came up");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(
+        dictated.record.text.to_ascii_lowercase().contains("hello"),
+        "the streamed partial must survive the failure: {:?}",
+        dictated.record.text
+    );
+    assert!(dictated.record.injected);
+    assert_eq!(rig.injector.inserted().len(), 1);
+    assert!(
+        rig.records()[0].latency.audio_secs > 0.4,
+        "the log must still show the audio that was captured: {:.2}s",
+        rig.records()[0].latency.audio_secs
+    );
+    assert!(
+        rig.records()[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("died mid-hold"),
+        "the words that never reached the engine leave no other trace: {:?}",
+        rig.records()[0].error
+    );
+}
+
+#[test]
+fn a_dictation_that_survives_a_mid_hold_failure_still_names_it() {
+    // The engine went on to return a real transcript through `finish()`, so
+    // this is a successful, injected dictation — and it must report as one,
+    // not as a failure. But it is a *truncated* one: everything said after the
+    // microphone died was never captured, and a record that reads as an
+    // ordinary short dictation hides that from whoever is debugging why their
+    // words went missing.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(PushFailsThenFinalEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("a delivered dictation is not a failure, whatever it survived");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(dictated.record.injected);
+    assert!(
+        dictated.record.text.to_ascii_lowercase().contains("caught"),
+        "the engine's own transcript is what gets delivered: {:?}",
+        dictated.record.text
+    );
+    assert_eq!(rig.injector.inserted().len(), 1);
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].injected);
+    assert!(
+        records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("died mid-hold"),
+        "a dictation that lost audio must not read as an ordinary one: {:?}",
+        records[0].error
+    );
+}
+
+#[test]
+fn a_mid_hold_failure_still_logs_the_real_audio_captured() {
+    // The sibling of the test above for a hold that never transcribed
+    // anything: with nothing to show for itself it is a failure, and the log
+    // has to carry both what the hold captured — this used to read
+    // `audio_secs: 0.0` for half a second of speech — and the mid-hold failure
+    // that explains it, alongside the engine's own account of the finish.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(PushFailsMidHoldEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let err = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect_err("nothing was ever transcribed");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(err.to_string().contains("died mid-hold"), "{err}");
+    assert!(rig.injector.inserted().is_empty());
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].injected);
+    let error = records[0].error.as_deref().unwrap_or_default();
+    assert!(error.contains("died mid-hold"), "{error}");
+    assert!(
+        error.contains("did not return a transcript"),
+        "the engine's own account of the finish belongs in the log too: {error}"
+    );
+    assert!(
+        records[0].latency.audio_secs > 0.4,
+        "the log must show the audio captured before the failure, not read as \
+         an empty hold: {:.2}s",
+        records[0].latency.audio_secs
+    );
+}
+
+#[test]
+fn a_dead_hotkey_thread_reports_the_words_without_ever_injecting() {
+    // The hotkey channel is the only place a key-up can come from, so with it
+    // gone the key can never be confirmed up — and text that cannot be proven
+    // to belong at the cursor must not be typed there, however much of it the
+    // engine already produced. Not typed is not the same as not kept: the words
+    // the user watched appear go in the log, which is the only place left they
+    // can be recovered from.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(PartialOnOpenEngine));
+
+    // Already disconnected: there is no hotkey thread at all.
+    let (keys_tx, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    drop(keys_tx);
+
+    let app_frames = rig.app.frames();
+    let err = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &keys_rx)
+        .expect_err("with no hotkey thread the hold cannot complete");
+
+    assert!(err.to_string().contains("hotkey thread stopped"), "{err}");
+    assert!(
+        rig.injector.inserted().is_empty(),
+        "no key-up was ever confirmed; nothing may be typed"
+    );
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].injected);
+    assert!(
+        records[0].text.to_ascii_lowercase().contains("hello there"),
+        "the words the engine produced must survive in the log: {:?}",
+        records[0].text
+    );
+    assert!(records[0]
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("hotkey thread stopped"));
+}
+
+#[test]
+fn a_dead_hotkey_thread_keeps_an_earlier_mid_hold_failure_too() {
+    // Two things went wrong in one hold: the microphone died, and then the
+    // hotkey thread did. The second is what ends the hold, but a log that
+    // reports only it hides the reason half the utterance is missing — and
+    // the early return that reports it must not skip the mid-hold bookkeeping
+    // the ordinary exit does.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(PartialThenPushFailsEngine));
+
+    let (keys_tx, keys_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        // Not `while !frames.is_empty()`: the hold stops reading this channel
+        // the moment the push fails, so the backlog it leaves never drains.
+        std::thread::sleep(Duration::from_millis(150));
+        // The push failure has fired by now; the hotkey thread dies next.
+        drop(keys_tx);
+    });
+
+    let app_frames = rig.app.frames();
+    let err = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &keys_rx)
+        .expect_err("with no hotkey thread the hold cannot complete");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(
+        rig.injector.inserted().is_empty(),
+        "no key-up was ever confirmed; nothing may be typed"
+    );
+    assert!(err.to_string().contains("died mid-hold"), "{err}");
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    let error = records[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("died mid-hold"),
+        "the microphone failure is the only trace of the words it cost: {error}"
+    );
+    assert!(
+        error.contains("hotkey thread stopped"),
+        "and the failure that actually ended the hold belongs there too: {error}"
+    );
+    assert!(
+        records[0].text.to_ascii_lowercase().contains("hello there"),
+        "the words transcribed before either failure are still the user's: {:?}",
+        records[0].text
+    );
+}
+
+#[test]
+fn a_salvage_inside_finish_is_delivered_and_still_named_in_the_log() {
+    // Nothing failed on the app's side of this hold — the microphone, the
+    // frames and the key-up were all fine — so the mid-hold bookkeeping has
+    // nothing to report. The engine erred after streaming words, and
+    // `Dictation::finish` salvaged them. Delivered, therefore not a failure;
+    // salvaged, therefore not an ordinary dictation either, and a log that
+    // shows only a suspiciously short transcript is how a real engine failure
+    // hid during the 2026-08-02 investigation.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(ErrorsOnFinishEngine));
+
+    let dictated = rig
+        .dictate()
+        .expect("the words landed, so this is no failure");
+
+    assert!(dictated.record.injected);
+    assert!(
+        dictated
+            .record
+            .text
+            .to_ascii_lowercase()
+            .contains("hello there"),
+        "the streamed partial is what the user watched appear: {:?}",
+        dictated.record.text
+    );
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("the socket died finalising"),
+        "a salvage must carry the engine's own account of why it is one: {:?}",
+        records[0].error
+    );
+}
+
+#[test]
+fn a_tail_feed_failure_injects_the_words_and_still_records_the_cause() {
+    // The key is already up, so the utterance is over and injecting what the
+    // overlay showed cannot land mid-sentence — this is the one path allowed
+    // to deliver without `finish()`. The words go in; the log still says the
+    // hold ended abnormally, because a socket that died flushing the tail is
+    // not an ordinary dictation and the next person reading the log needs it.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app.set_engine(Arc::new(TailFeedFailsEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        // Queued in a burst and released immediately, so frames are still
+        // buffered when the key comes up — that backlog is the tail.
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("the words landed, so this is a dictation and not a failure");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(dictated.record.injected);
+    assert_eq!(
+        rig.injector.inserted().len(),
+        1,
+        "the words the user watched appear must still be delivered"
+    );
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].injected, "the text reached the cursor");
+    assert!(records[0].text.to_ascii_lowercase().contains("hello"));
+    assert!(
+        records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("flushing the tail"),
+        "a salvage-driven completion must not read as an ordinary dictation: {:?}",
+        records[0].error
+    );
+}
+
+#[test]
+fn a_tail_feed_failure_still_reports_an_earlier_mid_hold_cause() {
+    // The engine went quiet mid-hold and the microphone stayed healthy, so the
+    // tail block still ran — and then failed. That exit delivers and returns on
+    // its own, so it has to fold in the cause the hold collected earlier or the
+    // engine going quiet leaves no trace at all. The two used to be coupled by
+    // accident (every mid-hold cause also closed the frame source); they are
+    // not any more.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(300));
+    rig.app
+        .set_engine(Arc::new(GoesQuietThenTailFeedFailsEngine));
+
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let keys = rig.keys.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("the dictation never armed capture");
+        // First burst: the engine goes quiet on the opening frame and the loop
+        // has time to notice, with the key still down.
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // Second burst, released with the key: this is what the tail block
+        // picks up, and what the engine refuses.
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(Instant::now(), &app_frames, &rig.keys_rx)
+        .expect("the words landed, so this is a dictation and not a failure");
+    speaker.join().expect("the speaker panicked");
+
+    assert!(dictated.record.injected);
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    let error = records[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("flushing the tail"),
+        "the failure that ended the hold: {error}"
+    );
+    assert!(
+        error.contains("stopped sending events"),
+        "and the one that cost the words nobody will ever see: {error}"
+    );
 }
 
 #[test]
@@ -806,6 +1373,398 @@ impl Engine for FailingEngine {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(TranscriptEvent::Error("no key".into())).unwrap();
         Ok(Box::new(FixedSession { text: "", tx, rx }))
+    }
+}
+
+/// Connects normally but never sends a terminal event, no matter how long
+/// `finish()` waits — models a Deepgram session stalled by a network failure
+/// (the 2026-08-02 regression) rather than a connection that fails outright.
+struct NeverConcludesEngine;
+
+struct NeverConcludesSession {
+    events: Receiver<TranscriptEvent>,
+    _keep: Sender<TranscriptEvent>,
+}
+
+impl Engine for NeverConcludesEngine {
+    fn name(&self) -> &'static str {
+        "never-concludes"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(NeverConcludesSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+impl Session for NeverConcludesSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Connects, takes half a second of audio, then refuses the rest — a socket
+/// dying in the middle of a hold, which fails the *feed* rather than anything
+/// `finish()` would ever see.
+struct PushFailsMidHoldEngine;
+
+struct PushFailsMidHoldSession {
+    events: Receiver<TranscriptEvent>,
+    _keep: Sender<TranscriptEvent>,
+    samples: usize,
+}
+
+impl Engine for PushFailsMidHoldEngine {
+    fn name(&self) -> &'static str {
+        "push-fails-mid-hold"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PushFailsMidHoldSession {
+            events: rx,
+            _keep: tx,
+            samples: 0,
+        }))
+    }
+}
+
+impl Session for PushFailsMidHoldSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        self.samples += pcm.len();
+        // 8000 samples at 16 kHz: half a second of very real speech.
+        if self.samples >= 8_000 {
+            anyhow::bail!("the websocket died mid-hold");
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Refuses audio mid-hold like [`PushFailsMidHoldEngine`], but still returns a
+/// real transcript when asked to finalise: the hold loses its tail of audio and
+/// succeeds anyway.
+struct PushFailsThenFinalEngine;
+
+struct PushFailsThenFinalSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Sender<TranscriptEvent>,
+    samples: usize,
+}
+
+impl Engine for PushFailsThenFinalEngine {
+    fn name(&self) -> &'static str {
+        "push-fails-then-final"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PushFailsThenFinalSession {
+            events: rx,
+            tx,
+            samples: 0,
+        }))
+    }
+}
+
+impl Session for PushFailsThenFinalSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        self.samples += pcm.len();
+        if self.samples >= 8_000 {
+            anyhow::bail!("the websocket died mid-hold");
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        let _ = self
+            .tx
+            .send(TranscriptEvent::Final("what it caught".into()));
+        Ok(())
+    }
+}
+
+/// Streams one partial the instant the session opens, then never concludes —
+/// words are available from the very first moment, whatever else happens.
+struct PartialOnOpenEngine;
+
+impl Engine for PartialOnOpenEngine {
+    fn name(&self) -> &'static str {
+        "partial-on-open"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Partial("hello there".into()))
+            .unwrap();
+        Ok(Box::new(NeverConcludesSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+/// Takes every frame the hold feeds it, then refuses the tail — the socket
+/// dying in the gap between key-up and `finish()`.
+struct TailFeedFailsEngine;
+
+struct TailFeedFailsSession {
+    events: Receiver<TranscriptEvent>,
+    _keep: Sender<TranscriptEvent>,
+}
+
+impl Engine for TailFeedFailsEngine {
+    fn name(&self) -> &'static str {
+        "tail-feed-fails"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        // Streamed up front so the words exist however few frames the hold got
+        // through before the key came up.
+        tx.send(TranscriptEvent::Partial("hello there".into()))
+            .unwrap();
+        Ok(Box::new(TailFeedFailsSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+impl Session for TailFeedFailsSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        // The hold feeds one 320-sample frame at a time; only the tail arrives
+        // as a single larger chunk, so this fails there and nowhere else.
+        if pcm.len() > 320 {
+            anyhow::bail!("the websocket died flushing the tail");
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// As [`TailFeedFailsEngine`], but it also drops its event sender on the first
+/// frame — the engine going quiet mid-hold while the microphone stays healthy,
+/// so the tail block still runs and then fails with a cause already recorded.
+struct GoesQuietThenTailFeedFailsEngine;
+
+struct GoesQuietThenTailFeedFailsSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Option<Sender<TranscriptEvent>>,
+}
+
+impl Engine for GoesQuietThenTailFeedFailsEngine {
+    fn name(&self) -> &'static str {
+        "goes-quiet-then-tail-feed-fails"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Partial("hello there".into()))
+            .unwrap();
+        Ok(Box::new(GoesQuietThenTailFeedFailsSession {
+            events: rx,
+            tx: Some(tx),
+        }))
+    }
+}
+
+impl Session for GoesQuietThenTailFeedFailsSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        if pcm.len() > 320 {
+            anyhow::bail!("the websocket died flushing the tail");
+        }
+        // Pump exit: the events channel disconnects, the frames keep flowing.
+        self.tx = None;
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Takes a connect budget of its own and comes up only after the app's
+/// final-transcript deadline has already passed, then answers the way a real
+/// socket does once it is up. The degraded-network connect that succeeds late.
+struct ConnectsLateEngine {
+    /// Whether the flush puts a rough interim on the wire just ahead of the
+    /// real transcript. Both shapes are real (see `engine/deepgram.rs`), and
+    /// the one with an interim is the one that can hand back the wrong words.
+    streams_first: bool,
+}
+
+struct ConnectsLateSession {
+    events: Receiver<TranscriptEvent>,
+    _worker: std::thread::JoinHandle<()>,
+}
+
+impl Engine for ConnectsLateEngine {
+    fn name(&self) -> &'static str {
+        "connects-late"
+    }
+    fn connect_budget(&self) -> Option<Duration> {
+        Some(Duration::from_secs(3))
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let streams_first = self.streams_first;
+        let worker = std::thread::spawn(move || {
+            // Past the 150ms the app is prepared to wait from key-up, inside
+            // the 3s the engine is allowed for its connect.
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = tx.send(TranscriptEvent::Connected);
+            std::thread::sleep(Duration::from_millis(50));
+            if streams_first {
+                let _ = tx.send(TranscriptEvent::Partial("hello ther".into()));
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            // A short hold can have nothing but the post-`Finalize` flush, in
+            // which case the whole transcript arrives at once.
+            let _ = tx.send(TranscriptEvent::Final("hello there".into()));
+        });
+        Ok(Box::new(ConnectsLateSession {
+            events: rx,
+            _worker: worker,
+        }))
+    }
+}
+
+impl Session for ConnectsLateSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams words, then answers the finalise with an error instead of a
+/// transcript — an engine failure with nothing wrong on the app's side of the
+/// hold, so `finish`'s own salvage is the only thing that can name it.
+struct ErrorsOnFinishEngine;
+
+struct ErrorsOnFinishSession {
+    tx: Sender<TranscriptEvent>,
+    rx: Receiver<TranscriptEvent>,
+}
+
+impl Engine for ErrorsOnFinishEngine {
+    fn name(&self) -> &'static str {
+        "errors-on-finish"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Partial("hello there".into()))
+            .unwrap();
+        Ok(Box::new(ErrorsOnFinishSession { tx, rx }))
+    }
+}
+
+impl Session for ErrorsOnFinishSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.rx
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.tx
+            .send(TranscriptEvent::Error("the socket died finalising".into()))?;
+        Ok(())
+    }
+}
+
+/// Never concludes, and asks for a much shorter wait than the streaming
+/// default — the shape of an engine that knows its own finalise cost.
+struct ImpatientEngine;
+
+impl Engine for ImpatientEngine {
+    fn name(&self) -> &'static str {
+        "impatient"
+    }
+    fn final_timeout(&self) -> Duration {
+        Duration::from_millis(200)
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(NeverConcludesSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+/// As [`PushFailsMidHoldEngine`], but it streams a partial first — so the hold
+/// dies with words already on the user's screen.
+struct PartialThenPushFailsEngine;
+
+struct PartialThenPushFailsSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Sender<TranscriptEvent>,
+    samples: usize,
+}
+
+impl Engine for PartialThenPushFailsEngine {
+    fn name(&self) -> &'static str {
+        "partial-then-push-fails"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(PartialThenPushFailsSession {
+            events: rx,
+            tx,
+            samples: 0,
+        }))
+    }
+}
+
+impl Session for PartialThenPushFailsSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        let before = self.samples;
+        self.samples += pcm.len();
+        if before < 4_000 && self.samples >= 4_000 {
+            let _ = self.tx.send(TranscriptEvent::Partial("hello there".into()));
+        }
+        if self.samples >= 8_000 {
+            anyhow::bail!("the websocket died mid-hold");
+        }
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

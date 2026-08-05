@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver};
-use iris_core::dictation::{Dictation, DEFAULT_FINAL_TIMEOUT};
+use iris_core::dictation::{Dictation, DictationOutcome};
 use iris_core::engine::Engine;
 use iris_core::hotkey::HotkeyEvent;
 use iris_core::latency::{ms, Mark, Timeline};
@@ -99,7 +99,11 @@ pub struct App<A: AudioSource> {
     audio: A,
     count: usize,
     report: bool,
-    final_timeout: Duration,
+    /// Set only by [`App::with_final_timeout`]. Left `None`, every dictation
+    /// asks the engine in force for its own bound, so switching engines at
+    /// runtime switches the wait with it instead of keeping the one the app
+    /// started with.
+    final_timeout: Option<Duration>,
 }
 
 impl<A: AudioSource> App<A> {
@@ -145,7 +149,7 @@ impl<A: AudioSource> App<A> {
             audio,
             count: 0,
             report: false,
-            final_timeout: DEFAULT_FINAL_TIMEOUT,
+            final_timeout: None,
         })
     }
 
@@ -156,11 +160,18 @@ impl<A: AudioSource> App<A> {
         self
     }
 
-    /// How long to wait for the final transcript after the key comes up.
+    /// Override how long to wait for the final transcript after the key comes
+    /// up, in place of the bound the engine asks for.
     #[must_use]
     pub fn with_final_timeout(mut self, timeout: Duration) -> Self {
-        self.final_timeout = timeout;
+        self.final_timeout = Some(timeout);
         self
+    }
+
+    /// The wait in force for the engine currently selected.
+    fn final_timeout(&self) -> Duration {
+        self.final_timeout
+            .unwrap_or_else(|| self.engine.final_timeout())
     }
 
     /// The configuration as it stands on disk, when CLI flags overrode parts
@@ -410,6 +421,12 @@ impl<A: AudioSource> App<A> {
                 // No transcript to save, but the failure still belongs in the
                 // log: "nothing happened when I pressed the key" is the hardest
                 // bug to report without one.
+                //
+                // Only opening the session or arming capture can land here —
+                // both happen before any audio exists, so this timeline is
+                // legitimately blank. Every failure *after* that point returns
+                // its own real timeline through `capture` (see `App::failed`);
+                // do not widen this fallback to cover them.
                 let mut record = DictationRecord::now(self.engine.name(), "");
                 record.error = Some(format!("{e:#}"));
                 Dictated {
@@ -426,9 +443,15 @@ impl<A: AudioSource> App<A> {
             println!("{}", dictated.timeline.report(self.count));
         }
 
+        // Delivery decides this, not `record.error`: a salvage can carry the
+        // cause of an abnormal hold *and* have put the user's words on screen,
+        // and the second of those is what the caller acted on. Only a dictation
+        // that delivered nothing is a failure — the cause of one that delivered
+        // belongs in the session log, which already has it, not in a console
+        // line contradicting the confirmation the user just watched.
         match &dictated.record.error {
-            Some(message) => anyhow::bail!("{message}"),
-            None => Ok(dictated),
+            Some(message) if !dictated.record.injected => anyhow::bail!("{message}"),
+            _ => Ok(dictated),
         }
     }
 
@@ -473,27 +496,45 @@ impl<A: AudioSource> App<A> {
         self.audio.arm().context("starting capture")?;
 
         let events = dictation.events();
-        // When the engine hangs up mid-hold we must *not* treat that as a key
-        // release: doing so finalises on a partial segment and injects truncated
-        // text while the user is still speaking. Keep capturing until the real
-        // key-up; `finish()` surfaces the engine failure or salvages partials.
+        // Nothing that fails mid-hold may end the hold: the key is still down,
+        // the user is still speaking, and finalising on a partial segment would
+        // type truncated text into whatever they are looking at. Whichever
+        // source dies — the engine's events, the microphone, the engine's
+        // appetite for frames — we note it and keep waiting for the real
+        // key-up, which is the only thing allowed to end an utterance.
         //
-        // crossbeam `select!` has no `if` guard on `recv`, so after disconnect
-        // we swap in a never-ready receiver and keep waiting on frames/keys.
+        // crossbeam `select!` has no `if` guard on `recv`, so a dead source is
+        // swapped for a never-ready receiver and the loop carries on.
         let never_events = crossbeam_channel::never();
+        let never_frames = crossbeam_channel::never();
         let mut engine_events_open = true;
+        let mut frames_open = true;
+        let mut mid_hold_failure: Option<anyhow::Error> = None;
 
-        let released_at = loop {
+        let held = loop {
             let event_rx = if engine_events_open {
                 &events
             } else {
                 &never_events
             };
+            let frame_rx = if frames_open { frames } else { &never_frames };
             select! {
-                recv(frames) -> frame => {
-                    let frame = frame.context("the audio thread stopped")?;
-                    self.pill.update_level(audio::level(&frame));
-                    dictation.feed(&frame)?;
+                recv(frame_rx) -> frame => {
+                    // The microphone stopping and the engine refusing the frame
+                    // are the same event to this hold: there is nothing left to
+                    // feed, and the words already produced are still the user's.
+                    // One handler, so the two cannot drift.
+                    let fed = frame
+                        .context("the audio thread stopped")
+                        .and_then(|frame| {
+                            self.pill.update_level(audio::level(&frame));
+                            dictation.feed(&frame)
+                        });
+                    if let Err(e) = fed {
+                        eprintln!("  capture failed mid-hold: {e:#}");
+                        mid_hold_failure.get_or_insert(e);
+                        frames_open = false;
+                    }
                 }
                 recv(event_rx) -> event => match event {
                     Ok(event) => {
@@ -507,88 +548,224 @@ impl<A: AudioSource> App<A> {
                         iris_core::vlog!(
                             "engine event channel closed mid-hold; waiting for key-up"
                         );
+                        // Recorded like any other mid-hold failure: everything
+                        // said from here on can only reach the transcript if
+                        // the engine happens to send it after `finish`, so a
+                        // dictation that ends this way is not an ordinary one
+                        // however complete its words look.
+                        mid_hold_failure.get_or_insert_with(|| {
+                            anyhow::anyhow!("the engine stopped sending events mid-hold")
+                        });
                         engine_events_open = false;
                     }
                 },
                 recv(keys) -> event => {
-                    match event.context("the hotkey thread stopped")? {
-                        HotkeyEvent::Up(at) => break at,
+                    match event.context("the hotkey thread stopped") {
+                        Ok(HotkeyEvent::Up(at)) => break Ok(at),
                         // A repeat press we never saw the release of. Ignore it
                         // rather than ending an utterance the user is still in.
-                        HotkeyEvent::Down(_) => {}
+                        Ok(HotkeyEvent::Down(_)) => {}
+                        Err(e) => break Err(e),
                     }
                 }
             }
         };
 
+        let released_at = match held {
+            Ok(at) => at,
+            Err(e) => {
+                // The hotkey channel is the only source a key-up can ever come
+                // from, so this hold can never be confirmed as over. Salvaging
+                // into an injection here would type into a window whose user
+                // may still be mid-sentence; the words are reported, not typed.
+                let outcome = dictation.abandon(&mut |_| {});
+                let dictated = self.reported(outcome, format!("{e:#}"));
+                return Ok(note_mid_hold(dictated, mid_hold_failure));
+            }
+        };
+
+        // Stamped before the tail is fed so a failure down there still logs a
+        // hold that reached key-up; `mark_at` records `released_at` itself, so
+        // the number is the same wherever this sits.
+        dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
+
         // Whatever the device buffered but had not delivered is still the
-        // user's speech; dropping it would truncate the last word.
-        let mut tail = Vec::new();
-        while let Ok(frame) = frames.try_recv() {
-            tail.extend_from_slice(&frame);
-        }
-        if !tail.is_empty() {
-            dictation.feed(&tail)?;
+        // user's speech; dropping it would truncate the last word. Unless the
+        // hold already gave up on that source: a backlog the loop deliberately
+        // stopped reading is not a tail, and the thing that refused it will
+        // only refuse it again.
+        if frames_open {
+            let mut tail = Vec::new();
+            while let Ok(frame) = frames.try_recv() {
+                tail.extend_from_slice(&frame);
+            }
+            if !tail.is_empty() {
+                if let Err(e) = dictation.feed(&tail) {
+                    let dictated = self.abandoned(dictation, e);
+                    return Ok(note_mid_hold(dictated, mid_hold_failure));
+                }
+            }
         }
 
-        dictation.timeline_mut().mark_at(Mark::KeyUp, released_at);
         self.pill.processing();
 
-        let outcome = {
+        let finished = {
+            let timeout = self.final_timeout();
             let pill = &mut self.pill;
-            dictation.finish(self.final_timeout, &mut |text: &str| {
+            dictation.finish(timeout, &mut |text: &str| {
                 iris_core::vlog!("~ {text}");
                 pill.set_partial_text(text);
-            })?
+            })
         };
-        let mut timeline = outcome.timeline;
-        let raw = outcome.text.trim().to_string();
+        let dictated = match finished {
+            Ok(outcome) => self.deliver(outcome),
+            Err(e) => {
+                // The engine never produced a transcript, but real audio may
+                // have been captured and marks stamped before it gave up —
+                // `e.timeline` carries that, so the record below reports what
+                // actually happened instead of reading as if the hold never
+                // captured anything.
+                let message = format!("{e:#}");
+                self.failed(e.timeline, message)
+            }
+        };
+        // Always, even when the hold went on to produce a transcript: what came
+        // back is then the part of the utterance that survived, and a record
+        // that does not say so reads as an ordinary dictation that happened to
+        // be short. The words the microphone never captured are invisible here
+        // by definition; the cause is the only trace they leave.
+        Ok(note_mid_hold(dictated, mid_hold_failure))
+    }
+
+    /// Polish the transcript, put it on screen, and record what happened.
+    ///
+    /// Shared by every path that ends with words in hand — a clean `finish`, a
+    /// partial salvaged from an engine that died, a partial salvaged from a
+    /// hold [`App::abandoned`] before `finish` could run. What the user gets
+    /// does not depend on which of those produced the text.
+    ///
+    /// [`DictationOutcome::cause`] is what keeps the *log* honest about the
+    /// difference: a salvage produced inside `finish` never reaches the
+    /// mid-hold bookkeeping in [`App::capture`], so without it an engine that
+    /// errored after two partials would record as a clean, unusually short
+    /// dictation.
+    fn deliver(&mut self, outcome: DictationOutcome) -> Dictated {
+        let DictationOutcome {
+            text: raw,
+            mut timeline,
+            cause,
+        } = outcome;
+        let raw = raw.trim().to_string();
 
         let mut record = DictationRecord::now(self.engine.name(), &raw);
-        if raw.is_empty() {
+        let dictated = if raw.is_empty() {
             // Silence, or a key tapped by accident. Injecting nothing is right;
             // so is not pretending to the overlay that text appeared.
             record.latency = LatencyBreakdown::from_timeline(&timeline);
-            return Ok(Dictated { record, timeline });
-        }
+            Dictated { record, timeline }
+        } else {
+            let (text, polished_info, polish_ms) = self.polish(&raw);
+            record.text = text.clone();
+            record.raw = (text != raw).then(|| raw.clone());
+            record.polish = polished_info;
 
-        let (text, polished_info, polish_ms) = self.polish(&raw);
-        record.text = text.clone();
-        record.raw = (text != raw).then(|| raw.clone());
-        record.polish = polished_info;
-
-        let payload = text::prepare(&text, self.config.inject.trailing_space);
-        match self.injector.inject(&payload) {
-            Ok(()) => {
-                timeline.mark(Mark::Injected);
-                record.injected = true;
-                // Key-release → text on screen: the number the pill prints.
-                let latency_ms = timeline
-                    .perceived()
-                    .map(ms)
-                    .unwrap_or(0.0)
-                    .round()
-                    .clamp(0.0, f64::from(u32::MAX)) as u32;
-                self.pill.inserted(latency_ms);
-            }
-            Err(e) => {
-                // The transcript is good; only the delivery failed. Say so, and
-                // make sure the record below carries the text. With history off
-                // there is no file to point at, so the console gets the words
-                // themselves — they must be recoverable from somewhere.
-                eprintln!("  could not insert the text: {e:#}");
-                if self.history.enabled() {
-                    eprintln!("  it is in {}", self.history.path().display());
-                } else {
-                    eprintln!("  it was: {text}");
+            let payload = text::prepare(&text, self.config.inject.trailing_space);
+            match self.injector.inject(&payload) {
+                Ok(()) => {
+                    timeline.mark(Mark::Injected);
+                    record.injected = true;
+                    // Key-release → text on screen: the number the pill prints.
+                    let latency_ms = timeline
+                        .perceived()
+                        .map(ms)
+                        .unwrap_or(0.0)
+                        .round()
+                        .clamp(0.0, f64::from(u32::MAX))
+                        as u32;
+                    self.pill.inserted(latency_ms);
                 }
-                record.error = Some(format!("injection failed: {e:#}"));
+                Err(e) => {
+                    // The transcript is good; only the delivery failed. Say so,
+                    // and make sure the record below carries the text. With
+                    // history off there is no file to point at, so the console
+                    // gets the words themselves — they must be recoverable from
+                    // somewhere.
+                    eprintln!("  could not insert the text: {e:#}");
+                    if self.history.enabled() {
+                        eprintln!("  it is in {}", self.history.path().display());
+                    } else {
+                        eprintln!("  it was: {text}");
+                    }
+                    record.error = Some(format!("injection failed: {e:#}"));
+                }
             }
-        }
 
+            record.latency = LatencyBreakdown::from_timeline(&timeline);
+            record.latency.polish_ms = polish_ms;
+            Dictated { record, timeline }
+        };
+
+        note_salvage(dictated, cause)
+    }
+
+    /// A hold that produced no transcript, recorded against the timeline as it
+    /// actually stood. Every no-transcript path inside [`App::capture`] goes
+    /// through here: a blank timeline would log real audio as `audio_secs:
+    /// 0.0` and make a network failure read as a broken microphone, which is
+    /// exactly the false trail the 2026-08-02 investigation had to walk back.
+    fn failed(&self, timeline: Timeline, message: String) -> Dictated {
+        let mut record = DictationRecord::now(self.engine.name(), "");
+        record.error = Some(message);
         record.latency = LatencyBreakdown::from_timeline(&timeline);
-        record.latency.polish_ms = polish_ms;
-        Ok(Dictated { record, timeline })
+        Dictated { record, timeline }
+    }
+
+    /// A hold that has words but may never put them on screen: recorded in
+    /// full, injected never.
+    ///
+    /// The dead-hotkey channel is why this exists. No key-up can arrive there,
+    /// so the utterance cannot be confirmed over and [`App::deliver`] — which
+    /// injects — is not allowed to run; but the words the user watched the
+    /// overlay produce are real, and dropping them to an empty transcript the
+    /// way [`App::failed`] does leaves them nowhere at all. This is that record
+    /// with the text put back, sharing `failed`'s single place for building it
+    /// so the failure half cannot drift.
+    fn reported(&self, outcome: DictationOutcome, cause: String) -> Dictated {
+        let DictationOutcome {
+            text,
+            timeline,
+            cause: salvage_cause,
+        } = outcome;
+        let mut dictated = self.failed(timeline, cause);
+        dictated.record.text = text.trim().to_string();
+        note_salvage(dictated, salvage_cause)
+    }
+
+    /// The tail feed failed: the key is already up, so the utterance is over
+    /// and the engine will never be asked to finalise it.
+    ///
+    /// This is the one path that delivers without [`Dictation::finish`], and it
+    /// is deliberately the only one: the key-up is confirmed, so injecting what
+    /// the overlay already showed cannot land mid-sentence. Words the user
+    /// watched appear are not thrown away by the failure that ended the hold —
+    /// but the record still names that failure, because a dictation that ended
+    /// this way is not an ordinary one and the log has to say so.
+    fn abandoned(&mut self, dictation: Dictation, error: anyhow::Error) -> Dictated {
+        let outcome = {
+            let pill = &mut self.pill;
+            dictation.abandon(&mut |text: &str| {
+                iris_core::vlog!("~ {text}");
+                pill.set_partial_text(text);
+            })
+        };
+        let cause = format!("{error:#}");
+        if outcome.text.trim().is_empty() {
+            return self.reported(outcome, cause);
+        }
+        eprintln!("  the hold ended early, delivering what was transcribed: {cause}");
+        self.pill.processing();
+        let dictated = self.deliver(outcome);
+        note_cause(dictated, error)
     }
 
     /// Clean up the transcript, falling back to the raw text on any failure.
@@ -615,6 +792,42 @@ impl<A: AudioSource> App<A> {
             }
         }
     }
+}
+
+/// Name why a hold ended abnormally on the record it produced anyway.
+///
+/// A dictation can be both: the words were recovered *and* something went
+/// wrong. Keeping only the words would log a dead microphone as an ordinary,
+/// unusually fast dictation — and a dead microphone is the single most useful
+/// thing in the file, because every hold after it will fail to arm capture.
+fn note_cause(dictated: Dictated, cause: anyhow::Error) -> Dictated {
+    note_reason(dictated, format!("{cause:#}"))
+}
+
+/// The mid-hold cause, when the hold had one. Every exit from [`App::capture`]
+/// goes through this, so none of them can quietly return without it.
+fn note_mid_hold(dictated: Dictated, cause: Option<anyhow::Error>) -> Dictated {
+    match cause {
+        Some(cause) => note_cause(dictated, cause),
+        None => dictated,
+    }
+}
+
+/// Why the words are a salvage rather than a transcript, when they are — see
+/// [`DictationOutcome::cause`].
+fn note_salvage(dictated: Dictated, cause: Option<String>) -> Dictated {
+    match cause {
+        Some(cause) => note_reason(dictated, cause),
+        None => dictated,
+    }
+}
+
+fn note_reason(mut dictated: Dictated, cause: String) -> Dictated {
+    dictated.record.error = Some(match dictated.record.error.take() {
+        Some(existing) => format!("{cause}; {existing}"),
+        None => cause,
+    });
+    dictated
 }
 
 fn open_history(config: &Config, config_path: &std::path::Path) -> SessionLog {

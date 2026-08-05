@@ -21,6 +21,52 @@ use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
 const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
 const DEFAULT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 
+/// How long to wait for the socket to come up, before a byte of audio moves.
+///
+/// Provisional. Nothing here is live-measured (`docs/spike-findings.md` lists
+/// this engine as compile + unit-tested, not run), but a TLS handshake with a
+/// healthy HTTPS API is well under a second, and this is the same order as
+/// Deepgram's own connect budget. Its job is to fail a blackholed or half-open
+/// connection fast instead of leaving [`FINAL_TIMEOUT`] as the only thing that
+/// ever ends the wait.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the whole request may take, connect included.
+///
+/// Provisional, and reasoned from size rather than measured: a minute of speech
+/// is a ~1.9 MB WAV, which a weak but working uplink (~1 Mbit/s) moves in ~15s,
+/// leaving ~10s for `whisper-large-v3-turbo` to run and answer. Raise it if
+/// real Groq latency ever says otherwise — but raise [`FINAL_TIMEOUT`] with it,
+/// or the outer wait will start cutting off requests that were going to succeed.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// The backstop under [`GroqEngine::final_timeout`]: a little above
+/// [`REQUEST_TIMEOUT`], so the request's own error is what reaches the user and
+/// this only fires if the client somehow does not.
+///
+/// [`REQUEST_TIMEOUT`] alone is the whole client-side worst case —
+/// `reqwest`'s request timeout is one deadline running from the start of the
+/// connect through to the end of the response body, so [`CONNECT_TIMEOUT`] is
+/// contained by it rather than added to it. The margin over it covers only
+/// this side of the channel: the runtime picking the spawned task back up,
+/// parsing the response, and handing the event over.
+///
+/// **This is a bound on how long the whole app stops responding.**
+/// `Dictation::finish` blocks the resident loop in `iris-app` — the pill stays
+/// frozen on "processing", and tray commands including Quit go unserviced —
+/// for as long as the engine's `final_timeout` allows. Any engine choosing that
+/// value is spending the user's whole UI, not just this dictation's latency.
+///
+/// The exposure is real and accepted: choosing Groq means a failing finalise
+/// can freeze the app, Quit included, for the full 28s here (the local engine's
+/// bound is 20s; `DEFAULT_FINAL_TIMEOUT`, which Deepgram inherits, is 6s). It
+/// is not bought down by lowering this number — with `streams_partials` false
+/// there is nothing to salvage, so a shorter bound pays for responsiveness
+/// with the user's whole utterance, which is the trade this project does not
+/// make. The fix is a non-blocking finalise path, tracked separately; do not
+/// approximate it by trimming this.
+const FINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(28);
+
 pub struct GroqEngine {
     key: String,
     model: String,
@@ -66,6 +112,16 @@ impl Engine for GroqEngine {
     /// audio is complete.
     fn streams_partials(&self) -> bool {
         false
+    }
+
+    /// Well above the streaming default: WAV encode, upload of the whole
+    /// utterance and Whisper inference all happen after key-up, and
+    /// `streams_partials` is `false` here — an expiry loses the whole
+    /// transcript, not a tail of it. It is a backstop rather than the working
+    /// bound, because [`CONNECT_TIMEOUT`] and [`REQUEST_TIMEOUT`] end a dead
+    /// request first; see [`FINAL_TIMEOUT`] for what this costs the UI.
+    fn final_timeout(&self) -> std::time::Duration {
+        FINAL_TIMEOUT
     }
 
     fn open(&self) -> Result<Box<dyn Session>> {
@@ -166,7 +222,13 @@ async fn transcribe(
         form = form.text("language", lang);
     }
 
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("building the Groq HTTP client")?;
+
+    let response = client
         .post(&url)
         .bearer_auth(key)
         .multipart(form)
@@ -203,6 +265,41 @@ mod tests {
             language: None,
         };
         assert!(!engine.streams_partials());
+    }
+
+    #[test]
+    fn the_outer_wait_is_a_backstop_over_the_request_s_own_deadline() {
+        // reqwest's request timeout is one deadline covering connect through
+        // response body, so REQUEST_TIMEOUT alone is the client-side worst
+        // case. This must stay above it — otherwise the outer wait cuts off
+        // requests that were still going to succeed — and not far above it,
+        // because every second here is a second the resident app spends
+        // unresponsive.
+        assert!(FINAL_TIMEOUT > REQUEST_TIMEOUT, "{FINAL_TIMEOUT:?}");
+        assert!(
+            FINAL_TIMEOUT - REQUEST_TIMEOUT < CONNECT_TIMEOUT,
+            "the margin is for handing the answer back, not for a second connect: {:?}",
+            FINAL_TIMEOUT - REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn groq_does_not_inherit_the_streaming_wait() {
+        // Upload and inference both happen after key-up here, and with no
+        // partials there is nothing to salvage when the wait runs out — an
+        // expiry costs the user the whole utterance. The streaming default is
+        // the wrong budget for that, and inheriting it silently is the bug.
+        let engine = GroqEngine {
+            key: "x".into(),
+            model: DEFAULT_MODEL.into(),
+            url: DEFAULT_URL.into(),
+            language: None,
+        };
+        assert!(
+            engine.final_timeout() > crate::dictation::DEFAULT_FINAL_TIMEOUT,
+            "a batch engine needs more room than the streaming default, not less: {:?}",
+            engine.final_timeout()
+        );
     }
 
     #[test]

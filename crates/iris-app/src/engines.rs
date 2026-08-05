@@ -125,6 +125,28 @@ impl Engine for LocalAdapter {
         self.inner.streams_partials()
     }
 
+    /// Provisional, and longer than the streaming default because the Whisper
+    /// finalizer runs entirely after key-up, here on the user's own CPU, and no
+    /// local finalise latency has been measured on real hardware in this
+    /// project.
+    ///
+    /// Unlike Groq's, this wait has no socket under it that could hang
+    /// half-open — the work is local and bounded by the machine — so there is
+    /// nothing to bound from underneath and this is the whole budget. It is
+    /// held well under Groq's for the reason that difference allows: the
+    /// layered engine streams partials, so an expiry costs the finalizer's
+    /// improvement on the tail rather than the utterance. It is still a bound
+    /// on how long the resident loop stops responding (see
+    /// `iris_core::engine::groq::FINAL_TIMEOUT`), which is why it is not simply
+    /// set to whatever the slowest imaginable CPU might need: choosing the
+    /// local engine means a stuck finalise can hold the app — Quit included —
+    /// for the full 20s, against 6s for the default Deepgram path (~14s there
+    /// when the connect grace had to be bought first). That is
+    /// accepted rather than trimmed, for the same reason Groq's 28s is.
+    fn final_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(20)
+    }
+
     fn open(&self) -> Result<Box<dyn iris_core::engine::Session>> {
         let session = self.inner.start().context("starting the local engine")?;
         let (tx, rx) = crossbeam_channel::unbounded();

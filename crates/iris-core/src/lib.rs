@@ -32,7 +32,7 @@ pub mod text;
 pub mod capture;
 
 pub use audio::{Resampler, FRAME_SAMPLES, SAMPLE_RATE};
-pub use dictation::{Dictation, DictationOutcome};
+pub use dictation::{Dictation, DictationError, DictationOutcome};
 pub use engine::{Engine, EngineSpec, Session, TranscriptEvent};
 pub use latency::{Mark, Timeline};
 

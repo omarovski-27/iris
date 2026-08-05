@@ -168,6 +168,110 @@ wrongly-deleted word is worse than a duplicated one. Containment rather than
 overlap, and where the one tolerance constant may and may not be applied, are
 load-bearing; the reasoning is in the same module doc.
 
+**`FINALIZE_ACK_TIMEOUT` and `FINALIZE_TIMEOUT` do not bound how long a
+dictation can hang.** They bound `deepgram.rs`'s own internal wait
+(ack-before-`CloseStream`, then silence-after-`CloseStream` — the second is
+re-armed on every inbound message, so it bounds *silence*, not the whole
+finalisation). The actual outer bound on `key-up → transcript` is
+`Dictation::DEFAULT_FINAL_TIMEOUT` (`iris-core/src/dictation.rs`), a plain
+`recv_timeout` in `Dictation::finish` that wraps the entire engine session,
+independent of and invisible from any per-engine timeout. A 2026-08-02
+regression (perceived latency up to ~10s during a network blip) traced to
+exactly this: a stalled Deepgram session kept trickling messages just often
+enough to keep re-arming `FINALIZE_TIMEOUT` without ever sending the close
+sign-off, so only the outer bound ended the wait. Diagnosing a hang from its
+milliseconds: check the engine's bound before assuming a Deepgram-side constant
+is misbehaving. **The outer bound is per engine, not global**:
+`DEFAULT_FINAL_TIMEOUT` is only the default behind `Engine::final_timeout`, and
+its 6s is streaming evidence. An engine that works after key-up — Groq's upload
++ inference, the local Whisper finalizer — overrides it with a deliberately
+generous, provisional value, because there the expiry costs the whole
+utterance (`streams_partials` is false, so nothing can be salvaged). Every
+caller of `Dictation::finish` asks the engine; `App` re-asks per dictation, so
+switching engines switches the wait. That per-engine bound is also a bound on
+the whole UI: `finish` blocks the resident loop, so Groq (28s) or the local
+engine (20s) can leave the pill frozen and Quit unserviced for that long. The
+numbers are accepted, not trimmed — with `streams_partials` false an early
+expiry costs the whole utterance — and on the default path, Deepgram, the
+ordinary bound is 6s. Deepgram's worst case is not 6s: on a hold that was still
+connecting with nothing salvageable, the connect grace below can hold the loop
+for the connect budget (8s from key-down) *plus* a re-based 6s finalise from the
+moment the socket comes up, ~14s — and a partial arriving after that grace was
+bought stops it growing without giving any of it back, so a dictation that ends
+up with words can pay it too. Quote that number, not the 6s, whenever this
+exposure is weighed. A non-blocking finalise is the real fix and is tracked
+elsewhere; do not approximate it by lowering a ceiling.
+
+**The outer bound may never end a session that is still legitimately
+connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)
+runs from key-down, the outer deadline from key-up — so no hold length makes
+the raw ordering stable, and ranking the constants against each other was
+tried and reverted. The relationship is enforced instead: `Engine::connect_budget`
+publishes the engine's connect ceiling and `Dictation::finish` extends its wait
+to cover it while there is nothing to salvage — the one case where giving up
+early costs the whole utterance rather than a tail. **Connecting is not the
+goal; the words are.** A grace that ended on `Connected` was built and rejected
+for exactly that reason: it spent the whole connect budget and then stopped
+waiting at the instant the connection became useful, losing the utterance to a
+socket that *worked*. So `Dictation::extend_while_nothing_to_salvage` extends
+rather than re-computing — still connecting buys key-down + connect budget,
+just connected buys `Mark::StreamReady` + the engine's own `final_timeout`, and
+a non-empty partial stops the buying, because from there expiry costs a tail.
+It stops the buying and nothing more: what an earlier pass bought stands, since
+the `Final` that would replace that interim with the accurate text is usually
+milliseconds behind it. So the 6s win is real but belongs to the dictation that
+never needed an extension; one that bought the grace and streamed its first
+partial afterwards still pays the ~14s worst case named above. A connect that
+fails on its own terms still reports as one (from `Mark::StreamReady`,
+engine-agnostically).
+`fm/iris-silent-and-instant` moves the same constant from another direction:
+keep the constant and the grace together or the data loss comes back.
+
+**Three regressions here were one defect: a wait bound that could move
+backwards.** The outer deadline undercutting the connect budget, `Connected`
+collapsing an extended bound to an already-past deadline, and the first partial
+doing the same — each looked like its own special case, and the third one cost
+the user accurate words (an interim typed while the engine's real `Final` was
+milliseconds behind it on the wire). They are now structurally impossible
+rather than absent by inspection: `WaitBound` (`dictation.rs`) is the single
+bound on `finish`'s wait and `WaitBound::extend_to` is its only mutator, so an
+event can buy the session more time and nothing can take time away. Stopping a
+*trigger* from shortening the wait is not the fix and never was; if a fourth
+one shows up, it belongs in the same monotonic bound, not in a fourth branch.
+
+**A failed dictation keeps its words and its timeline.** `Dictation::finish`
+and `Dictation::abandon` — the latter for a hold that ended without `finish`
+ever running — share one salvage rule: a non-empty `latest_partial` becomes the
+transcript, and the timeline carries the real `audio_secs` and marks. Every arm
+obeys it, `session.finish()` failing included. So a socket dying while the tail
+is fed costs no more than the same socket dying one statement later:
+`App::capture` sends that salvaged text through `App::deliver` — polish,
+injection, a normal record. Each salvage names itself: `DictationOutcome::cause`
+is `None` only for a real `Final`, and `App` folds it into `record.error`
+alongside any mid-hold cause, so a salvage never reads as an ordinary
+dictation. A hold that transcribed nothing becomes an `App::failed` error
+record; a hold whose words exist but may never be injected — only the dead
+hotkey channel — becomes an `App::reported` one, which is `failed` with the
+text put back. `record.error` and
+the `Result` of `App::dictate` are deliberately allowed to disagree: the
+`Result` follows delivery (`record.injected`), because a dictation whose words
+reached the screen is not a failure however abnormally it got there, and the
+console must not contradict the confirmation the user just watched. The blank `Timeline`
+in `App::dictate` covers only failures before any audio exists; do not widen it
+back, and do not let the two exits drift apart.
+
+**Nothing but a confirmed key-up may end a hold, and nothing else may inject.**
+A mid-hold failure — the microphone dying, the engine refusing a frame, the
+event channel closing — is noted, its source swapped for
+`crossbeam_channel::never()`, and the loop keeps waiting for the real
+`HotkeyEvent::Up`; finalising early would type a mid-sentence fragment into
+whatever the user is looking at while they are still speaking. Only two paths
+may reach injection, both after key-up by construction: `Dictation::finish`'s
+own salvage, and the tail-feed failure in `App::capture`. A dead hotkey channel
+is the exception that proves it — no key-up can ever arrive, so that hold ends
+at once and its words are recorded, with their real timeline and every cause
+the hold collected, but never typed.
+
 ## Sharp edges
 
 - API keys come from the environment only (`IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY`).

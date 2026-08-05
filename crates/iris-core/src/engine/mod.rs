@@ -86,6 +86,55 @@ pub trait Engine: Send + Sync {
         true
     }
 
+    /// How long a caller should wait after [`Session::finish`] before giving
+    /// up on this engine's transcript.
+    ///
+    /// **Choose this consciously.** The default,
+    /// [`crate::dictation::DEFAULT_FINAL_TIMEOUT`], is a *streaming* figure:
+    /// it assumes the transcript is nearly complete by key-up and only a
+    /// finalisation round-trip remains. An engine that does its real work in
+    /// `finish` — upload and inference after the key comes up, as [`groq`]
+    /// does — has a completely different distribution, and inheriting the
+    /// streaming bound means cutting the user's words off mid-upload. Where
+    /// [`Engine::streams_partials`] is `false` that loss is total, because
+    /// there is no partial to salvage.
+    ///
+    /// The bound is per engine, asked for per dictation, so switching engines
+    /// at runtime switches the wait with it.
+    ///
+    /// Choose it knowing what it costs: [`crate::dictation::Dictation::finish`]
+    /// blocks its caller's loop for this long, which in the resident app means
+    /// a frozen overlay and an unresponsive tray. An engine that needs a
+    /// generous value should bound its own work from underneath (a request
+    /// timeout, a connect timeout) and leave this as the backstop.
+    fn final_timeout(&self) -> std::time::Duration {
+        crate::dictation::DEFAULT_FINAL_TIMEOUT
+    }
+
+    /// How long this engine allows itself to get its transport up, measured
+    /// from key-down. `None` for an engine with no connect step of its own.
+    ///
+    /// Publishing it is what stops [`Engine::final_timeout`] — measured from
+    /// key-up, so on a short hold it can expire first — from killing a connect
+    /// that is still inside the budget this engine set for it.
+    /// [`crate::dictation::Dictation::finish`] waits out this budget instead
+    /// while the session has produced nothing to salvage — and, if the connect
+    /// then succeeds after the plain deadline has already passed, gives it
+    /// [`Engine::final_timeout`] from that instant to produce something, so
+    /// the wait covers the whole path rather than ending exactly where the
+    /// connection starts being useful. That whole window is the one case where
+    /// giving up early costs the whole utterance rather than a tail of it. It
+    /// is not a second final timeout, and it is not a place to buy an engine
+    /// more room in general: a single partial stops any further extending. It
+    /// does not shorten the window already bought, so a late connect that
+    /// streams its first partial after that point still blocks for it.
+    ///
+    /// An engine whose connect happens *inside* `finish` (a batch upload, say)
+    /// already has it covered by `final_timeout` and should leave this `None`.
+    fn connect_budget(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Open a streaming session. Must return without waiting on the network.
     fn open(&self) -> Result<Box<dyn Session>>;
 }
