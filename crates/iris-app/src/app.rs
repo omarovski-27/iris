@@ -409,7 +409,7 @@ impl<A: AudioSource> App<A> {
                 // against the running engine alone would answer `Applied`
                 // without writing anything, and the next refresh would snap the
                 // picker back.
-                if choice == self.config.engine && choice == self.saved.engine {
+                if choice == self.config.engine && choice == self.on_disk().engine {
                     self.report(from_window, outcome);
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
@@ -419,9 +419,7 @@ impl<A: AudioSource> App<A> {
                     Ok(engine) => {
                         self.pill.set_engine(engine.name());
                         self.engine = engine;
-                        let mut candidate = self.saved.clone();
-                        command.apply_to(&mut candidate);
-                        match self.persist(candidate) {
+                        match self.persist(&command) {
                             Ok(()) => println!("  engine: {choice}"),
                             Err(e) => outcome = Self::persist_failed(&e),
                         }
@@ -439,10 +437,8 @@ impl<A: AudioSource> App<A> {
             Command::SetDevice(device) => match self.audio.set_device(device.clone()) {
                 Ok(()) => {
                     command.apply_to(&mut self.config);
-                    let mut candidate = self.saved.clone();
-                    command.apply_to(&mut candidate);
                     let description = self.audio.describe();
-                    match self.persist(candidate) {
+                    match self.persist(&command) {
                         Ok(()) => println!("  microphone: {description}"),
                         Err(e) => outcome = Self::persist_failed(&e),
                     }
@@ -456,9 +452,7 @@ impl<A: AudioSource> App<A> {
                 let enabled = *enabled;
                 command.apply_to(&mut self.config);
                 self.polisher = polish::build(&self.config);
-                let mut candidate = self.saved.clone();
-                command.apply_to(&mut candidate);
-                match self.persist(candidate) {
+                match self.persist(&command) {
                     Ok(()) => println!("  polish: {}", if enabled { "on" } else { "off" }),
                     Err(e) => outcome = Self::persist_failed(&e),
                 }
@@ -467,9 +461,7 @@ impl<A: AudioSource> App<A> {
                 let theme = *theme;
                 command.apply_to(&mut self.config);
                 self.pill.set_theme(theme);
-                let mut candidate = self.saved.clone();
-                command.apply_to(&mut candidate);
-                if let Err(e) = self.persist(candidate) {
+                if let Err(e) = self.persist(&command) {
                     outcome = Self::persist_failed(&e);
                 }
             }
@@ -480,15 +472,11 @@ impl<A: AudioSource> App<A> {
                 // does through `Command::Reload`. Only `saved` — what the
                 // *next* launch will read — takes the new value.
                 let key = *key;
-                if key != self.saved.hotkey {
-                    let mut candidate = self.saved.clone();
-                    command.apply_to(&mut candidate);
-                    match self.persist(candidate) {
-                        Ok(()) => {
-                            println!("  hotkey: {key} (restart Iris for this to take effect)");
-                        }
-                        Err(e) => outcome = Self::persist_failed(&e),
+                match self.persist(&command) {
+                    Ok(()) => {
+                        println!("  hotkey: {key} (restart Iris for this to take effect)");
                     }
+                    Err(e) => outcome = Self::persist_failed(&e),
                 }
             }
             Command::SetOverlayEnabled(enabled) => {
@@ -496,16 +484,12 @@ impl<A: AudioSource> App<A> {
                 // not) once in `main`, so `self.config.overlay_enabled` stays
                 // as it was until a restart.
                 let enabled = *enabled;
-                if enabled != self.saved.overlay_enabled {
-                    let mut candidate = self.saved.clone();
-                    command.apply_to(&mut candidate);
-                    match self.persist(candidate) {
-                        Ok(()) => println!(
-                            "  overlay: {} (restart Iris for this to take effect)",
-                            if enabled { "on" } else { "off" }
-                        ),
-                        Err(e) => outcome = Self::persist_failed(&e),
-                    }
+                match self.persist(&command) {
+                    Ok(()) => println!(
+                        "  overlay: {} (restart Iris for this to take effect)",
+                        if enabled { "on" } else { "off" }
+                    ),
+                    Err(e) => outcome = Self::persist_failed(&e),
                 }
             }
             Command::OpenSettings => self.window.open(),
@@ -607,24 +591,54 @@ impl<A: AudioSource> App<A> {
         }
     }
 
-    /// Write `candidate` to the config file and, only on success, make it
-    /// [`App::saved`].
+    /// Write the file with `command`'s one field changed and, only on
+    /// success, make what was written [`App::saved`].
     ///
-    /// Every `Set*` arm builds `candidate` as a clone of `saved` with its one
-    /// field changed, rather than mutating `saved` directly, so a write
-    /// failure leaves `saved` exactly where it was instead of stranding the
-    /// rejected value in memory to be smuggled onto disk by the *next*
-    /// command's successful save. The failure is the caller's to answer for:
-    /// a change the loop took in memory but could not write is not saved, and
-    /// the UI that asked has to hear that rather than "Saved" over a value
-    /// the next launch will not see. See [`App::persist_failed`], which every
-    /// `Set*` arm routes it through.
-    fn persist(&mut self, candidate: Config) -> Result<()> {
+    /// The candidate is built on [`App::on_disk`] — the file as it stands
+    /// *now* — with only this command's field applied on top, so a change
+    /// made to `config.toml` by hand while Iris is running survives the next
+    /// setting change instead of being overwritten by a snapshot taken before
+    /// it. The settings window points the user straight at that file for the
+    /// API keys, so the hand edit is the documented workflow, not an edge
+    /// case. Nothing else in the candidate comes from memory, and in
+    /// particular nothing comes from [`App::config`], which carries the CLI
+    /// overrides this file must never learn about.
+    ///
+    /// `saved` moves only on a successful write, so a write failure leaves it
+    /// exactly where it was instead of stranding the rejected value in memory
+    /// to be smuggled onto disk by the *next* command's successful save. The
+    /// failure is the caller's to answer for: a change the loop took in
+    /// memory but could not write is not saved, and the UI that asked has to
+    /// hear that rather than "Saved" over a value the next launch will not
+    /// see. See [`App::persist_failed`], which every `Set*` arm routes it
+    /// through.
+    fn persist(&mut self, command: &Command) -> Result<()> {
+        let mut candidate = self.on_disk();
+        command.apply_to(&mut candidate);
         candidate
             .save(&self.config_path)
             .with_context(|| format!("cannot save {}", self.config_path.display()))?;
         self.saved = candidate;
         Ok(())
+    }
+
+    /// The configuration as the file holds it now, falling back to
+    /// [`App::saved`] when there is nothing readable to merge with.
+    ///
+    /// The same last-good-snapshot rule the settings window applies to its own
+    /// re-reads: a file that is unreadable for a moment — mid-write, or
+    /// hand-edited into a parse error — must not turn a setting change into a
+    /// reset to defaults. A *missing* file gets the same treatment for a
+    /// stronger reason: [`Config::load`] reports it as the defaults it is, so
+    /// merging onto that reading would quietly rewrite every setting — API
+    /// keys included — out of a file someone deleted or a drive that dropped
+    /// out. `main` creates the file before the loop starts, so the last
+    /// snapshot is the better answer in both cases.
+    fn on_disk(&self) -> Config {
+        if !self.config_path.exists() {
+            return self.saved.clone();
+        }
+        Config::load(&self.config_path).unwrap_or_else(|_| self.saved.clone())
     }
 
     /// Report a failed [`App::persist`] on the console and to the window.

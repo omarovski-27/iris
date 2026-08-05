@@ -287,10 +287,14 @@ impl WindowState {
             ),
         };
         let history_path = config.history_path(env.config_path);
-        let history_stamp = history_stamp(&history_path);
-        let (history, unreadable_history) = match load_history(&history_path) {
-            Ok(history) => (history, None),
-            Err(e) => (Vec::new(), Some(unreadable_log(&e))),
+        let stamp = history_stamp(&history_path);
+        // Same invariant `refresh` enforces: the stamp moves only on a read
+        // that produced records, so a log that could be stat-ed but not read
+        // is retried on the next tick rather than passing for one this window
+        // has already seen.
+        let (history, history_stamp, unreadable_history) = match load_history(&history_path) {
+            Ok(history) => (history, stamp, None),
+            Err(e) => (Vec::new(), None, Some(unreadable_log(&e))),
         };
         let insights_day = local_day(env.utc_offset_seconds);
         let insights = Insights::compute(&history, &insights_day);
@@ -1023,6 +1027,68 @@ mod tests {
             "{message}"
         );
         assert_eq!(level, StatusLevel::Warn);
+    }
+
+    /// The same rule at the other end: a log that could not be read when the
+    /// window *opened* is not a state this window has seen either, so the
+    /// stamp it would otherwise have recorded would tell every later tick
+    /// there was nothing to re-read — History frozen empty, on the tab that
+    /// opens first, until the log's size or mtime happened to move.
+    ///
+    /// Unix-only, and only because of how the failure has to be staged: it
+    /// needs a log that `stat` answers for and `open` refuses, which on
+    /// Windows a directory at the log's path is and here a mode-000 file is.
+    /// The behaviour under test is portable.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_could_not_be_read_at_startup_is_read_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let log_path = dir.path().join("history.jsonl");
+        let mut config = Config::default();
+        config.history.path = Some(log_path.clone());
+        config.save(&config_path).unwrap();
+        let mut log = SessionLog::open(log_path.clone(), 10);
+        log.append(&DictationRecord::now("mock", "first")).unwrap();
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&log_path).is_ok() {
+            // root ignores the mode, and there is no other way to stage this.
+            return;
+        }
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+        assert!(state.history.is_empty());
+        assert!(state.history_read_failing);
+        assert_eq!(
+            state.history_stamp, None,
+            "a read that failed is not the read the records came from"
+        );
+        let (message, level) = state.status_flash().expect("the failure went silent");
+        assert!(
+            message.contains("Could not read the session log"),
+            "{message}"
+        );
+        assert_eq!(level, StatusLevel::Warn);
+
+        // An ordinary tick — no Refresh click — has it the moment it opens.
+        // The stamp is untouched by that: the size and mtime are the ones the
+        // failed read already saw, which is exactly what the old code would
+        // have recorded and then compared equal to for the rest of the
+        // session.
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        state.last_refresh = Instant::now() - REFRESH_INTERVAL - Duration::from_secs(1);
+        state.refresh(&env, false);
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].text, "first");
+        assert!(!state.history_read_failing);
+        assert!(state.history_stamp.is_some());
     }
 
     /// `App::run` drains commands between dictations, so an answer can be

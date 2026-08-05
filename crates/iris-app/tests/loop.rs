@@ -1472,6 +1472,95 @@ fn choosing_the_running_engine_still_writes_it_over_a_divergent_file() {
     );
 }
 
+/// The settings window's "Open config file" button sends the user to
+/// `config.toml` by hand for everything the window does not show — the API
+/// keys above all — and promises the window picks the edit up within a couple
+/// of seconds. So the next setting change must not write the file back from a
+/// snapshot taken before that edit: pasting a key and then toggling Polish is
+/// the documented workflow, and it cannot be what deletes the key.
+#[test]
+fn a_hand_edited_config_survives_the_next_setting_change() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    // `main` writes the file before the loop starts (`Config::load_or_create`)
+    // — the rig does not, so stand it in here.
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    // The hand edit, made while the loop is already running.
+    let mut edited = Config::load(&config_path).expect("reading the config file");
+    edited.keys.deepgram = Some("hand-edited-key".into());
+    edited.save(&config_path).expect("hand-editing the config");
+
+    commands.send(Command::SetPolish(false)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.keys.deepgram.as_deref(),
+        Some("hand-edited-key"),
+        "a setting change reverted the hand-edited key"
+    );
+    assert!(!saved.polish.enabled, "the change itself was not written");
+}
+
+/// The same staleness, seen from the no-op guard rather than the write: a
+/// setting whose in-memory snapshot already holds the chosen value, over a
+/// file that does not, is still a real change to the file. Skipping the write
+/// there would flash "Saved" over a picker the next refresh snaps back.
+#[test]
+fn choosing_a_setting_the_file_diverged_from_still_writes_it() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    // The file, hand-edited after launch, no longer holds what the loop last
+    // wrote — for either of the two restart-gated settings.
+    let mut file_config = Config::default();
+    file_config.polish.llm = false;
+    file_config.hotkey = Key::F8;
+    file_config.overlay_enabled = false;
+    file_config
+        .save(&config_path)
+        .expect("seeding the config file");
+
+    commands.send(Command::SetHotkey(Key::RightCtrl)).unwrap();
+    commands.send(Command::SetOverlayEnabled(true)).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.hotkey,
+        Key::RightCtrl,
+        "the hotkey was reported saved but never written"
+    );
+    assert!(
+        saved.overlay_enabled,
+        "the overlay toggle was reported saved but never written"
+    );
+}
+
 /// `show_live_text` is the opt-in the live-text ribbon is reached through
 /// (off by default since round 3), so editing it and reloading has to take
 /// effect there and then — the same treatment `theme` already gets. Before
@@ -1598,8 +1687,11 @@ fn reload_keeps_in_force_settings_that_need_a_restart() {
 #[cfg(not(feature = "local-native"))]
 #[test]
 fn reload_does_not_persist_a_failed_engine_choice() {
-    // A file that asks for an engine we cannot build must not poison `saved`:
-    // the next tray persist would otherwise write a cold-start failure.
+    // A file that asks for an engine we cannot build must not poison what the
+    // loop is running or what it writes of its own accord. The line itself is
+    // the user's — a later persist merges onto the file as it stands, so an
+    // unrelated tray change neither adopts the failed engine nor silently
+    // deletes the line the user typed and was told about on the console.
     let dir = tempfile::tempdir().expect("temp dir");
     let config_path = dir.path().join("config.toml");
 
@@ -1646,7 +1738,11 @@ fn reload_does_not_persist_a_failed_engine_choice() {
 
     assert_eq!(app.config().engine, EngineChoice::Mock);
     let saved = Config::load(&config_path).expect("the config was written");
-    assert_eq!(saved.engine, EngineChoice::Mock);
+    assert_eq!(
+        saved.engine,
+        EngineChoice::Local,
+        "the tray change rewrote the engine line the user wrote by hand"
+    );
     assert_eq!(saved.theme, Theme::Light);
 }
 

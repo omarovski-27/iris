@@ -211,8 +211,9 @@ fn spectrum_sample(t: f32) -> (u8, u8, u8) {
 /// the *whole* instruction rather than half of it. Leaving the engine edit out
 /// sends a user who follows it literally back to this same menu, key pasted in
 /// and still in demo mode. Every line is a disabled label: a signpost at the
-/// file the existing "Open settings…" item already opens, not a second place
-/// to configure anything.
+/// file the "Open settings…" item reaches — that item opens the settings
+/// window, whose Settings tab has the "Open config file" button — not a second
+/// place to configure anything.
 ///
 /// The wording is pinned to `packaging/windows/README.md` by
 /// `iris-app/tests/settings.rs`, which follows both documents against a config
