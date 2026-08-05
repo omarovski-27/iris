@@ -280,10 +280,17 @@ that record is how a user recovers words that never made it onto the screen, and
 the durable half of it: the transcript a paste leaves on the clipboard survives
 only until the next copy. `iris --history` prints the tail of it.
 
-A record with an `error` carries a zeroed `latency` block (`App::dictate`'s
-`Err` arm builds a fresh record rather than the timeline it was tracking), so
-`"audio_secs":0.0` on an errored row is consistent with *some* audio having
-been captured before the failure — it is not proof that none was.
+A record with an `error` carries the timeline as it actually stood, so
+`audio_secs` and the spans on it are real: a failed dictation that captured
+five seconds of speech says so, instead of reading as a microphone that never
+delivered a frame. The one exception is a failure *before* any audio exists —
+the engine session refusing to open, capture refusing to arm — which logs a
+zeroed `latency` block, and there the zero is the truth.
+
+An `error` and `"injected":true` can appear on the same row. That is a
+dictation whose words reached the screen after something about the hold went
+wrong — a partial salvaged from an engine that died, a microphone that stopped
+mid-hold — and the `error` is the only trace of the part that was lost.
 
 ## Engines
 
@@ -293,6 +300,17 @@ been captured before the failure — it is not proof that none was.
 | `deepgram` | `IRIS_DEEPGRAM_KEY` | streaming; hides its latency behind speech, except for a hold too short to get a first result back (see below) |
 | `groq` | `IRIS_GROQ_KEY` | batch on key-release; cannot hide latency |
 | `local` | `--features local-native` | on-device; see below |
+
+**How long a stuck dictation holds the app depends on the engine.** After the
+key comes up Iris waits for the final transcript on the main loop, so until
+that wait ends the pill stays on "processing" and the tray — Quit included —
+does not respond. Deepgram waits 6 s, or up to ~14 s when the socket was still
+connecting and nothing had streamed back yet; `local` waits 20 s and `groq`
+28 s. Those two get the longer waits on purpose: both do their real work after
+the key comes up, and `groq` has no partial to fall back on at all, so cutting
+the wait short would cost the whole utterance rather than its tail. The
+constants and the reasoning behind each live in `AGENTS.md` and the engine
+module docs.
 
 A hold shorter than Deepgram's connect-plus-first-result latency (~1-3 s) has
 nothing streamed back by key-release, so its whole transcript rides on the
