@@ -1324,6 +1324,7 @@ mod tests {
         let engine = DeepgramEngine {
             key: "x".into(),
             url: DEFAULT_BASE_URL.into(),
+            warm: WarmPool::new(),
         };
         assert!(
             engine.connect_budget() == Some(CONNECT_TIMEOUT)
@@ -2469,10 +2470,7 @@ mod tests {
         );
 
         assert!(
-            eventually(Duration::from_secs(5), || count
-                .load(Ordering::SeqCst)
-                >= 1)
-            .await,
+            eventually(Duration::from_secs(5), || count.load(Ordering::SeqCst) >= 1).await,
             "the maintenance loop never ran: no connection was ever made"
         );
         assert!(
@@ -2511,10 +2509,7 @@ mod tests {
         ));
 
         assert!(
-            eventually(Duration::from_secs(5), || count
-                .load(Ordering::SeqCst)
-                >= 1)
-            .await,
+            eventually(Duration::from_secs(5), || count.load(Ordering::SeqCst) >= 1).await,
             "the loop should keep a spare while dictations are recent"
         );
         tokio::time::timeout(Duration::from_secs(5), running)
@@ -2568,17 +2563,16 @@ mod tests {
         ));
 
         assert!(
-            eventually(Duration::from_secs(5), || count
-                .load(Ordering::SeqCst)
-                >= 1)
-            .await,
+            eventually(Duration::from_secs(5), || count.load(Ordering::SeqCst) >= 1).await,
             "the loop should have a spare up before the pool is dropped"
         );
 
         drop(pool);
         tokio::time::timeout(Duration::from_secs(5), running)
             .await
-            .expect("an abandoned pool's loop must exit rather than run for the life of the process")
+            .expect(
+                "an abandoned pool's loop must exit rather than run for the life of the process",
+            )
             .unwrap();
 
         let settled = count.load(Ordering::SeqCst);
