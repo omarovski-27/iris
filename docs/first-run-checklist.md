@@ -100,6 +100,17 @@ on the machine you're actually going to use Iris on.
       window that flashes and closes before it can be read.
 - [ ] The same misconfiguration launched from an open PowerShell prompt
       prints to the console and shows *no* dialog.
+- [ ] Upgrading over a `config.toml` an older build wrote: the first start
+      rewrites it, adding `version = 1` and turning `show_live_text` off once.
+      Everything else in the file survives, and a `show_live_text = true` set
+      by hand afterwards sticks across restarts. `iris --verbose` from an open
+      PowerShell prompt is where that one-time rewrite is reported; a failed
+      rewrite prints unconditionally, but on a Start-Menu launch that lands in
+      Iris's own minimized console rather than a dialog, so the reset quietly
+      repeats on every start until the stamp reaches disk. Going back to an
+      older build needs the `version` line deleted first — the zip README's
+      "Downgrading to an older Iris" (`packaging/windows/README.md`) is the
+      copy of that path to keep accurate.
 - [ ] Tray → Settings opens `config.toml` in the default editor.
 - [ ] After adding a real key and saving, a full restart is what puts it in
       force — not tray → Reload settings. Launched from an open PowerShell
@@ -139,6 +150,20 @@ on the machine you're actually going to use Iris on.
 - [ ] The pill appears and animates at real speed — the motion timings are
       unverified outside the filmstrip renderer (`pill-demo --filmstrip`),
       which is not the same as watching it live.
+- [ ] The resting shape is a narrow glass capsule holding a wave row and an
+      elapsed-recording timer side by side — not a circle, and not the old
+      wide rectangle — and the bars visibly grow with your voice. Live text is
+      off by default, so this is the *only* presentation you get until you set
+      `show_live_text = true` in `config.toml`.
+- [ ] The timer's digits stay readable over both a light and a dark desktop,
+      with no dark plate behind them. Only their outline colour carries that
+      (`theme.timer_edge`), and it has been judged only against the synthetic
+      backdrop in `crates/iris-overlay/docs/round3-evidence/`, never a real
+      one. The digits must not jitter as seconds tick over, and must stay
+      clear of the centred dot / spinner / checkmark in every state.
+- [ ] With `show_live_text = true` and a restart-free tray → Reload settings,
+      the ribbon opens with the words again and the timer steps aside rather
+      than the two overlapping on the right-hand edge.
 - [ ] Dark and Light themes both render legibly against real desktop
       backgrounds.
 - [ ] The confirmation hold and self-dismiss after a successful insert look
@@ -157,7 +182,9 @@ on the machine you're actually going to use Iris on.
 
 ## What this build does not include
 
-This build is packaged from `main` and predates two branches still in
-flight: the Settings window (PR #13) and the round-3 overlay capsule (PR
-#15). If either has since merged, this checklist and the packaged zip are
-stale — repackage with `scripts/package-windows.sh` and re-run this list.
+The round-3 overlay capsule (PR #15) is in the tree now, and the Overlay and
+First-run config items above are written for it — repackage with
+`scripts/package-windows.sh` before working through this list, or the zip you
+verify predates it. One branch is still in flight: the Settings window (PR
+#13). If it has since merged, this checklist and the packaged zip are stale —
+repackage and re-run this list.

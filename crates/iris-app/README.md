@@ -198,8 +198,9 @@ recoverably rather than silently:
 Note that "delivered" here only ever means the keystrokes or the paste
 shortcut reached Windows' input queue. Neither Windows nor Iris can confirm
 that the app on the other end rendered them correctly — that gap is exactly
-what the original bug was — so the timing shown on the pill is a delivery
-time, not a receipt.
+what the original bug was — so the latency Iris records for a dictation is a
+delivery time, not a receipt. (The overlay shows no latency figure; its
+readout is the elapsed recording time — see `crates/iris-overlay/README.md`.)
 
 **Keys.** `IRIS_DEEPGRAM_KEY`, `IRIS_GROQ_KEY` and `IRIS_LLM_KEY` take
 precedence over the file. Keys in the file are copied into the environment at
