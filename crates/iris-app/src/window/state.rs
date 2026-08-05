@@ -849,9 +849,7 @@ mod tests {
         outcomes_tx
             .send((
                 inflight_id(&state, 0),
-                CommandOutcome::Rejected(
-                    "cannot switch to groq: IRIS_GROQ_KEY is not set".into(),
-                ),
+                CommandOutcome::Rejected("cannot switch to groq: IRIS_GROQ_KEY is not set".into()),
             ))
             .unwrap();
         state.poll_outcomes(&env);
@@ -947,8 +945,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let devices = || Vec::new();
         let reopen_signal = no_reopen();
-        let (outcomes_tx, outcomes) =
-            crossbeam_channel::unbounded::<(CommandId, CommandOutcome)>();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded::<(CommandId, CommandOutcome)>();
         let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let mut state = WindowState::new(&env);
 
