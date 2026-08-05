@@ -65,7 +65,7 @@ pub enum Command {
     /// Rebind the push-to-talk key. Persisted immediately; needs a restart to
     /// take effect, because the hook is installed once in `main`.
     SetHotkey(Key),
-    /// Show or hide the live-text pill overlay. Persisted immediately; needs
+    /// Show or hide the pill overlay. Persisted immediately; needs
     /// a restart, because the overlay is spawned once in `main`.
     SetOverlayEnabled(bool),
     /// Open the settings window, or focus it if already open.

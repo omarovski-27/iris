@@ -535,7 +535,7 @@ impl WindowState {
         );
     }
 
-    /// Show or hide the live-text pill overlay. Saved now; needs a restart —
+    /// Show or hide the pill overlay. Saved now; needs a restart —
     /// the overlay is spawned once in `main` before this window exists.
     pub fn set_overlay_enabled(&mut self, env: &Env, enabled: bool) {
         self.dispatch(

@@ -166,7 +166,7 @@ fn overlay_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris
         let mut enabled = state.config.overlay_enabled;
         ui.horizontal(|ui| {
             if ui
-                .checkbox(&mut enabled, "Show the live-text pill while dictating")
+                .checkbox(&mut enabled, "Show the pill overlay while dictating")
                 .changed()
             {
                 state.set_overlay_enabled(env, enabled);

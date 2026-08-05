@@ -417,7 +417,7 @@ pub struct Config {
     /// Flipping this default is the one thing [`CURRENT_VERSION`] exists for;
     /// see [`Config::migrate`].
     pub show_live_text: bool,
-    /// Show the live-text pill overlay while dictating.
+    /// Show the pill overlay while dictating.
     ///
     /// Read once at startup (`main` spawns the overlay before [`App`](crate::App)
     /// exists), so like `hotkey` a change here needs a restart to take effect.
