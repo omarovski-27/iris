@@ -92,3 +92,22 @@ pub fn init_crypto() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the shared config is that rustls's session cache —
+    /// which lives on the `ClientConfig` instance — outlives a single connect.
+    /// A refactor that builds one per call would still compile and still
+    /// connect; only the resumption this module documents would quietly stop
+    /// happening. Nothing here touches the network.
+    #[test]
+    fn every_connect_gets_the_same_client_config_allocation() {
+        assert!(
+            Arc::ptr_eq(&tls_connector(), &tls_connector()),
+            "tls_connector must hand out the one shared ClientConfig; a \
+             per-call config empties rustls's session cache every dictation"
+        );
+    }
+}
