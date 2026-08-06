@@ -1,13 +1,19 @@
 <#
 .SYNOPSIS
-    Installs Iris for the current user.
+    Installs Iris for the current user, replacing any previous install in place.
 
 .DESCRIPTION
     Copies iris.exe into %LOCALAPPDATA%\Iris, adds a Start Menu shortcut, and
     optionally a Desktop shortcut and a run-at-login entry. No admin rights
-    needed; nothing is written outside the current user's profile. Run-at-login
-    is a shortcut in the per-user Startup folder, not a registry key, so
-    removing it is one file delete.
+    needed; nothing is written outside the current user's profile.
+
+    Every install is a clean replace, in one step: it quits any Iris that is
+    currently running, deletes the Start Menu / Desktop / Startup shortcuts a
+    previous run of this script created, and replaces %LOCALAPPDATA%\Iris
+    before copying the new build in - so upgrading, or re-running with
+    different flags, never leaves a stale shortcut or a stale binary behind.
+    Your settings and dictation history live in %APPDATA%\iris, a separate
+    folder this script never touches; see -Uninstall.
 
 .PARAMETER Desktop
     Also add a Desktop shortcut.
@@ -15,13 +21,21 @@
 .PARAMETER RunAtLogin
     Also start Iris automatically when you log in.
 
+.PARAMETER Uninstall
+    Remove Iris instead of installing it: quit it if running, delete
+    %LOCALAPPDATA%\Iris and every shortcut this script creates, then exit.
+    Does not touch %APPDATA%\iris (your settings and dictation history) -
+    delete that yourself if you want a full wipe.
+
 .EXAMPLE
     .\install.ps1
     .\install.ps1 -Desktop -RunAtLogin
+    .\install.ps1 -Uninstall
 #>
 param(
     [switch]$Desktop,
-    [switch]$RunAtLogin
+    [switch]$RunAtLogin,
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,37 +55,118 @@ function Test-Interactive {
     return $true
 }
 
+$installDir = Join-Path $env:LOCALAPPDATA "Iris"
+$targetExe = Join-Path $installDir "iris.exe"
+
+# Resolved through the shell, not as literal %APPDATA% subpaths: folder
+# redirection (Group Policy, some OEM images) moves these, and a shortcut
+# written to the unredirected path is never enumerated by Windows. Shared by
+# both removal and (re)creation so the two always agree on where "the"
+# shortcut is.
+$startMenuShortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "Iris.lnk"
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "Iris.lnk"
+$startupShortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "Iris.lnk"
+
+# config.toml and the *.jsonl dictation history only ever live in
+# %APPDATA%\iris, never in $installDir - this script owns $installDir
+# completely and normally puts nothing there but iris.exe. That separation is
+# what makes a clean-replace safe by construction, but "normally" is not a
+# promise: a custom --config pointing here, or a future mistake, would put
+# real user data in the path of a recursive delete. Check for it every time
+# rather than trust the invariant blindly, and refuse to remove anything
+# rather than guess.
+function Assert-NoUserDataIn($dir) {
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $userFiles = Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq "config.toml" -or $_.Extension -eq ".jsonl" }
+    if ($userFiles) {
+        $names = ($userFiles | ForEach-Object { $_.FullName }) -join "`n  "
+        throw ("Refusing to remove $dir - it contains what looks like Iris settings or " +
+            "dictation history:`n  $names`nMove or back up those files, then run this script again.")
+    }
+}
+
+# Windows locks a running image against writes, so upgrading over a live Iris
+# fails with a raw "used by another process" - and a clean-replace has no
+# manual "quit it first" step for the caller to follow, so this does it.
+# Killing a resident tray app is safe here: every dictation is written to the
+# session log and every setting change to config.toml as it happens (see
+# CLAUDE.md), so there is no in-memory state that a graceful shutdown would
+# have saved and a forceful one loses.
+function Stop-RunningIris {
+    $running = Get-Process -Name "iris" -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Host "Stopping the running Iris so it can be replaced..."
+        $running | Stop-Process -Force
+        $running | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-PreviousInstall {
+    Assert-NoUserDataIn $installDir
+    Stop-RunningIris
+    $found = $false
+    if (Test-Path -LiteralPath $installDir) {
+        Remove-Item -LiteralPath $installDir -Recurse -Force
+        $found = $true
+    }
+    foreach ($shortcut in @($startMenuShortcut, $desktopShortcut, $startupShortcut)) {
+        if (Test-Path -LiteralPath $shortcut) {
+            Remove-Item -LiteralPath $shortcut -Force
+            $found = $true
+        }
+    }
+    return $found
+}
+
 try {
+    if ($Uninstall) {
+        if (Remove-PreviousInstall) {
+            Write-Host "Iris removed: $installDir and its shortcuts are gone."
+        } else {
+            Write-Host "Nothing to remove - Iris was not installed."
+        }
+        Write-Host "Your settings and dictation history are untouched, at %APPDATA%\iris."
+        return
+    }
+
     $sourceExe = Join-Path $PSScriptRoot "iris.exe"
     if (-not (Test-Path $sourceExe)) {
         throw "iris.exe not found next to install.ps1 - run this script from inside the extracted Iris folder."
     }
 
-    $installDir = Join-Path $env:LOCALAPPDATA "Iris"
-    $targetExe = Join-Path $installDir "iris.exe"
-
-    # Windows locks a running image against writes, so upgrading over a live
-    # Iris fails with a raw "used by another process". Say what to do instead.
-    if (Get-Process -Name "iris" -ErrorAction SilentlyContinue) {
-        throw "Iris is running. Quit it first (right-click the tray icon -> Quit), then run this installer again."
-    }
-
-    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-
     # Extracting the zip straight into %LOCALAPPDATA%\Iris makes source and
-    # target the same file, and Copy-Item refuses to copy a file onto itself -
-    # which would abort an install that is in fact already correct. Compare
-    # resolved paths, since either side can arrive via a link or a short name.
+    # target the same file. Check for that *before* any removal runs below -
+    # a clean-replace that deletes $installDir would otherwise delete the very
+    # file it is about to copy from. Compare resolved paths, since either side
+    # can arrive via a link or a short name.
     $resolvedSource = (Resolve-Path -LiteralPath $sourceExe).Path
     $resolvedTarget = if (Test-Path -LiteralPath $targetExe) {
         (Resolve-Path -LiteralPath $targetExe).Path
     } else {
         $null
     }
+
     if ($resolvedTarget -eq $resolvedSource) {
         Write-Host "Already installed at $targetExe - keeping it in place."
     } else {
+        Assert-NoUserDataIn $installDir
+        Stop-RunningIris
+        if (Test-Path -LiteralPath $installDir) {
+            Remove-Item -LiteralPath $installDir -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
         Copy-Item -LiteralPath $resolvedSource -Destination $targetExe -Force
+    }
+
+    # Clean-replace the shortcuts too: delete whatever a previous run left,
+    # then create only what *this* run asks for. Otherwise re-running without
+    # -RunAtLogin (or -Desktop) leaves the old one behind, silently still
+    # autostarting or sitting on the desktop.
+    foreach ($shortcut in @($startMenuShortcut, $desktopShortcut, $startupShortcut)) {
+        if (Test-Path -LiteralPath $shortcut) {
+            Remove-Item -LiteralPath $shortcut -Force
+        }
     }
 
     $shell = New-Object -ComObject WScript.Shell
@@ -84,29 +179,18 @@ try {
         $shortcut.TargetPath = $targetExe
         $shortcut.WorkingDirectory = $installDir
         $shortcut.Description = "Iris - push-to-talk dictation"
-        # iris.exe is a console binary (the startup banner is deliberate), so
-        # without this every launch pops a console window and leaves it open
-        # for the life of the app. 7 = minimized.
-        $shortcut.WindowStyle = 7
         $shortcut.Save()
     }
 
-    # Resolved through the shell, not as literal %APPDATA% subpaths: folder
-    # redirection (Group Policy, some OEM images) moves these, and a shortcut
-    # written to the unredirected path is never enumerated by Windows.
-    $startMenuDir = [Environment]::GetFolderPath("Programs")
-    New-IrisShortcut -Path (Join-Path $startMenuDir "Iris.lnk")
+    New-IrisShortcut -Path $startMenuShortcut
     Write-Host "Start Menu shortcut created."
 
     if ($Desktop) {
-        $desktopDir = [Environment]::GetFolderPath("Desktop")
-        New-IrisShortcut -Path (Join-Path $desktopDir "Iris.lnk")
+        New-IrisShortcut -Path $desktopShortcut
         Write-Host "Desktop shortcut created."
     }
 
     if ($RunAtLogin) {
-        $startupDir = [Environment]::GetFolderPath("Startup")
-        $startupShortcut = Join-Path $startupDir "Iris.lnk"
         New-IrisShortcut -Path $startupShortcut
         Write-Host "Iris will now start automatically at login."
         Write-Host "To undo: delete `"$startupShortcut`""

@@ -259,8 +259,8 @@ fn the_packaged_readme_and_the_tray_notice_give_the_same_working_instructions() 
     );
 
     // Now the tray, which is the same instruction for the user who never
-    // extracted the zip's README — the minimized shortcut means it is all they
-    // get. Same words as the README, and they have to work the same way.
+    // extracted the zip's README — the console-less shortcut means it is all
+    // they get. Same words as the README, and they have to work the same way.
     let notice = tray::demo_notice(&Config::default(), &path)
         .expect("the config Iris generates is on the mock engine");
     let spoken = notice.lines().join("\n");

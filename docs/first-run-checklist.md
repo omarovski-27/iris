@@ -9,13 +9,23 @@ on the machine you're actually going to use Iris on.
 
 ## Launch
 
-- [ ] `iris.exe` starts without a console flash-and-vanish (a silent crash on
-      launch looks exactly like that).
-- [ ] The startup banner prints exactly three lines — hotkey, listening
-      device, and the settings path — and nothing else (no per-dictation
-      output, no millisecond figures). Compile- and review-verified only;
-      `banner()` is `#[cfg(windows)]` and has never executed anywhere this
-      build was produced.
+- [ ] `iris.exe` never shows a console window on any launch path — double-click,
+      Start Menu, Startup folder — not even a flash. (A silent crash on launch
+      looks exactly like the old flash-and-vanish did, so absence of a window
+      is not by itself proof of success; check the next item too.)
+- [ ] From an already-open PowerShell or Command Prompt, `iris.exe
+      --print-config` prints to that same window and returns to the prompt —
+      confirming `attach_console_for_cli_output` (`main.rs`) reconnects
+      stdout when a parent console exists, instead of the diagnostic output
+      silently vanishing along with the console the GUI subsystem no longer
+      allocates. Try `--verbose` and `--list-devices` too.
+- [ ] The startup banner (three lines — hotkey, listening device, settings
+      path, nothing else: no per-dictation output, no millisecond figures)
+      shows up in that same open-terminal run of plain `iris.exe`, and is
+      never seen at all from a double-click or a shortcut, which is expected
+      — there is no console there for it to print to. Compile- and
+      review-verified only up to this point; `banner()` is `#[cfg(windows)]`
+      and has never executed anywhere this build was produced.
 - [ ] The `.exe` shows the prism-triangle icon (Explorer, taskbar, Alt-Tab) —
       not the default Rust/generic binary icon.
 - [ ] Right-click `iris.exe` → Properties → Details shows the version and
@@ -43,19 +53,38 @@ on the machine you're actually going to use Iris on.
       transcript in `install.log`. `Test-Interactive`'s job is telling these
       two cases apart, and getting it wrong either way is bad: hanging
       forever, or losing the failure message on a real double-click.
-- [ ] Running it a second time while Iris is running says "Iris is running.
-      Quit it first" instead of a raw file-in-use error.
-- [ ] The Start Menu shortcut appears and launches Iris, with its console
-      window minimized rather than sitting open on the desktop.
+- [ ] Running it a second time while Iris is running is a clean replace, not
+      an error: `install.ps1` prints "Stopping the running Iris so it can be
+      replaced...", the tray icon disappears, and the install finishes and
+      relaunches nothing on its own — confirm Iris is actually gone (no tray
+      icon, no `iris.exe` in Task Manager) rather than just quiet.
+- [ ] Re-running the installer with different flags is a genuine clean
+      replace, not additive: install once with `-RunAtLogin`, confirm the
+      Startup shortcut exists, then re-run *without* `-RunAtLogin` and confirm
+      it is gone — not left behind autostarting Iris. Same check for
+      `-Desktop`.
+- [ ] The Start Menu shortcut appears and launches Iris with **no console
+      window at all** — nothing to minimize, nothing to notice. (This is the
+      GUI-subsystem check from the Launch section above, exercised through the
+      installed shortcut specifically rather than a manual double-click.)
 - [ ] `-Desktop` adds a working desktop shortcut.
 - [ ] `-RunAtLogin` actually starts Iris after a real login (not just a
       shortcut sitting in the Startup folder) — log out and back in, or
       restart, to confirm.
-- [ ] The zip README's **Uninstall** steps are complete: after deleting
-      `%LOCALAPPDATA%\Iris` and the shortcuts it names, nothing of Iris is
-      left running, launchable or listed. Confirm the claim they rest on —
-      that Iris never appears in Settings → Apps → Installed apps, because
-      `install.ps1` writes no registry entry.
+- [ ] `install.ps1 -Uninstall` actually removes Iris in one step: quits it if
+      running, deletes `%LOCALAPPDATA%\Iris`, and deletes every shortcut a
+      previous install created (Start Menu, and Desktop/Startup if you made
+      them) — confirm nothing of Iris is left running, launchable or listed
+      (Settings → Apps → Installed apps stays empty; `install.ps1` writes no
+      registry entry, uninstall or not).
+- [ ] `install.ps1 -Uninstall` leaves `%APPDATA%\iris\config.toml` and
+      `history.jsonl` untouched — a real key you pasted in and real dictation
+      history must both survive an uninstall.
+- [ ] Put a `config.toml` or a `*.jsonl` file directly inside
+      `%LOCALAPPDATA%\Iris` by hand (simulating the one way user data could
+      end up somewhere a clean replace would otherwise delete), then run
+      `install.ps1` again: it must refuse and name the file rather than
+      silently deleting it.
 
 ## First-run config
 
@@ -64,8 +93,9 @@ on the machine you're actually going to use Iris on.
       someone who has never opened a TOML file.
 - [ ] With no key configured, the app runs on the mock engine without
       crashing (dictation "works" but transcribes to a stub).
-- [ ] Launched from the Start Menu shortcut — minimized, so the startup banner
-      is never seen, which is the whole point — the tray menu opens with four
+- [ ] Launched from the Start Menu shortcut — no console exists on this launch
+      path at all, so the startup banner is never seen, which is the whole
+      point — the tray menu opens with four
       disabled lines above everything else (`tray::demo_notice`): the "Demo
       mode: transcripts are stubs" headline, the two numbered edits (change
       the existing `engine = "mock"` line; add a `[keys]` block at the very
@@ -96,10 +126,13 @@ on the machine you're actually going to use Iris on.
       is a clear sentence naming the config path and telling you to start Iris
       again after editing it — not a Rust panic or stack trace.
 - [ ] Do the same again, but launched from the Start Menu shortcut: the
-      message arrives as an "Iris could not start" dialog box, not a console
-      window that flashes and closes before it can be read.
+      message arrives as an "Iris could not start" dialog box — there is no
+      console on this launch path at all for it to print to instead.
 - [ ] The same misconfiguration launched from an open PowerShell prompt
-      prints to the console and shows *no* dialog.
+      prints to that console (confirming `attach_console_for_cli_output`
+      reconnected it) and shows *no* dialog — `GetConsoleProcessList` seeing
+      more than one process (the shell and `iris.exe`) is what tells
+      `report_failure` (`main.rs`) the two cases apart.
 - [ ] Upgrading over a `config.toml` an older build wrote: the first start
       rewrites it, adding `version = 1` and turning `show_live_text` off once.
       Everything else in the file survives, and a `show_live_text = true` set

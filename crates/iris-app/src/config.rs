@@ -538,6 +538,15 @@ impl Config {
         true
     }
 
+    /// [`Config::load_or_create`], with an unconditional `eprintln!` as the
+    /// migration-save failure report — every test and every caller that does
+    /// not need more than that.
+    pub fn load_or_create(path: &Path) -> Result<Self> {
+        Self::load_or_create_reporting(path, |e| {
+            eprintln!("cannot save {}: {e:#}", path.display());
+        })
+    }
+
     /// Load from `path`, writing a documented default file first if it is
     /// missing, so that the settings window's "Open config file" always has
     /// something to open.
@@ -552,13 +561,25 @@ impl Config {
     /// setting that keeps reverting with nothing on screen to explain it is
     /// exactly the failure a quiet console must not hide.
     ///
+    /// `on_migration_save_error` is that unconditional report. This module
+    /// stays free of the `windows` dependency and portable on Linux, so it
+    /// cannot pop the "Iris could not start" dialog itself; `main` is the
+    /// caller that knows whether a console exists to fall back to, and
+    /// supplies a reporter that does both — see its call site. Every other
+    /// caller (tests included) gets [`Config::load_or_create`]'s plain
+    /// `eprintln!`, which is the whole story on a platform with no dialog to
+    /// show.
+    ///
     /// A *successful* migration stays behind `--verbose`. It rewrites the
     /// user's file and overrides a value that file stated, which is worth a
     /// record; it is also a once-per-install event on a healthy path, and the
     /// console is quiet by product decision, so it is a diagnostic rather than
     /// a greeting. `iris --verbose` is what turns the one-time override into
     /// something a user who noticed live text disappear can find.
-    pub fn load_or_create(path: &Path) -> Result<Self> {
+    pub fn load_or_create_reporting(
+        path: &Path,
+        on_migration_save_error: impl FnOnce(&anyhow::Error),
+    ) -> Result<Self> {
         if !path.exists() {
             let config = Self::default();
             config.save(path)?;
@@ -573,7 +594,7 @@ impl Config {
                      restore it",
                     path.display()
                 ),
-                Err(e) => eprintln!("cannot save {}: {e:#}", path.display()),
+                Err(e) => on_migration_save_error(&e),
             }
         }
         Ok(config)
@@ -906,6 +927,37 @@ mod tests {
             "the migration repeated and ate a deliberate setting"
         );
         assert!(Config::load(&path).unwrap().show_live_text);
+    }
+
+    /// A failed migration-save must not fail the whole load — the module's
+    /// first rule is that Iris starts — but it must not be swallowed either:
+    /// `load_or_create` no longer has a console guaranteed to be watching, so
+    /// `load_or_create_reporting`'s callback is the only place this can still
+    /// reach a user (see `main.rs`'s call site, which also pops a dialog).
+    /// Forced by occupying `save`'s own temp-file path with a directory,
+    /// which fails the write with `EISDIR` independent of the user this test
+    /// runs as — a read-only-directory trick would silently pass under root.
+    #[test]
+    fn a_migration_save_failure_is_reported_but_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "engine = \"groq\"\nshow_live_text = true\n").unwrap();
+        std::fs::create_dir(path.with_extension("toml.tmp")).unwrap();
+
+        let mut reported = None;
+        let config = Config::load_or_create_reporting(&path, |e| {
+            reported = Some(format!("{e:#}"));
+        })
+        .expect("a failed migration save must not fail the whole load");
+
+        assert!(
+            !config.show_live_text,
+            "the migration still holds in memory for this run even though the save failed"
+        );
+        assert!(
+            reported.is_some(),
+            "a migration-save failure must be reported, not swallowed"
+        );
     }
 
     #[test]

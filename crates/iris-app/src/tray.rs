@@ -202,18 +202,19 @@ fn spectrum_sample(t: f32) -> (u8, u8, u8) {
 
 /// What the menu shows while Iris is still on the offline mock engine.
 ///
-/// The installed shortcut launches `iris.exe` minimized
-/// (`packaging/windows/install.ps1`), so the startup banner's pointer at the
-/// config file is never read on the path a non-developer actually takes: they
-/// see stub transcripts and nothing at all saying why. The tray is the only
-/// surface left, so the state has to be legible there — and, because this is
-/// the surface for someone who never opened the zip's README, it has to carry
-/// the *whole* instruction rather than half of it. Leaving the engine edit out
-/// sends a user who follows it literally back to this same menu, key pasted in
-/// and still in demo mode. Every line is a disabled label: a signpost at the
-/// file the "Open settings…" item reaches — that item opens the settings
-/// window, whose Settings tab has the "Open config file" button — not a second
-/// place to configure anything.
+/// `iris.exe` is a GUI-subsystem binary (see `windows_subsystem` in
+/// `main.rs`), so a double-click, the Start Menu shortcut and the Startup
+/// shortcut alike open no console at all — the startup banner's pointer at
+/// the config file is never read on the path a non-developer actually takes:
+/// they see stub transcripts and nothing at all saying why. The tray is the
+/// only surface left, so the state has to be legible there — and, because
+/// this is the surface for someone who never opened the zip's README, it has
+/// to carry the *whole* instruction rather than half of it. Leaving the
+/// engine edit out sends a user who follows it literally back to this same
+/// menu, key pasted in and still in demo mode. Every line is a disabled
+/// label: a signpost at the file the "Open settings…" item reaches — that
+/// item opens the settings window, whose Settings tab has the "Open config
+/// file" button — not a second place to configure anything.
 ///
 /// The wording is pinned to `packaging/windows/README.md` by
 /// `iris-app/tests/settings.rs`, which follows both documents against a config
@@ -743,8 +744,9 @@ mod tests {
         assert!(tip.contains("polish: on"), "{tip}");
     }
 
-    /// The installed shortcut is minimized, so the startup banner never reaches
-    /// a first-run user: the tray has to carry the mock state on its own.
+    /// The installed shortcut opens no console at all, so the startup banner
+    /// never reaches a first-run user: the tray has to carry the mock state
+    /// on its own.
     #[test]
     fn the_menu_says_when_transcripts_are_stubs_and_where_the_key_goes() {
         let path = Path::new("C:/Users/somebody/AppData/Roaming/iris/config.toml");

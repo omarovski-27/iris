@@ -8,6 +8,15 @@
 //!
 //! `--demo-dictation` is safe to run unattended: it forces the mock engine and
 //! a dry-run injector, so there is no network and no `SendInput`.
+//!
+//! This is also, incidentally, coverage for the other half of the
+//! console-output contract: `Command::output()` below pipes stdout/stderr,
+//! which gives the child real, already-inherited handles the same way
+//! redirecting to a file does (`iris.exe > out.txt`). `main.rs`'s
+//! `attach_console_for_cli_output` is written to leave already-wired stdio
+//! alone rather than tear it up with a console handle — if that check ever
+//! regressed, every assertion below would start reading empty output instead
+//! of a real transcript, on any platform.
 
 use std::process::Command;
 

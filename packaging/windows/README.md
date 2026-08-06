@@ -39,6 +39,17 @@ shortcut. No admin rights needed; nothing is written outside your user
 profile. `-RunAtLogin` adds a shortcut in your Startup folder — delete it to
 undo, there is no registry entry.
 
+Re-running this script — to upgrade, or to add `-Desktop`/`-RunAtLogin` you
+skipped the first time — is a **clean replace**, in one step: it quits any
+Iris that is currently running, deletes whatever Start Menu, Desktop and
+Startup shortcuts a previous run created, and replaces `%LOCALAPPDATA%\Iris`
+before copying the new build in. You never need to quit Iris or delete
+anything by hand first. Your settings and dictation history live in
+`%APPDATA%\iris`, a separate folder this script never touches, so an upgrade
+never resets your key or your history — and if re-running with different
+flags means a shortcut you had (say, the Startup one) is no longer requested,
+it is removed rather than left stale.
+
 3. Launch **Iris** from the Start Menu (or your shortcut).
 
 ## First run
@@ -116,30 +127,37 @@ upgrading again later repeats that one-time reset.
 
 Iris does not register itself with Windows, so it does **not** appear in
 **Settings → Apps → Installed apps** — there is nothing to click there, and
-that is not a bug. Removing it is deleting what `install.ps1` created:
+that is not a bug.
 
-1. Quit Iris — right-click the tray icon → **Quit Iris**.
-2. Delete the folder `%LOCALAPPDATA%\Iris`. That is the whole app.
-3. Delete the shortcuts. Find the Start Menu one the way you launch it —
-   open the Start Menu, search for **Iris**, right-click the result →
-   **Open file location**, and delete the `Iris.lnk` that Explorer highlights.
-   If you installed with `-Desktop` there is one on your Desktop too, and with
-   `-RunAtLogin` one more in your Startup folder (press Win+R and run
-   `shell:startup` to open it). Deleting the Startup one is also how you stop
-   Iris starting at login without removing the rest.
-
-   Those folders are usually `%APPDATA%\Microsoft\Windows\Start Menu\Programs`
-   and `...\Programs\Startup` if you would rather check directly — but
-   Windows moves them on some machines (Group Policy folder redirection, some
-   work laptops, some OEM images), which is why the installer asks Windows
-   where they are rather than assuming, and why the search above is the
-   instruction that always finds them.
-4. Optional: delete `%APPDATA%\iris` as well. That folder holds your settings
-   (including any key you pasted in) and your dictation history — leave it if
-   you might reinstall, since a fresh install picks it straight back up.
+1. Open PowerShell in this folder (or the folder you originally extracted the
+   zip into — any copy of `install.ps1` does the same removal) and run:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
+   ```
+   This quits Iris if it is running, deletes `%LOCALAPPDATA%\Iris`, and
+   deletes every shortcut a previous install created — Start Menu, Desktop,
+   and Startup (which is also what stops Iris starting at login). One step,
+   nothing to hunt for by hand.
+2. Optional: delete `%APPDATA%\iris` as well. That folder holds your settings
+   (including any key you pasted in) and your dictation history —
+   `-Uninstall` deliberately leaves it alone, so a reinstall picks it straight
+   back up. Delete it yourself if you want a full wipe.
 
 Nothing is written outside your user profile and there are no registry
-entries, so those deletions are the complete uninstall.
+entries, so those two steps are the complete uninstall.
+
+If you would rather not run the script, uninstalling by hand is exactly the
+same two things: quit Iris (right-click the tray icon → **Quit Iris**),
+delete the folder `%LOCALAPPDATA%\Iris`, and delete the shortcuts — the Start
+Menu one is found by opening the Start Menu, searching for **Iris**,
+right-clicking the result → **Open file location**, and deleting the
+`Iris.lnk` Explorer highlights; a Desktop or Startup one (press Win+R,
+`shell:startup`) the same way if you installed with `-Desktop` or
+`-RunAtLogin`. Those shortcut folders are usually
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs` and `...\Programs\Startup`
+if you would rather check directly — but Windows moves them on some machines
+(Group Policy folder redirection, some work laptops, some OEM images), which
+is why `install.ps1` asks Windows where they are rather than assuming.
 
 ## Anything else
 
