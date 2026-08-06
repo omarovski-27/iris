@@ -16,7 +16,7 @@
 //! dictation means a fresh, empty cache every dictation — every single
 //! connect pays a full handshake, never a resumed one.
 //!
-//! [`tls_connector`] builds that same default config exactly once (identical
+//! `tls_connector` builds that same default config exactly once (identical
 //! root store, identical `webpki-roots` version tokio-tungstenite itself
 //! pins) and hands out a cloned `Arc` to it. Reusing the same `Arc` across
 //! connects to the same host (Deepgram) is what lets rustls's client-side
@@ -66,7 +66,7 @@ static TLS_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 /// A shared rustls client config for websocket connects, so repeat
 /// connections to the same host can resume a TLS session instead of paying a
 /// full handshake. See the module doc.
-pub fn tls_connector() -> Arc<ClientConfig> {
+pub(crate) fn tls_connector() -> Arc<ClientConfig> {
     init_crypto();
     TLS_CONFIG
         .get_or_init(|| {
