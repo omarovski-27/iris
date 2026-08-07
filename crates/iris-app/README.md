@@ -231,14 +231,14 @@ no windowing framework of its own. The alternatives weighed against it are in
 `[target.'cfg(windows)']` and the tray is simply absent elsewhere.
 
 Menu: engine picker, microphone picker, theme, polish toggle, open settings,
-reload settings, quit. "Open settings" opens the settings window (below) —
-opening it twice focuses the existing window rather than making a second one,
-and closing it never stops dictation, which owns its own thread throughout.
-The config file is still one click away, from that window's Settings tab, so
-"Reload settings" keeps meaning what it always did. A window that cannot start
-at all does not turn the item into a no-op: `window::EditorWindow` takes over
-and every click opens `config.toml` in the editor instead — what the item did
-before this window existed — saying so each time.
+reload settings, quit. "Open settings" opens the settings window (below,
+opened by default on launch too) — opening it twice focuses the existing
+window rather than making a second one. The config file is still one click
+away, from that window's Settings tab, so "Reload settings" keeps meaning what
+it always did. A window that cannot start at all does not turn the item into a
+no-op: `window::EditorWindow` takes over and every click opens `config.toml`
+in the editor instead — what the item did before this window existed — saying
+so each time.
 
 While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,
@@ -281,6 +281,24 @@ is a remote control, not a display. Reconciling it would need the item handles
 kept on the tray thread plus a state-update message from the loop, a deliberate
 non-goal for v1.
 
+## Single instance
+
+`crate::single_instance`, checked at the very top of `main.rs`'s Windows
+`run` — before the microphone, the hotkey hook or the tray exist — because a
+tray-resident app that let a second launch run alongside the first would end
+up with two of each. A named Win32 mutex marks one process as primary; a
+named auto-reset event lets a later launch wake the primary's settings window
+(`App::with_reopen_signal`, drained in `App::run` the same way
+`Command::OpenSettings` is) instead of piling up behind it. Both names are
+qualified with `USERNAME` — Remote Desktop / Terminal Services can put more
+than one interactive user in one session, and the default, session-local
+kernel-object namespace would conflate them. A second launch that finds the
+lock held signals the primary and exits immediately, before touching anything
+the primary already owns. Off Windows — and if the check itself fails to
+start — every launch is treated as primary with no reopen signal, on the same
+"an accessory must not be why dictation stops working" terms as the overlay
+and the settings window elsewhere in this file.
+
 ## Overlay
 
 The loop drives a `PillSink`. On Windows the resident app spawns
@@ -319,8 +337,15 @@ the real pill adapter (visible on Windows; headless state machine elsewhere).
 
 ## Settings window
 
-`crate::window`, opened from the tray's `Settings` item. Three sections, in
-priority order:
+`crate::window`. Opened automatically on every deliberate launch — the icon,
+the Start Menu, launching Iris again while it is already running (see
+`single_instance` below) — so opening Iris shows something rather than
+starting a background process with nothing on screen. Also reachable from the
+tray's `Settings` item once closed; closing it never stops dictation, which
+owns its own thread throughout. The Startup-folder shortcut is the one
+exception: it carries `--background` (`Args::background` in `main.rs`), so a
+boot-time autostart stays quietly in the tray rather than opening a window at
+every login. Three sections, in priority order:
 
 - **History** — the session log below, newest first, with a search box and a
   one-click copy per entry; a failed injection shows its reason in place, not

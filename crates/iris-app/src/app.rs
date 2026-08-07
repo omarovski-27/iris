@@ -182,6 +182,10 @@ pub struct App<A: AudioSource> {
     /// one, and only ever fed for commands that arrived on `window_commands`:
     /// the tray has no status line to put an answer in.
     window_outcomes: Option<Sender<(CommandId, CommandOutcome)>>,
+    /// Fires once for every later launch that found this process already
+    /// running, so it can raise the window instead of doing nothing visible.
+    /// `never()` by default; see [`App::with_reopen_signal`].
+    reopen: Receiver<()>,
     history: SessionLog,
     audio: A,
     count: usize,
@@ -236,6 +240,7 @@ impl<A: AudioSource> App<A> {
             window: Box::new(NoopWindow),
             window_commands: crossbeam_channel::never(),
             window_outcomes: None,
+            reopen: crossbeam_channel::never(),
             history,
             audio,
             count: 0,
@@ -249,6 +254,28 @@ impl<A: AudioSource> App<A> {
     pub fn with_window(mut self, window: Box<dyn WindowSink>) -> Self {
         self.window = window;
         self
+    }
+
+    /// Raise the settings window whenever a later launch attempt signals it
+    /// found this process already running, in place of the default
+    /// `never()` receiver that simply never fires.
+    ///
+    /// See [`crate::single_instance`] for what sends on this.
+    #[must_use]
+    pub fn with_reopen_signal(mut self, reopen: Receiver<()>) -> Self {
+        self.reopen = reopen;
+        self
+    }
+
+    /// Open (or focus) the settings window right now, without waiting for a
+    /// [`Command::OpenSettings`] to arrive on a channel.
+    ///
+    /// The one caller today is `main`, for the deliberate launches — the
+    /// icon, the Start Menu — that must show the window immediately rather
+    /// than leaving it to the tray's `Settings` item; the Startup shortcut
+    /// does not call this, so a boot-time autostart stays in the tray.
+    pub fn open_window(&self) {
+        self.window.open();
     }
 
     /// Give the loop somewhere real to report a failed injection.
@@ -362,6 +389,10 @@ impl<A: AudioSource> App<A> {
         // cannot turn this into a busy loop — unlike `control`, losing the
         // window must not end the whole dictation loop.
         let mut window_commands = self.window_commands.clone();
+        // Cloned out for the same borrow-checker reason as `window_commands`
+        // above: `select!`'s arm body still needs `&mut self` for `apply`,
+        // even though this arm never calls it.
+        let reopen = self.reopen.clone();
         loop {
             let pressed_at = select! {
                 recv(keys) -> event => match event {
@@ -391,6 +422,12 @@ impl<A: AudioSource> App<A> {
                         continue;
                     }
                 },
+                // A later launch found this instance already running: show
+                // it, the same action `Command::OpenSettings` takes.
+                recv(reopen) -> _ => {
+                    self.window.open();
+                    continue;
+                }
                 // Idle audio from a warm microphone. Dropped on purpose.
                 recv(frames) -> _ => continue,
             };

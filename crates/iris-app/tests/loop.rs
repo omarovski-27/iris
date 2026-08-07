@@ -1188,6 +1188,38 @@ fn open_settings_opens_the_window() {
     assert_eq!(window.opens(), 2);
 }
 
+/// A later launch that found this process already running
+/// (`iris_app::single_instance`) must raise the window the same way the
+/// tray's `Settings` item does — the fix for a double-click on an
+/// already-running Iris doing nothing visible.
+#[test]
+fn a_reopen_signal_opens_the_window_like_open_settings_does() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let window = rig.window.clone();
+    let (reopen_tx, reopen_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app.with_reopen_signal(reopen_rx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    reopen_tx.send(()).unwrap();
+    reopen_tx.send(()).unwrap();
+    // `reopen` and `commands` are separate channels, so `Quit` is held back
+    // until both signals are seen — sent alongside them, `select!`'s random
+    // choice between ready channels could pick `Quit` first and end the loop
+    // before either reopen fired the window.
+    wait_for(|| window.opens() == 2);
+    commands.send(Command::Quit).unwrap();
+
+    loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(window.opens(), 2);
+}
+
 /// The window sends `Command`s on its own channel, distinct from the tray's,
 /// and `App::run` must drain both — this is what lets a setting changed in
 /// the window take effect without a second, window-owned copy of `App::apply`.

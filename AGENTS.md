@@ -113,7 +113,21 @@ Load-bearing beyond that crate:
   session log or echoes the text back when the log is off).
   `crates/iris-app/tests/console.rs` drives the real binary and holds this.
 - **The settings window** (`iris-app::window`) is the History/Settings/Insights
-  UI opened from the tray's `Settings` item. See "Settings window" below.
+  UI, opened by default on every deliberate launch (`App::open_window`, called
+  from `main`'s `run` unless `--background`) as well as from the tray's
+  `Settings` item. See "Settings window" below.
+- **A second launch wakes the first instance instead of starting a second
+  one.** `iris_app::single_instance::acquire` (checked before the microphone,
+  the hotkey hook or the tray exist) claims a named Win32 mutex; a launch that
+  finds it held signals a named event and exits immediately. `App::run` drains
+  that signal the same way it drains `Command::OpenSettings`
+  (`App::with_reopen_signal`). See "Single instance" in `iris-app/README.md`.
+- **A panic during startup or the resident loop must still show something.**
+  `main::install_panic_dialog`, the first line of `main`, chains the default
+  panic hook onto the same `dialog::show` message box a returned `Result::Err`
+  already reaches — without it, a panic on a console-less launch (icon,
+  Start Menu, Startup shortcut) is entirely silent, which is
+  indistinguishable from the app never having started.
 
 ```bash
 cargo run -p iris-app -- --demo-dictation                 # mock + dry-run + pill
@@ -490,11 +504,18 @@ When updating this file, preserve this bar for all agents and keep entries conci
 
 ## Settings window (`iris-app::window`)
 
-- Opened from the tray's `Settings` item (`Command::OpenSettings`); one
-  `iris-window` thread for process life, mirroring `tray`/`iris-overlay`. The
-  toolkit choice (`egui`/`eframe` over a WebView shell, a retained Win32
-  toolkit, or extending `iris-overlay`'s renderer) and the evidence for it are
-  in `window/mod.rs`'s module docs — read that before reconsidering it.
+- Opened on every deliberate launch by default — `main`'s `run` calls
+  `App::open_window` right after `start_resident` unless `--background` was
+  passed — and also from the tray's `Settings` item (`Command::OpenSettings`)
+  or a later launch attempt (`single_instance`, below) once closed. One
+  `iris-window` thread for process life either way, mirroring
+  `tray`/`iris-overlay`. `--background` is the one exception, carried only by
+  the Startup-folder shortcut `install.ps1` creates (`-RunAtLogin`): a
+  boot-time autostart must stay quietly in the tray, not put a window on
+  screen at every login — a captain-decided split (2026-08-07), not left to
+  guess. The toolkit choice (`egui`/`eframe` over a WebView shell, a retained
+  Win32 toolkit, or extending `iris-overlay`'s renderer) and the evidence for
+  it are in `window/mod.rs`'s module docs — read that before reconsidering it.
 - **Portable view, `cfg(windows)` shell.** `window::ui` and everything it
   calls (`state`, `insights`, `search`, `egui_theme`) depend on plain `egui`
   only and type-check on Linux; only `window::shell` depends on `eframe` and
