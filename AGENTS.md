@@ -62,7 +62,15 @@ either. Verify the subsystem field of a cross-compiled `.exe` with
 `x86_64-w64-mingw32-objdump -p <path> | grep -i subsystem` (expect `Subsystem
 00000002 (Windows GUI)`, not `00000003 (Windows CUI)`); there is no way to
 verify "no window ever flashes" from this environment — that needs
-`docs/first-run-checklist.md` on real Windows.
+`docs/first-run-checklist.md` on real Windows. The embedded icon and version
+resource are also checkable from Linux without Windows interop: `icoutils`
+(`wrestool`/`icotool`, `apt-get install icoutils`, not preinstalled) lists
+and extracts them — `wrestool -l <exe>` for the resource table,
+`wrestool -x --raw --type=16 --name=1 --language=1033 <exe>` piped through
+`strings` for the `FileDescription`/`FileVersion`/`ProductName` strings, and
+`wrestool -x --type=14 --name=1 --language=1033 -o icon.ico <exe>` +
+`icotool -x icon.ico` to render the icon frames as PNGs and confirm it's the
+real prism mark, not a generic/default one.
 
 `install.ps1` is a **clean replace**, not an additive install: every run
 quits a running Iris, deletes the Start Menu/Desktop/Startup shortcuts a
