@@ -42,6 +42,7 @@ use crate::audio::{self, AudioSource};
 use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, LatencyBreakdown, PolishInfo, SessionLog};
 use crate::inject::Injector;
+use crate::notify::{FailureNotice, NoopFailureNotice};
 use crate::pill::PillSink;
 use crate::window::{NoopWindow, WindowSink};
 use crate::{engines, polish};
@@ -161,6 +162,12 @@ pub struct App<A: AudioSource> {
     engine: Arc<dyn Engine>,
     polisher: Option<Arc<dyn Polisher>>,
     injector: Arc<dyn Injector>,
+    /// Told when a delivery fails, so the words and the failure itself can
+    /// reach the user somewhere other than a console that may not exist.
+    /// [`NoopFailureNotice`](crate::notify::NoopFailureNotice) by default —
+    /// only the real resident loop wires a live one; see
+    /// [`App::with_failure_notice`].
+    notice: Arc<dyn FailureNotice>,
     pill: Box<dyn PillSink>,
     /// Opens/focuses the settings window on [`Command::OpenSettings`].
     /// [`NoopWindow`] by default — only the real resident loop wires a live
@@ -224,6 +231,7 @@ impl<A: AudioSource> App<A> {
             engine,
             polisher,
             injector,
+            notice: Arc::new(NoopFailureNotice),
             pill,
             window: Box::new(NoopWindow),
             window_commands: crossbeam_channel::never(),
@@ -240,6 +248,18 @@ impl<A: AudioSource> App<A> {
     #[must_use]
     pub fn with_window(mut self, window: Box<dyn WindowSink>) -> Self {
         self.window = window;
+        self
+    }
+
+    /// Give the loop somewhere real to report a failed injection.
+    ///
+    /// Only the resident loop (`main.rs`'s `start_resident`) should ever pass
+    /// [`crate::notify::SystemFailureNotice`] here — see the module docs on
+    /// [`crate::notify`] for why every other caller keeps the default
+    /// [`NoopFailureNotice`].
+    #[must_use]
+    pub fn with_failure_notice(mut self, notice: Arc<dyn FailureNotice>) -> Self {
+        self.notice = notice;
         self
     }
 
@@ -944,17 +964,26 @@ impl<A: AudioSource> App<A> {
                     self.pill.inserted(latency_ms);
                 }
                 Err(e) => {
-                    // The transcript is good; only the delivery failed. Say so,
-                    // and make sure the record below carries the text. With
-                    // history off there is no file to point at, so the console
-                    // gets the words themselves — they must be recoverable from
-                    // somewhere.
+                    // The transcript is good; only the delivery failed. Say
+                    // so, and make sure the record below carries the text.
+                    // With history off there is no file to point at, so the
+                    // console gets the words themselves — they must be
+                    // recoverable from somewhere.
                     eprintln!("  could not insert the text: {e:#}");
                     if self.history.enabled() {
                         eprintln!("  it is in {}", self.history.path().display());
                     } else {
                         eprintln!("  it was: {text}");
                     }
+                    // The eprintln!s above are the whole story on a launch
+                    // with a console attached to read them; `self.notice` is
+                    // the same failure reaching a launch with none — the
+                    // GUI-subsystem double-click/Start Menu/Startup path most
+                    // users actually take. It decides for itself whether that
+                    // means the clipboard, a dialog, both or neither; see
+                    // `crate::notify`.
+                    self.notice
+                        .injection_failed(&text, &format!("{e:#}"), self.history.enabled());
                     record.error = Some(format!("injection failed: {e:#}"));
                 }
             }

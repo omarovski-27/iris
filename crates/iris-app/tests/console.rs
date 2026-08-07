@@ -15,8 +15,11 @@
 //! redirecting to a file does (`iris.exe > out.txt`). `main.rs`'s
 //! `attach_console_for_cli_output` is written to leave already-wired stdio
 //! alone rather than tear it up with a console handle — if that check ever
-//! regressed, every assertion below would start reading empty output instead
-//! of a real transcript, on any platform.
+//! regressed on Windows, every assertion below would start reading empty
+//! output instead of a real transcript. `attach_console_for_cli_output` is
+//! `#[cfg(windows)]`, so this protection is real only when this suite runs
+//! on Windows; the portable `cargo test` loop this file normally runs in
+//! does not compile that function at all and cannot catch a regression in it.
 
 use std::process::Command;
 

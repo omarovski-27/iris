@@ -67,6 +67,14 @@ $startMenuShortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "Iris.
 $desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "Iris.lnk"
 $startupShortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "Iris.lnk"
 
+# True when $path is $dir itself or anything under it. Trailing-separator
+# normalised first so $installDir = "C:\Foo\Iris" cannot false-positive match
+# a sibling like "C:\Foo\IrisExtra\...".
+function Test-PathIsInside($path, $dir) {
+    $normalizedDir = $dir.TrimEnd('\') + '\'
+    return $path.StartsWith($normalizedDir, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 # config.toml and the *.jsonl dictation history only ever live in
 # %APPDATA%\iris, never in $installDir - this script owns $installDir
 # completely and normally puts nothing there but iris.exe. That separation is
@@ -86,6 +94,21 @@ function Assert-NoUserDataIn($dir) {
     }
 }
 
+# Matched by executable path under $installDir, not by image name alone:
+# "Iris" is a common enough product name that an unrelated process could
+# share it, and a routine upgrade must never force-kill something that is not
+# this app. A process whose path cannot be read (permissions, a 32/64-bit
+# mismatch) is treated as not ours and left alone rather than guessed at.
+function Get-RunningIrisProcesses {
+    Get-Process -Name "iris" -ErrorAction SilentlyContinue | Where-Object {
+        try {
+            $_.Path -and (Test-PathIsInside $_.Path $installDir)
+        } catch {
+            $false
+        }
+    }
+}
+
 # Windows locks a running image against writes, so upgrading over a live Iris
 # fails with a raw "used by another process" - and a clean-replace has no
 # manual "quit it first" step for the caller to follow, so this does it.
@@ -94,11 +117,19 @@ function Assert-NoUserDataIn($dir) {
 # CLAUDE.md), so there is no in-memory state that a graceful shutdown would
 # have saved and a forceful one loses.
 function Stop-RunningIris {
-    $running = Get-Process -Name "iris" -ErrorAction SilentlyContinue
-    if ($running) {
-        Write-Host "Stopping the running Iris so it can be replaced..."
-        $running | Stop-Process -Force
-        $running | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    $running = Get-RunningIrisProcesses
+    if (-not $running) { return }
+
+    Write-Host "Stopping the running Iris so it can be replaced..."
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+
+    # Wait-Process gives up silently on its own timeout; re-check rather than
+    # assume it worked, so a slow-to-exit Iris (AV scan, a second instance
+    # started meanwhile) surfaces this actionable error instead of the raw
+    # "used by another process" failure the message below replaces.
+    if (Get-RunningIrisProcesses) {
+        throw "Iris is still running. Quit it manually (right-click the tray icon -> Quit Iris), then run this installer again."
     }
 }
 
@@ -149,6 +180,19 @@ try {
 
     if ($resolvedTarget -eq $resolvedSource) {
         Write-Host "Already installed at $targetExe - keeping it in place."
+    } elseif (Test-PathIsInside $resolvedSource $installDir) {
+        # Not the same file, but still not safe to wipe: the zip was
+        # extracted into a *subfolder* of $installDir (Explorer's "Extract
+        # All" default names that folder after the zip when the destination
+        # is set to %LOCALAPPDATA%\Iris). Deleting $installDir here would
+        # delete the source this copy is about to read from. Skip the
+        # directory reset and just place the exe - still a clean replace for
+        # the running process and the shortcuts, just not a wiped directory,
+        # and the extracted folder (install.ps1, README, LICENSE) is left in
+        # place rather than destroyed.
+        Stop-RunningIris
+        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+        Copy-Item -LiteralPath $resolvedSource -Destination $targetExe -Force
     } else {
         Assert-NoUserDataIn $installDir
         Stop-RunningIris

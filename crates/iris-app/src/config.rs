@@ -543,8 +543,17 @@ impl Config {
     /// not need more than that.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         Self::load_or_create_reporting(path, |e| {
-            eprintln!("cannot save {}: {e:#}", path.display());
+            eprintln!("{}", Self::migration_save_error_message(path, e));
         })
+    }
+
+    /// The migration-save failure wording, shared by every reporter of it —
+    /// [`Config::load_or_create`]'s `eprintln!` and `main`'s reporter, which
+    /// also shows it in the "Iris could not update its settings" dialog. One
+    /// function means the two can never drift apart; see
+    /// `migration_save_error_message_is_shared_by_every_reporter` below.
+    pub fn migration_save_error_message(path: &Path, e: &anyhow::Error) -> String {
+        format!("cannot save {}: {e:#}", path.display())
     }
 
     /// Load from `path`, writing a documented default file first if it is
@@ -958,6 +967,21 @@ mod tests {
             reported.is_some(),
             "a migration-save failure must be reported, not swallowed"
         );
+    }
+
+    /// `load_or_create`'s plain `eprintln!` and `main`'s reporter (which
+    /// also pops a dialog) must show the same words for the same failure —
+    /// only `migration_save_error_message` can guarantee that, since nothing
+    /// else ties the two call sites together.
+    #[test]
+    fn migration_save_error_message_is_shared_by_every_reporter() {
+        let path = Path::new("/somewhere/iris/config.toml");
+        let err = anyhow::anyhow!("permission denied");
+
+        let message = Config::migration_save_error_message(path, &err);
+
+        assert!(message.contains("/somewhere/iris/config.toml"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
     }
 
     #[test]

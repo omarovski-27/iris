@@ -14,11 +14,16 @@ on the machine you're actually going to use Iris on.
       looks exactly like the old flash-and-vanish did, so absence of a window
       is not by itself proof of success; check the next item too.)
 - [ ] From an already-open PowerShell or Command Prompt, `iris.exe
-      --print-config` prints to that same window and returns to the prompt —
-      confirming `attach_console_for_cli_output` (`main.rs`) reconnects
-      stdout when a parent console exists, instead of the diagnostic output
-      silently vanishing along with the console the GUI subsystem no longer
-      allocates. Try `--verbose` and `--list-devices` too.
+      --print-config` prints to that same window — confirming
+      `attach_console_for_cli_output` (`main.rs`) reconnects stdout when a
+      parent console exists, instead of the diagnostic output silently
+      vanishing along with the console the GUI subsystem no longer allocates.
+      A GUI-subsystem process does not block the shell the way a console
+      binary does, so the prompt reappears immediately rather than waiting
+      for `iris.exe` to exit — expect the output to land after the prompt has
+      already come back (piping, e.g. `iris.exe --print-config | more`,
+      behaves normally), and do not read that ordering as a failure. Try
+      `--verbose` and `--list-devices` too.
 - [ ] The startup banner (three lines — hotkey, listening device, settings
       path, nothing else: no per-dictation output, no millisecond figures)
       shows up in that same open-terminal run of plain `iris.exe`, and is
@@ -249,6 +254,22 @@ want it without dictating first.
       only accepts paste). `inject::effective_method`'s clipboard fallback
       for long transcripts is unit-tested but never watched land on a real
       focused window.
+- [ ] Force an injection failure (e.g. hold the hotkey over an elevated
+      window, which `SendInput` cannot reach) with `[history] enabled =
+      false` in `config.toml`, launched from the Start Menu shortcut — no
+      console on this launch path, and history off so the session log
+      cannot recover the words either. Confirm both halves of
+      `notify::SystemFailureNotice` fire: an "Iris could not type your
+      dictation" dialog naming the error, and the transcript sitting on the
+      clipboard, ready to paste by hand. Only mechanically verified here via
+      the portable test double (`RecordingFailureNotice` in
+      `tests/loop.rs`) — the real dialog and the real clipboard write have
+      never executed anywhere this build was produced.
+- [ ] The same failure with history left on: the dialog still appears (the
+      failure itself must stay visible either way), but the message points
+      at the session log instead of the clipboard, and the clipboard is left
+      untouched — `SystemFailureNotice` must not write to it when the words
+      are already durably recoverable from the log.
 
 ## What this build does not include
 
