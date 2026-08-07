@@ -1,12 +1,12 @@
 # iris-overlay
 
 The Iris pill: a small always-on-top shape that appears bottom-centre while
-you hold the dictation hotkey. By default it is a quiet glass circle — the
-core glyph plus a small elapsed-recording timer, nothing else — collapsing
-into a checkmark the instant text lands, and taking itself off screen a
-moment later. A config opt-in (`show_live_text`, off by default) widens the
-same shape further into a ribbon that shows the live transcript as words
-arrive.
+you hold the dictation hotkey. By default it is a quiet glass capsule, close
+to a circle — the core glyph, a compact scrolling audio waveform, and a small
+elapsed-recording timer — collapsing into a checkmark the instant text lands,
+and taking itself off screen a moment later. A config opt-in (`show_live_text`,
+off by default) widens the same shape further into a ribbon that shows the
+live transcript as words arrive.
 
 It is the product's hero surface. It never takes focus, never accepts a
 click, and **never types**: text injection lives in `iris-core` and is not
@@ -14,9 +14,9 @@ reachable from here.
 
 ```
 listening, default          listening, opt-in text open        inserted
-   ╭──────╮                 ╭────────────────────────────╮
-   │⬤ 0:07│  ──────▶        │  ...the report needs three  │  ──▶   ⓥ
-   ╰──────╯                 ╰────────────────────────────╯
+ ╭────────────╮              ╭────────────────────────────╮
+ │⬤ ıllıılı 0:07│  ──────▶    │  ...the report needs three  │  ──▶   ⓥ
+ ╰────────────╯              ╰────────────────────────────╯
 ```
 
 ## Using it
@@ -101,11 +101,12 @@ shape, not two: only its width animates. Height, placement, and every motion
 timing are unchanged from before.
 
 - `layout::ORB_D` (34) is the shape's constant height, at every width.
-- `layout::REST_W` (102) is the width at rest — no live text on screen, which
-  is the default and what most users ever see. Round 4 (below) walked this
-  back from round 3's 128: it is now as close to the pre-round-3 true circle
-  as clearing the core glyph for a small elapsed-recording timer requires,
-  and nothing wider — no wave row shares the shape any more.
+- `layout::REST_W` (118) is the width at rest — no live text on screen, which
+  is the default and what most users ever see. Round 4 walked this back from
+  round 3's 128 to 102 (the wave row deleted outright); round 5 (below) grew
+  it back out a little to make room for the wave row's return as a compact,
+  genuine waveform — still clearly short of round 3's 128, not creeping back
+  toward it.
 - `layout::TIMER_FONT` (10) is the timer's own font size — its own small
   constant, deliberately not `TEXT_FONT` (15), the live-text ribbon's size.
   See "Round 4", below.
@@ -136,10 +137,10 @@ and the motion budget are not.
 
 | | Then | Now |
 |---|---|---|
-| Geometry | Fixed 168×34 capsule | One shape, width animates 102→460 (34 at rest between the two orb rounds; 128 during round 3; see "Round 4") |
+| Geometry | Fixed 168×34 capsule | One shape, width animates 118→460 (34 at rest between the two orb rounds; 128 during round 3; 102 during round 4; see "Round 5") |
 | Motion | `motion.rs` timings and curves | **Identical** — every constant is imported, none copied |
 | Colour | Prism dark / Porcelain light | Same two palettes, same tokens, no new colours needed |
-| Waveform | 28-bar spectrum (`spectrum.rs`) | Gone. Round 1 replaced it with an independently-tuned bar row (`draw_wave`); round 4 removed that row outright — see "Glass" and "Round 4", below. `spectrum.rs` itself has been gone since round 1; nothing in the current design shares code with it. |
+| Waveform | 28-bar spectrum (`spectrum.rs`) | A history-driven bar row (`draw_wave`) — round 1 built a single-level fan-out version, round 4 deleted it, round 5 rebuilt it reading a rolling history of real levels instead. See "Glass" and "Round 5", below. `spectrum.rs` itself has been gone since round 1; nothing in the current design shares code with it. |
 | Shell | Opaque | Translucent glass at a constant `GLASS_FILL_ALPHA`; legibility is carried per-run — `theme.text_scrim` behind the live text, `theme.timer_edge` around the timer's digits — never a text-linked opacity ramp on the shell |
 | Transcript | Never held (`set_partial_len`, a count) | Held while on screen (`set_partial_text`, the string) — only when live text is opted in, since round 3 |
 | Engine chip | Rendered below the pill | Carried on the model, not rendered — no room without competing with the words |
@@ -192,19 +193,21 @@ dedicated `text_scrim` token paints a soft band behind the text run only,
 sized to the text and fading with it, in `draw_ribbon`. That is what actually
 guarantees legibility now; the shell fill is free to be purely aesthetic.
 
-**The wave — round 1 brought it back, round 4 removed it again.** Between
-those two rounds, `draw_wave` was a new, independently-tuned bar row, not a
-port of the deleted `spectrum.rs`: a taper with a floor instead of one that
-hit zero at both ends (the old row's failure the captain named as "the
-waves... get cut off about 75%"), and an expansive `powf(1.6)` response curve
-so quiet and loud read as clearly different. Round 3 gave it two sizes,
-centred on the shape at rest and in a band above the live text once the
-ribbon opened. None of it exists any more: round 4's *"I don't want the
-dashes"* is this row, named plainly, and `draw_wave` and every `WAVE_*`
-constant are gone from the crate outright rather than left unreachable — see
-"Round 4", below. The scrim and timer legibility mechanisms this row used to
-constrain (`text_band`'s ceiling, `draw_timer`'s clearance) now answer only to
-the face metrics and the core glyph.
+**The wave — round 1 brought it back, round 4 removed it, round 5 rebuilt it
+on a different foundation.** Round 1's `draw_wave` was a new,
+independently-tuned bar row, not a port of the deleted `spectrum.rs`: a taper
+with a floor instead of one that hit zero at both ends (the old row's failure
+the captain named as "the waves... get cut off about 75%"), and an expansive
+`powf(1.6)` response curve so quiet and loud read as clearly different. Round
+3 gave it two sizes, centred on the shape at rest and in a band above the
+live text once the ribbon opened — but every bar in that row read the *same*
+current level, with position the only thing that varied it, which is what
+round 4 named "the dashes" and deleted outright. Round 5 rebuilt the row from
+that same response curve, but each bar now reads one sample from a rolling
+history of recent levels instead of the one shared current value — see
+"Round 5", below, for the full mechanism. The scrim and timer legibility
+mechanisms the row constrains (`text_band`'s ceiling, `draw_timer`'s
+clearance) are unchanged from round 3.
 
 ## Round 3: text off by default, a narrower capsule, and a timer
 
@@ -362,14 +365,110 @@ Two changes:
   width the shape takes (unchanged since round 1), so the clearance
   requirement is symmetric and the capsule cannot be narrower than twice it
   — `the_timer_keeps_real_air_between_itself_and_the_centred_glyph` pins the
-  exact number; `the_rest_width_is_close_to_the_circle_it_was_before_round_3`
-  and `render::tests::the_resting_shape_is_close_to_a_circle_with_a_small_timer`
-  both regression-guard against drifting back toward round 3's width.
+  exact number; `layout::tests::the_rest_width_stays_compact_not_round_3s_128`
+  and `render::tests::the_resting_shape_stays_compact_not_round_3s_capsule`
+  both regression-guard against drifting back toward round 3's width (their
+  names and bounds moved again in round 5, below, once the wave row needed
+  room too, but the guard is the same idea).
 
 Everything else about the timer — the outline-not-plate legibility mechanism,
 the fade-proportionality guard, the anchor separation from live text, the
 saturating four-character format — is exactly what round 3 built, described
 above; only the font size and the geometry it drives changed.
+
+## Round 5: the timeline answered — a real scrolling waveform, not dashes
+
+The captain, on round 4's PR while it was still unmerged, was looking at
+round 3's build (static dashes, the 15px timer) and said so again — read at
+face value this looked like a regression, but the direction that followed
+(`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`)
+settled both open questions round 4 had escalated rather than guessed at,
+from three rendered options: *"Keep it small and minimal like the circle you
+liked, but the marks become a real audio waveform that moves with your
+voice, with a small timer beside it... this treats the 'timeline' you asked
+for as the sound wave itself."*
+
+**What this settles, concretely.**
+
+1. **"Timeline" = the sound wave**, not a separate element and not (as round
+   4's README speculated) simply a second name for the timer. Round 4's
+   textual analysis is superseded, not vindicated in different words — stop
+   re-deriving this from the design report; the captain has now defined it
+   directly.
+2. **The marks come back** — but the captain was explicit that *what* comes
+   back has to differ from round 3: "the reason round 3's was rejected as
+   dashes is that it did not read as sound. It must read as a waveform."
+3. **Shape stays compact.** `layout::REST_W` grows from round 4's 102 to 118
+   to give the row a real, minimal usable span — still clearly short of
+   round 3's 128, not creeping back toward it (`the_rest_width_stays_compact_
+   not_round_3s_128`, `the_resting_shape_stays_compact_not_round_3s_capsule`).
+4. **Timer unchanged.** `layout::TIMER_FONT` stays 10px; the captain's "the
+   font of the timer is pretty big" was about the round-3 build they had, not
+   this branch.
+
+**Why round 3's row read as dashes, mechanically.** Every bar answered the
+same question — "what is the current mic level?" — with only its position in
+the row (`sample_ramp`'s colour aside) making one bar differ from its
+neighbour. A row where every element carries the same one piece of
+information, laid out identically, is a static pattern by construction,
+whatever curve shapes each bar's height. It cannot read as sound no matter
+how the taper or the response curve is tuned, because sound is a sequence of
+different moments and the row had no memory of any moment but the current
+one.
+
+**The fix: give the row memory.** `Renderer` (`render/mod.rs`) now carries
+`wave_history: VecDeque<f32>`, a rolling buffer of recent `Model::level()`
+samples, one pushed every `WAVE_SAMPLE_INTERVAL_MS` (70ms) while — and only
+while — `model.state() == Listening`. `draw_wave` reads one *different*
+historical sample per bar rather than the one current level for all of them:
+the newest sample lands at the row's right edge (the same "newest is on the
+right" convention the live-text ribbon and the timer already use), and each
+bar to its left is an older moment. `wave_bar_scale` keeps round 1's
+expansive `powf(1.6)` response curve — quiet and loud still read as clearly
+different — but takes an `Option<f32>` now: `Some(level)` for a bar with a
+real sample, `None` for a column the history has not reached yet. There is
+no positional taper any more; whatever shape the row has is the shape the
+last few seconds of audio actually had, not a shape assigned by where a bar
+sits.
+
+**Freeze, not fabricate, once recording stops.** The old row fed a small
+constant "ambient" level into `wave_bar_scale` during `Processing` and
+`Inserted` so it had something to fade out from. Round 5 drops that: no new
+samples are pushed once `Listening` ends, so the row simply holds its last
+real shape while `wave_alpha` (unchanged) fades it out — a timeline of real
+audio or nothing, never a synthesised placeholder standing in for one.
+`the_history_stops_growing_the_moment_listening_ends` pins it.
+
+**A believable idle ripple, not a flat line.** A column the history has not
+reached yet — the first moments after `ShowListening`, before 70ms×(bar
+count) of real samples exist — reads as a slow, per-bar-decorrelated ripple
+well under the real-signal floor (`wave_bar_scale`'s `None` arm), rather than
+a hard zero or one repeated value. A flat resting row is exactly the
+"dashes" failure by another name; `an_unfilled_bar_ripples_quietly_instead_
+of_sitting_flat` and `the_idle_ripple_moves_over_time` hold both halves —
+quiet enough to never masquerade as a real loud moment, and never frozen.
+
+**Every appearance starts from silence.** `wave_history` is cleared the
+instant the shape is fully hidden (`presence <= 0.001`), so a fresh
+`ShowListening` never opens with the previous utterance's waveform still on
+screen — `a_fresh_utterance_starts_the_wave_row_from_silence` pins it.
+
+**Geometry, retuned for compactness, not rebuilt.** `WAVE_TARGET_PITCH` drops
+12→8 logical px and `WAVE_MIN_BARS` 7→5 — the row's height constants
+(`WAVE_MAX_H_REST`, `WAVE_MAX_H_RIBBON`, `WAVE_Y_OFFSET_RIBBON`) are
+untouched, so `the_wave_row_clears_the_live_text_ink_box`'s guarantee against
+the live-text ink box still holds on the same numbers. The compactness this
+round asks for comes entirely from the width side, matched to a smaller
+`REST_W` and a smaller minimum bar count than round 3 ever needed.
+
+Evidence for all of this has to be a sequence, not a single frame — round 3
+and round 4 both survived review on frozen stills, and the direction calls
+that out by name as not enough this time. `crates/iris-overlay/docs/round5-
+evidence/` has the wave row captured across silence, a ramp-up, two moments
+of speech-like variation (found by scanning for the loudest and quietest
+windows within that phase, not hand-picked, since a single guessed timestamp
+can land on a quiet moment purely by chance — see `pill_demo.rs`'s
+`pick_checkpoint`), and two moments of decay, both themes.
 
 ## Why a CPU raster path
 
@@ -473,7 +572,7 @@ cargo run --example pill-demo -- --filmstrip /tmp/iris-ribbon --live-text on
 cargo run --example pill-demo -- --filmstrip /tmp/iris-glass --backdrop
 
 # Regenerate the committed review set in place (both themes, every phase).
-cargo run --example pill-demo -- --evidence crates/iris-overlay/docs/round4-evidence
+cargo run --example pill-demo -- --evidence crates/iris-overlay/docs/round5-evidence
 ```
 
 The demo drives a full cycle with a synthetic speech envelope — syllables
@@ -491,7 +590,7 @@ passing it.
 
 `--backdrop` composites onto a synthetic desktop, without which a glass shape
 is reviewed against nothing. `--evidence` adds a fixed shot list on top, and
-is what regenerates `docs/round4-evidence/` — see that directory's README.
+is what regenerates `docs/round5-evidence/` — see that directory's README.
 
 ### From WSL
 

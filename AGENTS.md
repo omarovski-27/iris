@@ -458,28 +458,41 @@ When updating this file, preserve this bar for all agents and keep entries conci
 - The design is **captain-decided** (2026-07-31, superseding the prior
   captain-locked fixed capsule of the same date; round 3 on 2026-08-01
   changed the default and the resting shape; round 4 on 2026-08-07 reversed
-  round 3's shape and wave-row decisions specifically — see below): a
-  shape-shifting shape that can open into a live-text ribbon, Prism dark
-  default, Porcelain light, prism-triangle icon unchanged (tray uses the same
-  mark via `tray::icon_rgba`). Full rationale and the two rejected
-  alternatives: `data/iris-ui-directions/report.md` in the fleet's records.
+  round 3's shape and wave-row decisions; round 5 on 2026-08-07/08 answered
+  round 4's two escalated open questions and brought the wave row back on a
+  different foundation — see below): a shape-shifting shape that can open
+  into a live-text ribbon, Prism dark default, Porcelain light,
+  prism-triangle icon unchanged (tray uses the same mark via
+  `tray::icon_rgba`). Full rationale and the two rejected alternatives:
+  `data/iris-ui-directions/report.md` in the fleet's records.
 - **Round 3 (2026-08-01):** `show_live_text` defaults to `false`
-  (`iris-app::config::Config`) — unchanged by round 4, still the shipped
-  default. Round 3 also widened the resting shape into a capsule holding a
-  wave row and a large timer; round 4, immediately below, reversed both.
+  (`iris-app::config::Config`) — unchanged since, still the shipped default.
+  Round 3 also widened the resting shape into a capsule holding a wave row
+  and a large timer; round 4 reversed both, round 5 (below) partly reversed
+  round 4.
 - **Round 4 (2026-08-07):** the captain used round 3's shipped capsule and
   rejected it — *"I don't like the dashes... I like the design of the
-  previous circle. It was very minimalistic... I don't want the huge
-  font."* The wave row is deleted outright (`render::draw_wave` and every
-  `WAVE_*` constant no longer exist), and the resting shape is
-  `layout::REST_W` (102, down from round 3's 128) — as close to the
-  pre-round-3 true circle as clearing the core glyph for a small
-  `layout::TIMER_FONT` (10, not the live-text `TEXT_FONT` 15) timer requires.
-  See `crates/iris-overlay/README.md`'s "Round 4" section before touching
-  `layout::REST_W`, `layout::TIMER_FONT`, `render::draw_timer`, or the width
-  formula in `Renderer::draw` — and do not resurrect the wave row piecemeal;
-  read "Round 3" there first for why it existed and why "the dashes" killed
-  it.
+  previous circle... I don't want the huge font."* Deleted the wave row
+  outright and moved the timer to its own small `layout::TIMER_FONT` (10, not
+  the live-text `TEXT_FONT` 15). The captain had only ever seen round 3's
+  build (PR #22 was still unmerged), which round 5 (immediately below)
+  discovered and corrected for.
+- **Round 5 (2026-08-07/08,
+  `/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`):**
+  answered round 4's two escalated questions from three rendered options —
+  *"the timeline you asked for [is] the sound wave itself... the marks
+  become a real audio waveform that moves with your voice."* The wave row is
+  back, but rebuilt on a rolling history of `Model::level()`
+  (`Renderer::wave_history`, sampled while `Listening`, frozen once it ends)
+  instead of round 3's single-current-level fan-out — each bar now reads a
+  different historical moment, which is what makes it read as sound rather
+  than "dashes". `layout::REST_W` grew from round 4's 102 to 118 to give the
+  row real room, still clearly short of round 3's 128. `layout::TIMER_FONT`
+  is unchanged at 10. See `crates/iris-overlay/README.md`'s "Round 5" section
+  before touching `render::draw_wave`, `wave_bar_scale`, `Renderer::
+  wave_history`, or `layout::REST_W` — and do not reintroduce a
+  single-current-level-fanned-out bar row; that shape is what "dashes" means
+  in every round's own words.
 - Geometry is one capsule whose width animates between the rest width
   (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) —
   `layout::ORB_D` is the shape's constant height, at every width. No solid

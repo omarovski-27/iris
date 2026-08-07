@@ -194,19 +194,23 @@ on the machine you're actually going to use Iris on.
 - [ ] The pill appears and animates at real speed — the motion timings are
       unverified outside the filmstrip renderer (`pill-demo --filmstrip`),
       which is not the same as watching it live.
-- [ ] The resting shape reads as close to a plain circle as a small
-      elapsed-recording timer beside the glyph allows — no wave row, no bars,
-      no dashes of any kind, and not the old wide rectangle either. Live text
-      is off by default, so this is the *only* presentation you get until you
-      set `show_live_text = true` in `config.toml`.
+- [ ] The resting shape is compact — a glyph, a small scrolling audio
+      waveform, and a small timer, close to round 4's circle but with real
+      room for the wave row (round 5) — not round 3's wide capsule. The wave
+      row genuinely moves with your voice and visibly differs bar to bar over
+      time (a real waveform), not a synchronised, static-looking fan of
+      identical marks ("dashes" — the thing round 4 removed and round 5
+      rebuilt to not reintroduce). Live text is off by default, so this is
+      the *only* presentation you get until you set `show_live_text = true`
+      in `config.toml`.
 - [ ] The timer is small — its own dedicated size, noticeably smaller than
       the live-text ribbon's type — and its digits stay readable over both a
       light and a dark desktop, with no dark plate behind them. Only their
       outline colour carries that (`theme.timer_edge`), and it has been
       judged only against the synthetic backdrop in
-      `crates/iris-overlay/docs/round4-evidence/`, never a real one. The
+      `crates/iris-overlay/docs/round5-evidence/`, never a real one. The
       digits must not jitter as seconds tick over, and must stay clear of the
-      centred dot / spinner / checkmark in every state.
+      centred dot / spinner / checkmark and the wave row in every state.
 - [ ] With `show_live_text = true` and a restart-free tray → Reload settings,
       the ribbon opens with the words again and the timer steps aside rather
       than the two overlapping on the right-hand edge.
@@ -275,10 +279,11 @@ want it without dictating first.
 
 ## What this build does not include
 
-The round-4 overlay (circle + small timer, no wave row), the settings window
-(PR #13) are both in the tree now, and the Overlay, First-run config and
-Settings window items above are written for them — repackage with
-`scripts/package-windows.sh` before working through this list, or the zip you
-verify predates them. No branch is still in flight; if one lands after this,
-this checklist and the packaged zip are stale — repackage and re-run this
+The round-5 overlay (compact shape, a real scrolling wave row, small timer),
+the settings window (PR #13) are both in the tree now, and the Overlay,
+First-run config and Settings window items above are written for them —
+repackage with `scripts/package-windows.sh` before working through this
+list, or the zip you verify predates them. No branch is still in flight; if
+one lands after this, this checklist and the packaged zip are stale —
+repackage and re-run this
 list.
