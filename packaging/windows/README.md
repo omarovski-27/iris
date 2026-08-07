@@ -29,7 +29,8 @@ that it is wrong.
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
    Add `-Desktop` for a desktop shortcut and/or `-RunAtLogin` to start Iris
-   automatically when you log in:
+   automatically when you log in — quietly, in the tray, ready for the
+   hotkey, without putting its window on screen at every login:
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install.ps1 -Desktop -RunAtLogin
    ```
@@ -50,7 +51,11 @@ never resets your key or your history — and if re-running with different
 flags means a shortcut you had (say, the Startup one) is no longer requested,
 it is removed rather than left stale.
 
-3. Launch **Iris** from the Start Menu (or your shortcut).
+3. Launch **Iris** from the Start Menu (or your shortcut). Its window (History,
+   Settings, Insights) opens on screen — that is Iris, running; a tray icon
+   also appears, and closing the window later leaves dictation running from
+   there. Launching Iris again while it is already running just brings this
+   same window back, rather than starting a second copy.
 
 ## First run
 
@@ -58,12 +63,13 @@ First launch writes `%APPDATA%\iris\config.toml` — commented defaults, no key
 needed yet. Out of the box Iris runs the offline **mock** engine, so dictation
 "works" but the transcript is a stub, not what you said.
 
-To dictate for real, right-click the tray icon → **Open settings…**. That opens
-the Iris window (History, Settings, Insights); its **Settings** tab has an
+To dictate for real, use the Iris window's **Settings** tab and its
 **Open config file** button, which hands `config.toml` to your editor — the key
-goes in the file, never in the window. The file's header comment says the same
-as what follows. There are two separate edits, and they go in two different
-places — pasting them together as one block leaves a file Iris refuses to load.
+goes in the file, never in the window. (Closed the window? Right-click the
+tray icon → **Open settings…** to bring it back.) The file's header comment
+says the same as what follows. There are two separate edits, and they go in two
+different places — pasting them together as one block leaves a file Iris
+refuses to load.
 
 **1. Change the engine, in place.** Near the top of the file, among the other
 settings, is a line reading `engine = "mock"`. Edit that line — do not add a

@@ -114,9 +114,26 @@ struct Args {
     /// window, the same role `--demo-dictation` plays for the loop.
     #[arg(long)]
     demo_window: bool,
+
+    /// Start resident without opening the settings window.
+    ///
+    /// Set only on the Startup-folder shortcut `install.ps1` creates: a
+    /// boot-time autostart must go quietly to the tray, ready for the
+    /// hotkey, not put a window on screen at every login. Every other launch
+    /// path — the Start Menu shortcut, a Desktop shortcut, a plain
+    /// double-click of the `.exe` — omits this flag, because opening Iris is
+    /// exactly the deliberate action the window should answer.
+    #[arg(long, hide = true)]
+    background: bool,
 }
 
 fn main() -> Result<()> {
+    // Before anything else can panic: every fallible startup/run step already
+    // reaches `report_failure`'s dialog through `inspect_err`, but a panic
+    // bypasses `Result` entirely, and the default hook only writes to
+    // stderr — exactly the console a GUI-subsystem launch does not have. See
+    // `install_panic_dialog`.
+    install_panic_dialog();
     // Before anything prints, including clap's own --help/error output: a GUI
     // subsystem process starts with no console at all, so this is the only
     // chance to reconnect stdout/stderr to one before the first `println!`.
@@ -240,9 +257,14 @@ struct Resident {
     commands: crossbeam_channel::Receiver<iris_app::Command>,
     overlay: Option<iris_overlay::Overlay>,
     // Guards: dropping the listener uninstalls the hook, dropping the tray
-    // stops its thread. Declared after `app` so they outlive it.
+    // stops its thread, dropping the single-instance guard releases the lock
+    // a later launch checks. Declared after `app` so they outlive it.
     _listener: iris_core::hotkey::Listener,
     _tray: iris_app::tray::Tray,
+    // `None` only when `single_instance::acquire` itself failed (logged at
+    // the call site in `run`) — a degraded mode with no second-launch
+    // detection, not a startup failure.
+    _single_instance: Option<iris_app::single_instance::Guard>,
 }
 
 /// The resident loop.
@@ -253,10 +275,39 @@ fn run(
     config_path: &std::path::Path,
     args: &Args,
 ) -> Result<()> {
-    let mut resident = start_resident(config, file_config, config_path, args)
-        .inspect_err(report_startup_failure)?;
+    // Best-effort: a single-instance check that itself fails to start must
+    // not be the reason dictation stops working, so a broken lock is treated
+    // the same as "no other instance found" rather than aborting startup.
+    let (single_instance, reopen) = match iris_app::single_instance::acquire() {
+        Ok(iris_app::single_instance::Instance::AlreadyRunning) => {
+            iris_core::vlog!("already running; asked it to show its window");
+            return Ok(());
+        }
+        Ok(iris_app::single_instance::Instance::Primary { guard, reopen }) => (Some(guard), reopen),
+        Err(e) => {
+            eprintln!("  single-instance check unavailable: {e:#}");
+            (None, crossbeam_channel::never())
+        }
+    };
+
+    let mut resident = start_resident(
+        config,
+        file_config,
+        config_path,
+        args,
+        single_instance,
+        reopen,
+    )
+    .inspect_err(report_startup_failure)?;
 
     banner(&resident.app, config_path);
+    // The Startup shortcut carries `--background` (see `Args::background`):
+    // a boot-time autostart must stay in the tray, ready for the hotkey,
+    // never put a window on screen unasked. Every other launch path is
+    // exactly the deliberate "open Iris" action the window should answer.
+    if !args.background {
+        resident.app.open_window();
+    }
     let result = resident.app.run(&resident.keys, &resident.commands);
     // Explicit shutdown so the window is gone before we exit — and before the
     // dialog below, which is modal.
@@ -273,6 +324,8 @@ fn start_resident(
     file_config: Config,
     config_path: &std::path::Path,
     args: &Args,
+    single_instance: Option<iris_app::single_instance::Guard>,
+    reopen: crossbeam_channel::Receiver<()>,
 ) -> Result<Resident> {
     use iris_app::audio::MicAudio;
     use iris_app::inject::SystemInjector;
@@ -346,6 +399,7 @@ fn start_resident(
         .with_file_config(file_config)
         .with_window(window)
         .with_window_commands(window_commands_rx, window_outcomes_tx)
+        .with_reopen_signal(reopen)
         .with_failure_notice(notice);
 
     Ok(Resident {
@@ -355,6 +409,7 @@ fn start_resident(
         overlay,
         _listener: listener,
         _tray: tray,
+        _single_instance: single_instance,
     })
 }
 
@@ -881,6 +936,33 @@ fn attach_console_for_cli_output() {
             let _ = SetStdHandle(STD_ERROR_HANDLE, console);
         }
     }
+}
+
+/// Show the same "something went wrong" dialog for a panic as for a returned
+/// error, so a crash during startup or the resident loop is never the silent
+/// "double-click did nothing" a GUI-subsystem binary would otherwise produce.
+///
+/// Every fallible step already reaches [`report_startup_failure`] or
+/// [`report_run_failure`] through `?`/`inspect_err`, but a panic unwinds past
+/// all of that — the default hook only writes to stderr, which a
+/// console-less launch has nowhere to send. This chains onto the default
+/// hook (so a real terminal invocation, or a test harness, still sees the
+/// usual backtrace) and additionally calls [`iris_app::dialog::show`], which
+/// is already a no-op whenever stdout/stderr are shared with a live console
+/// (`GetConsoleProcessList`) — the same test that keeps `report_failure` from
+/// popping up over a terminal invocation. Portable and unconditional (not
+/// `#[cfg(windows)]`): `dialog::show` is itself the no-op off Windows, so
+/// there is nothing platform-specific left to gate here.
+///
+/// Not unit-tested: replacing the global panic hook is process-wide and would
+/// fight the test harness's own; the same gap `attach_console_for_cli_output`
+/// and `report_failure` leave for the same reason.
+fn install_panic_dialog() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        iris_app::dialog::show("Iris has stopped unexpectedly", &info.to_string());
+    }));
 }
 
 /// Put a failed startup in front of the user when stderr has nowhere to land.

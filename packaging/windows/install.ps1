@@ -216,11 +216,12 @@ try {
     $shell = New-Object -ComObject WScript.Shell
 
     function New-IrisShortcut {
-        param([string]$Path)
+        param([string]$Path, [string]$Arguments = "")
         $parent = Split-Path -Parent $Path
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
         $shortcut = $shell.CreateShortcut($Path)
         $shortcut.TargetPath = $targetExe
+        $shortcut.Arguments = $Arguments
         $shortcut.WorkingDirectory = $installDir
         $shortcut.Description = "Iris - push-to-talk dictation"
         $shortcut.Save()
@@ -235,7 +236,12 @@ try {
     }
 
     if ($RunAtLogin) {
-        New-IrisShortcut -Path $startupShortcut
+        # --background: a boot-time autostart must go quietly to the tray,
+        # ready for the hotkey - never put the settings window on screen at
+        # every login. The Start Menu and Desktop shortcuts above carry no
+        # arguments, because opening Iris from either is exactly the
+        # deliberate action the window should answer.
+        New-IrisShortcut -Path $startupShortcut -Arguments "--background"
         Write-Host "Iris will now start automatically at login."
         Write-Host "To undo: delete `"$startupShortcut`""
     }

@@ -63,8 +63,13 @@ egui = "0.32"
 tray-icon = { version = "0.24", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    # A named mutex + event pair so a second launch can wake the first
+    # instance's window instead of starting a second resident process. See
+    # `single_instance`.
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     # GetTimeZoneInformation: the settings window's "Dictations today" needs
     # the local calendar day, and `time`'s own local-offset lookup is unsound

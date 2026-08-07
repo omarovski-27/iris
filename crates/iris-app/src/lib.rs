@@ -67,6 +67,7 @@ pub mod inject;
 pub mod notify;
 pub mod pill;
 pub mod polish;
+pub mod single_instance;
 pub mod tray;
 pub mod window;
 
