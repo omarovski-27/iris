@@ -28,6 +28,14 @@ pub trait FailureNotice: Send + Sync {
     /// data-loss bug for a privacy one. Called once per failed injection, on
     /// the dictation thread, after `App::deliver` gives up.
     fn injection_failed(&self, text: &str, error: &str, history_enabled: bool);
+
+    /// Told that a dictation produced no words at all because the engine
+    /// never reached a real connection to the transcription service — see
+    /// `iris_core::dictation::DictationOutcome::never_connected`. There is no
+    /// text to preserve here, unlike [`FailureNotice::injection_failed`]:
+    /// nothing was ever transcribed, so `error` is the whole story. Called
+    /// once per such dictation, on the dictation thread, from `App::failed`.
+    fn connection_failed(&self, error: &str);
 }
 
 /// The real thing: the clipboard when history is off, and a visible dialog
@@ -62,6 +70,13 @@ impl FailureNotice for SystemFailureNotice {
             &format!("{where_text}\n\n{error}"),
         );
     }
+
+    fn connection_failed(&self, error: &str) {
+        crate::dialog::show(
+            "Iris could not reach the transcription service",
+            &format!("Nothing was sent — check your internet connection and try again.\n\n{error}"),
+        );
+    }
 }
 
 /// Remembers every call, for tests. Never touches a real clipboard or shows a
@@ -69,6 +84,7 @@ impl FailureNotice for SystemFailureNotice {
 #[derive(Debug, Default)]
 pub struct RecordingFailureNotice {
     calls: std::sync::Mutex<Vec<(String, String, bool)>>,
+    connection_calls: std::sync::Mutex<Vec<String>>,
 }
 
 impl RecordingFailureNotice {
@@ -82,6 +98,11 @@ impl RecordingFailureNotice {
     pub fn calls(&self) -> Vec<(String, String, bool)> {
         self.calls.lock().expect("notice mutex").clone()
     }
+
+    /// Every [`FailureNotice::connection_failed`] call so far, in order.
+    pub fn connection_calls(&self) -> Vec<String> {
+        self.connection_calls.lock().expect("notice mutex").clone()
+    }
 }
 
 impl FailureNotice for RecordingFailureNotice {
@@ -91,6 +112,13 @@ impl FailureNotice for RecordingFailureNotice {
             error.to_string(),
             history_enabled,
         ));
+    }
+
+    fn connection_failed(&self, error: &str) {
+        self.connection_calls
+            .lock()
+            .expect("notice mutex")
+            .push(error.to_string());
     }
 }
 
@@ -103,6 +131,7 @@ pub struct NoopFailureNotice;
 
 impl FailureNotice for NoopFailureNotice {
     fn injection_failed(&self, _text: &str, _error: &str, _history_enabled: bool) {}
+    fn connection_failed(&self, _error: &str) {}
 }
 
 #[cfg(test)]
@@ -125,7 +154,21 @@ mod tests {
     }
 
     #[test]
+    fn recording_notice_collects_connection_failures_separately_from_injection_failures() {
+        let notice = RecordingFailureNotice::new();
+        notice.connection_failed("could not resolve host");
+        notice.injection_failed("hello", "boom", false);
+
+        assert_eq!(notice.connection_calls(), ["could not resolve host"]);
+        assert_eq!(
+            notice.calls(),
+            [("hello".to_string(), "boom".to_string(), false)]
+        );
+    }
+
+    #[test]
     fn noop_notice_does_not_panic() {
         NoopFailureNotice.injection_failed("hello", "boom", false);
+        NoopFailureNotice.connection_failed("boom");
     }
 }
