@@ -346,13 +346,9 @@ enum Phase {
     Inserted,
 }
 
-/// How long each evidence shot listens before it is caught. Long enough for
-/// the level smoothing to settle several times over, and it puts a readable
-/// `0:07` on the timer.
+/// How long each evidence shot listens before it is caught. Long enough to
+/// put a readable `0:07` on the timer.
 const EVIDENCE_LISTEN_MS: u64 = 7_000;
-/// The two held levels the volume-response pair is judged on.
-const EVIDENCE_QUIET: f32 = 0.05;
-const EVIDENCE_LOUD: f32 = 1.0;
 
 /// Drive a fresh pill to exactly one reviewable frame.
 ///
@@ -412,18 +408,19 @@ fn shot(
     pill
 }
 
-/// Regenerate the committed round-3 review set.
+/// Regenerate the committed round-4 review set.
 ///
-/// Every file under `docs/round3-evidence/` comes out of here, which is the
-/// point: the set is a held-level, backdrop-composited selection that a plain
+/// Every file under `docs/round4-evidence/` comes out of here, which is the
+/// point: the set is a backdrop-composited selection that a plain
 /// `--filmstrip` run cannot produce, and evidence nobody can reproduce is
-/// evidence nobody can check against a later change.
+/// evidence nobody can check against a later change. Round 3's
+/// quiet/loud-sustained pair is gone from this shot list — it existed to show
+/// the wave row's volume response, and round 4 removed the wave row outright,
+/// so nothing on screen depends on `Command::Level` any more.
 fn evidence(args: &Args, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
 
-    let shots: [(&str, Option<f32>, Phase); 5] = [
-        ("quiet-sustained", Some(EVIDENCE_QUIET), Phase::Listening),
-        ("loud-sustained", Some(EVIDENCE_LOUD), Phase::Listening),
+    let shots: [(&str, Option<f32>, Phase); 3] = [
         ("listening-natural", None, Phase::Listening),
         ("processing-frozen", None, Phase::Processing),
         ("inserted-frozen", None, Phase::Inserted),

@@ -457,24 +457,35 @@ When updating this file, preserve this bar for all agents and keep entries conci
   not this one.
 - The design is **captain-decided** (2026-07-31, superseding the prior
   captain-locked fixed capsule of the same date; round 3 on 2026-08-01
-  superseded the default — see below): a shape-shifting shape that can open
-  into a live-text ribbon, Prism dark default, Porcelain light,
-  prism-triangle icon unchanged (tray uses the same mark via
-  `tray::icon_rgba`). Full rationale and the two rejected alternatives:
-  `data/iris-ui-directions/report.md` in the fleet's records.
+  changed the default and the resting shape; round 4 on 2026-08-07 reversed
+  round 3's shape and wave-row decisions specifically — see below): a
+  shape-shifting shape that can open into a live-text ribbon, Prism dark
+  default, Porcelain light, prism-triangle icon unchanged (tray uses the same
+  mark via `tray::icon_rgba`). Full rationale and the two rejected
+  alternatives: `data/iris-ui-directions/report.md` in the fleet's records.
 - **Round 3 (2026-08-01):** `show_live_text` defaults to `false`
-  (`iris-app::config::Config`) — most users now only ever see the resting
-  capsule, never the ribbon. That capsule holds a wave row and an
-  elapsed-recording timer side by side, not a bare circle. See
-  `crates/iris-overlay/README.md`'s "Round 3" section before touching
-  `layout::REST_W`, `render::draw_timer`, or the width formula in
-  `Renderer::draw`.
-- Geometry is one capsule whose width animates between the rest capsule
-  (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) — there is no
-  fixed pill size and no true circle in normal operation any more.
-  `layout::ORB_D` is now just the shape's constant height. No solid rec-red
-  (mint/sky live core). Motion timings in `motion.rs` are unchanged and stay
-  captain criteria; every one is imported by the new shape, not copied.
+  (`iris-app::config::Config`) — unchanged by round 4, still the shipped
+  default. Round 3 also widened the resting shape into a capsule holding a
+  wave row and a large timer; round 4, immediately below, reversed both.
+- **Round 4 (2026-08-07):** the captain used round 3's shipped capsule and
+  rejected it — *"I don't like the dashes... I like the design of the
+  previous circle. It was very minimalistic... I don't want the huge
+  font."* The wave row is deleted outright (`render::draw_wave` and every
+  `WAVE_*` constant no longer exist), and the resting shape is
+  `layout::REST_W` (102, down from round 3's 128) — as close to the
+  pre-round-3 true circle as clearing the core glyph for a small
+  `layout::TIMER_FONT` (10, not the live-text `TEXT_FONT` 15) timer requires.
+  See `crates/iris-overlay/README.md`'s "Round 4" section before touching
+  `layout::REST_W`, `layout::TIMER_FONT`, `render::draw_timer`, or the width
+  formula in `Renderer::draw` — and do not resurrect the wave row piecemeal;
+  read "Round 3" there first for why it existed and why "the dashes" killed
+  it.
+- Geometry is one capsule whose width animates between the rest width
+  (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) —
+  `layout::ORB_D` is the shape's constant height, at every width. No solid
+  rec-red (mint/sky live core). Motion timings in `motion.rs` are unchanged
+  and stay captain criteria; every one is imported by the new shape, not
+  copied.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
 - The rasteriser (`render/`) is portable and the window (`window/win32.rs`) is

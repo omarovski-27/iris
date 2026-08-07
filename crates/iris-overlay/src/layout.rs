@@ -13,11 +13,17 @@
 //! no separate "orb shape" and "ribbon shape", only one shape whose width
 //! animates. Height never changes. [`ORB_D`] is the height, at every width.
 //!
-//! At rest — no live text on screen, which is the default and what most
-//! users ever see — the shape sits at [`REST_W`], a capsule holding the wave
-//! row and an elapsed-recording timer side by side (captain feedback, round
-//! 3: "not just a dot or a circle, more like the pipe thing", and a follow-up
-//! asking for a timer beside the waves). Live text, when the config opts back
+//! **Round 4 (captain, live-desktop review, on the round-3 capsule): "I like
+//! the design of the previous circle. It was very minimalistic. I want to add
+//! to it the timeline. That's it. I don't want the dashes. I don't want the
+//! huge font. I don't want huge size."** Round 3's wave row (the "dashes") is
+//! gone outright — there is no bar row anywhere in this design any more, at
+//! any `open`. At rest — no live text on screen, which is the default and
+//! what most users ever see — the shape sits at [`REST_W`], the previous
+//! true-circle orb widened only as far as clearing the core glyph for the
+//! elapsed-recording timer takes, in a dedicated small [`TIMER_FONT`] rather
+//! than the live-text size round 3 mistakenly reused. See `render/mod.rs`'s
+//! `draw_timer` and `timer_right_edge`. Live text, when the config opts back
 //! in, still widens the same shape further, up to [`RIBBON_MAX_W`].
 //!
 //! The **window is fixed-size**, sized for the *widest* state
@@ -39,17 +45,18 @@
 /// The shape's constant height, at every width. Unchanged across all three
 /// rounds of feedback on this surface — see the module doc's "The shape".
 pub const ORB_D: f32 = 34.0;
-/// Width of the shape at rest: no live text on screen, just the wave row and
-/// the elapsed-recording timer sharing the surface. Noticeably narrower than
-/// the previous signed-off pill's 168×34 (captain, round 3: "it was really
-/// wide, we need to narrow it down"), but wide enough relative to [`ORB_D`]'s
-/// height to read unmistakably as a capsule, and wide enough to give the
-/// timer its own zone beside the wave row without crowding either — see
-/// `render/mod.rs`'s `draw_wave` (`right_reserve`) and `draw_timer` for how
-/// the width splits between the two. Treated as a direction, not a number to
-/// hit exactly (round-3 addendum): a composition that needs a few more pixels
-/// to read well is worth more than a cramped one at a rounder number.
-pub const REST_W: f32 = 128.0;
+/// Width of the shape at rest: no live text on screen, just the core glyph
+/// and the small elapsed-recording timer sharing the surface — no wave row
+/// any more (round 4 removed it outright). Only as wide as
+/// `render/mod.rs`'s `timer_right_edge` needs to clear the centred glyph by
+/// `GLYPH_TIMER_GAP` before the timer's own run, at [`TIMER_FONT`]; the
+/// glyph stays fixed at the shape's horizontal centre (as at every other
+/// width this shape takes), so the requirement is symmetric and the capsule
+/// cannot be narrower than twice that clearance. Dramatically narrower than
+/// round 3's 128 — see
+/// `the_rest_width_is_close_to_the_circle_it_was_before_round_3` — because
+/// nothing else needs room here any more.
+pub const REST_W: f32 = 102.0;
 /// Widest the ribbon grows before new words start scrolling the oldest ones
 /// off the leading edge instead of growing further.
 pub const RIBBON_MAX_W: f32 = 460.0;
@@ -57,6 +64,15 @@ pub const RIBBON_MAX_W: f32 = 460.0;
 pub const RIBBON_PAD_X: f32 = 18.0;
 /// Live-text font size.
 pub const TEXT_FONT: f32 = 15.0;
+/// The elapsed-recording timer's font size — deliberately its own, much
+/// smaller constant, not [`TEXT_FONT`]. Round 3 reused the live-text size for
+/// the timer, which is the concrete shape of "the timer is very big... I
+/// don't want the huge font" (captain, round 4): a four-character clock
+/// reading at sentence-sized type. Matches the original signed-off pill's
+/// telemetry-text size (`data/iris-ui-directions/report.md`, "Typography":
+/// "the old pill's telemetry text (10–11 px)") — the last time this crate
+/// shipped a small secondary readout, this is the size that was.
+pub const TIMER_FONT: f32 = 10.0;
 
 /// Transparent margin around the shape, every side, for the drop shadow and
 /// state glow to bleed into.
@@ -229,6 +245,9 @@ pub struct Layout {
     pub text_pad_x: f32,
     /// Live-text font size, in device pixels.
     pub text_font: f32,
+    /// Elapsed-recording timer's font size, in device pixels. Deliberately
+    /// separate from [`Layout::text_font`] — see [`TIMER_FONT`].
+    pub timer_font: f32,
 }
 
 impl Layout {
@@ -252,6 +271,7 @@ impl Layout {
             ribbon_max_w: px(RIBBON_MAX_W),
             text_pad_x: px(RIBBON_PAD_X),
             text_font: px(TEXT_FONT),
+            timer_font: px(TIMER_FONT),
         }
     }
 }
@@ -267,15 +287,17 @@ mod tests {
         assert_eq!(WORK_AREA_GAP, 58.0, "placement anchor stays unchanged");
     }
 
-    /// The captain's complaint was specifically about width ("it was really
-    /// wide, we need to narrow it down"), not about the shape reading as a
-    /// circle instead of a capsule — the rest width has to sit strictly
-    /// between those two failure modes.
+    /// Round 4 reversed round 3's own complaint: the captain went back to
+    /// preferring the pre-round-3 true circle, plus a small timer, over the
+    /// wide capsule round 3 asked for. `REST_W` can't be an exact circle any
+    /// more — the timer needs some room beside the glyph — but it must read
+    /// as close to that minimal original as the timer's own width allows, not
+    /// anywhere near round 3's 128.
     #[test]
-    fn rest_width_is_a_capsule_narrower_than_the_old_signed_off_pill() {
-        const OLD_SIGNED_OFF_PILL_W: f32 = 168.0;
-        const { assert!(REST_W < OLD_SIGNED_OFF_PILL_W) };
-        const { assert!(REST_W > ORB_D * 1.5) };
+    fn the_rest_width_is_close_to_the_circle_it_was_before_round_3() {
+        const ROUND_3_CAPSULE_W: f32 = 128.0;
+        const { assert!(REST_W < ROUND_3_CAPSULE_W * 0.85) };
+        const { assert!(REST_W > ORB_D) };
     }
 
     #[test]
@@ -312,6 +334,7 @@ mod tests {
         assert!((two.rest_w - one.rest_w * 2.0).abs() < 0.01);
         assert!((two.ribbon_max_w - one.ribbon_max_w * 2.0).abs() < 0.01);
         assert!((two.text_font - one.text_font * 2.0).abs() < 0.01);
+        assert!((two.timer_font - one.timer_font * 2.0).abs() < 0.01);
     }
 
     #[test]
