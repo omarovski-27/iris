@@ -154,11 +154,31 @@ the session close instead. Three earlier designs (unbounded coverage-catch-up, a
 fixed ceiling, a stall detector) were tried and rejected first. The measured
 figures and the full reasoning — including why an inferred "Deepgram is probably
 done" always loses to this authoritative signal — live in the module doc of
-`crates/iris-core/src/engine/deepgram.rs`, beside the constants they set. Session
-prewarming was also tried and dropped: a live idle probe found Deepgram closes
-an unused connection in roughly 12-15s (see Sharp edges), far short of real
-gaps between dictations, so it protected against a race that barely occurred
-in practice.
+`crates/iris-core/src/engine/deepgram.rs`, beside the constants they set. Static
+session prewarming (open one connection ahead of the key press and hope it is
+still there) was tried and dropped: a live idle probe found Deepgram closes an
+unused connection in roughly 12-15s, far short of real gaps between
+dictations, so it protected against a race that barely occurred in practice.
+That finding does not rule out *actively* holding a connection open — an
+actively-kept-alive spare (`WarmPool`, Deepgram's `KeepAlive` control frame,
+bounded to a few minutes' idle window) was built, tagged `warmpool-v1-withdrawn`
+(pushed to origin, so it survives a squash-merge or branch deletion), and
+withdrawn before ever reaching the captain: three
+review rounds kept surfacing data-loss-class lifecycle defects in the same
+abstraction (a stale-handoff replay that could still outrun the outer wait
+bound, an ack window sized for the wrong traffic shape, a "fixed" spare-
+replacement promptness bug that turned out not to be fixed), and a component
+where fixes keep silently failing to hold does not get well from being
+patched again — see `docs/spike-findings.md` §6 for the decision and the
+redesign task it points to. Do not resurrect it piecemeal; a redesign starts
+from measured latency on real Windows hardware, not from reintroducing the
+same shape. A shared `rustls::ClientConfig` (`engine/net.rs::tls_connector`)
+was also tried for TLS session resumption on every cold connect, independent
+of the pool and kept: it works (live-verified against the real endpoint), but
+live-measured wall-clock impact was negligible, because TLS 1.3's full
+handshake is already 1-RTT and resumption without 0-RTT saves crypto compute,
+not a round trip — kept as a harmless, real-but-modest win, not mistaken for
+the fix.
 
 **A re-emitted final segment is discriminated by the audio span it covers, never
 by when it arrived.** A guard keyed on arrival — anything landing after the
@@ -223,11 +243,9 @@ It stops the buying and nothing more: what an earlier pass bought stands, since
 the `Final` that would replace that interim with the accurate text is usually
 milliseconds behind it. So the 6s win is real but belongs to the dictation that
 never needed an extension; one that bought the grace and streamed its first
-partial afterwards still pays the ~14s worst case named above. A connect that
+partial afterwards still pays the worst case named above. A connect that
 fails on its own terms still reports as one (from `Mark::StreamReady`,
 engine-agnostically).
-`fm/iris-silent-and-instant` moves the same constant from another direction:
-keep the constant and the grace together or the data loss comes back.
 
 **Three regressions here were one defect: a wait bound that could move
 backwards.** The outer deadline undercutting the connect budget, `Connected`
@@ -324,7 +342,63 @@ the hold collected, but never typed.
 - Deepgram closes an idle websocket connection (no audio sent) in roughly
   12-15s, live-measured. Relevant to any future connection-reuse idea: it
   only pays off within that window of the last dictation, not across the
-  minutes-apart gaps typical of real desktop use.
+  minutes-apart gaps typical of real desktop use — see the withdrawn
+  `WarmPool` note above.
+- The 24-of-31 "Deepgram returned no transcript" failures a 2026-08 session
+  log audit set out to explain were not a live bug: every one predated the
+  `from_finalize` gate (`5e53f96`, 2026-08-01T18:03:56Z) merging to `main`,
+  and zero recurred in the ~42 hours of real use after it landed. Established
+  by timestamp correlation against the merge time, not by re-deriving the
+  mechanism — if a similar cluster resurfaces, check the build actually
+  includes that commit before assuming a new regression.
+- **"Almost no audio reached the transcription engine" is still a live,
+  recurring failure as of 2026-08-04 — the dominant remaining silent-dictation
+  cause, not a closed one.** The original 2026-08 audit left two such
+  failures unexplained (right after a 36-minute idle gap, 1.3s apart — a
+  retry pattern, not an accidental tap). A third landed 2026-08-04T18:17:23Z,
+  28.8 minutes after the prior dictation — same signature, well after
+  `5e53f96` (2026-08-01) — so this is not the already-fixed pre-`5e53f96`
+  mechanism recurring; it is a distinct, still-open one. In the 17 real
+  dictations since `5e53f96` landed (`history.jsonl`), 6 failed (35%); 3 of
+  those 6 are this exact message and a 4th ("heard the audio but returned no
+  words") is the same `conclude()` branch shape from `sent_secs` (the bytes
+  `pump_inner` actually forwarded), not the pre-fix mechanism either. All
+  three confirmed "almost no audio" occurrences follow a gap of at least
+  ~29 minutes since the prior dictation (36.3min, then a 1.3s retry, then
+  28.8min) — well past any plausible warm-connection window, so a kept-alive
+  spare (see the withdrawn `WarmPool` note above) would not have been
+  available for any of them regardless.
+  `audio_secs: 0.0` on these rows is the real value, not a masked one: the
+  message itself comes from `deepgram.rs`'s `conclude()`, which sees only a
+  `Transcript` and `sent_secs` and never touches the timeline — the stamp is
+  in `Dictation::finish` and `Dictation::abandon`
+  (`iris-core/src/dictation.rs`), and those are the only paths that can carry
+  this error into the log. Every exit of both sets `self.timeline.audio_secs
+  = self.audio_secs()` from `self.samples` (populated by `feed()`) before
+  returning — so zero here means capture genuinely produced zero samples,
+  not that a real capture got lost in translation on the way to the log.
+  That rules out the connect-latency theory (real samples captured but not
+  flushed in time) as the explanation for *these* rows and points back at
+  capture itself. Suspected but *not established*: `MicAudio`
+  (`iris-app/src/audio.rs`) opens its WASAPI stream once and never
+  revalidates or reopens it, so a stream gone stale after a long idle gap
+  (sleep, a Bluetooth mic, Windows audio power management) could produce a
+  session with a live socket but no real samples. `capture.rs`'s cpal
+  `on_error` callback is unconditional `eprintln!`, unchanged from `main` —
+  see the console rule above for why that matters — so a stream-level
+  failure is at least visible without `--verbose`. (An earlier pass on this
+  branch regressed it to `vlog!`, gated behind `--verbose`; caught and
+  reverted before reaching `main`, so nothing shipped from that detour — do
+  not describe this as a fix this branch delivers.) A *stale-but-not-erroring*
+  stream would never trip `on_error` at all, so its absence in the log does
+  not clear this theory, and the callback firing only to stderr never reaches
+  the session log either — `on_error` and `history.jsonl` are two disconnected
+  diagnostics today. Confirming the theory needs live
+  telemetry from a real Windows session (frame counts and real amplitude on
+  the first hold after a long idle gap) that this repo cannot gather; do not
+  assume it is fixed, and do not read the pre-`5e53f96` root-cause finding
+  above as covering this failure mode too — they are different mechanisms
+  that happen to share an error family.
 
 ## Maintaining this file
 

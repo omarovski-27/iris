@@ -429,11 +429,22 @@ async fn pump_inner(
             .context("bad API key header")?,
     );
 
-    let (mut socket, response) =
-        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-            .await
-            .context("timed out connecting to Deepgram")?
-            .context("connecting to Deepgram (check IRIS_DEEPGRAM_KEY)")?;
+    // A shared TLS config (see `net::tls_connector`'s doc) lets rustls resume
+    // a session on the second and later connect in this process's lifetime
+    // instead of paying a full handshake every single dictation.
+    let connector = net::tls_connector();
+    let (mut socket, response) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(connector)),
+        ),
+    )
+    .await
+    .context("timed out connecting to Deepgram")?
+    .context("connecting to Deepgram (check IRIS_DEEPGRAM_KEY)")?;
 
     vlog!("deepgram connected: HTTP {}", response.status());
     let _ = events.send(TranscriptEvent::Connected);
