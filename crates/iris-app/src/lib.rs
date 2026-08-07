@@ -48,10 +48,11 @@
 //! project's `CLAUDE.md`), so [`inject::SystemInjector`] is constructed by
 //! `main` and nowhere else.
 
-// Deny rather than forbid: a couple of Win32 calls have no safe wrapper — the
-// tray's message pump, and `window::shell`'s one timezone query. Each opts
-// back in explicitly, at the smallest scope that compiles, with the reason
-// written above it; nothing else in the crate may.
+// Deny rather than forbid: a few Win32 calls have no safe wrapper — the
+// tray's message pump, `window::shell`'s one timezone query, and `dialog`'s
+// message box + console-sharing check. Each opts back in explicitly, at the
+// smallest scope that compiles, with the reason written above it; nothing
+// else in the crate may.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -59,9 +60,11 @@
 pub mod app;
 pub mod audio;
 pub mod config;
+pub mod dialog;
 pub mod engines;
 pub mod history;
 pub mod inject;
+pub mod notify;
 pub mod pill;
 pub mod polish;
 pub mod tray;
@@ -71,5 +74,6 @@ pub use app::{App, Command, CommandId, CommandOutcome, Dictated};
 pub use config::{Config, EngineChoice, Theme};
 pub use history::{DictationRecord, LatencyBreakdown, SessionLog};
 pub use inject::{Injector, RecordingInjector};
+pub use notify::{FailureNotice, NoopFailureNotice, RecordingFailureNotice};
 pub use pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillEvent, PillSink, RecordingPill};
 pub use window::{EditorWindow, NoopWindow, RecordingWindow, WindowSink};

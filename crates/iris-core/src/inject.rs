@@ -117,6 +117,27 @@ pub fn inject(text: &str, method: Method, hotkey: Key) -> Result<()> {
     imp(text, effective, hotkey)
 }
 
+/// Put `text` on the clipboard — nothing else. No accelerator sent, no
+/// keystrokes, no assumption about which window has focus: unlike
+/// [`inject`], this is not a delivery attempt, it is putting the words
+/// somewhere a user who already knows to paste can find them, for a caller
+/// (an injection-failure notice) that has already given up on typing.
+///
+/// Excludes the write from Clipboard History and Cloud Clipboard sync the
+/// same way [`Method::Clipboard`]'s own writes do — see
+/// `win::decline_history_and_cloud_sync` — so this is not a second, less
+/// careful clipboard path.
+#[cfg(windows)]
+pub fn copy_to_clipboard(text: &str) -> Result<()> {
+    win::copy_to_clipboard(text)
+}
+
+/// Off Windows there is no clipboard to write to.
+#[cfg(not(windows))]
+pub fn copy_to_clipboard(_text: &str) -> Result<()> {
+    anyhow::bail!("the clipboard needs Windows")
+}
+
 /// The window that will receive the text, as far as [`accepts_paste`] needs
 /// to know it: two strings, so the decision that reads them stays portable
 /// and testable off Windows.
@@ -1181,6 +1202,18 @@ mod win {
             let _ = DestroyWindow(owner);
             result
         }
+    }
+
+    /// Put `text` on the clipboard, and nothing else — no accelerator sent,
+    /// no assumption about what has focus. [`set_clipboard`] already does
+    /// exactly this (open, empty, write, exclude from history) as the first
+    /// half of [`paste`]; this is that half on its own, for a caller with no
+    /// keystroke to send and no hotkey state to read. `ClipboardError`'s
+    /// `cleared` distinction is `paste`'s alone — it decides whether to fall
+    /// back to typing, which does not apply here — so it collapses to the
+    /// one thing this caller needs: why the write failed.
+    pub fn copy_to_clipboard(text: &str) -> Result<()> {
+        set_clipboard(text).map_err(|e| e.source)
     }
 }
 

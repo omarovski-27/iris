@@ -47,6 +47,34 @@ in `packaging/windows/README.md`, and
 edit there that would not load is a test failure rather than a bricked
 config.
 
+`iris` is a GUI-subsystem binary (`#![cfg_attr(windows, windows_subsystem =
+"windows")]` in `main.rs`) — **no launch path may ever show a console
+window**, a repeat product requirement after a v0.1.0 regression shipped
+exactly that. Do not reach for a console-subsystem/minimized-shortcut
+workaround again; that was tried and is what regressed. A real terminal
+invocation (`--print-config`, `--verbose`, …) still gets its output back via
+`attach_console_for_cli_output` (`AttachConsole(ATTACH_PARENT_PROCESS)` +
+rebinding stdout/stderr to `CONOUT$`, skipped when stdio is already a real
+inherited handle e.g. `iris.exe > out.txt`); a start-up or run failure reaches
+a console-less launch through the existing `report_failure` message box
+instead — see both functions' doc comments in `main.rs` before touching
+either. Verify the subsystem field of a cross-compiled `.exe` with
+`x86_64-w64-mingw32-objdump -p <path> | grep -i subsystem` (expect `Subsystem
+00000002 (Windows GUI)`, not `00000003 (Windows CUI)`); there is no way to
+verify "no window ever flashes" from this environment — that needs
+`docs/first-run-checklist.md` on real Windows.
+
+`install.ps1` is a **clean replace**, not an additive install: every run
+quits a running Iris, deletes the Start Menu/Desktop/Startup shortcuts a
+previous run created, and replaces `%LOCALAPPDATA%\Iris`, before copying the
+new build in — so upgrading or re-running with different flags never leaves a
+stale shortcut or a stale binary. `-Uninstall` does the removal half only.
+Both are safe by construction because `%LOCALAPPDATA%\Iris` never holds
+anything but `iris.exe` — `config.toml` and `history.jsonl` live in
+`%APPDATA%\iris`, which the script never touches — but `Assert-NoUserDataIn`
+checks that invariant before every recursive delete rather than trust it
+blindly; keep that guard if this script changes again.
+
 After packaging a new build, work through
 `docs/first-run-checklist.md` on a real Windows machine — this repo has no WSL
 Windows-interop in most sandboxes, so nothing Windows-specific (`#[cfg(windows)]`

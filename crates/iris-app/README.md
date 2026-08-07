@@ -91,9 +91,11 @@ earlier build has that pinned on disk whether or not the user chose it, so the
 first start after upgrading resets an unstamped `true` to `false` (the round-3
 default — see [Overlay](#overlay)) and writes `version = 1`. That happens once
 per install: a `true` set after the stamp is a real choice and survives. If
-the rewrite fails, Iris says so on the console and keeps running — but the
-reset will repeat on the next start until the stamp lands. `Config::migrate`
-in `src/config.rs` is the implementation and carries the full reasoning.
+the rewrite fails, Iris says so — on the console when a terminal launched it,
+in an "Iris could not update its settings" dialog otherwise (`main.rs`'s
+`Config::load_or_create_reporting` call) — and keeps running, but the reset
+will repeat on the next start until the stamp lands. `Config::migrate` in
+`src/config.rs` is the implementation and carries the full reasoning.
 
 **Hotkey.** `ralt` and `rwin` are excluded from the stuck-hotkey correction
 `inject.rs` applies before every injection burst for the other choices, so they
@@ -241,9 +243,10 @@ before this window existed — saying so each time.
 While the mock engine is in force the menu opens with four disabled labels above
 all of that (`tray::demo_notice`): what the mock engine means for the transcript,
 both edits that leave it — the `engine` line changed in place, a `[keys]` block
-appended at the end — and the config path they go in. They are there because the
-installed shortcut launches the exe minimized
-(`packaging/windows/install.ps1`), which is exactly the launch where the startup
+appended at the end — and the config path they go in. They are there because
+`iris.exe` is a GUI-subsystem binary (`main.rs`'s `windows_subsystem`
+attribute) — a double-click, the Start Menu shortcut and the Startup shortcut
+alike open no console at all — which is exactly the launch where the startup
 banner's pointer at the same file is never read — leaving a first-run user on
 stub transcripts with no explanation on screen. That also makes this the surface
 for someone who never opened the zip's README, so it carries the whole

@@ -9,6 +9,17 @@
 //!    fail for a reason the user must act on (a missing key);
 //! 4. run the loop and never touch it again.
 
+// GUI subsystem: stops Windows allocating a console for *any* launch of this
+// binary — double-click, Start Menu, Startup folder, all of them. Before this
+// attribute existed the linker defaulted to the console subsystem, so every
+// one of those launches opened a terminal window whether or not the app ever
+// wrote a line to it; a v0.1.0 release shipped exactly that regression. See
+// `attach_console_for_cli_output` for how a real terminal invocation (`iris
+// --print-config`, `--verbose`, …) still gets its output back, and
+// `report_failure` for how a start-up failure reaches a user who now has no
+// console to read stderr from.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -17,6 +28,8 @@ use clap::Parser;
 use iris_app::audio::AudioSource;
 use iris_app::config::{self, Config, EngineChoice};
 use iris_app::inject::{DryRunInjector, Injector};
+#[cfg(windows)]
+use iris_app::notify::{FailureNotice, NoopFailureNotice};
 use iris_app::pill::{overlay_theme, LogPill, NoopPill, OverlayPill, PillSink};
 use iris_app::{App, DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
@@ -104,15 +117,32 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Before anything prints, including clap's own --help/error output: a GUI
+    // subsystem process starts with no console at all, so this is the only
+    // chance to reconnect stdout/stderr to one before the first `println!`.
+    #[cfg(windows)]
+    attach_console_for_cli_output();
+
     let args = Args::parse();
     iris_core::log::set_verbose(args.verbose);
 
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     // Kept as loaded: `config` below takes the CLI overrides, which are
     // run-only and must never be written back to the file.
-    let file_config = Config::load_or_create(&config_path)
-        .with_context(|| format!("loading {}", config_path.display()))
-        .inspect_err(report_startup_failure)?;
+    //
+    // A migration-save failure is not fatal (see the doc comment on
+    // `load_or_create_reporting`), so it never reaches the `inspect_err`
+    // below; report it here, the same two ways as a fatal one — the
+    // `eprintln!` a real terminal invocation now sees via
+    // `attach_console_for_cli_output`, and the dialog a console-less launch
+    // needs instead.
+    let file_config = Config::load_or_create_reporting(&config_path, |e| {
+        eprintln!("{}", Config::migration_save_error_message(&config_path, e));
+        #[cfg(windows)]
+        report_failure("Iris could not update its settings", e);
+    })
+    .with_context(|| format!("loading {}", config_path.display()))
+    .inspect_err(report_startup_failure)?;
     let mut config = file_config.clone();
     apply_overrides(&mut config, &args);
 
@@ -246,6 +276,7 @@ fn start_resident(
 ) -> Result<Resident> {
     use iris_app::audio::MicAudio;
     use iris_app::inject::SystemInjector;
+    use iris_app::notify::SystemFailureNotice;
     use iris_app::tray;
 
     let audio = MicAudio::new(config.audio.device.clone(), config.audio.warm)?;
@@ -253,6 +284,15 @@ fn start_resident(
         Arc::new(DryRunInjector)
     } else {
         Arc::new(SystemInjector::new(config.inject.method, config.hotkey))
+    };
+    // Same split as the injector above: `--dry-run` never really fails to
+    // inject, but keeping the two in lockstep means a failure notice can
+    // never reach a real clipboard or a real dialog on a run that promised
+    // not to touch the desktop.
+    let notice: Arc<dyn FailureNotice> = if args.dry_run {
+        Arc::new(NoopFailureNotice)
+    } else {
+        Arc::new(SystemFailureNotice)
     };
 
     let devices = iris_core::capture::list_devices()
@@ -305,7 +345,8 @@ fn start_resident(
         .with_report(args.report)
         .with_file_config(file_config)
         .with_window(window)
-        .with_window_commands(window_commands_rx, window_outcomes_tx);
+        .with_window_commands(window_commands_rx, window_outcomes_tx)
+        .with_failure_notice(notice);
 
     Ok(Resident {
         app,
@@ -757,12 +798,97 @@ fn print_history(config: &Config, config_path: &std::path::Path, n: usize) -> Re
     Ok(())
 }
 
+/// Give a real terminal invocation (`iris --print-config`, `--verbose`,
+/// `--list-devices`, `--history`, …) somewhere to print, without ever giving a
+/// double-click or a shortcut a console of its own.
+///
+/// The `windows_subsystem = "windows"` attribute at the top of this file is
+/// what stops Windows allocating a console for every launch; the cost is that
+/// a GUI-subsystem process starts with no console and, unlike a
+/// console-subsystem one, is *not* auto-attached to its parent's console when
+/// that parent is an interactive shell. Left alone, running `iris.exe
+/// --verbose` from PowerShell would print into the void exactly like a
+/// double-click does. `AttachConsole(ATTACH_PARENT_PROCESS)` is the documented
+/// fix: if the process that launched us owns a console, attach to it and
+/// rebind stdout/stderr to `CONOUT$` so `println!`/`eprintln!` land there. If
+/// there is no parent console — Explorer, the Start Menu, a Startup-folder
+/// shortcut — the call fails and this does nothing, which is exactly the
+/// silent, windowless launch the product requires; nothing here can make a
+/// console appear where the parent had none.
+///
+/// Skipped, stream by stream, wherever stdout or stderr is already a real
+/// handle: `iris.exe > out.txt`, `iris.exe 2> err.txt` and `iris.exe | more`
+/// each hand the child valid, inherited handles for the redirected stream
+/// through ordinary `CreateProcess` handle inheritance, regardless of
+/// subsystem, and attaching here would tear one of those up and replace it
+/// with the console instead. The two streams are judged independently and
+/// only the unwired one is rebound — `iris.exe 2> err.txt` must still leave
+/// the redirected stderr handle alone, and `iris.exe --verbose > out.txt`
+/// must still attach and wire up stderr so `--verbose` diagnostics are not
+/// silently dropped. Must run before the first `println!`/`eprintln!` —
+/// including clap's own `--help`/error output — so it is the first thing
+/// `main` does.
+#[cfg(windows)]
+fn attach_console_for_cli_output() {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: querying our own current standard handles; no preconditions.
+    let stdout_wired = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.is_ok();
+    let stderr_wired = unsafe { GetStdHandle(STD_ERROR_HANDLE) }.is_ok();
+    if stdout_wired && stderr_wired {
+        return;
+    }
+    // SAFETY: no preconditions beyond a valid process; failure (no parent
+    // console) is the expected, silent case for a double-click launch.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+        return;
+    }
+
+    let conout = HSTRING::from("CONOUT$");
+    // SAFETY: `conout` is a NUL-terminated wide string that outlives the call.
+    let Ok(console) = (unsafe {
+        CreateFileW(
+            &conout,
+            (GENERIC_READ | GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }) else {
+        return;
+    };
+
+    // SAFETY: `console` is a just-opened, valid handle. Rust's stdout/stderr
+    // ask `GetStdHandle` again on every write rather than caching a handle
+    // grabbed at process start, so this takes effect immediately. Only the
+    // stream that was not already wired is rebound, so an inherited
+    // redirection on the other stream survives untouched.
+    unsafe {
+        if !stdout_wired {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, console);
+        }
+        if !stderr_wired {
+            let _ = SetStdHandle(STD_ERROR_HANDLE, console);
+        }
+    }
+}
+
 /// Put a failed startup in front of the user when stderr has nowhere to land.
 ///
 /// Covers the whole of starting up, in two calls that are each a whole phase
 /// rather than a single fallible step: `Config::load_or_create` in `main`, and
-/// [`start_resident`]. See [`report_failure`] for why a console binary needs a
-/// dialog at all, and [`report_run_failure`] for the one way the loop itself
+/// [`start_resident`]. See [`report_failure`] for why a windowed binary needs
+/// a dialog at all, and [`report_run_failure`] for the one way the loop itself
 /// can end that needs the same treatment.
 #[cfg(windows)]
 fn report_startup_failure(err: &anyhow::Error) {
@@ -782,51 +908,27 @@ fn report_run_failure(err: &anyhow::Error) {
     report_failure("Iris has stopped", err);
 }
 
-/// Show `err` in a message box, unless someone is watching a console that will
-/// outlive the process.
+/// Show `err` in a message box, unless someone is watching a console that
+/// will outlive the process.
 ///
-/// `iris` is a console binary, so launching it from the Start Menu or the
-/// Startup folder gives it a console window all of its own — one that closes
-/// with the process. A missing key, an unparseable config file, a microphone
-/// that is not there, a hook Windows took away: each is an actionable sentence,
-/// and in that launch path each would be a black rectangle that flashes and
-/// vanishes. When another process shares this console (a shell the user typed
-/// in), the message survives on stderr and there is nothing to do;
-/// `GetConsoleProcessList` is what tells the two apart.
+/// `iris` is a GUI-subsystem binary (see the `windows_subsystem` attribute at
+/// the top of this file), so launching it from the Start Menu, the Startup
+/// folder, or a plain double-click gives it no console at all — nothing for
+/// `eprintln!` to reach. A missing key, an unparseable config file, a
+/// microphone that is not there, a hook Windows took away: each is an
+/// actionable sentence, and on that launch path each would otherwise vanish
+/// with nothing on screen to say Iris failed. When a real terminal invocation
+/// reattached a console via [`attach_console_for_cli_output`], the message
+/// survives on stderr there instead and this dialog would be redundant.
+///
+/// A thin wrapper over `iris_app::dialog::show`, which lives in the library
+/// crate rather than here so `App`'s injection-failure notice
+/// (`iris_app::notify`) can show the same kind of dialog without a second
+/// `MessageBoxW`/`GetConsoleProcessList` copy; see that module's doc comment
+/// for the console-sharing check both paths share.
 #[cfg(windows)]
 fn report_failure(caption: &str, err: &anyhow::Error) {
-    use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::System::Console::GetConsoleProcessList;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    };
-
-    let mut pids = [0u32; 2];
-    // SAFETY: `pids` is a valid, writable buffer of the length passed in;
-    // the call only fills it and returns the count.
-    let sharing_console = unsafe { GetConsoleProcessList(&mut pids) } > 1;
-    if sharing_console {
-        return;
-    }
-
-    let text = HSTRING::from(format!("{err:#}"));
-    let caption = HSTRING::from(caption);
-    // MB_SETFOREGROUND and MB_TOPMOST are what make this visible at all in the
-    // launch it exists for: a process started from the Startup folder has
-    // never held the foreground, so Windows' foreground lock would otherwise
-    // leave the box behind the active window with only a flashing taskbar
-    // button — and the installed shortcut minimizes the console, so there is
-    // no second cue.
-    //
-    // SAFETY: both strings are NUL-terminated and outlive the modal call.
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(text.as_ptr()),
-            PCWSTR(caption.as_ptr()),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
-        );
-    }
+    iris_app::dialog::show(caption, &format!("{err:#}"));
 }
 
 /// Off Windows there is no console-less launch path and no dialog to show, so

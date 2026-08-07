@@ -20,8 +20,8 @@ use iris_app::audio::ChannelAudio;
 use iris_app::config::{Config, EngineChoice, Theme};
 use iris_app::pill::PillEvent;
 use iris_app::{
-    App, CommandId, CommandOutcome, Injector, RecordingInjector, RecordingPill, RecordingWindow,
-    SessionLog,
+    App, CommandId, CommandOutcome, FailureNotice, Injector, RecordingFailureNotice,
+    RecordingInjector, RecordingPill, RecordingWindow, SessionLog,
 };
 use iris_core::engine::{Engine, Session, TranscriptEvent};
 use iris_core::hotkey::{HotkeyEvent, Key};
@@ -43,6 +43,7 @@ struct Rig {
     commands: Sender<Command>,
     commands_rx: Receiver<Command>,
     injector: Arc<RecordingInjector>,
+    notice: Arc<RecordingFailureNotice>,
     pill: RecordingPill,
     window: RecordingWindow,
     config_path: std::path::PathBuf,
@@ -70,6 +71,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     let armed = audio.armed();
     let pill = RecordingPill::new();
     let window = RecordingWindow::new();
+    let notice = Arc::new(RecordingFailureNotice::new());
 
     let app = App::new(
         config,
@@ -81,7 +83,8 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
     .expect("building the app")
     // Keep a failing test from hanging for ten seconds per dictation.
     .with_final_timeout(Duration::from_secs(5))
-    .with_window(Box::new(window.clone()));
+    .with_window(Box::new(window.clone()))
+    .with_failure_notice(notice.clone() as Arc<dyn FailureNotice>);
 
     let (keys, keys_rx) = crossbeam_channel::unbounded();
     let (commands, commands_rx) = crossbeam_channel::unbounded();
@@ -95,6 +98,7 @@ fn rig_with_injector(configure: impl FnOnce(&mut Config), injector: Arc<Recordin
         commands,
         commands_rx,
         injector,
+        notice,
         pill,
         window,
         config_path,
@@ -314,6 +318,53 @@ fn a_failed_injection_still_saves_the_words() {
             PillEvent::Hide
         ]
     );
+}
+
+/// The whole reason `FailureNotice` exists: with history off, the session
+/// log writes nothing (see `history_disabled_writes_no_file`), so a failed
+/// injection has no fallback record at all except this one — and, on the
+/// shipped GUI-subsystem launch path, no console either. This is what proves
+/// the notice actually fires, with the real words and the real error, not
+/// just that the dictation loop survives the failure.
+#[test]
+fn a_failed_injection_with_history_off_still_notifies_with_the_words() {
+    let injector = Arc::new(RecordingInjector::failing("the focused window is elevated"));
+    let mut rig = rig_with_injector(|config| config.history.enabled = false, injector);
+
+    let err = rig.dictate().expect_err("injection failed");
+    assert!(err.to_string().contains("elevated"), "{err}");
+
+    assert!(
+        rig.records().is_empty(),
+        "history is off, so the log must not have recovered the words instead"
+    );
+
+    let calls = rig.notice.calls();
+    assert_eq!(calls.len(), 1, "the failure notice must fire exactly once");
+    let (text, error, history_enabled) = &calls[0];
+    assert_eq!(
+        text, TRANSCRIPT,
+        "the notice must carry the actual transcript, not just a flag"
+    );
+    assert!(error.contains("elevated"), "{error}");
+    assert!(!history_enabled, "history really was off for this call");
+}
+
+/// The same failure with history on: the log already recovers the words
+/// (`a_failed_injection_still_saves_the_words`), but the failure itself must
+/// still be visible on a console-less launch, so the notice still fires —
+/// just told `history_enabled = true`, which is what tells
+/// `SystemFailureNotice` not to also put the words on the clipboard.
+#[test]
+fn a_failed_injection_with_history_on_still_notifies() {
+    let injector = Arc::new(RecordingInjector::failing("the focused window is elevated"));
+    let mut rig = rig_with_injector(|_| {}, injector);
+
+    rig.dictate().expect_err("injection failed");
+
+    let calls = rig.notice.calls();
+    assert_eq!(calls.len(), 1, "the failure notice must fire exactly once");
+    assert!(calls[0].2, "history really was on for this call");
 }
 
 #[test]
