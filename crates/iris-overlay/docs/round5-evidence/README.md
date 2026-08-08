@@ -77,8 +77,11 @@ and wrong to the person judging them. Fixed before this set was regenerated:
   "Round 5", "Freeze, not fabricate, once recording stops") rather than
   continuing to move or count.
 - `*-wave-sequence-0-silence.png` — near-silence, sampled well after the
-  rolling history has filled with quiet — now a faint, mostly-collapsed row
-  rather than a row of visible marks.
+  rolling history has filled with quiet — a short row of bars, clearly
+  visible but clearly the quietest state in the sequence. (Earlier revisions
+  of this file described this frame as "a faint, mostly-collapsed row" — that
+  was the installed build's actual, unintended behaviour; see "Legibility
+  retune" below for why it changed.)
 - `*-wave-sequence-1-rampup.png` — a smooth ramp from quiet to loud; the
   ascending bar heights left to right are the row directly showing its own
   time axis.
@@ -94,3 +97,46 @@ and wrong to the person judging them. Fixed before this set was regenerated:
   this round. The timer is absent by design here — it and the live text
   share one right-aligned anchor, so `render::timer_alpha` is zero for every
   openness at which text is drawn.
+
+## Legibility retune (post-install correction)
+
+Round 5 shipped (`a33769b`) and the captain, reviewing the real installed
+build rather than these zoomed evidence stills, reported the wave row was
+present but not usable: *"there are no sound waves. The dashes are just
+plain and nothing is moving. Or no. They are moving, but they are so small
+and they are clear colored. So they aren't visible."*
+
+The bars *were* moving — the rolling-history mechanism this round's evidence
+documents above was working. The failure was purely visual weight, and it
+came from three changes to `render/mod.rs`'s `WAVE_*` constants and
+`draw_wave`'s alpha, applied together, each defensible alone but
+double-counting the same signal in combination:
+
+1. a quiet bar's *opacity* faded with the same `scale` value that already
+   shrinks its *height* (`colour.fade(alpha * scale)`) — so a quiet bar was
+   short **and** faint from one number, not two independent cues;
+2. `WAVE_IDLE_FLOOR` (the height floor under every bar, quiet or idle) was
+   `0.05` — at `WAVE_MAX_H_REST` (22 logical px) that is roughly one device
+   pixel at 100% DPI, which anti-aliases away to nothing;
+3. `WAVE_RESPONSE_EXPONENT` was `2.4`, compressing every quiet-to-moderate
+   level down near that same near-zero floor before either of the above even
+   applied.
+
+The fix rebalances all three rather than reverting any single one: bar alpha
+now blends a floor (`WAVE_BAR_ALPHA_FLOOR = 0.62`) up to full by `scale`
+instead of using `scale` as the alpha outright, so height alone carries most
+of the "quieter" signal; `WAVE_IDLE_FLOOR` rose to `0.22` and
+`WAVE_RESPONSE_EXPONENT` eased to `1.7` so a quiet bar keeps a legible sliver
+of height instead of collapsing toward it; and `WAVE_BAR_W_FRAC` widened
+from `0.3` back to `0.4` now that a quiet bar's height no longer collapses
+close enough to its width to read as a dot. See the doc comments on each
+constant in `render/mod.rs` for the full reasoning.
+
+**Why this set's own stills didn't catch it first**: every frame here is
+528×102 px, already close to the real ~224×106 device-px overlay window, but
+composited large enough in a docs viewer or diff tool to read as bigger than
+its real on-screen footprint — the same trap the captain's own feedback
+named. `../wave-visibility-evidence/` composites the same kind of frame onto
+a full simulated desktop at true, unscaled 1:1 pixel density specifically to
+avoid that trap; look there, not here, to judge whether a bar is actually
+visible on a real monitor.
