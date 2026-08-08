@@ -448,10 +448,29 @@ a hard zero or one repeated value. A flat resting row is exactly the
 of_sitting_flat` and `the_idle_ripple_moves_over_time` hold both halves —
 quiet enough to never masquerade as a real loud moment, and never frozen.
 
-**Every appearance starts from silence.** `wave_history` is cleared the
-instant the shape is fully hidden (`presence <= 0.001`), so a fresh
+**Every appearance starts from silence.** The reset fires on the way *in*, not
+on the way out: `wave_history` is cleared on the first frame `draw` sees the
+model back in `OverlayState::Listening` (`Renderer::listening_last_frame` is
+the memory that tells a new session from a continuing one), so a fresh
 `ShowListening` never opens with the previous utterance's waveform still on
-screen — `a_fresh_utterance_starts_the_wave_row_from_silence` pins it.
+screen. Round 5 first cleared it the instant the shape was fully hidden
+(`presence <= 0.001`) instead, which was dead code in the shipped app —
+`window/win32.rs`'s loop stops calling `draw` at all once `Model::is_idle()`
+(`presence <= 0.0`), a condition the discrete per-frame step reaches without
+passing through the `(0.0, 0.001]` band. Two companions make the freshly
+emptied row genuinely silent rather than merely empty: `wave_last_sample_ms`
+is re-based to the current frame in the same block, so the
+`WAVE_SAMPLE_INTERVAL_MS` gate cannot fire off a minutes-old timestamp and
+sample before the microphone has reported anything; and `Command::ShowListening`
+zeroes `Model::level`/`level_target` alongside the text and the timer it
+already reset, so the level being sampled is silence rather than the last
+utterance's converged loudness (the run loop keeps ticking while idle, so
+without that it would sit there indefinitely).
+`a_fresh_utterance_starts_the_wave_row_from_silence_even_past_a_skipped_idle_frame`
+pins all three, and drives `tick`/`draw` the way the real Win32 loop does —
+skipping `draw` whenever `Model::is_idle()` — because a test that calls `draw`
+on every tick reaches branches the window loop cannot, which is how the
+presence-gated version shipped looking covered.
 
 **Geometry, retuned for compactness, not rebuilt.** `WAVE_TARGET_PITCH` drops
 12→8 logical px and `WAVE_MIN_BARS` 7→5 — the row's height constants
