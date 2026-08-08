@@ -13,12 +13,24 @@
 //! no separate "orb shape" and "ribbon shape", only one shape whose width
 //! animates. Height never changes. [`ORB_D`] is the height, at every width.
 //!
-//! At rest — no live text on screen, which is the default and what most
-//! users ever see — the shape sits at [`REST_W`], a capsule holding the wave
-//! row and an elapsed-recording timer side by side (captain feedback, round
-//! 3: "not just a dot or a circle, more like the pipe thing", and a follow-up
-//! asking for a timer beside the waves). Live text, when the config opts back
-//! in, still widens the same shape further, up to [`RIBBON_MAX_W`].
+//! **Round 4** (captain, on round 3's capsule): asked for the wave row gone
+//! outright and the shape back near the pre-round-3 circle. Built exactly
+//! that — then the captain, having only ever seen round 3's build (PR #22
+//! was still unmerged), clarified in **round 5**
+//! (`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`)
+//! that "the timeline" they asked for *is* a sound wave, not the bare
+//! circle-plus-digits round 4 shipped: *"the marks become a real audio
+//! waveform that moves with your voice, with a small timer beside it... this
+//! treats the timeline you asked for as the sound wave itself."* So the wave
+//! row is back — round 4's deletion was correct against its own wording and
+//! is superseded, not wrong — rebuilt in `render/mod.rs` as a genuine
+//! scrolling history of recent microphone level rather than round 3's single
+//! current level fanned out with a positional taper, which is what read as
+//! static "dashes" rather than sound. [`REST_W`] holds compact: near round
+//! 4's 102, not round 3's 128 — just wide enough for the glyph, a minimal
+//! wave row, and the small [`TIMER_FONT`] timer together. Live text, when the
+//! config opts back in, still widens the same shape further, up to
+//! [`RIBBON_MAX_W`].
 //!
 //! The **window is fixed-size**, sized for the *widest* state
 //! ([`RIBBON_MAX_W`]) up front — see `window/win32.rs`'s `Surface::present`,
@@ -39,17 +51,18 @@
 /// The shape's constant height, at every width. Unchanged across all three
 /// rounds of feedback on this surface — see the module doc's "The shape".
 pub const ORB_D: f32 = 34.0;
-/// Width of the shape at rest: no live text on screen, just the wave row and
-/// the elapsed-recording timer sharing the surface. Noticeably narrower than
-/// the previous signed-off pill's 168×34 (captain, round 3: "it was really
-/// wide, we need to narrow it down"), but wide enough relative to [`ORB_D`]'s
-/// height to read unmistakably as a capsule, and wide enough to give the
-/// timer its own zone beside the wave row without crowding either — see
-/// `render/mod.rs`'s `draw_wave` (`right_reserve`) and `draw_timer` for how
-/// the width splits between the two. Treated as a direction, not a number to
-/// hit exactly (round-3 addendum): a composition that needs a few more pixels
-/// to read well is worth more than a cramped one at a rounder number.
-pub const REST_W: f32 = 128.0;
+/// Width of the shape at rest: no live text on screen, just the core glyph,
+/// a compact scrolling wave row, and the small elapsed-recording timer
+/// sharing the surface (round 5). Wide enough for `render/mod.rs`'s
+/// `timer_right_edge` to clear the centred glyph by `GLYPH_TIMER_GAP` before
+/// the timer's own run, at [`TIMER_FONT`], *and* to leave the wave row a
+/// minimal but real usable span — narrower than either bound alone would
+/// need is not an option, since the two share the same row. Still
+/// dramatically narrower than round 3's 128: round 3's width paid for a
+/// 15px timer and a wide, sparse bar row; this pays only for what a 10px
+/// timer and a deliberately minimal wave need. See
+/// `the_rest_width_stays_compact_not_round_3s_128`.
+pub const REST_W: f32 = 118.0;
 /// Widest the ribbon grows before new words start scrolling the oldest ones
 /// off the leading edge instead of growing further.
 pub const RIBBON_MAX_W: f32 = 460.0;
@@ -57,6 +70,15 @@ pub const RIBBON_MAX_W: f32 = 460.0;
 pub const RIBBON_PAD_X: f32 = 18.0;
 /// Live-text font size.
 pub const TEXT_FONT: f32 = 15.0;
+/// The elapsed-recording timer's font size — deliberately its own, much
+/// smaller constant, not [`TEXT_FONT`]. Round 3 reused the live-text size for
+/// the timer, which is the concrete shape of "the timer is very big... I
+/// don't want the huge font" (captain, round 4): a four-character clock
+/// reading at sentence-sized type. Matches the original signed-off pill's
+/// telemetry-text size (`data/iris-ui-directions/report.md`, "Typography":
+/// "the old pill's telemetry text (10–11 px)") — the last time this crate
+/// shipped a small secondary readout, this is the size that was.
+pub const TIMER_FONT: f32 = 10.0;
 
 /// Transparent margin around the shape, every side, for the drop shadow and
 /// state glow to bleed into.
@@ -229,6 +251,9 @@ pub struct Layout {
     pub text_pad_x: f32,
     /// Live-text font size, in device pixels.
     pub text_font: f32,
+    /// Elapsed-recording timer's font size, in device pixels. Deliberately
+    /// separate from [`Layout::text_font`] — see [`TIMER_FONT`].
+    pub timer_font: f32,
 }
 
 impl Layout {
@@ -252,6 +277,7 @@ impl Layout {
             ribbon_max_w: px(RIBBON_MAX_W),
             text_pad_x: px(RIBBON_PAD_X),
             text_font: px(TEXT_FONT),
+            timer_font: px(TIMER_FONT),
         }
     }
 }
@@ -267,15 +293,18 @@ mod tests {
         assert_eq!(WORK_AREA_GAP, 58.0, "placement anchor stays unchanged");
     }
 
-    /// The captain's complaint was specifically about width ("it was really
-    /// wide, we need to narrow it down"), not about the shape reading as a
-    /// circle instead of a capsule — the rest width has to sit strictly
-    /// between those two failure modes.
+    /// Round 5 (captain, `round5-direction.md`): "compact... hold the line
+    /// near [round 4's 102] and do not let the wave row push it back toward
+    /// 128." `REST_W` can't be round 4's exact 102 any more — the wave row
+    /// needs its own minimal usable span alongside the glyph and timer — but
+    /// it must stay clearly short of round 3's rejected width, not creep back
+    /// toward it one retune at a time.
     #[test]
-    fn rest_width_is_a_capsule_narrower_than_the_old_signed_off_pill() {
-        const OLD_SIGNED_OFF_PILL_W: f32 = 168.0;
-        const { assert!(REST_W < OLD_SIGNED_OFF_PILL_W) };
-        const { assert!(REST_W > ORB_D * 1.5) };
+    fn the_rest_width_stays_compact_not_round_3s_128() {
+        const ROUND_3_CAPSULE_W: f32 = 128.0;
+        const ROUND_4_W: f32 = 102.0;
+        const { assert!(REST_W < ROUND_3_CAPSULE_W * 0.95) };
+        const { assert!(REST_W > ROUND_4_W) };
     }
 
     #[test]
@@ -312,6 +341,7 @@ mod tests {
         assert!((two.rest_w - one.rest_w * 2.0).abs() < 0.01);
         assert!((two.ribbon_max_w - one.ribbon_max_w * 2.0).abs() < 0.01);
         assert!((two.text_font - one.text_font * 2.0).abs() < 0.01);
+        assert!((two.timer_font - one.timer_font * 2.0).abs() < 0.01);
     }
 
     #[test]

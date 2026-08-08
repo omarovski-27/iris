@@ -9,7 +9,7 @@
 //! cargo run --example pill-demo -- --filmstrip /tmp/iris-pill
 //!
 //! # The committed review set, regenerated in place:
-//! cargo run --example pill-demo -- --evidence crates/iris-overlay/docs/round3-evidence
+//! cargo run --example pill-demo -- --evidence crates/iris-overlay/docs/round5-evidence
 //! ```
 //!
 //! See `crates/iris-overlay/README.md` for the WSL loop.
@@ -137,8 +137,8 @@ struct Args {
     #[arg(long)]
     backdrop: bool,
 
-    /// Write the committed round-3 review set — the exact files under
-    /// `docs/round3-evidence/` — to this directory. Implies `--backdrop`.
+    /// Write the committed round-5 review set — the exact files under
+    /// `docs/round5-evidence/` — to this directory. Implies `--backdrop`.
     ///
     /// The set is a fixed shot list: it picks its own themes, levels, phases
     /// and utterance, and honours only `--scale`. Every flag it would
@@ -346,13 +346,9 @@ enum Phase {
     Inserted,
 }
 
-/// How long each evidence shot listens before it is caught. Long enough for
-/// the level smoothing to settle several times over, and it puts a readable
-/// `0:07` on the timer.
+/// How long each evidence shot listens before it is caught. Long enough to
+/// put a readable `0:07` on the timer.
 const EVIDENCE_LISTEN_MS: u64 = 7_000;
-/// The two held levels the volume-response pair is judged on.
-const EVIDENCE_QUIET: f32 = 0.05;
-const EVIDENCE_LOUD: f32 = 1.0;
 
 /// Drive a fresh pill to exactly one reviewable frame.
 ///
@@ -412,18 +408,19 @@ fn shot(
     pill
 }
 
-/// Regenerate the committed round-3 review set.
+/// Regenerate the committed round-5 review set.
 ///
-/// Every file under `docs/round3-evidence/` comes out of here, which is the
-/// point: the set is a held-level, backdrop-composited selection that a plain
+/// Every file under `docs/round5-evidence/` comes out of here, which is the
+/// point: the set is a backdrop-composited selection that a plain
 /// `--filmstrip` run cannot produce, and evidence nobody can reproduce is
-/// evidence nobody can check against a later change.
+/// evidence nobody can check against a later change. The fixed single-frame
+/// shots (`listening-natural`, `processing-frozen`, `inserted-frozen`) still
+/// exist, but round 5's own requirement — the wave row shown as a *sequence*,
+/// not a frozen frame — is [`wave_sequence_evidence`], appended per theme.
 fn evidence(args: &Args, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
 
-    let shots: [(&str, Option<f32>, Phase); 5] = [
-        ("quiet-sustained", Some(EVIDENCE_QUIET), Phase::Listening),
-        ("loud-sustained", Some(EVIDENCE_LOUD), Phase::Listening),
+    let shots: [(&str, Option<f32>, Phase); 3] = [
         ("listening-natural", None, Phase::Listening),
         ("processing-frozen", None, Phase::Processing),
         ("inserted-frozen", None, Phase::Inserted),
@@ -437,6 +434,7 @@ fn evidence(args: &Args, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>>
             write_frame(&pill, &path, true)?;
             written += 1;
         }
+        written += wave_sequence_evidence(theme, args.scale, &dir, theme_name)?;
     }
 
     // The opt-in ribbon, for contrast: not the default any more, and the one
@@ -453,6 +451,135 @@ fn evidence(args: &Args, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>>
 
     println!("{written} evidence frames -> {}", dir.display());
     Ok(())
+}
+
+/// `WAVE_HISTORY_LEN * WAVE_SAMPLE_INTERVAL_MS` is private to the crate, so
+/// this is that budget written out rather than imported: how far back a
+/// still's visible row can possibly reach.
+const WAVE_HISTORY_SPAN_MS: u64 = 2_800;
+
+const SILENCE_MS: u64 = 3_000;
+const RAMP_MS: u64 = 3_000;
+const RAMP_END: u64 = SILENCE_MS + RAMP_MS;
+/// Long enough that the speech phase has room for a genuinely quiet moment
+/// and a genuinely loud one, each with a full [`WAVE_HISTORY_SPAN_MS`] of
+/// scan room *after* `RAMP_END` so neither checkpoint's row still has ramp
+/// samples bleeding in from the edge.
+const SPEECH_MS: u64 = 6_000;
+const SPEECH_END: u64 = RAMP_END + SPEECH_MS;
+const DECAY_MS: u64 = 4_000;
+
+/// Round 5's own required evidence
+/// (`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`):
+/// "render the wave row across a sequence of level histories (silence,
+/// ramp-up, speech-like varying, decay)... so the motion is judgeable from
+/// stills" — a single frozen frame is exactly what round 3 and round 4 both
+/// survived review on, and the direction calls that out by name as not
+/// enough this time.
+///
+/// Four phases, run back to back through one continuous `ShowListening`:
+/// near-silent, a smooth ramp to loud, [`synthetic_level`]'s speech-like
+/// oscillation, and a decay back toward quiet.
+fn evidence_level_profile(ms: u64) -> f32 {
+    const QUIET: f32 = 0.04;
+    const LOUD: f32 = 0.9;
+
+    if ms < SILENCE_MS {
+        QUIET
+    } else if ms < RAMP_END {
+        let t = (ms - SILENCE_MS) as f32 / RAMP_MS as f32;
+        QUIET + t * (LOUD - QUIET)
+    } else if ms < SPEECH_END {
+        synthetic_level(ms - RAMP_END)
+    } else {
+        let t = ((ms - SPEECH_END) as f32 / DECAY_MS as f32).min(1.0);
+        LOUD * (1.0 - t) + QUIET * t
+    }
+}
+
+/// The timestamp in `search_from..=search_to` whose preceding
+/// [`WAVE_HISTORY_SPAN_MS`] window has the highest (`want_loud`) or lowest
+/// mean [`evidence_level_profile`] — a coarse brute-force scan, cheap
+/// because the profile is a pure function and this runs once at generation
+/// time, never per rendered frame. Exists because "speech-like varying"
+/// oscillates, so a single hand-picked timestamp risks landing on a quiet
+/// moment even during the loud-sounding phase, same as the frozen-frame
+/// mistake this whole evidence set exists to avoid, one level up.
+fn pick_checkpoint(search_from: u64, search_to: u64, want_loud: bool) -> u64 {
+    const STEP_MS: u64 = 50;
+    let mut best = search_from.max(WAVE_HISTORY_SPAN_MS);
+    let mut best_avg = f32::NAN;
+    let mut t = best;
+    while t <= search_to {
+        let start = t - WAVE_HISTORY_SPAN_MS;
+        let (mut sum, mut n) = (0.0f32, 0u32);
+        let mut s = start;
+        while s <= t {
+            sum += evidence_level_profile(s);
+            n += 1;
+            s += 70;
+        }
+        let avg = sum / n as f32;
+        if best_avg.is_nan() || (want_loud && avg > best_avg) || (!want_loud && avg < best_avg) {
+            best_avg = avg;
+            best = t;
+        }
+        t += STEP_MS;
+    }
+    best
+}
+
+/// One still per checkpoint, captured along one continuous listening period
+/// driven by [`evidence_level_profile`]. Silence and the ramp get one
+/// checkpoint each (nothing to contrast within them); the speech phase gets
+/// its loudest and quietest moments, found by [`pick_checkpoint`], so
+/// "speech-like varying" is shown *varying* rather than at one arbitrary
+/// instant; decay gets a still partway through (still visibly elevated) and
+/// one near the end (settled), so the descent itself is visible across two
+/// frames rather than asserted. Returns the number of frames written.
+fn wave_sequence_evidence(
+    theme: Theme,
+    scale: f32,
+    dir: &Path,
+    theme_name: &str,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let mut pill = HeadlessOverlay::new(scale, theme);
+    pill.tick(0);
+    pill.apply(Command::ShowListening);
+
+    let speech_scan_from = RAMP_END + WAVE_HISTORY_SPAN_MS;
+    let mut checkpoints: [(u64, &str); 6] = [
+        (SILENCE_MS - 100, "0-silence"),
+        (RAMP_END - 100, "1-rampup"),
+        (0, "2a-speech-quiet"),
+        (0, "2b-speech-loud"),
+        (SPEECH_END + 1_500, "3a-decay-partway"),
+        (SPEECH_END + DECAY_MS - 100, "3b-decay-settled"),
+    ];
+    checkpoints[2].0 = pick_checkpoint(speech_scan_from, SPEECH_END, false);
+    checkpoints[3].0 = pick_checkpoint(speech_scan_from, SPEECH_END, true);
+    // The capture loop below ticks strictly forward, so the array has to be
+    // in time order regardless of which of "quiet" or "loud" the scan found
+    // first — swap the pair (time and label together) rather than just the
+    // time, so each still is still filed under its own correct label.
+    if checkpoints[2].0 > checkpoints[3].0 {
+        checkpoints.swap(2, 3);
+    }
+
+    let mut now = 0u64;
+    let mut written = 0u32;
+    for (at_ms, label) in checkpoints {
+        while now < at_ms {
+            now += 16;
+            pill.apply(Command::Level(evidence_level_profile(now)));
+            pill.tick(now);
+            pill.render();
+        }
+        let path = dir.join(format!("{theme_name}-wave-sequence-{label}.png"));
+        write_frame(&pill, &path, true)?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// Write one frame, optionally composited over [`backdrop_pixmap`].

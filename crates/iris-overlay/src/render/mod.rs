@@ -31,6 +31,8 @@ mod text;
 
 pub use text::{Align, FontAtlas, TextPaint};
 
+use std::collections::VecDeque;
+
 use tiny_skia::{
     Color, FillRule, GradientStop, LinearGradient, Mask, Paint, Path, Pixmap, Point, Shader,
     SpreadMode, Stroke, StrokeDash, Transform,
@@ -68,74 +70,94 @@ const GLOW_SIGMA: f32 = 14.0;
 /// Negative spread of the coloured state halo.
 const GLOW_SPREAD: f32 = 3.0;
 
-// ---------------------------------------------------------------------------
-// the wave
-// ---------------------------------------------------------------------------
-//
-// Brought back after direct captain feedback on a first pass that dropped it
-// in favour of a plain pulsing dot: "I like the waves, and I like how it
-// moves." Two things are deliberately different from the previous 28-bar
-// design it echoes:
-//
-// - The taper has a floor instead of hitting exactly zero at both ends. The
-//   previous row's `sqrt(sin(pi*p))` taper measured out at under 75% of peak
-//   height for the outer ~18% of bars each side even at maximum volume, and
-//   the very end bars never moved at all regardless of signal — see the
-//   design report for the exact numbers. That is what "the waves... get cut
-//   off about 75%" was.
-// - The response curve is expansive (`powf(1.6)`), not linear, so quiet and
-//   loud read as clearly different at a glance rather than compressing
-//   toward the middle — the captain's explicit ask, and a real functional
-//   need: silent dictations were going unnoticed until the text failed to
-//   land.
-//
-// Bar count and pitch are recomputed from the shape's *current* width every
-// frame — the same reasoning as the mask cache above: a fixed bar count
-// would either be sparse and thin at the wide-open ribbon or crowded past
-// legibility at the narrow resting capsule, so density targets a constant
-// pitch instead and the bar count follows.
-const WAVE_INSET: f32 = 7.0;
-const WAVE_TARGET_PITCH: f32 = 12.0;
-const WAVE_MIN_BARS: usize = 7;
-const WAVE_MAX_BARS: usize = 40;
-const WAVE_BAR_W_FRAC: f32 = 0.46;
-/// Bar height at full deflection, and how far the row's centre sits above the
-/// shape's — for the two ends of the `open` tween.
-///
-/// Round 3 (captain, live-desktop review): "waves that get bigger whenever
-/// the voice is louder" is the primary content of the default (no live text)
-/// presentation, and the row was still sized for its old job — a decoration
-/// sharing the shape with a wide text run — which reads as a few flat ticks
-/// at this shape's size. But that old sizing cannot simply grow: `_RIBBON`'s
-/// bottom edge — `h/2 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON/2)` — has to
-/// stay clear of the top of the live text's ink box once the ribbon opens, or
-/// the text scrim (held below the row, see [`draw_ribbon`]) cannot cover the
-/// glyphs it exists to back; at this shape height that ceiling is only a
-/// couple of px above the old numbers. So the row now has two sizes, crossfed
-/// by `open` exactly like everything else that changes as the ribbon opens
-/// (see [`wave_geometry`]): big and centred at rest, where nothing else
-/// shares its vertical space but the core glyph (which paints over it, not
-/// beside it) and the timer (off to the side, out of the row's x-range via
-/// `right_reserve`); small and offset once real text needs the row below it.
-/// `_RIBBON`'s numbers are untouched from before this round —
-/// `the_wave_row_clears_the_live_text_ink_box` still pins them against the
-/// real font at every scale, and that guard is the one to run before
-/// retuning either `_RIBBON` constant.
-const WAVE_MAX_H_REST: f32 = 22.0;
-const WAVE_Y_OFFSET_REST: f32 = 0.0;
-const WAVE_MAX_H_RIBBON: f32 = 6.0;
-const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
-const WAVE_IDLE_FLOOR: f32 = 0.05;
-const WAVE_PROCESSING_ENV: f32 = 0.16;
-const WAVE_RESTING_ENV: f32 = 0.05;
-
 /// Breathing room above and below the live text's ink box before the text
 /// scrim's rounded edge starts, in logical pixels.
 const SCRIM_PAD_Y: f32 = 3.0;
 
+// ---------------------------------------------------------------------------
+// the wave — round 5
+// ---------------------------------------------------------------------------
+//
+// Round 3 built a bar row that read as "dashes": every bar reacted to the
+// *same* current level, with a positional taper doing all the work of
+// varying bar to bar — a synchronised, static-looking fan, not sound. Round 4
+// deleted it outright rather than retune it, on the wording it had at the
+// time ("I don't want the dashes"). Round 5
+// (`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`)
+// answered both open questions from that round at once: "the timeline" the
+// captain asked for *is* a sound wave, and what makes it read as one is each
+// bar showing a genuinely different moment, not a different position.
+//
+// So each bar now reads one sample from a short rolling history of recent
+// `Model::level()` (`Renderer::wave_history`, sampled at `draw`-loop cadence
+// while `Listening`, frozen — no new samples — the instant recording stops).
+// The newest sample lands at the row's right edge, the same "newest is on
+// the right" convention the live-text ribbon and the timer already use.
+// There is no positional taper: whatever shape the row has is the shape the
+// last few seconds of audio actually had.
+const WAVE_INSET: f32 = 6.0;
+/// A firstmate visual review of the first cut of this round found the bars
+/// reading as a row of dots rather than a waveform: too few, too wide
+/// relative to their pitch, capped rounded enough to read as circles. Pitch
+/// and bar-width-fraction both dropped so the same compact width holds more,
+/// narrower bars — `porcelain-wave-sequence-1-rampup.png` from that first
+/// cut ("tall narrow vertical bars, obviously sound") is the target this
+/// retune generalises to every frame, not just the ramp.
+const WAVE_TARGET_PITCH: f32 = 5.0;
+const WAVE_MIN_BARS: usize = 8;
+const WAVE_MAX_BARS: usize = 48;
+/// Narrow enough that a bar stays visibly a bar — width clearly under its
+/// own height — even at the shortest heights silence ever produces, not
+/// only at speech amplitudes. A first retune (`0.4`) fixed the wide-open
+/// ribbon and loud frames but still read as round dots at rest, where
+/// height and width were close enough that `WAVE_BAR_CORNER_FRAC`'s
+/// rounding made the two indistinguishable.
+const WAVE_BAR_W_FRAC: f32 = 0.3;
+/// Corner radius as a fraction of bar width. Less than the `0.5` a fully
+/// rounded (pill/circle) cap would use — at the narrow widths
+/// [`WAVE_BAR_W_FRAC`] now draws, full rounding is indistinguishable from a
+/// dot; this keeps a soft edge without erasing the bar's rectangular
+/// silhouette.
+const WAVE_BAR_CORNER_FRAC: f32 = 0.3;
+/// Bar height at full deflection, and how far the row's centre sits above the
+/// shape's — for the two ends of the `open` tween. Unchanged in value from
+/// round 3: the compactness round 5 asks for comes from the *width* side
+/// (`WAVE_TARGET_PITCH`, `WAVE_MIN_BARS`), not from shrinking the row's
+/// height, and `_RIBBON`'s numbers are still what
+/// `the_wave_row_clears_the_live_text_ink_box` pins against the real font.
+const WAVE_MAX_H_REST: f32 = 22.0;
+const WAVE_Y_OFFSET_REST: f32 = 0.0;
+const WAVE_MAX_H_RIBBON: f32 = 6.0;
+const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
+/// Bar height never reaches exactly zero, real sample or idle ripple alike —
+/// a completely flat bar is closer to the "dashes" failure than a very quiet
+/// one.
+const WAVE_IDLE_FLOOR: f32 = 0.05;
+/// Exponent [`wave_bar_scale`] raises a real level to. Raised from round 1's
+/// `1.6` in the same firstmate review that narrowed the bars: a stronger
+/// tall-to-short ratio at speech amplitudes is what makes height, not just
+/// bar count, read as sound.
+const WAVE_RESPONSE_EXPONENT: f32 = 2.4;
+/// How much of the idle ripple (see [`wave_ripple`]) blends into a real
+/// sample that is itself near the floor, so silence reads as a live quiet
+/// waveform rather than N identical stubs. Small relative to a genuinely
+/// loud bar's own range (`1.0 - WAVE_IDLE_FLOOR`), so it is felt as texture
+/// on a quiet bar and vanishes under a loud one, never the other way round.
+/// Raised from an initial `0.07` once a rendered silence frame still read as
+/// too uniform even with texture present — firstmate visual review.
+const WAVE_TEXTURE_AMPLITUDE: f32 = 0.11;
 /// Gap between the wave row's right edge and the timer's left edge, so the
 /// two read as sharing the capsule rather than colliding. See [`draw_timer`].
-const WAVE_TIMER_GAP: f32 = 8.0;
+const WAVE_TIMER_GAP: f32 = 6.0;
+/// How often a fresh sample is rolled into the wave row's history, in ms.
+/// Short enough that the row reads as continuous motion rather than visibly
+/// stepping; long enough that neighbouring bars are genuinely different
+/// moments rather than the same instant redrawn.
+const WAVE_SAMPLE_INTERVAL_MS: u64 = 70;
+/// How many samples the rolling history keeps. Sized to the widest row this
+/// shape ever draws (`WAVE_MAX_BARS`) so nothing is buffered that could
+/// never be shown.
+const WAVE_HISTORY_LEN: usize = WAVE_MAX_BARS;
 
 /// The wave row's `(max_h, y_offset)`, in logical px, at a given `open`
 /// (0 = closed/rest, 1 = fully-open ribbon). Linear in `open`, the same shape
@@ -157,26 +179,59 @@ fn wave_geometry(open: f32) -> (f32, f32) {
 /// [`text_band`] is the only caller: this is how the scrim's ceiling reads the
 /// row's real extent instead of a size the bars do not actually have yet.
 /// [`wave_geometry`] — not this function — is what both sides share.
-/// [`draw_wave`] calls it directly and places its tallest bar at
-/// `cy ± max_h/2`; this is that lower edge off the same pair, in closed form,
-/// so retuning the row means retuning [`wave_geometry`] and both follow.
 fn wave_row_bottom(l: &Layout, y: f32, h: f32, open: f32) -> f32 {
     let (max_h, y_offset) = wave_geometry(open);
     y + h * 0.5 - (y_offset - max_h * 0.5) * l.scale
 }
 
-/// scaleY for one wave bar. `p` is its position across the row, 0.0–1.0;
-/// `i` is its raw index, used only to decorrelate neighbours.
-fn wave_bar_scale(p: f32, i: f32, env: f32, now_ms: u64) -> f32 {
+/// A slow, per-bar-decorrelated ripple in `0.0..=1.0` — `i` only decorrelates
+/// neighbouring bars, `now_ms` drives the animation. Shared by both the
+/// idle branch of [`wave_bar_scale`] and the texture it blends into a real
+/// sample near the noise floor, so "no sample yet" and "a real but very
+/// quiet sample" read as the same kind of live quiet, not two different
+/// mechanisms that happen to look similar.
+fn wave_ripple(i: f32, now_ms: u64) -> f32 {
     let t = now_ms as f32;
-    // Floor of 0.4 rather than 0: a gentle lens taper without ever going
-    // fully flat at the ends. See the module-level comment above.
-    let taper = 0.4 + 0.6 * (std::f32::consts::PI * p).sin().max(0.0).sqrt();
-    let wobble = 0.4 + 0.6 * ((t / 88.0 + i * 0.9).sin() * (t / 230.0 + i * 0.33).sin()).abs();
-    // Expansive, not linear: widens the gap between quiet and loud instead
-    // of compressing it.
-    let response = env.clamp(0.0, 1.0).powf(1.6);
-    WAVE_IDLE_FLOOR + response * taper * wobble * (1.0 - WAVE_IDLE_FLOOR)
+    0.5 + 0.5 * ((t / 340.0 + i * 0.7).sin() * (t / 810.0 + i * 0.29).sin()).abs()
+}
+
+/// scaleY for one wave bar, given the historical level sample it represents
+/// — `None` for a column the rolling history has not reached yet, meaning
+/// the row is still filling in from silence since the hotkey went down. `i`
+/// decorrelates the idle ripple (and the quiet-real-sample texture, below)
+/// between neighbouring bars.
+///
+/// A firstmate visual review of the first cut of this caught silence
+/// rendering as a row of *identical* marks — every bar reading the same
+/// near-zero level with literally nothing to vary it, which is
+/// indistinguishable from round 3's rejected "dashes" regardless of the
+/// mechanism behind it. A real sample that is itself near
+/// [`WAVE_IDLE_FLOOR`] now gets the same ripple texture blended in, scaled
+/// by how much headroom is left below a genuinely loud response — so it
+/// fades to nothing once the signal is unambiguously loud, and a loud bar is
+/// still read purely from data, never dressed up as texture.
+fn wave_bar_scale(sample: Option<f32>, i: f32, now_ms: u64) -> f32 {
+    match sample {
+        Some(level) => {
+            // Expansive, not linear: widens the gap between quiet and loud
+            // instead of compressing it (captain, round 1: "so it's showing
+            // that it's clearly hearing you"), and pushed further still in
+            // round 5 (firstmate review: bar-to-bar contrast read too weak
+            // to look like sound rather than a row of similar dots).
+            let response = level.clamp(0.0, 1.0).powf(WAVE_RESPONSE_EXPONENT);
+            let base = WAVE_IDLE_FLOOR + response * (1.0 - WAVE_IDLE_FLOOR);
+            let texture_room = (1.0 - response).max(0.0);
+            base + WAVE_TEXTURE_AMPLITUDE * texture_room * wave_ripple(i, now_ms)
+        }
+        None => {
+            // A believable resting state, not a flat line of identical
+            // stubs — that flatness is exactly what read as "dashes": a
+            // slow, per-bar-decorrelated ripple well under the real-signal
+            // floor, so it never competes with an actual sample once one
+            // arrives.
+            WAVE_IDLE_FLOOR * (0.5 + 0.5 * wave_ripple(i, now_ms))
+        }
+    }
 }
 
 /// How visible the whole bar row is, given the three state weights.
@@ -204,6 +259,11 @@ fn wave_alpha(listening: f32, processing: f32, inserted: f32) -> f32 {
 /// and scales by [`timer_alpha`], so it shrinks to zero in lockstep with the
 /// timer's own fade as live text opens the ribbon and the row reclaims the
 /// full width exactly as the timer vacates it.
+///
+/// `history` is [`Renderer::wave_history`]: the newest sample lands at index
+/// `history.len() - 1` and is drawn at the row's right edge (index
+/// `count - 1`); a bar older than the history's own length gets no sample at
+/// all — see [`wave_bar_scale`] for how that column reads instead.
 #[allow(clippy::too_many_arguments)]
 fn draw_wave(
     pixmap: &mut Pixmap,
@@ -214,11 +274,11 @@ fn draw_wave(
     h: f32,
     open: f32,
     right_reserve: f32,
+    history: &VecDeque<f32>,
     clip: Option<&Mask>,
 ) {
     let l = ctx.layout;
     let theme = ctx.theme;
-    let model = ctx.model;
 
     let listening = ctx.state_alpha(OverlayState::Listening);
     let processing = ctx.state_alpha(OverlayState::Processing);
@@ -227,9 +287,6 @@ fn draw_wave(
     if alpha <= 0.001 {
         return;
     }
-    let env = model.level() * listening
-        + WAVE_PROCESSING_ENV * processing
-        + WAVE_RESTING_ENV * (1.0 - listening - processing).max(0.0);
 
     let inset = WAVE_INSET * l.scale;
     let usable = (w - 2.0 * inset - right_reserve.max(0.0)).max(0.0);
@@ -244,7 +301,8 @@ fn draw_wave(
     let (row_max_h, row_y_offset) = wave_geometry(open);
     let cy = y + h * 0.5 - row_y_offset * l.scale;
     let max_h = row_max_h * l.scale;
-    let now_ms = model.now_ms();
+    let now_ms = ctx.model.now_ms();
+    let hist_len = history.len();
 
     for i in 0..count {
         let p = if count > 1 {
@@ -252,13 +310,26 @@ fn draw_wave(
         } else {
             0.5
         };
-        let scale = wave_bar_scale(p, i as f32, env, now_ms);
+        // 0 = the newest sample, which belongs at the row's right edge.
+        let age = count - 1 - i;
+        let sample = (age < hist_len).then(|| history[hist_len - 1 - age]);
+        let scale = wave_bar_scale(sample, i as f32, now_ms);
         let bh = (max_h * scale).max(l.scale * 0.6);
         let bx = x + inset + pitch * i as f32 + (pitch - bar_w) * 0.5;
         let by = cy - bh * 0.5;
-        if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * 0.5) {
+        if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * WAVE_BAR_CORNER_FRAC) {
             let colour = sample_ramp(theme.spectrum, p);
-            fill_clipped(pixmap, ctx, &path, ctx.c(colour.fade(alpha)), clip);
+            // `scale` fades a bar's own opacity, not only its height. Height
+            // alone stops being a legible signal at the couple of device px
+            // silence produces — a firstmate visual review found a rendered
+            // near-silent frame still read as a row of same-looking marks
+            // even with real per-bar height variation present, just too
+            // subtle to see at that size. A quiet bar fading toward
+            // near-transparent alongside its short height is what actually
+            // reads as "collapsing toward a thin line" rather than "a row of
+            // small solid dots" — and a loud bar, at `scale` near `1.0`,
+            // loses nothing.
+            fill_clipped(pixmap, ctx, &path, ctx.c(colour.fade(alpha * scale)), clip);
         }
     }
 }
@@ -495,13 +566,14 @@ fn glyph_half_w(l: &Layout) -> f32 {
 /// far as clearing [`glyph_half_w`] by [`GLYPH_TIMER_GAP`] takes, and never
 /// closer to the capsule's edge than [`TIMER_EDGE_PAD_MIN`].
 ///
-/// This exists because the shape is narrow on purpose ([`crate::layout::REST_W`],
-/// captain-locked) and both the glyph and the timer are centred on fixed
-/// anchors inside it: at the resting padding a four-character readout's
-/// leading digit landed *on* the spinner's outer edge. Reserving against the
-/// glyph rather than widening the capsule is the trade this shape asks for —
-/// and the clamp is the honest half of it, so a future wider run degrades to
-/// less clearance instead of digits hanging off the glass.
+/// This exists because the shape is as close to the pre-round-3 circle as a
+/// four-character timer allows ([`crate::layout::REST_W`]) and the glyph is
+/// centred on a fixed anchor inside it: at the resting padding alone a
+/// four-character readout's leading digit landed *on* the spinner's outer
+/// edge. Reserving against the glyph rather than widening the capsule
+/// further is the trade this shape asks for — and the clamp is the honest
+/// half of it, so a future wider run degrades to less clearance instead of
+/// digits hanging off the glass.
 fn timer_right_edge(l: &Layout, x: f32, w: f32, timer_w: f32) -> f32 {
     let clear_of_glyph = l.center_x + glyph_half_w(l) + GLYPH_TIMER_GAP * l.scale + timer_w;
     (x + w - l.text_pad_x)
@@ -521,6 +593,18 @@ pub struct Renderer {
     measured_w: f32,
     prev_now: u64,
     started: bool,
+
+    /// Recent [`Model::level`] samples, oldest first, that [`draw_wave`]
+    /// reads to draw the row as a genuine scrolling waveform rather than one
+    /// current level fanned across every bar. Cleared whenever the shape is
+    /// fully hidden, so every appearance starts from silence rather than
+    /// picking up a stale utterance's shape. See the wave section's module
+    /// doc, above.
+    wave_history: VecDeque<f32>,
+    /// `model.now_ms()` the last sample was rolled into `wave_history`, so a
+    /// fresh one is taken only every [`WAVE_SAMPLE_INTERVAL_MS`], not every
+    /// frame.
+    wave_last_sample_ms: u64,
 }
 
 impl Renderer {
@@ -545,6 +629,8 @@ impl Renderer {
             measured_w,
             prev_now: 0,
             started: false,
+            wave_history: VecDeque::with_capacity(WAVE_HISTORY_LEN),
+            wave_last_sample_ms: 0,
         }
     }
 
@@ -581,6 +667,14 @@ impl Renderer {
     #[must_use]
     pub fn pixmap(&self) -> &Pixmap {
         &self.pixmap
+    }
+
+    /// The wave row's rolling history, oldest first — test-only, so a
+    /// regression can assert directly on the samples a frame actually
+    /// accumulated instead of reasoning about it through pixels alone.
+    #[cfg(test)]
+    fn wave_history_snapshot(&self) -> Vec<f32> {
+        self.wave_history.iter().copied().collect()
     }
 
     /// Draw `model` and return the frame. Premultiplied RGBA, ready for
@@ -641,13 +735,33 @@ impl Renderer {
             masks,
             openness,
             measured_w,
+            wave_history,
+            wave_last_sample_ms,
             ..
         } = self;
 
         pixmap.fill(Color::TRANSPARENT);
         let presence = model.presence();
         if presence <= 0.001 {
+            // Every appearance starts from silence, not a stale utterance's
+            // waveform left over from the last one.
+            wave_history.clear();
             return &self.pixmap;
+        }
+
+        // Roll a fresh sample into the wave's history only while the mic is
+        // actually live: `Processing` and `Inserted` freeze the row at
+        // whatever shape it last had, rather than manufacturing an ambient
+        // level for it to hold — the timeline it draws is real audio or
+        // nothing, never a synthesised placeholder.
+        if model.state() == OverlayState::Listening
+            && model.now_ms().saturating_sub(*wave_last_sample_ms) >= WAVE_SAMPLE_INTERVAL_MS
+        {
+            *wave_last_sample_ms = model.now_ms();
+            if wave_history.len() >= WAVE_HISTORY_LEN {
+                wave_history.pop_front();
+            }
+            wave_history.push_back(model.level());
         }
 
         let theme = *model.theme();
@@ -699,7 +813,7 @@ impl Renderer {
         let glyph_a = glyph_alpha(open);
         let timer_a = timer_alpha(open);
         let timer_text = format_timer(model.listening_ms());
-        let timer_w = atlas.measure(&timer_text, layout.text_font, 0.0);
+        let timer_w = atlas.measure(&timer_text, layout.timer_font, 0.0);
         let timer_right = timer_right_edge(layout, x, w, timer_w);
         let timer_zone =
             ((x + w - timer_right) + timer_w + WAVE_TIMER_GAP * layout.scale) * timer_a;
@@ -714,6 +828,7 @@ impl Renderer {
             h,
             open,
             timer_zone,
+            wave_history,
             cached.map(|m| &m.clip),
         );
         draw_glyph(pixmap, &ctx, glyph_a);
@@ -763,13 +878,12 @@ impl Ctx<'_> {
     ///
     /// Reads [`shown_state`] / [`shown_cross`], so the cross-fade is frozen
     /// while the shape is *leaving*. Letting it run there means every term
-    /// written as `1.0 - inserted` (the core dot) or `1.0 - inserted * 0.9`
-    /// (the wave row) *inverts* over the 90 ms after the inserted hold
-    /// expires — the checkmark dissolved into a re-emerging mint dot and a
-    /// full bar row while the shape faded out. Holding the last visible state
-    /// at full weight leaves presence as the single thing that animates an
-    /// exit, which is what it was always meant to be. Enter, and every
-    /// visible-to-visible transition, are untouched.
+    /// written as `1.0 - inserted` (the core dot) *inverts* over the 90 ms
+    /// after the inserted hold expires — the checkmark dissolved into a
+    /// re-emerging mint dot while the shape faded out. Holding the last
+    /// visible state at full weight leaves presence as the single thing that
+    /// animates an exit, which is what it was always meant to be. Enter, and
+    /// every visible-to-visible transition, are untouched.
     fn state_alpha(&self, state: OverlayState) -> f32 {
         fade_between(
             shown_state(self.model) == state,
@@ -793,8 +907,8 @@ impl Ctx<'_> {
 /// while the shape is on its way out this is the state it is leaving *from*,
 /// and every appearance decision in this module reads it instead of
 /// [`Model::state`] — one place, so an exit can never half-switch, with the
-/// wave row and the core dot holding while the glow, the core's colour or the
-/// processing shimmer jump to their `Hidden` answers on the first exit frame.
+/// core dot holding while the glow, the core's colour or the processing
+/// shimmer jump to their `Hidden` answers on the first exit frame.
 ///
 /// What deliberately does *not* read it: anything measuring elapsed time in
 /// the current state (the check's draw-on progress), and the ribbon's
@@ -1174,15 +1288,19 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 }
 
 /// The elapsed-recording timer: `m:ss`, right-aligned in the same row the
-/// live-text ribbon used, sharing the capsule with the wave row rather than
-/// sitting under it — this design's second round rejected an under-pill
+/// live-text ribbon uses, sharing the capsule with the core glyph rather
+/// than sitting under it — this design's second round rejected an under-pill
 /// caption outright, and the fix here is not to resurrect that placement in
-/// a new form. `alpha` is [`timer_alpha`], *not* the [`glyph_alpha`] the
-/// centred glyph uses: this run and the ribbon's are drawn on one anchor, so
-/// only a fade that is zero wherever [`text_alpha`] is non-zero keeps digits
-/// off the newest live word. `right` is [`timer_right_edge`], which holds the
-/// run clear of the centred glyph inside a capsule too narrow for the resting
-/// padding to do it alone.
+/// a new form. Drawn at [`crate::layout::TIMER_FONT`], its own small size —
+/// round 4 (captain, live-desktop review of round 3's shipped capsule):
+/// "the timer is very big... I don't want the huge font", the concrete
+/// shape of round 3 having reused the live-text size for this run. `alpha`
+/// is [`timer_alpha`], *not* the [`glyph_alpha`] the centred glyph uses:
+/// this run and the ribbon's are drawn on one anchor, so only a fade that is
+/// zero wherever [`text_alpha`] is non-zero keeps digits off the newest live
+/// word. `right` is [`timer_right_edge`], which holds the run clear of the
+/// centred glyph inside a capsule too narrow for the resting padding to do
+/// it alone.
 ///
 /// Cascadia Mono is monospaced (`the_face_is_monospaced` pins this), so every
 /// digit and the colon share one advance width and the run never reshuffles
@@ -1241,7 +1359,7 @@ fn draw_timer(
             atlas.draw(
                 pixmap,
                 text,
-                l.text_font,
+                l.timer_font,
                 0.0,
                 tx + ux * d,
                 ty + uy * d,
@@ -1254,7 +1372,7 @@ fn draw_timer(
     atlas.draw(
         pixmap,
         text,
-        l.text_font,
+        l.timer_font,
         0.0,
         tx,
         ty,
@@ -1271,9 +1389,10 @@ fn draw_timer(
 /// not from the ink of whichever suffix happens to be shown this frame, so
 /// neither moves as words scroll off the left — the band would otherwise
 /// breathe by a pixel or three every time a descender entered or left the
-/// window, and the run with it. The top is held at or below the waveform
-/// row's bottom edge, which
-/// `the_wave_row_clears_the_live_text_ink_box` pins against the real glyphs.
+/// window, and the run with it. The top is held at or below the wave row's
+/// bottom edge, which `the_wave_row_clears_the_live_text_ink_box` pins
+/// against the real glyphs — round 5 restored this clamp along with the row
+/// itself; see the wave section's module doc, above, and `wave_row_bottom`.
 ///
 /// It takes `open` for exactly one reason: the row it has to stay clear of is
 /// itself a function of `open` (see [`wave_geometry`]), and only reaches the
@@ -1352,8 +1471,7 @@ fn draw_ribbon(
     //
     // Vertically the band is the face's own line box rather than the shape or
     // the shown substring's ink, and its top edge is held at or below the
-    // bottom of the waveform row: a shape-height band reached up into the bars
-    // and visibly darkened them along the whole length of the text.
+    // bottom of the wave row — see `text_band`.
     let text_w = atlas.measure(shown, l.text_font, 0.0);
     if text_w > 0.0 {
         let scrim_pad = l.text_pad_x * 0.4;
@@ -1506,8 +1624,8 @@ mod tests {
     }
 
     /// Alpha of a pixel in the shell body itself: off-centre and low enough to
-    /// be clear of the wave row, the core glyph and its halo, all of which
-    /// paint opaque colours over the glass.
+    /// be clear of the core glyph and its halo, and the timer's own zone,
+    /// all of which paint opaque colours over the glass.
     fn body_alpha(r: &Renderer) -> u8 {
         let l = r.layout();
         let x = (l.center_x - 12.0 * l.scale) as u32;
@@ -1542,21 +1660,24 @@ mod tests {
         span
     }
 
-    /// Round 3 of captain feedback: the resting shape (no live text — the
-    /// shipped default) must read as a capsule, not the old true circle. This
-    /// pins the actual drawn width to `layout.rest_w`, not `layout.shape_h`,
-    /// which is the exact regression a stray `shape_h` left in `draw`'s width
-    /// formula would reintroduce.
+    /// Round 5 (`round5-direction.md`): "compact... hold the line near
+    /// [round 4's 102] and do not let the wave row push it back toward 128."
+    /// The resting shape (no live text — the shipped default) has to hold
+    /// three things now — glyph, wave row, timer — so it cannot be round 4's
+    /// bare 102 any more, but this pins the actual drawn width to
+    /// `layout.rest_w` (the same regression a stray `shape_h` left in
+    /// `draw`'s width formula would reintroduce) and checks it stays clearly
+    /// short of round 3's rejected 128, not creeping back toward it.
     #[test]
-    fn the_resting_shape_is_the_capsule_width_not_a_circle() {
+    fn the_resting_shape_stays_compact_not_round_3s_capsule() {
         let (r, _) = drive(&[Command::ShowListening], 400, PRISM_DARK);
         let l = r.layout();
         let (lo, hi) = lit_span_at(&r, l.center_y as u32, 30).expect("nothing drawn at centre row");
         let width = (hi - lo) as f32;
+        const ROUND_3_CAPSULE_W: f32 = 128.0;
         assert!(
-            width > l.shape_h * 1.5,
-            "resting width {width} reads as a circle (shape_h {})",
-            l.shape_h
+            width < ROUND_3_CAPSULE_W * 0.95,
+            "resting width {width} is as wide as round 3's rejected capsule"
         );
         // Within a shadow-blur's worth of the exact rest width — the shell
         // itself, not the ambient shadow bleeding a few px wider.
@@ -1567,82 +1688,282 @@ mod tests {
         );
     }
 
-    /// How far above the row's centre the wave's own ink reaches, in device
-    /// px, at the loudest bar in the frame.
-    ///
-    /// Measures *bar ink*, not "anything lit": the glass body fills the whole
-    /// capsule interior at [`GLASS_FILL_ALPHA`] with the ambient shadow and
-    /// state glow under it, so a low alpha threshold here is satisfied by
-    /// every interior pixel before a single bar is drawn. Bars are painted at
-    /// full alpha (`wave_alpha` is 1.0 while listening), so they are the only
-    /// thing in the row that composites to near-opaque. The run has to be
-    /// *contiguous* upward from the centre for the same reason: the lit top
-    /// edge (`inner_highlight`) is a near-opaque hairline of its own along the
-    /// top of the shape, and a plain topmost-hit scan would find it instead of
-    /// a bar.
-    fn wave_reach(r: &Renderer) -> u32 {
-        let l = r.layout();
-        let px = |x: u32, y: u32| r.pixmap().pixels()[(y * l.window_w + x) as usize];
-        let cy = l.center_y as u32;
-        // Every column of the row except the core glyph's own opaque circle at
-        // dead centre (radius ~0.17 * shape_h with its pulse) and the timer's
-        // zone off to the right — so this measures bars, never the dot or a
-        // digit. The loudest bar is whichever one the wobble has up at this
-        // instant, so all of them are considered.
-        let lo = (l.center_x - l.rest_w * 0.5 + WAVE_INSET * l.scale) as u32;
-        let hi = (l.center_x - l.shape_h * 0.25) as u32;
-        let mut furthest = 0;
-        for x in lo..hi {
-            let mut dy = 0;
-            while dy < (l.shape_h * 0.5) as u32 && px(x, cy.saturating_sub(dy)).alpha() > 200 {
-                dy += 1;
-            }
-            furthest = furthest.max(dy.saturating_sub(1));
+    /// The round-3 bug, at the unit level: every bar reacted to the *same*
+    /// instantaneous level, with a positional taper doing the work of
+    /// varying bar to bar — decorrelated position, not decorrelated time.
+    /// `wave_bar_scale` must not read `i` at all for a real sample; only the
+    /// idle-ripple branch (no sample yet) is allowed to vary by position.
+    #[test]
+    fn a_loud_sample_reads_the_same_regardless_of_which_bar_it_lands_on() {
+        // Loud enough that WAVE_TEXTURE_AMPLITUDE's headroom term is
+        // negligible — this is checking for a reintroduced *height* taper,
+        // not the deliberate quiet-sample texture below.
+        let first = wave_bar_scale(Some(1.0), 0.0, 12_345);
+        for i in [1.0f32, 7.0, 19.0, 39.0] {
+            let got = wave_bar_scale(Some(1.0), i, 12_345);
+            assert!(
+                (got - first).abs() < 1e-6,
+                "bar 0 read {first}, bar {i} read {got} — a positional taper crept back in"
+            );
         }
-        furthest
     }
 
-    /// A visual review of the first cut of this composition found the wave
-    /// row reading as a few flat, barely-visible ticks: it was still sized
-    /// for its old job (a decoration sharing the shape with a wide text run),
-    /// not the primary content of a shape with nothing else in it. This
-    /// drives a sustained loud level and checks that some bar's ink actually
-    /// reaches well away from the row's own centre — and, against a silent
-    /// frame drawn the same way, that what is being measured is the bars
-    /// responding to level at all rather than the glass underneath them.
+    /// The counterpart to the test above: a real sample near the floor
+    /// *must* vary by position, on purpose — this is the fix for silence
+    /// rendering as a row of identical marks (firstmate review of the first
+    /// round-5 cut), and it would be indistinguishable from the bug it fixes
+    /// if this ever collapsed back to one value.
+    #[test]
+    fn a_quiet_real_sample_still_varies_by_position_like_the_idle_ripple_does() {
+        let first = wave_bar_scale(Some(0.0), 0.0, 12_345);
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..8 {
+            let got = wave_bar_scale(Some(0.0), i as f32, 12_345);
+            distinct.insert((got * 10_000.0) as i64);
+            assert!(
+                got < WAVE_IDLE_FLOOR + WAVE_TEXTURE_AMPLITUDE + 1e-6,
+                "bar {i} read {got}, past the texture's own ceiling — it would read as signal"
+            );
+        }
+        assert!(
+            distinct.len() > 1,
+            "every bar read the exact same near-zero value ({first}) — that is the row of \
+             identical marks this exists to fix"
+        );
+    }
+
+    /// The expansive response curve the captain asked for in round 1 ("so
+    /// it's showing that it's clearly hearing you") must still hold per
+    /// sample: loud reads clearly taller than quiet.
+    #[test]
+    fn a_loud_sample_reads_taller_than_a_quiet_one() {
+        let quiet = wave_bar_scale(Some(0.05), 3.0, 0);
+        let loud = wave_bar_scale(Some(1.0), 3.0, 0);
+        assert!(
+            loud > quiet * 2.0,
+            "quiet {quiet}, loud {loud} — the response barely differs"
+        );
+    }
+
+    /// A column the rolling history has not reached yet (the row is still
+    /// filling in from silence) must read as a quiet, believable ripple —
+    /// round 5's own words for what a flat resting row is not allowed to be
+    /// again: "not a flat line of identical stubs." Two things pin that:
+    /// it stays below the real-signal floor (so it never masquerades as an
+    /// actual loud moment), and it is not one constant value stamped across
+    /// every idle bar (that flatness is the "dashes" failure by another
+    /// name).
+    #[test]
+    fn an_unfilled_bar_ripples_quietly_instead_of_sitting_flat() {
+        let quietest_real_sample = wave_bar_scale(Some(0.0), 0.0, 0);
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..8 {
+            let idle = wave_bar_scale(None, i as f32, 5_000);
+            assert!(
+                idle <= quietest_real_sample + 1e-6,
+                "bar {i}: idle ripple {idle} reached as high as a real quiet sample \
+                 {quietest_real_sample} — it would read as signal, not silence"
+            );
+            distinct.insert((idle * 10_000.0) as i64);
+        }
+        assert!(
+            distinct.len() > 1,
+            "every idle bar read the exact same value — that is a flat line of \
+             identical stubs, the failure this exists to avoid"
+        );
+    }
+
+    /// The same idle ripple must animate — a believable ripple moves; a
+    /// value frozen in time is a flat line that merely differs by position
+    /// instead of by neither.
+    #[test]
+    fn the_idle_ripple_moves_over_time() {
+        let a = wave_bar_scale(None, 2.0, 0);
+        let b = wave_bar_scale(None, 2.0, 4_000);
+        assert!(
+            (a - b).abs() > 1e-6,
+            "the idle ripple read {a} at t=0 and {b} at t=4000 — it is not moving"
+        );
+    }
+
+    /// The whole point of round 5: the row has to be a real rolling history
+    /// of what the microphone actually measured, not a single current level
+    /// re-read every frame. Feeding two very different levels, settled long
+    /// enough apart to leave the smoothing behind, must leave *both* values
+    /// somewhere in the buffer — round 3's design had no memory at all, so a
+    /// buffer that collapsed to one repeated value would be that bug back.
+    #[test]
+    fn the_history_keeps_distinct_samples_not_one_collapsed_value() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        let mut r = Renderer::new(1.0);
+        let mut t = 0u64;
+        while t < 1_400 {
+            t += 16;
+            // Long enough per phase (well past LEVEL_ATTACK_MS/RELEASE_MS)
+            // that consecutive sampled levels are genuinely different, not
+            // still mid-transition from the last toggle.
+            let level = if (t / 350) % 2 == 0 { 0.05 } else { 0.95 };
+            model.apply(Command::Level(level));
+            model.tick(t);
+            r.draw(&model);
+        }
+        let history = r.wave_history_snapshot();
+        assert!(
+            history.len() >= 4,
+            "only {} samples accumulated over 1.4s of listening",
+            history.len()
+        );
+        let quiet = history.iter().filter(|&&v| v < 0.3).count();
+        let loud = history.iter().filter(|&&v| v > 0.6).count();
+        assert!(
+            quiet > 0 && loud > 0,
+            "history never captured both a quiet and a loud moment: {history:?}"
+        );
+    }
+
+    /// Recording stops the instant `Listening` ends; the row must freeze
+    /// exactly there, not keep manufacturing an ambient level to hold. A
+    /// timeline of real audio that quietly starts inventing frames the
+    /// microphone never produced is worse than one that just stops.
+    #[test]
+    fn the_history_stops_growing_the_moment_listening_ends() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        model.apply(Command::Level(0.8));
+        let mut r = Renderer::new(1.0);
+        let mut t = 0u64;
+        while t < 600 {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+        }
+        let settled = r.wave_history_snapshot();
+        assert!(!settled.is_empty(), "nothing accumulated while listening");
+
+        model.apply(Command::Processing);
+        for _ in 0..80 {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+        }
+        assert_eq!(
+            r.wave_history_snapshot(),
+            settled,
+            "the history kept changing after listening ended"
+        );
+    }
+
+    /// Every appearance starts from silence. A wave row that kept the last
+    /// utterance's shape across a fresh `ShowListening` would draw a loud
+    /// waveform before the microphone had captured a single new sample.
+    #[test]
+    fn a_fresh_utterance_starts_the_wave_row_from_silence() {
+        let mut model = Model::new(PRISM_DARK);
+        model.tick(0);
+        model.apply(Command::ShowListening);
+        model.apply(Command::Level(1.0));
+        let mut r = Renderer::new(1.0);
+        let mut t = 0u64;
+        while t < 600 {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+        }
+        assert!(!r.wave_history_snapshot().is_empty());
+
+        model.apply(Command::Hide);
+        while !model.is_idle() {
+            t += 16;
+            model.tick(t);
+            r.draw(&model);
+        }
+        assert!(
+            r.wave_history_snapshot().is_empty(),
+            "history survived past the shape going fully hidden"
+        );
+    }
+
+    /// The text scrim is held below the wave row, so the row's bottom edge is
+    /// what decides whether the scrim can cover the glyphs at all. Measured
+    /// against every printable ASCII character, because a `$` or a brace rides
+    /// higher than any letter and the scrim is sized to whatever the
+    /// transcript actually contains.
+    #[test]
+    fn the_wave_row_clears_the_live_text_ink_box() {
+        let printable: String = (0x20u8..0x7F).map(char::from).collect();
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let l = Layout::new(scale);
+            let mut atlas = FontAtlas::new();
+            let (ink_top, _) = atlas.ink_extents(&printable, l.text_font);
+            let baseline = l.shape_h * 0.5 + atlas.baseline_offset(l.text_font);
+            let ink_box_top = baseline - ink_top;
+            let wave_bottom =
+                l.shape_h * 0.5 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON * 0.5) * l.scale;
+            assert!(
+                wave_bottom < ink_box_top,
+                "scale {scale}: wave row ends at {wave_bottom}, into an ink box starting at {ink_box_top}"
+            );
+            let wave_top =
+                l.shape_h * 0.5 - (WAVE_Y_OFFSET_RIBBON + WAVE_MAX_H_RIBBON * 0.5) * l.scale;
+            assert!(
+                wave_top > 0.0,
+                "scale {scale}: wave row starts at {wave_top}, outside the shape"
+            );
+        }
+    }
+
+    /// A visual review of the first round-5 cut found the row reading as
+    /// nearly invisible at rest — this drives a sustained loud level and
+    /// checks that some bar's ink actually reaches well away from the row's
+    /// own centre, against a silent frame drawn the same way, so what is
+    /// being measured is genuine response rather than the glass underneath.
     #[test]
     fn the_wave_row_has_real_presence_at_a_loud_sustained_level() {
-        // Long enough for the one-pole level smoothing to settle.
+        // Long enough for the rolling history to fill with the held level.
         let (loud, _) = drive(
             &[Command::ShowListening, Command::Level(1.0)],
-            600,
+            1_000,
             PRISM_DARK,
         );
         let (silent, _) = drive(
             &[Command::ShowListening, Command::Level(0.0)],
-            600,
+            1_000,
             PRISM_DARK,
         );
 
-        let reach = wave_reach(&loud);
-        let quiet_reach = wave_reach(&silent);
-        // The bar the flat-ticks cut actually drew: `_RIBBON`-sized, so its
-        // *whole* height was `WAVE_MAX_H_RIBBON`. Reaching further than that
-        // above the row's centre alone is what "real presence" means here.
-        // Deliberately not a fraction of `WAVE_MAX_H_REST` — a threshold
-        // derived from the constant under test shrinks with it and passes the
-        // regression it exists to catch.
-        let min_reach = (WAVE_MAX_H_RIBBON * loud.layout().scale) as u32;
+        let l = loud.layout();
+        let px = |r: &Renderer, x: u32, y: u32| r.pixmap().pixels()[(y * l.window_w + x) as usize];
+        let cy = l.center_y as u32;
+        // The row's usable span excludes the centred glyph and the timer
+        // zone on the right — scan only the left portion, clear of both.
+        let lo = (l.center_x - l.rest_w * 0.5 + WAVE_INSET * l.scale) as u32;
+        let hi = (l.center_x - l.shape_h * 0.3) as u32;
+        let reach = |r: &Renderer| -> u32 {
+            let mut furthest = 0;
+            for x in lo..hi {
+                let mut dy = 0;
+                while dy < (l.shape_h * 0.5) as u32 && px(r, x, cy.saturating_sub(dy)).alpha() > 200
+                {
+                    dy += 1;
+                }
+                furthest = furthest.max(dy.saturating_sub(1));
+            }
+            furthest
+        };
+
+        let loud_reach = reach(&loud);
+        let quiet_reach = reach(&silent);
         assert!(
-            reach > min_reach,
-            "loudest bar only reached {reach} px from the row's centre, wanted more than \
-             {min_reach} (the whole height of the `_RIBBON`-sized row) — the row reads as \
-             flat ticks again"
+            loud_reach > (WAVE_MAX_H_REST * loud.layout().scale * 0.3) as u32,
+            "loudest bar only reached {loud_reach} px from the row's centre"
         );
         assert!(
-            quiet_reach * 2 < reach,
-            "a silent frame measured {quiet_reach} px against the loud frame's {reach} — this \
-             is measuring the glass body, not the bars"
+            quiet_reach * 2 < loud_reach,
+            "a silent frame measured {quiet_reach} px against the loud frame's {loud_reach} — \
+             this is measuring the glass body, not the bars"
         );
     }
 
@@ -1688,12 +2009,12 @@ mod tests {
         }
     }
 
-    /// The addendum's second requirement: an elapsed-recording timer shares
-    /// the capsule with the wave row in the default presentation. This does
-    /// not assert exact digits (that's `state::tests::timer_formats_like_a_stopwatch`
-    /// and `the_timer_freezes_when_speech_ends`) — just that glyph ink is
-    /// drawn in the right-aligned zone `draw_timer` owns, in `theme.ink` and
-    /// never the near-black scrim.
+    /// An elapsed-recording timer shares the capsule with the core glyph in
+    /// the default presentation. This does not assert exact digits (that's
+    /// `state::tests::timer_formats_like_a_stopwatch` and
+    /// `the_timer_freezes_when_speech_ends`) — just that glyph ink is drawn
+    /// in the right-aligned zone `draw_timer` owns, in `theme.ink` and never
+    /// the near-black scrim.
     ///
     /// Colour is the whole of the assertion, deliberately. The zone sits
     /// inside the capsule, so the glass body lights every pixel in it at
@@ -1701,7 +2022,7 @@ mod tests {
     /// crisp ink pass composites to a near-opaque pixel carrying `theme.ink`'s
     /// own near-white RGB.
     #[test]
-    fn the_timer_draws_ink_coloured_pixels_beside_the_waves() {
+    fn the_timer_draws_ink_coloured_pixels_in_its_own_zone() {
         let (r, _) = drive(
             &[Command::ShowListening, Command::Level(0.5)],
             1200,
@@ -1714,7 +2035,7 @@ mod tests {
         // drifted apart once the timer started being pushed in to clear the
         // glyph.
         let mut atlas = FontAtlas::new();
-        let timer_w = atlas.measure(&format_timer(1_200), l.text_font, 0.0);
+        let timer_w = atlas.measure(&format_timer(1_200), l.timer_font, 0.0);
         let x = l.center_x - l.rest_w * 0.5;
         let right_edge = timer_right_edge(l, x, l.rest_w, timer_w) as u32;
         let zone_start = (right_edge as f32 - timer_w) as u32;
@@ -1743,6 +2064,64 @@ mod tests {
         );
     }
 
+    /// A tall bar sits close to the timer's reserved zone by construction —
+    /// the margin `draw_wave`'s `usable` computation leaves is exactly
+    /// `WAVE_INSET`, not a generous one — and a firstmate visual review
+    /// flagged what looked like a collision in a rendered ramp-up frame.
+    ///
+    /// A first cut of this test compared the timer zone's raw pixel colours
+    /// against `theme.spectrum`'s stops directly and failed on Porcelain —
+    /// a false positive, not a real bug: `fill_glass_shell` tints the
+    /// *entire* shell, timer zone included, with that same ramp at low alpha
+    /// by design, so "the pixel is a spectrum colour" is true everywhere on
+    /// the shell and proves nothing about a bar specifically. The property
+    /// that actually holds is narrower and provably correct instead of
+    /// merely plausible: nothing in the timer zone depends on the wave
+    /// row's amplitude at all, since `draw_glyph` and `draw_timer` take no
+    /// level, so a loud frame and a silent frame — same elapsed time, same
+    /// digits, same everything else — must render *byte-identical* pixels
+    /// there. A real collision would fail that regardless of what colour it
+    /// happened to be.
+    #[test]
+    fn the_wave_row_never_reaches_the_timers_zone_at_full_amplitude() {
+        for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+            let (loud, _) = drive(&[Command::ShowListening, Command::Level(1.0)], 2_000, theme);
+            let (quiet, _) = drive(&[Command::ShowListening, Command::Level(0.0)], 2_000, theme);
+            let l = loud.layout();
+            let mut atlas = FontAtlas::new();
+            let timer_w = atlas.measure(&format_timer(2_000), l.timer_font, 0.0);
+            let x = l.center_x - l.rest_w * 0.5;
+            let right_edge = timer_right_edge(l, x, l.rest_w, timer_w) as u32;
+            let zone_start = (right_edge as f32 - timer_w) as u32;
+
+            let mut checked = 0;
+            for y in (l.center_y - 12.0 * l.scale) as u32..=(l.center_y + 12.0 * l.scale) as u32 {
+                for x in zone_start..=right_edge {
+                    let idx = (y * l.window_w + x) as usize;
+                    let a = loud.pixmap().pixels()[idx];
+                    let b = quiet.pixmap().pixels()[idx];
+                    let diff = i32::from(a.red()).abs_diff(i32::from(b.red()))
+                        + i32::from(a.green()).abs_diff(i32::from(b.green()))
+                        + i32::from(a.blue()).abs_diff(i32::from(b.blue()))
+                        + i32::from(a.alpha()).abs_diff(i32::from(b.alpha()));
+                    assert!(
+                        diff == 0,
+                        "{}: pixel ({x},{y}) in the timer zone differs between a loud and a \
+                         silent frame ({a:?} vs {b:?}) — something wave-level-dependent is \
+                         painting there",
+                        theme.name
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked > 10,
+                "{}: only {checked} px sampled in the timer zone",
+                theme.name
+            );
+        }
+    }
+
     /// The theme side of the timer's contrast guarantee is pinned in
     /// `theme::tests::the_timer_edge_reads_against_any_desktop_the_ink_cannot`;
     /// this is the renderer's half of it — that `theme.timer_edge` reaches
@@ -1765,7 +2144,7 @@ mod tests {
         let l = r.layout();
         let edge = PRISM_DARK.timer_edge;
         let mut atlas = FontAtlas::new();
-        let timer_w = atlas.measure(&format_timer(1_200), l.text_font, 0.0);
+        let timer_w = atlas.measure(&format_timer(1_200), l.timer_font, 0.0);
         let x = l.center_x - l.rest_w * 0.5;
         let right_edge = timer_right_edge(l, x, l.rest_w, timer_w) as u32;
         let zone_start = (right_edge as f32 - timer_w - TIMER_EDGE_OFFSET * l.scale) as u32;
@@ -1795,10 +2174,9 @@ mod tests {
 
     /// The shared guard for this file's recurring compositing bug: two things
     /// meant to fade together, reasoned about only at the endpoints, wrong
-    /// everywhere in between. It has now bitten three unrelated pairs on this
-    /// shape — the text scrim against the enlarged wave row through the
-    /// ribbon morph, the elapsed timer against live text, and the timer's
-    /// outline against its own ink.
+    /// everywhere in between. It has now bitten unrelated pairs on this
+    /// shape — the elapsed timer against live text, and the timer's outline
+    /// against its own ink.
     ///
     /// Use it for **any** element in this renderer drawn as several
     /// accumulating alpha passes that is supposed to fade in proportion with
@@ -1924,35 +2302,6 @@ mod tests {
         );
     }
 
-    /// The text scrim is held below the wave row, so the row's bottom edge is
-    /// what decides whether the scrim can cover the glyphs at all. Measured
-    /// against every printable ASCII character, because a `$` or a brace rides
-    /// higher than any letter and the scrim is sized to whatever the
-    /// transcript actually contains.
-    #[test]
-    fn the_wave_row_clears_the_live_text_ink_box() {
-        let printable: String = (0x20u8..0x7F).map(char::from).collect();
-        for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            let l = Layout::new(scale);
-            let mut atlas = FontAtlas::new();
-            let (ink_top, _) = atlas.ink_extents(&printable, l.text_font);
-            let baseline = l.shape_h * 0.5 + atlas.baseline_offset(l.text_font);
-            let ink_box_top = baseline - ink_top;
-            let wave_bottom =
-                l.shape_h * 0.5 - (WAVE_Y_OFFSET_RIBBON - WAVE_MAX_H_RIBBON * 0.5) * l.scale;
-            assert!(
-                wave_bottom < ink_box_top,
-                "scale {scale}: wave row ends at {wave_bottom}, into an ink box starting at {ink_box_top}"
-            );
-            let wave_top =
-                l.shape_h * 0.5 - (WAVE_Y_OFFSET_RIBBON + WAVE_MAX_H_RIBBON * 0.5) * l.scale;
-            assert!(
-                wave_top > 0.0,
-                "scale {scale}: wave row starts at {wave_top}, outside the shape"
-            );
-        }
-    }
-
     /// What the scrim has to be for the whole of the morph, and what it has to
     /// cover once the ribbon is open.
     ///
@@ -2049,10 +2398,10 @@ mod tests {
     }
 
     /// The exit that follows a successful insert: the checkmark fades out on
-    /// its own. The bug this pins had the mint core dot and the whole wave row
-    /// fading back *in* underneath it, because the state cross-fade kept
-    /// running toward `Hidden` — which draws nothing — while presence was
-    /// already carrying the exit.
+    /// its own. The bug this pins had the mint core dot fading back *in*
+    /// underneath it, because the state cross-fade kept running toward
+    /// `Hidden` — which draws nothing — while presence was already carrying
+    /// the exit.
     #[test]
     fn nothing_fades_back_in_while_the_inserted_check_leaves() {
         let mut model = Model::new(PRISM_DARK);
@@ -2078,17 +2427,10 @@ mod tests {
                 alpha: model.presence(),
                 model: &model,
             };
-            let listening = ctx.state_alpha(OverlayState::Listening);
-            let processing = ctx.state_alpha(OverlayState::Processing);
             let inserted = ctx.state_alpha(OverlayState::Inserted);
             assert!(
                 (inserted - 1.0).abs() < 1e-6,
                 "at {t} ms the inserted weight had already decayed to {inserted}"
-            );
-            assert!(
-                wave_alpha(listening, processing, inserted) <= 0.001,
-                "at {t} ms the wave row came back at {}",
-                wave_alpha(listening, processing, inserted)
             );
             assert!(
                 (1.0 - inserted) * glyph_alpha(0.0) <= 0.001,
@@ -2172,99 +2514,6 @@ mod tests {
                 assert!(frames > 4, "{name}: only {frames} exit frames sampled");
             }
         }
-    }
-
-    /// The same thing at the pixel level, and the reason it is worth two
-    /// tests: the row of bars is drawn *over* the glass, so ink reappearing
-    /// there shows up as the band getting more opaque even while the shape as
-    /// a whole is fading out.
-    #[test]
-    fn the_wave_band_only_ever_fades_during_the_exit() {
-        let mut model = Model::new(PRISM_DARK);
-        model.tick(0);
-        model.apply(Command::ShowListening);
-        model.apply(Command::Level(1.0));
-        let mut r = Renderer::new(1.0);
-        let mut t = 0u64;
-        while t < 400 {
-            t += 16;
-            model.tick(t);
-            r.draw(&model);
-        }
-        model.apply(Command::Inserted { latency_ms: 142 });
-
-        // Sampled in *shape-local* space and mapped through the same enter
-        // transform the frame was drawn with: the exit slides the shape up by
-        // 10 px and shrinks it to 90 %, so a fixed window rectangle would
-        // watch different parts of the shape drift past and prove nothing.
-        //
-        // No text is ever sent, so `wave_alpha` is a deterministic 0 for the
-        // whole monitored window: once `Inserted` is entered directly from
-        // `Listening` (skipping `Processing`, as a streaming engine's final
-        // does), its cross-fade completes long before `INSERTED_HOLD_MS`
-        // expires, and [`Ctx::state_alpha`] freezes every state weight at
-        // that value for the rest of the exit — so by the time this closure
-        // is ever sampled (only once `state()` has become `Hidden`) there is
-        // no live path left for wave ink to reappear on its own account. What
-        // this still protects is the more general property the docstring
-        // above describes: the whole row's worth of ink — shell, frozen
-        // glow, frozen checkmark, all fading only through `presence` — must
-        // never read as *more* opaque frame over frame while leaving. The
-        // sampled rectangle is the row's *entire* footprint (not a thin
-        // slice of it): large enough that the ±1 device px a continuously
-        // moving `map()` can round a rectangle edge to does not itself swing
-        // the sum by a meaningful fraction, which a narrower strip here was
-        // found to do.
-        let band_alpha = |r: &Renderer, model: &Model| -> u64 {
-            let l = r.layout();
-            let (dy, s) = model.enter_transform(l.scale);
-            let oy = l.center_y + l.shape_h * 0.5;
-            let map = |x: f32, y: f32| -> (u32, u32) {
-                (
-                    (l.center_x + (x - l.center_x) * s).round() as u32,
-                    (oy + dy + (y - oy) * s).round() as u32,
-                )
-            };
-            let row = l.center_y - WAVE_Y_OFFSET_REST * l.scale;
-            let (x0, y0) = map(
-                l.center_x - l.shape_h * 0.45,
-                row - WAVE_MAX_H_REST * 0.5 * l.scale,
-            );
-            let (x1, y1) = map(
-                l.center_x + l.shape_h * 0.45,
-                row + WAVE_MAX_H_REST * 0.5 * l.scale,
-            );
-            let mut sum = 0u64;
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    sum += u64::from(r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha());
-                }
-            }
-            sum
-        };
-
-        let mut previous = None;
-        let mut exit_frames = 0;
-        let gone_by = t + u64::from(INSERTED_HOLD_MS) + u64::from(EXIT_MS) + 200;
-        while t < gone_by {
-            t += 16;
-            model.tick(t);
-            r.draw(&model);
-            if model.state().is_visible() {
-                continue;
-            }
-            let now = band_alpha(&r, &model);
-            if let Some(before) = previous {
-                assert!(
-                    now <= before,
-                    "at {t} ms the wave band got denser as the pill left: {before} → {now}"
-                );
-            }
-            previous = Some(now);
-            exit_frames += 1;
-        }
-        assert!(exit_frames > 4, "only {exit_frames} exit frames sampled");
-        assert_eq!(previous, Some(0), "the pill never finished leaving");
     }
 
     #[test]
@@ -2533,7 +2782,7 @@ mod tests {
             // Saturating format: this is the widest run that can ever be
             // drawn, whatever the model's clock says.
             let widest = format_timer(u64::MAX);
-            let timer_w = atlas.measure(&widest, l.text_font, 0.0);
+            let timer_w = atlas.measure(&widest, l.timer_font, 0.0);
             let x = l.center_x - l.rest_w * 0.5;
             let right = timer_right_edge(&l, x, l.rest_w, timer_w);
             let gap = (right - timer_w) - (l.center_x + glyph_half_w(&l));
