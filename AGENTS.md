@@ -556,6 +556,23 @@ When updating this file, preserve this bar for all agents and keep entries conci
   wave_history`, or `layout::REST_W` — and do not reintroduce a
   single-current-level-fanned-out bar row; that shape is what "dashes" means
   in every round's own words.
+- **Per-appearance reset state must be reachable from `window/win32.rs`'s real
+  loop, not gated on `presence <= `-some-epsilon during the exit fade.** That
+  loop stops calling `Renderer::draw` at all once `Model::is_idle()`
+  (`state == Hidden && presence <= 0.0`), so a reset written inside `draw`'s
+  own near-zero-presence branch — `wave_history`'s original clear — was dead
+  code in the shipped app: `is_idle` is strictly narrower than that branch's
+  condition, and the discrete per-frame presence step almost always lands
+  exactly on `0.0`, skipping the tiny window in between. The next dictation
+  opened showing the previous one's waveform tail; PR #22 shipped it. Fixed by
+  keying the reset off the frame `draw` first sees the model re-enter
+  `OverlayState::Listening` (`Renderer::listening_last_frame`) instead — see
+  the doc comment on `Renderer::wave_history` in `render/mod.rs` for the full
+  reasoning and why `Model::previous_state` cannot substitute. A test that
+  only calls `draw` directly (as the headless harness and most tests in that
+  file do) cannot catch this class of bug — it has no idle short-circuit to
+  skip. A regression test must drive `tick`/`draw` the way the real loop does,
+  skipping `draw` whenever `Model::is_idle()`.
 - Geometry is one capsule whose width animates between the rest width
   (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) —
   `layout::ORB_D` is the shape's constant height, at every width. No solid
