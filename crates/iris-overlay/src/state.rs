@@ -171,6 +171,8 @@ impl Model {
                 if self.state != Listening {
                     self.latency_ms = None;
                     self.text.clear();
+                    self.level = 0.0;
+                    self.level_target = 0.0;
                     self.listen_started_at = self.now_ms;
                     self.listen_frozen_ms = None;
                     self.enter(Listening);
@@ -332,6 +334,15 @@ impl Model {
     }
 
     /// The smoothed microphone level, 0.0–1.0.
+    ///
+    /// Silence at the start of every dictation: a fresh
+    /// [`Command::ShowListening`] resets both this and the target it is
+    /// smoothing towards, the same way it clears the text and the timer.
+    /// Nothing else can — [`Command::Level`] is the only other writer, the
+    /// audio thread stops sending it the moment a hold ends, and the run loop
+    /// keeps calling [`Model::tick`] while idle, so without this reset the
+    /// level would sit on the last utterance's loudness indefinitely and the
+    /// next appearance would open reading that instead of the room.
     #[must_use]
     pub fn level(&self) -> f32 {
         self.level

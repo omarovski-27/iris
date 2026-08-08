@@ -617,7 +617,11 @@ pub struct Renderer {
     wave_history: VecDeque<f32>,
     /// `model.now_ms()` the last sample was rolled into `wave_history`, so a
     /// fresh one is taken only every [`WAVE_SAMPLE_INTERVAL_MS`], not every
-    /// frame.
+    /// frame. Re-based alongside the `wave_history` clear, because between
+    /// two dictations it goes arbitrarily stale: left alone, the interval
+    /// gate would be satisfied on the first frame of the new session and the
+    /// freshly emptied row would immediately take a sample from a
+    /// [`Model::level`] no microphone had spoken to yet.
     wave_last_sample_ms: u64,
     /// Whether the previous [`Renderer::draw`] call saw the model already in
     /// [`OverlayState::Listening`] — the memory the `entering_listening`
@@ -774,13 +778,18 @@ impl Renderer {
         // old presence-gated clear could not rely on that branch, and why
         // `Model::previous_state` cannot stand in for `listening_last_frame`
         // here.
-        let entering_listening =
-            model.state() == OverlayState::Listening && !*listening_last_frame;
-        *listening_last_frame = model.state() == OverlayState::Listening;
+        let listening = model.state() == OverlayState::Listening;
+        let entering_listening = listening && !*listening_last_frame;
+        *listening_last_frame = listening;
         if entering_listening {
             // Every appearance starts from silence, not a stale utterance's
-            // waveform left over from the last one.
+            // waveform left over from the last one. Re-basing the sample
+            // clock is part of that: it is minutes old by now, so leaving it
+            // would let the interval gate below fire on this very frame,
+            // rolling a sample in before the microphone has reported
+            // anything about this dictation.
             wave_history.clear();
+            *wave_last_sample_ms = model.now_ms();
         }
 
         let presence = model.presence();
@@ -793,7 +802,7 @@ impl Renderer {
         // whatever shape it last had, rather than manufacturing an ambient
         // level for it to hold — the timeline it draws is real audio or
         // nothing, never a synthesised placeholder.
-        if model.state() == OverlayState::Listening
+        if listening
             && model.now_ms().saturating_sub(*wave_last_sample_ms) >= WAVE_SAMPLE_INTERVAL_MS
         {
             *wave_last_sample_ms = model.now_ms();
@@ -1932,6 +1941,11 @@ mod tests {
             stale.len() > 1,
             "test setup: not enough samples accumulated to tell stale history from fresh"
         );
+        assert!(
+            stale.iter().all(|s| *s > 0.5),
+            "test setup: the first utterance has to be loud for a leftover of it \
+             to be distinguishable from silence: {stale:?}"
+        );
 
         model.apply(Command::Hide);
         while !model.is_idle() {
@@ -1954,17 +1968,38 @@ mod tests {
         assert!(!model.is_idle());
         r.draw(&model);
 
-        // Because the interval since the last rolled sample is now large, this
-        // very frame is allowed to roll in one fresh sample of its own — that
-        // is the row starting to draw real audio immediately, not a leftover.
-        // What it must not hold is any of `stale`'s old, loud samples.
+        // The row opens genuinely empty: none of `stale`'s loud samples
+        // survive, and the sample clock is re-based so this frame cannot roll
+        // one in off a level the new microphone has not spoken to yet.
+        assert!(
+            r.wave_history_snapshot().is_empty(),
+            "the new dictation opened with {} samples already in the wave row \
+             (stale history had {}): {:?}",
+            r.wave_history_snapshot().len(),
+            stale.len(),
+            r.wave_history_snapshot(),
+        );
+
+        // Keep driving the loop, without ever reporting a level: the row
+        // starts filling on its own cadence, and every bar it takes has to
+        // read as the silence the room actually is.
+        let quiet_until = t + WAVE_SAMPLE_INTERVAL_MS * 3;
+        while t < quiet_until {
+            t += FRAME_INTERVAL_MS;
+            model.tick(t);
+            if !model.is_idle() {
+                r.draw(&model);
+            }
+        }
         let fresh = r.wave_history_snapshot();
         assert!(
-            fresh.len() <= 1,
-            "the new dictation opened with {} samples still in the wave row \
-             (stale history had {}), not one freshly cleared and re-primed: {fresh:?}",
-            fresh.len(),
-            stale.len(),
+            !fresh.is_empty(),
+            "the wave row never resumed sampling for the new dictation"
+        );
+        assert!(
+            fresh.iter().all(|s| *s < 0.05),
+            "the new dictation's first bars carry the previous utterance's \
+             loudness instead of silence: {fresh:?} (previous row was {stale:?})"
         );
     }
 
