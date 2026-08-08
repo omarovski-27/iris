@@ -20,4 +20,11 @@ Thumbs.db
 
 # Local env / keys
 .env
+.env.*
 *.local
+
+# Iris's own config/history, in case a local --config points them at the repo
+# (the default path is outside the repo, at the platform config dir). Anchored
+# to the root so this doesn't shadow crate-level files like .cargo/config.toml.
+/config.toml
+/history.jsonl
