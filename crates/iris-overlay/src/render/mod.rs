@@ -596,15 +596,38 @@ pub struct Renderer {
 
     /// Recent [`Model::level`] samples, oldest first, that [`draw_wave`]
     /// reads to draw the row as a genuine scrolling waveform rather than one
-    /// current level fanned across every bar. Cleared whenever the shape is
-    /// fully hidden, so every appearance starts from silence rather than
-    /// picking up a stale utterance's shape. See the wave section's module
-    /// doc, above.
+    /// current level fanned across every bar. Cleared the moment a fresh
+    /// [`OverlayState::Listening`] session begins (see the
+    /// `entering_listening` check in [`Renderer::draw`]), so every
+    /// appearance starts from silence rather than picking up a stale
+    /// utterance's shape.
+    ///
+    /// This used to be cleared on the *exit* fade instead, keyed off
+    /// `model.presence() <= 0.001`. That was dead code in the real app:
+    /// `window/win32.rs`'s loop never calls `draw` once
+    /// [`Model::is_idle`] is true, and `is_idle` is exactly
+    /// `presence <= 0.0` — a strictly narrower condition reached by a
+    /// discrete per-frame step that, in practice, jumps straight past the
+    /// `(0.0, 0.001]` band onto `0.0` rather than landing inside it, so the
+    /// clear could fire only in the vanishingly narrow window the exit
+    /// animation's ticks essentially never land on. The headless test
+    /// harness papered over this because it calls [`Renderer::draw`]
+    /// directly on every tick, with no idle short-circuit — a path the real
+    /// window loop cannot reach. See the wave section's module doc, above.
     wave_history: VecDeque<f32>,
     /// `model.now_ms()` the last sample was rolled into `wave_history`, so a
     /// fresh one is taken only every [`WAVE_SAMPLE_INTERVAL_MS`], not every
     /// frame.
     wave_last_sample_ms: u64,
+    /// Whether the previous [`Renderer::draw`] call saw the model already in
+    /// [`OverlayState::Listening`] — the memory the `entering_listening`
+    /// check needs to tell "still listening" from "a new dictation just
+    /// started". [`Model::previous_state`] cannot answer that: it freezes at
+    /// whatever state preceded `Listening` and holds there for the whole
+    /// session, so it reads identically on frame one and frame one hundred.
+    /// Comparing against what *this renderer* drew last frame is what
+    /// actually distinguishes them.
+    listening_last_frame: bool,
 }
 
 impl Renderer {
@@ -631,6 +654,7 @@ impl Renderer {
             started: false,
             wave_history: VecDeque::with_capacity(WAVE_HISTORY_LEN),
             wave_last_sample_ms: 0,
+            listening_last_frame: false,
         }
     }
 
@@ -737,15 +761,30 @@ impl Renderer {
             measured_w,
             wave_history,
             wave_last_sample_ms,
+            listening_last_frame,
             ..
         } = self;
 
         pixmap.fill(Color::TRANSPARENT);
-        let presence = model.presence();
-        if presence <= 0.001 {
+
+        // A new dictation starting is the one point the production loop
+        // reliably calls `draw` on — unlike the exit fade, which
+        // `window/win32.rs` stops calling `draw` for entirely once
+        // `Model::is_idle()`. See `wave_history`'s doc comment for why the
+        // old presence-gated clear could not rely on that branch, and why
+        // `Model::previous_state` cannot stand in for `listening_last_frame`
+        // here.
+        let entering_listening =
+            model.state() == OverlayState::Listening && !*listening_last_frame;
+        *listening_last_frame = model.state() == OverlayState::Listening;
+        if entering_listening {
             // Every appearance starts from silence, not a stale utterance's
             // waveform left over from the last one.
             wave_history.clear();
+        }
+
+        let presence = model.presence();
+        if presence <= 0.001 {
             return &self.pixmap;
         }
 
@@ -1585,7 +1624,7 @@ fn stroke(pixmap: &mut Pixmap, ctx: &Ctx<'_>, path: Option<Path>, colour: Rgba, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{EXIT_MS, INSERTED_HOLD_MS, STATE_CROSS_MS};
+    use crate::motion::{EXIT_MS, FRAME_INTERVAL_MS, INSERTED_HOLD_MS, STATE_CROSS_MS};
     use crate::state::Command;
     use crate::theme::{PORCELAIN_LIGHT, PRISM_DARK};
 
@@ -1859,8 +1898,24 @@ mod tests {
     /// Every appearance starts from silence. A wave row that kept the last
     /// utterance's shape across a fresh `ShowListening` would draw a loud
     /// waveform before the microphone had captured a single new sample.
+    ///
+    /// This drives the model and renderer the way `window/win32.rs`'s real
+    /// loop does, not the way most other tests in this file do: `draw` is
+    /// skipped for any tick where `Model::is_idle()` is true, exactly
+    /// mirroring the loop's `if model.is_idle() { ...; continue; }` skip. A
+    /// version of this test that called `draw` on every tick regardless —
+    /// including the ones with `presence` near zero — is what let the
+    /// shipped regression through: that always reaches the old
+    /// presence-gated clear, a branch the real window loop cannot reach
+    /// because it stops calling `draw` at all once idle. See
+    /// `wave_history`'s doc comment on [`Renderer`] for the full story.
+    /// `FRAME_INTERVAL_MS` reproduces the real per-frame step size, so
+    /// `presence` numerically jumps straight from a value above the old
+    /// `0.001` threshold to exactly `0.0` on the frame idle is reached —
+    /// the discrete skip that made the old branch dead code — rather than
+    /// relying on luck to land there.
     #[test]
-    fn a_fresh_utterance_starts_the_wave_row_from_silence() {
+    fn a_fresh_utterance_starts_the_wave_row_from_silence_even_past_a_skipped_idle_frame() {
         let mut model = Model::new(PRISM_DARK);
         model.tick(0);
         model.apply(Command::ShowListening);
@@ -1868,21 +1923,48 @@ mod tests {
         let mut r = Renderer::new(1.0);
         let mut t = 0u64;
         while t < 600 {
-            t += 16;
+            t += FRAME_INTERVAL_MS;
             model.tick(t);
             r.draw(&model);
         }
-        assert!(!r.wave_history_snapshot().is_empty());
+        let stale = r.wave_history_snapshot();
+        assert!(
+            stale.len() > 1,
+            "test setup: not enough samples accumulated to tell stale history from fresh"
+        );
 
         model.apply(Command::Hide);
         while !model.is_idle() {
-            t += 16;
+            t += FRAME_INTERVAL_MS;
             model.tick(t);
-            r.draw(&model);
+            // The real loop never calls `draw` once `is_idle()` — a tick can
+            // cross from "fading" to "idle" right here, so this check has to
+            // happen after `tick`, exactly as `window/win32.rs` does it.
+            if !model.is_idle() {
+                r.draw(&model);
+            }
         }
+
+        // The hotkey goes down again for a fresh dictation: apply the
+        // command, tick, then draw — the same order `window/win32.rs` uses
+        // (drain commands, tick, then draw if not idle).
+        model.apply(Command::ShowListening);
+        t += FRAME_INTERVAL_MS;
+        model.tick(t);
+        assert!(!model.is_idle());
+        r.draw(&model);
+
+        // Because the interval since the last rolled sample is now large, this
+        // very frame is allowed to roll in one fresh sample of its own — that
+        // is the row starting to draw real audio immediately, not a leftover.
+        // What it must not hold is any of `stale`'s old, loud samples.
+        let fresh = r.wave_history_snapshot();
         assert!(
-            r.wave_history_snapshot().is_empty(),
-            "history survived past the shape going fully hidden"
+            fresh.len() <= 1,
+            "the new dictation opened with {} samples still in the wave row \
+             (stale history had {}), not one freshly cleared and re-primed: {fresh:?}",
+            fresh.len(),
+            stale.len(),
         );
     }
 
