@@ -485,6 +485,50 @@ fn a_stalled_dictation_still_logs_the_real_audio_captured() {
          hold: {:.2}s",
         records[0].latency.audio_secs
     );
+    // A stalled-but-connected session is a different failure than an offline
+    // one and must not be tagged as such — see the test below for the case
+    // this does misdiagnose as offline.
+    assert!(!records[0].connection_failed);
+    assert!(rig.notice.connection_calls().is_empty());
+}
+
+#[test]
+fn an_offline_dictation_notifies_promptly_and_is_tagged_in_the_log() {
+    // The captain's report: with no internet, a dictation must not silently
+    // produce nothing. This models the offline shape specifically — an engine
+    // that publishes a real connect budget (like Deepgram) and never gets
+    // anywhere near it: no `Connected`, no error, nothing at all — and checks
+    // both halves of the fix: the same notice mechanism `App::deliver` already
+    // uses for a failed injection fires once, and the session log tags the
+    // record distinctly so a future diagnosis of the real capture bug is not
+    // polluted by offline attempts.
+    let mut rig = rig().with_final_timeout(Duration::from_millis(100));
+    rig.app.set_engine(Arc::new(NeverConnectsEngine {
+        connect_budget: Duration::from_millis(50),
+    }));
+
+    let err = rig.dictate().expect_err("the engine never connects");
+    assert!(err.to_string().contains("never connected"), "{err}");
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].injected);
+    assert!(records[0].text.is_empty());
+    assert!(
+        records[0].connection_failed,
+        "an offline attempt must be distinguishable in the session log"
+    );
+
+    let calls = rig.notice.connection_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the connection-failure notice must fire exactly once"
+    );
+    assert!(
+        rig.notice.calls().is_empty(),
+        "this is not an injection failure, so the injection notice must stay quiet"
+    );
 }
 
 #[test]
@@ -1930,6 +1974,49 @@ impl Engine for NeverConcludesEngine {
 }
 
 impl Session for NeverConcludesSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Never sends anything at all — no `Connected`, no error, nothing. Models a
+/// hold with no internet: the socket never comes up, so unlike
+/// [`NeverConcludesEngine`] this never reaches [`Mark::StreamReady`]. A
+/// published `connect_budget`, like Deepgram's, is what lets [`Dictation`]
+/// recognise this shape as "never connected" rather than an ordinary stalled
+/// session.
+struct NeverConnectsEngine {
+    connect_budget: Duration,
+}
+
+struct NeverConnectsSession {
+    events: Receiver<TranscriptEvent>,
+    _keep: Sender<TranscriptEvent>,
+}
+
+impl Engine for NeverConnectsEngine {
+    fn name(&self) -> &'static str {
+        "never-connects"
+    }
+    fn connect_budget(&self) -> Option<Duration> {
+        Some(self.connect_budget)
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Ok(Box::new(NeverConnectsSession {
+            events: rx,
+            _keep: tx,
+        }))
+    }
+}
+
+impl Session for NeverConnectsSession {
     fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
         Ok(())
     }

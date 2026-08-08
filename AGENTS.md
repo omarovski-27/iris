@@ -120,6 +120,47 @@ Load-bearing beyond that crate:
   injection-failure path in `App::capture`, `app.rs`, which points at the
   session log or echoes the text back when the log is off).
   `crates/iris-app/tests/console.rs` drives the real binary and holds this.
+- **No internet must fail visibly, not silently.** A dictation that never
+  reaches a real connection (offline, DNS down, the endpoint unreachable) used
+  to end in nothing but an `eprintln!` — invisible on the console-less launch
+  path most users take, and indistinguishable in the session log from the
+  separately-tracked "almost no audio reached the transcription engine"
+  capture bug. `DictationOutcome::never_connected`
+  (`iris-core/src/dictation.rs`) is the fix's signal: true only when
+  `Mark::StreamReady` was never reached *and* the engine published a real
+  `Engine::connect_budget` — gated that way because Groq/local send
+  `Connected` immediately at `open()` with no real handshake behind it, so the
+  mark means nothing for them and would misclassify an unrelated post-connect
+  failure as "offline". Today only Deepgram publishes a connect budget, so
+  this is effectively Deepgram-only; extending it to another engine means that
+  engine's `Connected` event has to mean a real socket first. `App::failed`
+  (`app.rs`) is the one place that acts on the flag: it tags
+  `DictationRecord::connection_failed` (`history.rs`, `#[serde(default)]` for
+  old log lines) and calls `FailureNotice::connection_failed`
+  (`notify.rs`) — a second method on the *same* trait/dialog mechanism
+  `injection_failed` already uses, not a second notification channel.
+  `crates/iris-app/tests/loop.rs`'s `an_offline_dictation_notifies_promptly_and_is_tagged_in_the_log`
+  and `a_stalled_but_connected_dictation_is_not_tagged_as_a_connection_failure`
+  cover the offline case and the false-positive it must not create (a
+  connected-but-stalled session, the 2026-08-02 regression shape). What this
+  does *not* change: the length of the wait itself (Deepgram's `CONNECT_TIMEOUT`
+  8s is an accepted tradeoff, not a bug — see the Deepgram section above), only
+  that it now always ends in something the user can see.
+- **`iris-engine-local` is real, tested code, not a stub — but is not part of
+  the shipped Windows binary.** `EngineChoice::Local` and a genuine
+  `LocalAdapter` (`iris-app/src/engines.rs`) implementing `Engine`/`Session`
+  over `iris_engine_local::LayeredLocalEngine` (streaming sherpa-onnx
+  Zipformer partials + whisper.cpp `base.en` batch finalizer behind Silero
+  VAD) exist end-to-end in the tray and settings UI today. It only compiles in
+  behind the `local-native` feature (`iris-app/Cargo.toml`), which
+  `scripts/package-windows.sh` does not pass — so selecting "local" in a
+  released build hits a clear stub error, not a crash. Cross-compiling the
+  real engines to `x86_64-pc-windows-gnu` from WSL fails at link time (sherpa's
+  prebuilt is MSVC-only; whisper.cpp/ggml needs Windows SDK symbols MinGW
+  headers lack) — confirmed by `cargo build` (not just `check`, which false-
+  positives by never invoking the linker). Making this a real, shippable
+  offline fallback needs a native-Windows (MSVC/msys2) build leg added to the
+  release pipeline; the local-engine code itself is not the blocker.
 - **The settings window** (`iris-app::window`) is the History/Settings/Insights
   UI, opened by default on every deliberate launch (`App::open_window`, called
   from `main`'s `run` unless `--background`) as well as from the tray's

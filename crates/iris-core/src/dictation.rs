@@ -96,6 +96,17 @@ pub struct DictationOutcome {
     /// dictation logged as an ordinary one is indistinguishable from the user
     /// having said less, which is how a real engine failure hides.
     pub cause: Option<String>,
+    /// Set when this dictation ended without ever reaching
+    /// [`Mark::StreamReady`] on an engine that publishes a real
+    /// [`Engine::connect_budget`] — the engine never got as far as an actual
+    /// network connection, which is what "no internet" looks like from here.
+    /// Gated on `connect_budget` being `Some` because an engine whose
+    /// `Connected` event is not a real handshake (Groq sends it immediately
+    /// at `open()`, before any request goes out) would otherwise read every
+    /// post-connect failure as a connectivity one. Always `false` alongside a
+    /// non-empty `text`: nothing can be salvaged before a real connection
+    /// exists for the engines this flag is meaningful for.
+    pub never_connected: bool,
 }
 
 /// [`Dictation::finish`] failed to produce a transcript, but real capture may
@@ -115,6 +126,10 @@ pub struct DictationError {
     /// only the flattened text in `message`.
     source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     pub timeline: Timeline,
+    /// See [`DictationOutcome::never_connected`] — the same signal, for the
+    /// path where [`Session::finish`] itself failed outright rather than the
+    /// wait running out.
+    pub never_connected: bool,
 }
 
 impl DictationError {
@@ -125,11 +140,13 @@ impl DictationError {
         timeline: Timeline,
         message: String,
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+        never_connected: bool,
     ) -> Box<Self> {
         Box::new(Self {
             message,
             source,
             timeline,
+            never_connected,
         })
     }
 }
@@ -287,6 +304,15 @@ impl Dictation {
         self.session.push(pcm)
     }
 
+    /// Whether this session never reached a real network connection — see
+    /// [`DictationOutcome::never_connected`]. A snapshot, safe to call at any
+    /// point: [`Mark::StreamReady`] is only ever set once, by
+    /// [`Dictation::absorb`] on [`TranscriptEvent::Connected`], so this can
+    /// only go from `true` to `false`, never back.
+    fn never_connected(&self) -> bool {
+        self.connect_budget.is_some() && self.timeline.at(Mark::StreamReady).is_none()
+    }
+
     /// Give up on this dictation without asking the engine to finalise, and
     /// take everything it can still show for itself.
     ///
@@ -318,10 +344,12 @@ impl Dictation {
             }
             _ => None,
         };
+        let never_connected = self.never_connected() && text.is_empty();
         DictationOutcome {
             text,
             timeline: self.timeline,
             cause,
+            never_connected,
         }
     }
 
@@ -509,6 +537,7 @@ impl Dictation {
             // The same rule as every arm below: a socket that dies as the
             // Finalize goes out costs no more than the same socket dying one
             // statement later, inside the wait.
+            let never_connected = self.never_connected();
             if let Some(text) = self.salvage_partial() {
                 self.timeline.transcript = text.clone();
                 return Ok(DictationOutcome {
@@ -517,13 +546,19 @@ impl Dictation {
                     // Flattened, because a cause is a leaf: it is one string in
                     // the log with no chain behind it to supply the context.
                     cause: Some(format!("{e:#}")),
+                    never_connected,
                 });
             }
             // Says what this layer knows and stops there; the engine's account
             // travels as the source, so a caller walking the chain reads each
             // cause once.
             let message = format!("{} engine failed to finalise", self.timeline.engine);
-            return Err(DictationError::fail(self.timeline, message, Some(e.into())));
+            return Err(DictationError::fail(
+                self.timeline,
+                message,
+                Some(e.into()),
+                never_connected,
+            ));
         }
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
 
@@ -588,6 +623,7 @@ impl Dictation {
                 waited.as_secs_f64()
             )),
         };
+        let never_connected = self.never_connected();
 
         match (ended, salvaged) {
             (Some(Ending::Final(text)), salvaged) => {
@@ -597,6 +633,7 @@ impl Dictation {
                     text,
                     timeline: self.timeline,
                     cause: None,
+                    never_connected: false,
                 })
             }
             (_, Some(text)) => {
@@ -610,12 +647,21 @@ impl Dictation {
                     text,
                     timeline: self.timeline,
                     cause,
+                    // A non-empty salvage can only exist once `Connected` has
+                    // fired (that is the only route to a non-empty
+                    // `latest_partial`), so this is always false here — kept
+                    // explicit rather than reusing `never_connected` so a
+                    // future change to that invariant fails loudly instead of
+                    // silently mislabelling a real partial as a connectivity
+                    // failure.
+                    never_connected: false,
                 })
             }
             (_, None) => Err(DictationError::fail(
                 self.timeline,
                 cause.unwrap_or_default(),
                 None,
+                never_connected,
             )),
         }
     }
@@ -1207,6 +1253,76 @@ mod tests {
             "and it must still end when that budget does: {waited:?}"
         );
         assert!(err.to_string().contains("never connected"), "{err}");
+        assert!(
+            err.never_connected,
+            "an engine that published a connect budget and never reached it must flag \
+             never_connected so the app layer can tell the user it could not reach the service"
+        );
+    }
+
+    #[test]
+    fn abandon_flags_never_connected_when_the_engine_never_came_up() {
+        // The dead-hotkey-channel path (`Dictation::abandon`) must classify a
+        // still-connecting session the same way `finish` does — it is the
+        // other route [`App`] can reach a `DictationOutcome` through.
+        let engine = SlowToConnect {
+            budget: Some(Duration::from_secs(8)),
+            up: false,
+        };
+        let mut dictation = Dictation::start(&engine).unwrap();
+        dictation.timeline_mut().mark(Mark::KeyDown);
+        let outcome = dictation.abandon(&mut |_| {});
+        assert!(outcome.text.is_empty());
+        assert!(outcome.never_connected);
+    }
+
+    #[test]
+    fn an_engine_with_no_connect_budget_is_never_flagged_never_connected() {
+        // Groq sends `Connected` immediately at `open()`, before any request
+        // goes out, and does not publish a connect budget — so `Mark::StreamReady`
+        // is not a real signal of network connectivity for it. An engine that
+        // fails without ever publishing a connect budget (this test's `Silent`
+        // engine, and by extension Groq/local) must never be flagged, even
+        // though the error text still says "never connected" — that wording is
+        // about the timeline mark, not about whether this flag is trustworthy.
+        struct Silent;
+        struct SilentSession {
+            events: crossbeam_channel::Receiver<TranscriptEvent>,
+            _keep: crossbeam_channel::Sender<TranscriptEvent>,
+        }
+        impl Engine for Silent {
+            fn name(&self) -> &'static str {
+                "silent"
+            }
+            fn open(&self) -> Result<Box<dyn Session>> {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                Ok(Box::new(SilentSession {
+                    events: rx,
+                    _keep: tx,
+                }))
+            }
+        }
+        impl Session for SilentSession {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.events
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let dictation = Dictation::start(&Silent).unwrap();
+        let err = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("never connected"), "{err}");
+        assert!(
+            !err.never_connected,
+            "no connect_budget means this signal is not trustworthy for this engine"
+        );
     }
 
     /// Connects only after the plain deadline has already gone by — inside the

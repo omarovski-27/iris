@@ -408,6 +408,7 @@ mod tests {
             polish: None,
             injected,
             error: error.map(str::to_string),
+            connection_failed: false,
             latency: LatencyBreakdown::default(),
         }
     }

@@ -119,6 +119,17 @@ pub struct DictationRecord {
     /// Why the dictation did not end in injected text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when this dictation never reached a real connection to the
+    /// transcription service — no internet, DNS down, the service
+    /// unreachable, or (rarer) a rejected key, all of which look the same
+    /// from here: the engine never got as far as a socket. Distinguishing
+    /// this from an ordinary capture failure matters for diagnosis — see
+    /// `AGENTS.md`'s "almost no audio reached the transcription engine" entry
+    /// on how much a prose-only distinction cost a previous investigation.
+    /// `#[serde(default)]` so a session log written before this field existed
+    /// still parses.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connection_failed: bool,
     /// The latency breakdown.
     pub latency: LatencyBreakdown,
 }
@@ -134,6 +145,7 @@ impl DictationRecord {
             polish: None,
             injected: false,
             error: None,
+            connection_failed: false,
             latency: LatencyBreakdown::default(),
         }
     }

@@ -942,7 +942,8 @@ impl<A: AudioSource> App<A> {
                 // actually happened instead of reading as if the hold never
                 // captured anything.
                 let message = format!("{e:#}");
-                self.failed(e.timeline, message)
+                let never_connected = e.never_connected;
+                self.failed(e.timeline, message, never_connected)
             }
         };
         // Always, even when the hold went on to produce a transcript: what came
@@ -970,7 +971,13 @@ impl<A: AudioSource> App<A> {
             text: raw,
             mut timeline,
             cause,
+            never_connected,
         } = outcome;
+        // `Dictation::finish` only ever produces `never_connected: true` on the
+        // branch with nothing to salvage, which returns `Err` and never reaches
+        // here — see `DictationOutcome::never_connected`'s doc. `App::failed` is
+        // the path that actually has to act on it.
+        debug_assert!(!never_connected, "a delivered outcome must have connected");
         let raw = raw.trim().to_string();
 
         let mut record = DictationRecord::now(self.engine.name(), &raw);
@@ -1038,10 +1045,25 @@ impl<A: AudioSource> App<A> {
     /// through here: a blank timeline would log real audio as `audio_secs:
     /// 0.0` and make a network failure read as a broken microphone, which is
     /// exactly the false trail the 2026-08-02 investigation had to walk back.
-    fn failed(&self, timeline: Timeline, message: String) -> Dictated {
+    ///
+    /// `never_connected` (see [`DictationOutcome::never_connected`]) is this
+    /// method's other job: it is the one signal that distinguishes "we could
+    /// not reach the transcription service" from every other no-transcript
+    /// cause, and this is the only place in `iris-app` that acts on it — the
+    /// session log gets a distinct, greppable field
+    /// ([`DictationRecord::connection_failed`]) instead of a message a future
+    /// diagnosis has to pattern-match, and the user gets told promptly through
+    /// [`FailureNotice::connection_failed`], the same dialog/clipboard
+    /// mechanism [`App::deliver`] already uses for a failed injection — not a
+    /// second, invented channel.
+    fn failed(&self, timeline: Timeline, message: String, never_connected: bool) -> Dictated {
         let mut record = DictationRecord::now(self.engine.name(), "");
-        record.error = Some(message);
+        record.error = Some(message.clone());
+        record.connection_failed = never_connected;
         record.latency = LatencyBreakdown::from_timeline(&timeline);
+        if never_connected {
+            self.notice.connection_failed(&message);
+        }
         Dictated { record, timeline }
     }
 
@@ -1060,8 +1082,10 @@ impl<A: AudioSource> App<A> {
             text,
             timeline,
             cause: salvage_cause,
+            never_connected,
         } = outcome;
-        let mut dictated = self.failed(timeline, cause);
+        let never_connected = never_connected && text.trim().is_empty();
+        let mut dictated = self.failed(timeline, cause, never_connected);
         dictated.record.text = text.trim().to_string();
         note_salvage(dictated, salvage_cause)
     }
