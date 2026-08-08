@@ -35,6 +35,39 @@ composited from this build's `2b-speech-loud` frame against a real screenshot
 of round 3's shipped, rejected row at a sustained loud level — left is the
 "dashes" the captain rejected, right is what replaced it.
 
+**A firstmate visual review of the first cut of this set caught three
+problems the renderer's own author had missed** — the same failure mode that
+got rounds 3 and 4 rejected: frames that looked fine to whoever rendered them
+and wrong to the person judging them. Fixed before this set was regenerated:
+
+1. **Silence still read as a row of identical dashes.** Near-constant quiet
+   samples were producing near-identical bar heights — real data, but with
+   nothing to visually distinguish it from round 3's static row. Fixed two
+   ways: a quiet real sample now blends in the same decorrelated ripple
+   texture an unfilled bar already used (`wave_bar_scale`'s `Some` branch),
+   and — the change that actually mattered once rendered and looked at — a
+   bar's *opacity*, not only its height, now fades with how quiet it is
+   (`draw_wave`). Height alone stopped being a legible signal at the 1-3
+   device px silence produces; a quiet bar collapsing toward near-transparent
+   is what actually reads as "a thin line" rather than "a row of small solid
+   dots," which is the alternative the review itself named as acceptable.
+2. **The bars read as rounded dots, not a waveform.** Too few, too wide
+   relative to their pitch, capped rounded enough to read as circles.
+   `WAVE_TARGET_PITCH` and `WAVE_BAR_W_FRAC` both dropped so the same compact
+   width holds more, narrower bars, `WAVE_BAR_CORNER_FRAC` replaced full
+   rounding with a fraction that keeps a soft edge without erasing the bar's
+   rectangular silhouette, and `WAVE_RESPONSE_EXPONENT` rose from round 1's
+   `1.6` for a stronger tall-to-short ratio at speech amplitudes.
+3. **A possible timer collision in a rendered ramp-up frame.** Checked
+   directly rather than assumed either way: `render::tests::the_wave_row_
+   never_reaches_the_timers_zone_at_full_amplitude` renders the same shape at
+   a sustained loud level and a silent one and asserts the timer's own zone
+   is byte-identical between the two — if a bar ever reached in, that zone
+   would differ with amplitude and nothing else does. It's identical, so this
+   was a proximity/rendering artifact of the small preview at round 3-era bar
+   widths, not a real collision — and the bars are visibly narrower now
+   regardless, per fix 2.
+
 - `*-default-listening-natural.png` — the resting shape at one arbitrary
   moment of a naturally speech-like level, the shipped default most users
   ever see.
@@ -44,7 +77,8 @@ of round 3's shipped, rejected row at a sustained loud level — left is the
   "Round 5", "Freeze, not fabricate, once recording stops") rather than
   continuing to move or count.
 - `*-wave-sequence-0-silence.png` — near-silence, sampled well after the
-  rolling history has filled with quiet.
+  rolling history has filled with quiet — now a faint, mostly-collapsed row
+  rather than a row of visible marks.
 - `*-wave-sequence-1-rampup.png` — a smooth ramp from quiet to loud; the
   ascending bar heights left to right are the row directly showing its own
   time axis.

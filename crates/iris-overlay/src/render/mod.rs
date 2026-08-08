@@ -96,10 +96,29 @@ const SCRIM_PAD_Y: f32 = 3.0;
 // There is no positional taper: whatever shape the row has is the shape the
 // last few seconds of audio actually had.
 const WAVE_INSET: f32 = 6.0;
-const WAVE_TARGET_PITCH: f32 = 8.0;
-const WAVE_MIN_BARS: usize = 5;
-const WAVE_MAX_BARS: usize = 40;
-const WAVE_BAR_W_FRAC: f32 = 0.46;
+/// A firstmate visual review of the first cut of this round found the bars
+/// reading as a row of dots rather than a waveform: too few, too wide
+/// relative to their pitch, capped rounded enough to read as circles. Pitch
+/// and bar-width-fraction both dropped so the same compact width holds more,
+/// narrower bars — `porcelain-wave-sequence-1-rampup.png` from that first
+/// cut ("tall narrow vertical bars, obviously sound") is the target this
+/// retune generalises to every frame, not just the ramp.
+const WAVE_TARGET_PITCH: f32 = 5.0;
+const WAVE_MIN_BARS: usize = 8;
+const WAVE_MAX_BARS: usize = 48;
+/// Narrow enough that a bar stays visibly a bar — width clearly under its
+/// own height — even at the shortest heights silence ever produces, not
+/// only at speech amplitudes. A first retune (`0.4`) fixed the wide-open
+/// ribbon and loud frames but still read as round dots at rest, where
+/// height and width were close enough that `WAVE_BAR_CORNER_FRAC`'s
+/// rounding made the two indistinguishable.
+const WAVE_BAR_W_FRAC: f32 = 0.3;
+/// Corner radius as a fraction of bar width. Less than the `0.5` a fully
+/// rounded (pill/circle) cap would use — at the narrow widths
+/// [`WAVE_BAR_W_FRAC`] now draws, full rounding is indistinguishable from a
+/// dot; this keeps a soft edge without erasing the bar's rectangular
+/// silhouette.
+const WAVE_BAR_CORNER_FRAC: f32 = 0.3;
 /// Bar height at full deflection, and how far the row's centre sits above the
 /// shape's — for the two ends of the `open` tween. Unchanged in value from
 /// round 3: the compactness round 5 asks for comes from the *width* side
@@ -114,6 +133,19 @@ const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
 /// a completely flat bar is closer to the "dashes" failure than a very quiet
 /// one.
 const WAVE_IDLE_FLOOR: f32 = 0.05;
+/// Exponent [`wave_bar_scale`] raises a real level to. Raised from round 1's
+/// `1.6` in the same firstmate review that narrowed the bars: a stronger
+/// tall-to-short ratio at speech amplitudes is what makes height, not just
+/// bar count, read as sound.
+const WAVE_RESPONSE_EXPONENT: f32 = 2.4;
+/// How much of the idle ripple (see [`wave_ripple`]) blends into a real
+/// sample that is itself near the floor, so silence reads as a live quiet
+/// waveform rather than N identical stubs. Small relative to a genuinely
+/// loud bar's own range (`1.0 - WAVE_IDLE_FLOOR`), so it is felt as texture
+/// on a quiet bar and vanishes under a loud one, never the other way round.
+/// Raised from an initial `0.07` once a rendered silence frame still read as
+/// too uniform even with texture present — firstmate visual review.
+const WAVE_TEXTURE_AMPLITUDE: f32 = 0.11;
 /// Gap between the wave row's right edge and the timer's left edge, so the
 /// two read as sharing the capsule rather than colliding. See [`draw_timer`].
 const WAVE_TIMER_GAP: f32 = 6.0;
@@ -152,19 +184,44 @@ fn wave_row_bottom(l: &Layout, y: f32, h: f32, open: f32) -> f32 {
     y + h * 0.5 - (y_offset - max_h * 0.5) * l.scale
 }
 
+/// A slow, per-bar-decorrelated ripple in `0.0..=1.0` — `i` only decorrelates
+/// neighbouring bars, `now_ms` drives the animation. Shared by both the
+/// idle branch of [`wave_bar_scale`] and the texture it blends into a real
+/// sample near the noise floor, so "no sample yet" and "a real but very
+/// quiet sample" read as the same kind of live quiet, not two different
+/// mechanisms that happen to look similar.
+fn wave_ripple(i: f32, now_ms: u64) -> f32 {
+    let t = now_ms as f32;
+    0.5 + 0.5 * ((t / 340.0 + i * 0.7).sin() * (t / 810.0 + i * 0.29).sin()).abs()
+}
+
 /// scaleY for one wave bar, given the historical level sample it represents
 /// — `None` for a column the rolling history has not reached yet, meaning
 /// the row is still filling in from silence since the hotkey went down. `i`
-/// only decorrelates the idle ripple between neighbouring bars that have no
-/// real sample yet.
+/// decorrelates the idle ripple (and the quiet-real-sample texture, below)
+/// between neighbouring bars.
+///
+/// A firstmate visual review of the first cut of this caught silence
+/// rendering as a row of *identical* marks — every bar reading the same
+/// near-zero level with literally nothing to vary it, which is
+/// indistinguishable from round 3's rejected "dashes" regardless of the
+/// mechanism behind it. A real sample that is itself near
+/// [`WAVE_IDLE_FLOOR`] now gets the same ripple texture blended in, scaled
+/// by how much headroom is left below a genuinely loud response — so it
+/// fades to nothing once the signal is unambiguously loud, and a loud bar is
+/// still read purely from data, never dressed up as texture.
 fn wave_bar_scale(sample: Option<f32>, i: f32, now_ms: u64) -> f32 {
     match sample {
         Some(level) => {
             // Expansive, not linear: widens the gap between quiet and loud
             // instead of compressing it (captain, round 1: "so it's showing
-            // that it's clearly hearing you").
-            let response = level.clamp(0.0, 1.0).powf(1.6);
-            WAVE_IDLE_FLOOR + response * (1.0 - WAVE_IDLE_FLOOR)
+            // that it's clearly hearing you"), and pushed further still in
+            // round 5 (firstmate review: bar-to-bar contrast read too weak
+            // to look like sound rather than a row of similar dots).
+            let response = level.clamp(0.0, 1.0).powf(WAVE_RESPONSE_EXPONENT);
+            let base = WAVE_IDLE_FLOOR + response * (1.0 - WAVE_IDLE_FLOOR);
+            let texture_room = (1.0 - response).max(0.0);
+            base + WAVE_TEXTURE_AMPLITUDE * texture_room * wave_ripple(i, now_ms)
         }
         None => {
             // A believable resting state, not a flat line of identical
@@ -172,10 +229,7 @@ fn wave_bar_scale(sample: Option<f32>, i: f32, now_ms: u64) -> f32 {
             // slow, per-bar-decorrelated ripple well under the real-signal
             // floor, so it never competes with an actual sample once one
             // arrives.
-            let t = now_ms as f32;
-            let wobble =
-                0.5 + 0.5 * ((t / 340.0 + i * 0.7).sin() * (t / 810.0 + i * 0.29).sin()).abs();
-            WAVE_IDLE_FLOOR * (0.5 + 0.5 * wobble)
+            WAVE_IDLE_FLOOR * (0.5 + 0.5 * wave_ripple(i, now_ms))
         }
     }
 }
@@ -263,9 +317,19 @@ fn draw_wave(
         let bh = (max_h * scale).max(l.scale * 0.6);
         let bx = x + inset + pitch * i as f32 + (pitch - bar_w) * 0.5;
         let by = cy - bh * 0.5;
-        if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * 0.5) {
+        if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * WAVE_BAR_CORNER_FRAC) {
             let colour = sample_ramp(theme.spectrum, p);
-            fill_clipped(pixmap, ctx, &path, ctx.c(colour.fade(alpha)), clip);
+            // `scale` fades a bar's own opacity, not only its height. Height
+            // alone stops being a legible signal at the couple of device px
+            // silence produces — a firstmate visual review found a rendered
+            // near-silent frame still read as a row of same-looking marks
+            // even with real per-bar height variation present, just too
+            // subtle to see at that size. A quiet bar fading toward
+            // near-transparent alongside its short height is what actually
+            // reads as "collapsing toward a thin line" rather than "a row of
+            // small solid dots" — and a loud bar, at `scale` near `1.0`,
+            // loses nothing.
+            fill_clipped(pixmap, ctx, &path, ctx.c(colour.fade(alpha * scale)), clip);
         }
     }
 }
@@ -1630,18 +1694,42 @@ mod tests {
     /// `wave_bar_scale` must not read `i` at all for a real sample; only the
     /// idle-ripple branch (no sample yet) is allowed to vary by position.
     #[test]
-    fn a_real_sample_reads_the_same_regardless_of_which_bar_it_lands_on() {
-        for level in [0.0f32, 0.3, 0.7, 1.0] {
-            let first = wave_bar_scale(Some(level), 0.0, 12_345);
-            for i in [1.0f32, 7.0, 19.0, 39.0] {
-                let got = wave_bar_scale(Some(level), i, 12_345);
-                assert!(
-                    (got - first).abs() < 1e-6,
-                    "level {level}: bar 0 read {first}, bar {i} read {got} — a positional \
-                     taper crept back in"
-                );
-            }
+    fn a_loud_sample_reads_the_same_regardless_of_which_bar_it_lands_on() {
+        // Loud enough that WAVE_TEXTURE_AMPLITUDE's headroom term is
+        // negligible — this is checking for a reintroduced *height* taper,
+        // not the deliberate quiet-sample texture below.
+        let first = wave_bar_scale(Some(1.0), 0.0, 12_345);
+        for i in [1.0f32, 7.0, 19.0, 39.0] {
+            let got = wave_bar_scale(Some(1.0), i, 12_345);
+            assert!(
+                (got - first).abs() < 1e-6,
+                "bar 0 read {first}, bar {i} read {got} — a positional taper crept back in"
+            );
         }
+    }
+
+    /// The counterpart to the test above: a real sample near the floor
+    /// *must* vary by position, on purpose — this is the fix for silence
+    /// rendering as a row of identical marks (firstmate review of the first
+    /// round-5 cut), and it would be indistinguishable from the bug it fixes
+    /// if this ever collapsed back to one value.
+    #[test]
+    fn a_quiet_real_sample_still_varies_by_position_like_the_idle_ripple_does() {
+        let first = wave_bar_scale(Some(0.0), 0.0, 12_345);
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..8 {
+            let got = wave_bar_scale(Some(0.0), i as f32, 12_345);
+            distinct.insert((got * 10_000.0) as i64);
+            assert!(
+                got < WAVE_IDLE_FLOOR + WAVE_TEXTURE_AMPLITUDE + 1e-6,
+                "bar {i} read {got}, past the texture's own ceiling — it would read as signal"
+            );
+        }
+        assert!(
+            distinct.len() > 1,
+            "every bar read the exact same near-zero value ({first}) — that is the row of \
+             identical marks this exists to fix"
+        );
     }
 
     /// The expansive response curve the captain asked for in round 1 ("so
@@ -1974,6 +2062,64 @@ mod tests {
             ink_px > 3,
             "timer zone drew {ink_px} ink-coloured px — the timer is not rendering"
         );
+    }
+
+    /// A tall bar sits close to the timer's reserved zone by construction —
+    /// the margin `draw_wave`'s `usable` computation leaves is exactly
+    /// `WAVE_INSET`, not a generous one — and a firstmate visual review
+    /// flagged what looked like a collision in a rendered ramp-up frame.
+    ///
+    /// A first cut of this test compared the timer zone's raw pixel colours
+    /// against `theme.spectrum`'s stops directly and failed on Porcelain —
+    /// a false positive, not a real bug: `fill_glass_shell` tints the
+    /// *entire* shell, timer zone included, with that same ramp at low alpha
+    /// by design, so "the pixel is a spectrum colour" is true everywhere on
+    /// the shell and proves nothing about a bar specifically. The property
+    /// that actually holds is narrower and provably correct instead of
+    /// merely plausible: nothing in the timer zone depends on the wave
+    /// row's amplitude at all, since `draw_glyph` and `draw_timer` take no
+    /// level, so a loud frame and a silent frame — same elapsed time, same
+    /// digits, same everything else — must render *byte-identical* pixels
+    /// there. A real collision would fail that regardless of what colour it
+    /// happened to be.
+    #[test]
+    fn the_wave_row_never_reaches_the_timers_zone_at_full_amplitude() {
+        for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+            let (loud, _) = drive(&[Command::ShowListening, Command::Level(1.0)], 2_000, theme);
+            let (quiet, _) = drive(&[Command::ShowListening, Command::Level(0.0)], 2_000, theme);
+            let l = loud.layout();
+            let mut atlas = FontAtlas::new();
+            let timer_w = atlas.measure(&format_timer(2_000), l.timer_font, 0.0);
+            let x = l.center_x - l.rest_w * 0.5;
+            let right_edge = timer_right_edge(l, x, l.rest_w, timer_w) as u32;
+            let zone_start = (right_edge as f32 - timer_w) as u32;
+
+            let mut checked = 0;
+            for y in (l.center_y - 12.0 * l.scale) as u32..=(l.center_y + 12.0 * l.scale) as u32 {
+                for x in zone_start..=right_edge {
+                    let idx = (y * l.window_w + x) as usize;
+                    let a = loud.pixmap().pixels()[idx];
+                    let b = quiet.pixmap().pixels()[idx];
+                    let diff = i32::from(a.red()).abs_diff(i32::from(b.red()))
+                        + i32::from(a.green()).abs_diff(i32::from(b.green()))
+                        + i32::from(a.blue()).abs_diff(i32::from(b.blue()))
+                        + i32::from(a.alpha()).abs_diff(i32::from(b.alpha()));
+                    assert!(
+                        diff == 0,
+                        "{}: pixel ({x},{y}) in the timer zone differs between a loud and a \
+                         silent frame ({a:?} vs {b:?}) — something wave-level-dependent is \
+                         painting there",
+                        theme.name
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked > 10,
+                "{}: only {checked} px sampled in the timer zone",
+                theme.name
+            );
+        }
     }
 
     /// The theme side of the timer's contrast guarantee is pinned in
