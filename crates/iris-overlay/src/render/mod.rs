@@ -106,18 +106,20 @@ const WAVE_INSET: f32 = 6.0;
 const WAVE_TARGET_PITCH: f32 = 5.0;
 const WAVE_MIN_BARS: usize = 8;
 const WAVE_MAX_BARS: usize = 48;
-/// Narrow enough that a bar stays visibly a bar — width clearly under its
-/// own height — even at the shortest heights silence ever produces, not
-/// only at speech amplitudes. A first retune (`0.4`) fixed the wide-open
-/// ribbon and loud frames but still read as round dots at rest, where
-/// height and width were close enough that `WAVE_BAR_CORNER_FRAC`'s
-/// rounding made the two indistinguishable.
-const WAVE_BAR_W_FRAC: f32 = 0.3;
+/// Wide enough to actually read as ink at real desktop scale (a firstmate
+/// visual review of the installed build found bars invisible on a real
+/// monitor — see `WAVE_IDLE_FLOOR` and the alpha note in [`draw_wave`] for
+/// the other two levers this same review corrected), narrow enough that a
+/// bar still reads clearly as a bar rather than a dot. The `0.3` this
+/// replaced was tuned to stay legible at the previous, much lower height
+/// floor; now that a quiet bar keeps real height (`WAVE_IDLE_FLOOR`) and
+/// real opacity ([`WAVE_BAR_ALPHA_FLOOR`]), a bar this wide no longer
+/// collapses toward round at rest the way the pre-`0.3` `0.4` once did.
+const WAVE_BAR_W_FRAC: f32 = 0.4;
 /// Corner radius as a fraction of bar width. Less than the `0.5` a fully
-/// rounded (pill/circle) cap would use — at the narrow widths
-/// [`WAVE_BAR_W_FRAC`] now draws, full rounding is indistinguishable from a
-/// dot; this keeps a soft edge without erasing the bar's rectangular
-/// silhouette.
+/// rounded (pill/circle) cap would use, so the row keeps a rectangular,
+/// bar-like silhouette rather than reading as a row of dots at
+/// [`WAVE_BAR_W_FRAC`]'s width.
 const WAVE_BAR_CORNER_FRAC: f32 = 0.3;
 /// Bar height at full deflection, and how far the row's centre sits above the
 /// shape's — for the two ends of the `open` tween. Unchanged in value from
@@ -132,12 +134,28 @@ const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
 /// Bar height never reaches exactly zero, real sample or idle ripple alike —
 /// a completely flat bar is closer to the "dashes" failure than a very quiet
 /// one.
-const WAVE_IDLE_FLOOR: f32 = 0.05;
-/// Exponent [`wave_bar_scale`] raises a real level to. Raised from round 1's
-/// `1.6` in the same firstmate review that narrowed the bars: a stronger
-/// tall-to-short ratio at speech amplitudes is what makes height, not just
-/// bar count, read as sound.
-const WAVE_RESPONSE_EXPONENT: f32 = 2.4;
+///
+/// Was `0.05` — at [`WAVE_MAX_H_REST`] that floors a quiet bar at ~1 device
+/// px at 100% DPI, and at [`WAVE_MAX_H_RIBBON`] at a fraction of one; a
+/// firstmate visual review of the installed build (round 5, squashed as
+/// `a33769b`) found exactly that: bars that moved but were too short and
+/// too faint to see on a real desktop. Raised so a quiet bar keeps a
+/// legible sliver of height instead of anti-aliasing away to nothing —
+/// "quieter" has to stay visible, not vanish. See also
+/// [`WAVE_RESPONSE_EXPONENT`] (why quiet levels no longer compress this
+/// close to the floor) and [`WAVE_BAR_ALPHA_FLOOR`] (the other half of the
+/// same bug: alpha was tied to this same collapsing value).
+const WAVE_IDLE_FLOOR: f32 = 0.22;
+/// Exponent [`wave_bar_scale`] raises a real level to. Round 1 shipped
+/// `1.6`; a firstmate review pushed it to `2.4` for stronger tall-to-short
+/// contrast, but combined with the old, much lower [`WAVE_IDLE_FLOOR`] and
+/// the alpha-tied-to-height bug ([`WAVE_BAR_ALPHA_FLOOR`]) that made every
+/// quiet-to-moderate level collapse toward invisible rather than merely
+/// short. Settled between the two: still clearly expansive (captain, round
+/// 1: "so it's showing that it's clearly hearing you"), without crushing
+/// moderate levels into the noise floor the way `2.4` did once the floor
+/// itself was this much higher.
+const WAVE_RESPONSE_EXPONENT: f32 = 1.7;
 /// How much of the idle ripple (see [`wave_ripple`]) blends into a real
 /// sample that is itself near the floor, so silence reads as a live quiet
 /// waveform rather than N identical stubs. Small relative to a genuinely
@@ -146,6 +164,25 @@ const WAVE_RESPONSE_EXPONENT: f32 = 2.4;
 /// Raised from an initial `0.07` once a rendered silence frame still read as
 /// too uniform even with texture present — firstmate visual review.
 const WAVE_TEXTURE_AMPLITUDE: f32 = 0.11;
+/// Floor on a bar's own opacity, as a fraction of the row's overall
+/// [`wave_alpha`] — see [`draw_wave`], which blends `WAVE_BAR_ALPHA_FLOOR ..=
+/// 1.0` by the same per-bar `scale` that drives height, rather than using
+/// `scale` as the alpha outright.
+///
+/// The installed build (round 5, squashed as `a33769b`) painted each bar at
+/// `alpha * scale` — the *same* `scale` that already shrinks a quiet bar's
+/// height. A quiet bar was therefore both short **and** faint at once, and
+/// the two multiply: at `scale` near [`WAVE_IDLE_FLOOR`]'s old `0.05` a bar
+/// was 5% tall *and* 5% opaque, which is indistinguishable from not drawn.
+/// This is firstmate's own read of the captain's "clear colored" — alpha
+/// tied to amplitude was a reasonable idea in isolation (round 5 review:
+/// "quiet/silent samples should fade toward near-transparent instead of
+/// drawing uniform dashes"), but stacked with a height that was *already*
+/// carrying the same signal, it double-counted amplitude into invisibility.
+/// A high floor keeps opacity's contribution to "quieter" small and lets
+/// height (which has far more resolution to spend it in, 22 device px vs.
+/// one channel of alpha) carry almost all of the signal instead.
+const WAVE_BAR_ALPHA_FLOOR: f32 = 0.62;
 /// Gap between the wave row's right edge and the timer's left edge, so the
 /// two read as sharing the capsule rather than colliding. See [`draw_timer`].
 const WAVE_TIMER_GAP: f32 = 6.0;
@@ -314,22 +351,30 @@ fn draw_wave(
         let age = count - 1 - i;
         let sample = (age < hist_len).then(|| history[hist_len - 1 - age]);
         let scale = wave_bar_scale(sample, i as f32, now_ms);
-        let bh = (max_h * scale).max(l.scale * 0.6);
+        // A hard pixel floor independent of `scale`: at `WAVE_MAX_H_RIBBON`
+        // (6 logical px) even `WAVE_IDLE_FLOOR`'s height fraction rounds to
+        // roughly one device px at 100% DPI, which anti-aliases away to
+        // nothing. `1.2` keeps a bar a couple of device px tall at minimum —
+        // still clearly the smallest mark in the row, but not sub-pixel.
+        let bh = (max_h * scale).max(l.scale * 1.2);
         let bx = x + inset + pitch * i as f32 + (pitch - bar_w) * 0.5;
         let by = cy - bh * 0.5;
         if let Some(path) = shapes::round_rect(bx, by, bar_w, bh, bar_w * WAVE_BAR_CORNER_FRAC) {
             let colour = sample_ramp(theme.spectrum, p);
-            // `scale` fades a bar's own opacity, not only its height. Height
-            // alone stops being a legible signal at the couple of device px
-            // silence produces — a firstmate visual review found a rendered
-            // near-silent frame still read as a row of same-looking marks
-            // even with real per-bar height variation present, just too
-            // subtle to see at that size. A quiet bar fading toward
-            // near-transparent alongside its short height is what actually
-            // reads as "collapsing toward a thin line" rather than "a row of
-            // small solid dots" — and a loud bar, at `scale` near `1.0`,
-            // loses nothing.
-            fill_clipped(pixmap, ctx, &path, ctx.c(colour.fade(alpha * scale)), clip);
+            // Alpha blends WAVE_BAR_ALPHA_FLOOR..=1.0 by `scale`, rather than
+            // using `scale` as the alpha outright — see
+            // [`WAVE_BAR_ALPHA_FLOOR`] for why the latter (the installed
+            // build's behaviour) doubles up with height and crushes a quiet
+            // bar to nothing. A loud bar, at `scale` near `1.0`, still lands
+            // at full opacity either way.
+            let bar_alpha = WAVE_BAR_ALPHA_FLOOR + (1.0 - WAVE_BAR_ALPHA_FLOOR) * scale.min(1.0);
+            fill_clipped(
+                pixmap,
+                ctx,
+                &path,
+                ctx.c(colour.fade(alpha * bar_alpha)),
+                clip,
+            );
         }
     }
 }
@@ -1672,12 +1717,19 @@ mod tests {
     }
 
     /// Alpha of a pixel in the shell body itself: off-centre and low enough to
-    /// be clear of the core glyph and its halo, and the timer's own zone,
-    /// all of which paint opaque colours over the glass.
+    /// be clear of the core glyph and its halo, the timer's own zone, and the
+    /// wave row (`WAVE_MAX_H_REST / 2` logical px above/below centre at
+    /// most) — all of which paint opaque colours over the glass. The `14.0`
+    /// vertical offset clears the row (half-height `11.0`) while staying
+    /// inside the shape body (half-height `layout::ORB_D / 2` = `17.0`); an
+    /// `8.0` offset used to clear it too, back when the row's own bars were
+    /// both shorter and thinner — a legibility retune widened and heightened
+    /// them (see the `WAVE_*` constants in `render::mod`), so the old probe
+    /// point now lands on real bar ink instead of bare glass.
     fn body_alpha(r: &Renderer) -> u8 {
         let l = r.layout();
         let x = (l.center_x - 12.0 * l.scale) as u32;
-        let y = (l.center_y + 8.0 * l.scale) as u32;
+        let y = (l.center_y + 14.0 * l.scale) as u32;
         r.pixmap().pixels()[(y * l.window_w + x) as usize].alpha()
     }
 

@@ -556,6 +556,30 @@ When updating this file, preserve this bar for all agents and keep entries conci
   wave_history`, or `layout::REST_W` — and do not reintroduce a
   single-current-level-fanned-out bar row; that shape is what "dashes" means
   in every round's own words.
+- **Legibility retune (2026-08-09):** round 5 shipped and the captain,
+  reviewing the real installed build rather than zoomed evidence stills,
+  reported the wave row moved but was too small and "clear colored" to see.
+  Root cause was three of round 5's own `WAVE_*` constants compounding: bar
+  *alpha* was tied to the same per-bar `scale` that already shrinks *height*
+  (`colour.fade(alpha * scale)`), so a quiet bar was short and faint from one
+  number instead of two independent signals, and `WAVE_IDLE_FLOOR` (`0.05`)
+  plus `WAVE_RESPONSE_EXPONENT` (`2.4`) were tuned tight enough alone to make
+  that collapse total — a quiet bar rounded to roughly one device px at 100%
+  DPI. Fixed by decoupling them: alpha now blends `WAVE_BAR_ALPHA_FLOOR`
+  (`0.62`) up to full by `scale` rather than using `scale` as alpha outright,
+  `WAVE_IDLE_FLOOR` rose to `0.22`, `WAVE_RESPONSE_EXPONENT` eased to `1.7`,
+  and `WAVE_BAR_W_FRAC` widened back to `0.4` now that height no longer
+  collapses close enough to width to read as a dot. Do not retune any of
+  these four without re-rendering at true, unscaled 1:1 pixel size and
+  actually looking — `crates/iris-overlay/examples/desktop_composite.rs`
+  composites a rendered frame onto a large neutral canvas at real device-px
+  size for exactly this, because every evidence PNG this crate produces is a
+  small crop that a docs viewer silently upscales, which is the same trap
+  that shipped round 5 unreadable. See
+  `crates/iris-overlay/docs/wave-visibility-evidence/` for the 1:1 evidence
+  (both themes, quiet and loud, plus before/after) and the "Legibility
+  retune" section of `crates/iris-overlay/docs/round5-evidence/README.md` for
+  the full writeup.
 - **Per-appearance reset state must be reachable from `window/win32.rs`'s real
   loop, not gated on `presence <= `-some-epsilon during the exit fade.** That
   loop stops calling `Renderer::draw` at all once `Model::is_idle()`
