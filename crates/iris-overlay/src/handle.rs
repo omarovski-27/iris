@@ -210,6 +210,16 @@ impl OverlayHandle {
         self.send(Command::Engine(label.into()));
     }
 
+    /// Mark the current listening session as a hands-free latch (recording
+    /// continues with the hotkey released) or not.
+    ///
+    /// Ignored unless the pill is currently listening in the sense that
+    /// matters visually — see [`crate::state::Command::Latched`] and
+    /// `render::core_colour`/`render::glow_colour` for what it changes.
+    pub fn set_latched(&self, on: bool) {
+        self.send(Command::Latched(on));
+    }
+
     /// The hotkey is up and the engine is finishing.
     ///
     /// Ignored unless the pill is currently listening.
@@ -283,6 +293,7 @@ mod tests {
         h.update_level(0.5);
         h.set_partial_text("hi there");
         h.set_engine("groq");
+        h.set_latched(true);
         h.processing();
         h.inserted(142);
         h.hide();
@@ -292,6 +303,7 @@ mod tests {
         assert!(matches!(rx.recv().unwrap(), Command::Level(v) if (v - 0.5).abs() < 1e-6));
         assert!(matches!(rx.recv().unwrap(), Command::PartialText(s) if s == "hi there"));
         assert!(matches!(rx.recv().unwrap(), Command::Engine(s) if s == "groq"));
+        assert!(matches!(rx.recv().unwrap(), Command::Latched(true)));
         assert!(matches!(rx.recv().unwrap(), Command::Processing));
         assert!(matches!(
             rx.recv().unwrap(),

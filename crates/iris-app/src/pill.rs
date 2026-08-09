@@ -72,6 +72,18 @@ pub trait PillSink: Send {
     /// design carries it on the model but does not draw it.
     fn set_engine(&mut self, _label: &str) {}
 
+    /// Mark the current listening session as a hands-free latch (recording
+    /// continues with the key released) or not. Default no-op.
+    ///
+    /// Orthogonal to [`Self::show_listening`]/[`Self::processing`]/
+    /// [`Self::hide`], the same way [`Self::set_partial_text`] is: it does
+    /// not itself change what state the pill is in, only how a `Listening`
+    /// pill is drawn, so a sink that only cares about the state machine can
+    /// ignore it. A sink that does implement it must not let a stale `true`
+    /// outlive the utterance — see `App::capture`'s hold loop, which always
+    /// calls this with `false` before the pill leaves `Listening`.
+    fn set_latched(&mut self, _on: bool) {}
+
     /// Map the app theme onto the overlay palette. Default no-op.
     fn set_theme(&mut self, _theme: Theme) {}
 
@@ -104,6 +116,9 @@ impl PillSink for Box<dyn PillSink> {
     }
     fn set_engine(&mut self, label: &str) {
         (**self).set_engine(label);
+    }
+    fn set_latched(&mut self, on: bool) {
+        (**self).set_latched(on);
     }
     fn set_theme(&mut self, theme: Theme) {
         (**self).set_theme(theme);
@@ -154,6 +169,9 @@ impl PillSink for LogPill {
     }
     fn set_engine(&mut self, label: &str) {
         iris_core::vlog!("pill: engine={label}");
+    }
+    fn set_latched(&mut self, on: bool) {
+        iris_core::vlog!("pill: latched={on}");
     }
     fn set_theme(&mut self, theme: Theme) {
         iris_core::vlog!("pill: theme={theme}");
@@ -260,6 +278,10 @@ impl PillSink for OverlayPill {
         self.handle.set_engine(label);
     }
 
+    fn set_latched(&mut self, on: bool) {
+        self.handle.set_latched(on);
+    }
+
     fn set_theme(&mut self, theme: Theme) {
         self.handle.set_theme(overlay_theme(theme));
     }
@@ -303,6 +325,8 @@ pub enum PillEvent {
     SetTheme(Theme),
     /// [`PillSink::set_show_live_text`], with the value pushed.
     SetShowLiveText(bool),
+    /// [`PillSink::set_latched`], with the value pushed.
+    SetLatched(bool),
 }
 
 /// A test double that remembers the state transitions it was told about.
@@ -389,6 +413,9 @@ impl PillSink for RecordingPill {
         self.state.lock().expect("pill mutex").engine = Some(label.to_string());
         self.push(PillEvent::SetEngine);
     }
+    fn set_latched(&mut self, on: bool) {
+        self.push(PillEvent::SetLatched(on));
+    }
     fn set_theme(&mut self, theme: Theme) {
         self.push(PillEvent::SetTheme(theme));
     }
@@ -417,6 +444,8 @@ mod tests {
         pill.update_level(0.25);
         pill.set_partial_text("hey");
         pill.update_level(0.75);
+        pill.set_latched(true);
+        pill.set_latched(false);
         pill.processing();
         pill.inserted(142);
         // Success path: no hide after inserted.
@@ -428,6 +457,8 @@ mod tests {
                 PillEvent::SetTheme(Theme::Dark),
                 PillEvent::ShowListening,
                 PillEvent::SetPartialText,
+                PillEvent::SetLatched(true),
+                PillEvent::SetLatched(false),
                 PillEvent::Processing,
                 PillEvent::Inserted { latency_ms: 142 },
             ]
@@ -442,6 +473,7 @@ mod tests {
     fn a_boxed_sink_forwards_every_method() {
         let mut pill: Box<dyn PillSink> = Box::new(RecordingPill::new());
         pill.show_listening();
+        pill.set_latched(true);
         pill.inserted(10);
         pill.hide();
         let mut noop = NoopPill;
@@ -449,6 +481,7 @@ mod tests {
         noop.update_level(1.0);
         noop.set_partial_text("hi");
         noop.set_engine("x");
+        noop.set_latched(true);
         noop.set_theme(Theme::Light);
         noop.processing();
         noop.inserted(0);

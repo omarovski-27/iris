@@ -183,6 +183,61 @@ Load-bearing beyond that crate:
   dictation still cannot start until the first's finalise (and, now, its
   detached delivery) is done — only Quit was carved out, not general
   concurrency.
+- **Hands-free latch: double-tap the hotkey to keep recording with the key
+  released, single tap to stop.** Built entirely inside `App::capture`'s
+  existing hold loop (`app.rs`) — one `dictate()`/`capture()` call still
+  covers the whole tap sequence, never a second dictation path. A private
+  `LatchPhase` (`Held` → `AwaitingSecondTap` → `Latched`) drives it: a
+  key-up released within `DOUBLE_TAP_WINDOW` (400ms, `is_candidate_tap`) of
+  its own press might be tap one of a double-tap, so the loop waits out the
+  rest of the window for a following `Down` instead of finalising
+  immediately; a `Down` that arrives in time latches (hands-free, no bound
+  but `MAX_LATCH_DURATION`, 5 minutes, overridable per-`App` by
+  `with_latch_cap` — the only way a test exercises the cap without a real
+  five-minute wait); the next `Down` while latched — the press alone, not
+  its release — stops it and finalises exactly like an ordinary key-up. An
+  ordinary hold-to-talk release past the window is untouched: zero added
+  latency, because `Held` never arms any of this phase's extra `select!`
+  arms. Two non-obvious traps, both caught by test regressions during
+  development, not by inspection:
+  - **`AwaitingSecondTap` must stop feeding frames, not just delay
+    breaking the loop.** Continuing to drain `frames` through the ordinary
+    per-frame arm during the wait silently changes what an engine sees:
+    whatever was still queued in the channel at the first tap's key-up used
+    to arrive as one batched "tail" feed after the loop broke (the existing
+    behaviour for *any* short, backlog-heavy hold, double-tap or not); left
+    live, it drains one frame at a time before the loop ever gets there.
+    `TailFeedFailsEngine`/`GoesQuietThenTailFeedFailsEngine`
+    (`iris-app/tests/loop.rs`) — which fail specifically on a batched
+    `push()` bigger than one frame — caught this immediately. Fixed by
+    excluding `AwaitingSecondTap` from the frame-reading arm; `Latched`
+    keeps reading normally, same as `Held`.
+  - **The quit-during-finalise fix above only covers the finalise wait, not
+    this loop.** A held key bounds `Held`'s exposure to the user's own
+    finger, but `AwaitingSecondTap` and `Latched` both run with the key
+    already up, so `LATCH_QUIT_POLL` (100ms, armed in both, never in
+    `Held`) polls `App::quit_flag` there too and ends the hold the moment
+    it sees Quit — otherwise a latch (or even an ordinary short hold
+    sitting in `AwaitingSecondTap`) can leave a tray Quit unread for up to
+    the double-tap window or the whole latch cap. Caught by a timing
+    regression in the existing quit test once its hold happened to be short
+    enough to enter `AwaitingSecondTap`.
+  - A lost hotkey channel is handled the same asymmetric way `Held` already
+    handles it, but the other two phases read it as *confirmed already
+    over* rather than *never confirmed*: `AwaitingSecondTap` finalises with
+    the tap's own key-up, `Latched` finalises with the words captured so
+    far — never the hard error `Held`'s loss still is. This is what keeps
+    `--demo-dictation`'s single-shot channel (dropped right after its one
+    `Up`) working once a short synthetic hold lands in `AwaitingSecondTap`.
+  The overlay visual is a colour swap only, not a new `OverlayState`:
+  `PillSink::set_latched`/`OverlayHandle::set_latched`/`Command::Latched(bool)`
+  set an orthogonal flag on `iris-overlay`'s `Model` (parallel to
+  `set_show_live_text`), reset by a fresh `ShowListening` the same way the
+  transcript and timer are; `render::core_colour`/`render::glow_colour`
+  read it and swap the core dot and halo from `theme.rec` (mint) to
+  `theme.accent` (sky) — the same sky `Processing` already uses — while
+  latched. No geometry, motion, wave-row, or timer-font change. Evidence:
+  `crates/iris-overlay/docs/handsfree-latch-evidence/`.
 - **`iris-engine-local` is real, tested code, not a stub — but is not part of
   the shipped Windows binary.** `EngineChoice::Local` and a genuine
   `LocalAdapter` (`iris-app/src/engines.rs`) implementing `Engine`/`Session`

@@ -1114,8 +1114,14 @@ fn fill_through(pixmap: &mut Pixmap, mask: &Mask, colour: Rgba) {
 
 /// The state halo's colour, cross-fading between the state being left and the
 /// one being shown.
+///
+/// `model.latched()` is a single model-wide flag, not per-state history, so a
+/// cross-fade away from a latched `Listening` reads it the same as the state
+/// being shown — imprecise only for the length of `STATE_CROSS_MS`, which is
+/// short enough that it does not matter.
 fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
     let pick = |state: OverlayState| match state {
+        OverlayState::Listening if model.latched() => theme.glow_latched,
         OverlayState::Listening => theme.glow_listening,
         OverlayState::Inserted => theme.glow_inserted,
         _ => theme.glow_idle,
@@ -1123,9 +1129,16 @@ fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
     pick(model.previous_state()).lerp(pick(shown_state(model)), shown_cross(model))
 }
 
-/// The core dot's colour: sky while the engine is working, mint otherwise.
+/// The core dot's colour: sky while the engine is working *or* while a
+/// hands-free latch is live, mint otherwise.
+///
+/// Processing and a live latch deliberately share `theme.accent` — both are
+/// "this pill needs a look, not steady-state listening" — while
+/// [`glow_colour`]'s halo is what actually tells a live latch apart from an
+/// ordinary held-key listen at this dot's small size.
 fn core_colour(theme: &Theme, model: &Model) -> Rgba {
-    if shown_state(model) == OverlayState::Processing {
+    let shown = shown_state(model);
+    if shown == OverlayState::Processing || (shown == OverlayState::Listening && model.latched()) {
         theme.accent
     } else {
         theme.rec
@@ -2608,6 +2621,83 @@ mod tests {
             sampled += 1;
         }
         assert!(sampled > 4, "only {sampled} exit frames sampled");
+    }
+
+    /// The one visual cue a hands-free latch has: the halo and the core dot
+    /// both swap from the mint `Listening` reads normally to the same sky
+    /// `theme.accent` `Processing` uses, in both themes. This is what a
+    /// captain glancing at the pill actually sees — a latch that changed
+    /// `Model::latched()` but produced no visible difference would defeat
+    /// the whole point of the feature (a silently-still-recording
+    /// microphone).
+    /// Ticks `m` forward to `until_ms` at 60 fps, settling the state
+    /// cross-fade — the pattern every other test in this module drives by
+    /// hand; factored out here only because these two tests share it twice.
+    fn settle(m: &mut Model, until_ms: u64) {
+        let mut t = 0u64;
+        while t < until_ms {
+            t += 16;
+            m.tick(t);
+        }
+    }
+
+    #[test]
+    fn a_latched_listen_reads_differently_from_an_ordinary_one() {
+        for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+            let mut ordinary = Model::new(theme);
+            ordinary.tick(0);
+            ordinary.apply(Command::ShowListening);
+            settle(&mut ordinary, u64::from(STATE_CROSS_MS) + 32);
+
+            let mut latched = Model::new(theme);
+            latched.tick(0);
+            latched.apply(Command::ShowListening);
+            latched.apply(Command::Latched(true));
+            settle(&mut latched, u64::from(STATE_CROSS_MS) + 32);
+
+            assert_eq!(shown_state(&ordinary), OverlayState::Listening);
+            assert_eq!(shown_state(&latched), OverlayState::Listening);
+            assert_ne!(
+                core_colour(&theme, &ordinary),
+                core_colour(&theme, &latched),
+                "{}: the core dot does not change when latched",
+                theme.name
+            );
+            assert_ne!(
+                glow_colour(&theme, &ordinary),
+                glow_colour(&theme, &latched),
+                "{}: the halo does not change when latched",
+                theme.name
+            );
+            assert_eq!(
+                core_colour(&theme, &latched),
+                theme.accent,
+                "{}: a latched core dot should read exactly like Processing's",
+                theme.name
+            );
+        }
+    }
+
+    /// Clearing the latch must snap the look back to an ordinary listen
+    /// immediately — no lingering halo or core colour from the latch that
+    /// just ended.
+    #[test]
+    fn clearing_the_latch_restores_the_ordinary_listening_colours() {
+        for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+            let mut m = Model::new(theme);
+            m.tick(0);
+            m.apply(Command::ShowListening);
+            settle(&mut m, u64::from(STATE_CROSS_MS) + 32);
+            let plain_core = core_colour(&theme, &m);
+            let plain_glow = glow_colour(&theme, &m);
+
+            m.apply(Command::Latched(true));
+            assert_ne!(core_colour(&theme, &m), plain_core, "{}", theme.name);
+
+            m.apply(Command::Latched(false));
+            assert_eq!(core_colour(&theme, &m), plain_core, "{}", theme.name);
+            assert_eq!(glow_colour(&theme, &m), plain_glow, "{}", theme.name);
+        }
     }
 
     /// Every appearance decision has to agree about what is on screen while

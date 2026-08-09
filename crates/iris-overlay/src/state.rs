@@ -69,6 +69,17 @@ pub enum Command {
     /// attention. Kept as live data rather than removed outright so a future
     /// direction can pick it back up without a contract change.
     Engine(String),
+    /// Mark the current `Listening` session as a hands-free latch (recording
+    /// continues with the hotkey released) or not.
+    ///
+    /// Orthogonal to the state machine below, the same way `Level` and
+    /// `PartialText` are: it never moves `state`, only how a `Listening`
+    /// pill is drawn (see `render::core_colour`/`render::glow_colour`), so it
+    /// applies unconditionally regardless of the current state. Reset to
+    /// `false` by a fresh `ShowListening`, the same way the transcript and
+    /// the timer are, so a latch never bleeds into the next utterance if the
+    /// caller ever forgot to send `Latched(false)` first.
+    Latched(bool),
     /// The hotkey is up; the engine is finishing.
     Processing,
     /// Text landed. Shows the check and the end-to-end latency, then hides
@@ -117,6 +128,7 @@ pub struct Model {
     text: String,
     engine: String,
     latency_ms: Option<u32>,
+    latched: bool,
 
     listen_started_at: u64,
     listen_frozen_ms: Option<u64>,
@@ -139,6 +151,7 @@ impl Model {
             text: String::new(),
             engine: String::new(),
             latency_ms: None,
+            latched: false,
             listen_started_at: 0,
             listen_frozen_ms: None,
         }
@@ -173,6 +186,7 @@ impl Model {
                     self.text.clear();
                     self.level = 0.0;
                     self.level_target = 0.0;
+                    self.latched = false;
                     self.listen_started_at = self.now_ms;
                     self.listen_frozen_ms = None;
                     self.enter(Listening);
@@ -187,6 +201,7 @@ impl Model {
             }
             Command::PartialText(text) => self.text = text,
             Command::Engine(label) => self.engine = label,
+            Command::Latched(on) => self.latched = on,
             Command::Processing => {
                 if matches!(self.state, Listening) {
                     self.freeze_timer();
@@ -360,6 +375,13 @@ impl Model {
     #[must_use]
     pub fn engine(&self) -> &str {
         &self.engine
+    }
+
+    /// Whether the current `Listening` session is a hands-free latch. See
+    /// [`Command::Latched`].
+    #[must_use]
+    pub fn latched(&self) -> bool {
+        self.latched
     }
 
     /// The latency to print, once one has been reported.
@@ -602,6 +624,7 @@ mod tests {
             Command::Level(0.5),
             Command::PartialText("hi".into()),
             Command::Engine("groq".into()),
+            Command::Latched(true),
             Command::Processing,
             Command::Inserted { latency_ms: 1 },
             Command::Hide,
@@ -610,6 +633,45 @@ mod tests {
             assert!(m.apply(c), "command should not stop the loop");
         }
         assert!(!m.apply(Command::Shutdown));
+    }
+
+    #[test]
+    fn latched_is_off_by_default_and_applies_regardless_of_state() {
+        let mut m = model();
+        assert!(!m.latched());
+
+        // Applies even from `Hidden`, the same way `Level`/`PartialText` do —
+        // it is a flag alongside the state machine, not a transition through
+        // it.
+        m.apply(Command::Latched(true));
+        assert!(m.latched());
+
+        m.apply(Command::ShowListening);
+        m.apply(Command::Latched(true));
+        assert!(m.latched());
+        m.apply(Command::Latched(false));
+        assert!(!m.latched());
+    }
+
+    /// A fresh utterance must never open already reading as latched, the same
+    /// way it must never open holding the previous utterance's transcript or
+    /// timer — see `Command::ShowListening`'s reset list. This is what stops a
+    /// caller that forgot `Latched(false)` before its own `processing()` call
+    /// from bleeding a stale latch into the very next dictation.
+    #[test]
+    fn a_fresh_show_listening_clears_a_stale_latch() {
+        let mut m = model();
+        m.apply(Command::ShowListening);
+        m.apply(Command::Latched(true));
+        assert!(m.latched());
+
+        m.apply(Command::Processing);
+        m.apply(Command::Inserted { latency_ms: 90 });
+        m.apply(Command::ShowListening);
+        assert!(
+            !m.latched(),
+            "a latch from the previous utterance survived into this one"
+        );
     }
 
     #[test]

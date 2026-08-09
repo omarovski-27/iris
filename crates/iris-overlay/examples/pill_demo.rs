@@ -126,6 +126,13 @@ struct Args {
     #[arg(long, value_parser = unit_level)]
     hold_level: Option<f32>,
 
+    /// Mark the listening session as a hands-free latch
+    /// (`iris-app`'s double-tap feature), sent right after `ShowListening`.
+    /// Live and filmstrip modes only; `--evidence` holds its own state and
+    /// rejects this flag.
+    #[arg(long)]
+    latched: bool,
+
     /// Composite each written PNG over a synthetic busy desktop instead of
     /// leaving it transparent — in filmstrip and evidence modes.
     ///
@@ -148,7 +155,7 @@ struct Args {
         long,
         conflicts_with_all = [
             "theme", "utterance", "live_text", "hold_level", "engine",
-            "cycles", "filmstrip", "filmstrip_step",
+            "cycles", "filmstrip", "filmstrip_step", "latched",
         ]
     )]
     evidence: Option<PathBuf>,
@@ -224,8 +231,14 @@ fn live(
     let mut cycle_no = 0u32;
     while args.cycles == 0 || cycle_no < args.cycles {
         cycle_no += 1;
-        println!("[{cycle_no}] listening");
+        println!(
+            "[{cycle_no}] listening{}",
+            if args.latched { " (latched)" } else { "" }
+        );
         pill.show_listening();
+        if args.latched {
+            pill.set_latched(true);
+        }
 
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(cycle.listen_ms) {
@@ -283,6 +296,9 @@ fn filmstrip(
     for cycle_no in 0..cycles {
         let base = now;
         pill.apply(Command::ShowListening);
+        if args.latched {
+            pill.apply(Command::Latched(true));
+        }
         // Thresholds rather than equalities: the frame step will not land
         // exactly on a phase boundary, and an `==` would silently skip it.
         let (mut said_processing, mut said_inserted) = (false, false);
