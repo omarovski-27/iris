@@ -229,15 +229,27 @@ Load-bearing beyond that crate:
     far — never the hard error `Held`'s loss still is. This is what keeps
     `--demo-dictation`'s single-shot channel (dropped right after its one
     `Up`) working once a short synthetic hold lands in `AwaitingSecondTap`.
-  The overlay visual is a colour swap only, not a new `OverlayState`:
-  `PillSink::set_latched`/`OverlayHandle::set_latched`/`Command::Latched(bool)`
-  set an orthogonal flag on `iris-overlay`'s `Model` (parallel to
-  `set_show_live_text`), reset by a fresh `ShowListening` the same way the
-  transcript and timer are; `render::core_colour`/`render::glow_colour`
-  read it and swap the core dot and halo from `theme.rec` (mint) to
-  `theme.accent` (sky) — the same sky `Processing` already uses — while
-  latched. No geometry, motion, wave-row, or timer-font change. Evidence:
-  `crates/iris-overlay/docs/handsfree-latch-evidence/`.
+  The overlay visual is additive to the existing colour tokens, not a new
+  `OverlayState`: `PillSink::set_latched`/`OverlayHandle::set_latched`/
+  `Command::Latched(bool)` set an orthogonal flag on `iris-overlay`'s
+  `Model` (parallel to `set_show_live_text`), reset by a fresh
+  `ShowListening` the same way the transcript and timer are;
+  `render::core_colour`/`render::glow_colour` read it and swap the core dot
+  and halo from `theme.rec` (mint) to `theme.accent` (sky) — the same sky
+  `Processing` already uses — while latched. No geometry, motion, wave-row,
+  or timer-font change. **The colour swap alone was not enough** — a
+  2026-08-10 review at real 1:1 desktop size found it not reliably distinct
+  at a glance, and colour alone fails outright for colour-vision
+  deficiency, which is the one failure mode this indicator most needs to
+  survive (a missed latch is a live microphone the user believes is off).
+  Fixed by adding a second, non-colour cue alongside the colour swap: a
+  stroked ring drawn around the core dot only while latched
+  (`LATCH_RING_R_FRAC` and friends, `render::draw_glyph`) — its *presence*,
+  not its hue, is the signal, so it survives grayscale or any CVD
+  simulation. Sized to sit clear of both the core dot and the halo's
+  pulsing maximum, and shares its radius family with `Processing`'s
+  spinner (`SPINNER_R_FRAC`) by design. Evidence (both themes, ring
+  visible): `crates/iris-overlay/docs/handsfree-latch-evidence/`.
 - **`iris-engine-local` is real, tested code, not a stub — but is not part of
   the shipped Windows binary.** `EngineChoice::Local` and a genuine
   `LocalAdapter` (`iris-app/src/engines.rs`) implementing `Engine`/`Session`

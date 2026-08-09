@@ -490,6 +490,23 @@ const CORE_PULSE_MAX: f32 = 1.12;
 const HALO_R_FRAC: f32 = 0.16;
 const HALO_GROW_FRAC: f32 = 0.22;
 const SPINNER_R_FRAC: f32 = 0.32;
+
+// The latched ring: a second, non-colour cue around the core dot while a
+// hands-free latch is live (`Model::latched()`). A 2026-08-10 legibility
+// pass found the colour swap alone (`core_colour`/`glow_colour`, mint ->
+// sky) was not reliably distinct at real desktop size and fails outright
+// for colour-vision deficiency — exactly the "silently-still-recording"
+// hazard the indicator exists to prevent. The ring's presence, not its hue,
+// is the signal: a hollow stroke reads as a shape difference in grayscale
+// or any CVD simulation, unlike a colour-only cue. Radius sits clear of the
+// core dot (`CORE_R_FRAC`, 0.15) and the halo's pulsing maximum
+// (`HALO_R_FRAC + HALO_GROW_FRAC`, 0.38) so it draws as a crisp ring, not a
+// blur folded into either — close to `SPINNER_R_FRAC` (0.32) by design, so
+// the zone a latch occupies and the zone `Processing`'s spinner occupies
+// read as the same place on the pill.
+const LATCH_RING_R_FRAC: f32 = 0.30;
+const LATCH_RING_STROKE_FRAC: f32 = 0.045;
+const LATCH_RING_ALPHA: f32 = 0.85;
 const SPINNER_STROKE_FRAC: f32 = 0.045;
 const CHECK_SIZE_FRAC: f32 = 0.6;
 const CHECK_STROKE_FRAC: f32 = 0.09;
@@ -1348,6 +1365,24 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
         if let Some(p) = shapes::circle(cx, cy, core_r) {
             fill(pixmap, ctx, &p, ctx.c(core_colour.fade(core_alpha)));
         }
+    }
+
+    // The latched ring — see `LATCH_RING_R_FRAC`'s doc comment for why this
+    // exists alongside the colour swap rather than instead of it. Gated the
+    // same way the halo above is (`listening`, `alpha`), so it fades and
+    // reappears exactly in step with the rest of the "currently listening"
+    // look and never survives into `Processing`/`Inserted`.
+    if listening > 0.001 && model.latched() {
+        let ring_r = l.shape_h * LATCH_RING_R_FRAC;
+        let ring_w = (l.shape_h * LATCH_RING_STROKE_FRAC).max(l.scale);
+        let ring_a = LATCH_RING_ALPHA * listening * alpha;
+        stroke(
+            pixmap,
+            ctx,
+            shapes::circle(cx, cy, ring_r),
+            ctx.c(core_colour.fade(ring_a)),
+            ring_w,
+        );
     }
 
     if processing > 0.001 {
