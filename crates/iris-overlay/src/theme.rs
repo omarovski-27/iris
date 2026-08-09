@@ -165,6 +165,14 @@ pub struct Theme {
     pub glow_idle: Rgba,
     /// Halo while listening.
     pub glow_listening: Rgba,
+    /// Halo while listening *and* hands-free latched — the one visual cue
+    /// that a latch is live, so it has to read as clearly different from
+    /// [`Self::glow_listening`] at a glance, not just a slightly different
+    /// mint. Sky rather than mint, echoing [`Self::accent`] (the same hue
+    /// [`Self::rec`] already lends to `Processing`'s core dot) rather than
+    /// introducing a third solid hue into a palette that is deliberately
+    /// down to two plus the one warm `warn` token.
+    pub glow_latched: Rgba,
     /// Halo while the inserted confirmation is on screen.
     pub glow_inserted: Rgba,
 
@@ -259,6 +267,11 @@ pub const PRISM_DARK: Theme = Theme {
     // Soft cool halos only — no purple blob, no crimson listening glow.
     glow_idle: Rgba::hex_a(0x6B_CBFF, 0.08),
     glow_listening: Rgba::hex_a(0x5C_E6A8, 0.10),
+    // Sky, not mint, and a touch stronger than glow_listening's 0.10 — a
+    // forgotten hands-free latch is the hazard this whole feature exists to
+    // make visible, so the halo should read as "still live" a little more
+    // insistently than an ordinary held-key listen.
+    glow_latched: Rgba::hex_a(0x6B_CBFF, 0.16),
     glow_inserted: Rgba::hex_a(0x5C_E6A8, 0.12),
 
     // Live waveform only: muted cool instrument spectrum (no rose/red candy).
@@ -324,6 +337,9 @@ pub const PORCELAIN_LIGHT: Theme = Theme {
 
     glow_idle: Rgba::hex_a(0x7A_A8_C8, 0.07),
     glow_listening: Rgba::hex_a(0x3D_BF8A, 0.09),
+    // Sky, not mint — see Prism's `glow_latched` for why, and why it is
+    // stronger than glow_listening.
+    glow_latched: Rgba::hex_a(0x6E_9F_C8, 0.15),
     glow_inserted: Rgba::hex_a(0x3D_BF8A, 0.10),
 
     spectrum: &[
@@ -434,6 +450,7 @@ mod tests {
                 theme.ambient_shadow,
                 theme.glow_idle,
                 theme.glow_listening,
+                theme.glow_latched,
                 theme.glow_inserted,
                 theme.ink,
                 theme.ink_dim,
@@ -659,6 +676,7 @@ mod tests {
         for theme in THEMES {
             not_red(theme.rec, "rec", theme.name);
             not_red(theme.glow_listening, "glow_listening", theme.name);
+            not_red(theme.glow_latched, "glow_latched", theme.name);
             not_red(theme.ring_listening, "ring_listening", theme.name);
         }
     }

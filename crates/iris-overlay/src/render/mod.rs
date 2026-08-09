@@ -490,6 +490,23 @@ const CORE_PULSE_MAX: f32 = 1.12;
 const HALO_R_FRAC: f32 = 0.16;
 const HALO_GROW_FRAC: f32 = 0.22;
 const SPINNER_R_FRAC: f32 = 0.32;
+
+// The latched ring: a second, non-colour cue around the core dot while a
+// hands-free latch is live (`Model::latched()`). A 2026-08-10 legibility
+// pass found the colour swap alone (`core_colour`/`glow_colour`, mint ->
+// sky) was not reliably distinct at real desktop size and fails outright
+// for colour-vision deficiency — exactly the "silently-still-recording"
+// hazard the indicator exists to prevent. The ring's presence, not its hue,
+// is the signal: a hollow stroke reads as a shape difference in grayscale
+// or any CVD simulation, unlike a colour-only cue. Radius sits clear of the
+// core dot (`CORE_R_FRAC`, 0.15) and the halo's pulsing maximum
+// (`HALO_R_FRAC + HALO_GROW_FRAC`, 0.38) so it draws as a crisp ring, not a
+// blur folded into either — close to `SPINNER_R_FRAC` (0.32) by design, so
+// the zone a latch occupies and the zone `Processing`'s spinner occupies
+// read as the same place on the pill.
+const LATCH_RING_R_FRAC: f32 = 0.30;
+const LATCH_RING_STROKE_FRAC: f32 = 0.045;
+const LATCH_RING_ALPHA: f32 = 0.85;
 const SPINNER_STROKE_FRAC: f32 = 0.045;
 const CHECK_SIZE_FRAC: f32 = 0.6;
 const CHECK_STROKE_FRAC: f32 = 0.09;
@@ -1114,8 +1131,14 @@ fn fill_through(pixmap: &mut Pixmap, mask: &Mask, colour: Rgba) {
 
 /// The state halo's colour, cross-fading between the state being left and the
 /// one being shown.
+///
+/// `model.latched()` is a single model-wide flag, not per-state history, so a
+/// cross-fade away from a latched `Listening` reads it the same as the state
+/// being shown — imprecise only for the length of `STATE_CROSS_MS`, which is
+/// short enough that it does not matter.
 fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
     let pick = |state: OverlayState| match state {
+        OverlayState::Listening if model.latched() => theme.glow_latched,
         OverlayState::Listening => theme.glow_listening,
         OverlayState::Inserted => theme.glow_inserted,
         _ => theme.glow_idle,
@@ -1123,9 +1146,16 @@ fn glow_colour(theme: &Theme, model: &Model) -> Rgba {
     pick(model.previous_state()).lerp(pick(shown_state(model)), shown_cross(model))
 }
 
-/// The core dot's colour: sky while the engine is working, mint otherwise.
+/// The core dot's colour: sky while the engine is working *or* while a
+/// hands-free latch is live, mint otherwise.
+///
+/// Processing and a live latch deliberately share `theme.accent` — both are
+/// "this pill needs a look, not steady-state listening" — while
+/// [`glow_colour`]'s halo is what actually tells a live latch apart from an
+/// ordinary held-key listen at this dot's small size.
 fn core_colour(theme: &Theme, model: &Model) -> Rgba {
-    if shown_state(model) == OverlayState::Processing {
+    let shown = shown_state(model);
+    if shown == OverlayState::Processing || (shown == OverlayState::Listening && model.latched()) {
         theme.accent
     } else {
         theme.rec
@@ -1335,6 +1365,24 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
         if let Some(p) = shapes::circle(cx, cy, core_r) {
             fill(pixmap, ctx, &p, ctx.c(core_colour.fade(core_alpha)));
         }
+    }
+
+    // The latched ring — see `LATCH_RING_R_FRAC`'s doc comment for why this
+    // exists alongside the colour swap rather than instead of it. Gated the
+    // same way the halo above is (`listening`, `alpha`), so it fades and
+    // reappears exactly in step with the rest of the "currently listening"
+    // look and never survives into `Processing`/`Inserted`.
+    if listening > 0.001 && model.latched() {
+        let ring_r = l.shape_h * LATCH_RING_R_FRAC;
+        let ring_w = (l.shape_h * LATCH_RING_STROKE_FRAC).max(l.scale);
+        let ring_a = LATCH_RING_ALPHA * listening * alpha;
+        stroke(
+            pixmap,
+            ctx,
+            shapes::circle(cx, cy, ring_r),
+            ctx.c(core_colour.fade(ring_a)),
+            ring_w,
+        );
     }
 
     if processing > 0.001 {
@@ -2608,6 +2656,83 @@ mod tests {
             sampled += 1;
         }
         assert!(sampled > 4, "only {sampled} exit frames sampled");
+    }
+
+    /// The one visual cue a hands-free latch has: the halo and the core dot
+    /// both swap from the mint `Listening` reads normally to the same sky
+    /// `theme.accent` `Processing` uses, in both themes. This is what a
+    /// captain glancing at the pill actually sees — a latch that changed
+    /// `Model::latched()` but produced no visible difference would defeat
+    /// the whole point of the feature (a silently-still-recording
+    /// microphone).
+    /// Ticks `m` forward to `until_ms` at 60 fps, settling the state
+    /// cross-fade — the pattern every other test in this module drives by
+    /// hand; factored out here only because these two tests share it twice.
+    fn settle(m: &mut Model, until_ms: u64) {
+        let mut t = 0u64;
+        while t < until_ms {
+            t += 16;
+            m.tick(t);
+        }
+    }
+
+    #[test]
+    fn a_latched_listen_reads_differently_from_an_ordinary_one() {
+        for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+            let mut ordinary = Model::new(theme);
+            ordinary.tick(0);
+            ordinary.apply(Command::ShowListening);
+            settle(&mut ordinary, u64::from(STATE_CROSS_MS) + 32);
+
+            let mut latched = Model::new(theme);
+            latched.tick(0);
+            latched.apply(Command::ShowListening);
+            latched.apply(Command::Latched(true));
+            settle(&mut latched, u64::from(STATE_CROSS_MS) + 32);
+
+            assert_eq!(shown_state(&ordinary), OverlayState::Listening);
+            assert_eq!(shown_state(&latched), OverlayState::Listening);
+            assert_ne!(
+                core_colour(&theme, &ordinary),
+                core_colour(&theme, &latched),
+                "{}: the core dot does not change when latched",
+                theme.name
+            );
+            assert_ne!(
+                glow_colour(&theme, &ordinary),
+                glow_colour(&theme, &latched),
+                "{}: the halo does not change when latched",
+                theme.name
+            );
+            assert_eq!(
+                core_colour(&theme, &latched),
+                theme.accent,
+                "{}: a latched core dot should read exactly like Processing's",
+                theme.name
+            );
+        }
+    }
+
+    /// Clearing the latch must snap the look back to an ordinary listen
+    /// immediately — no lingering halo or core colour from the latch that
+    /// just ended.
+    #[test]
+    fn clearing_the_latch_restores_the_ordinary_listening_colours() {
+        for theme in [PRISM_DARK, PORCELAIN_LIGHT] {
+            let mut m = Model::new(theme);
+            m.tick(0);
+            m.apply(Command::ShowListening);
+            settle(&mut m, u64::from(STATE_CROSS_MS) + 32);
+            let plain_core = core_colour(&theme, &m);
+            let plain_glow = glow_colour(&theme, &m);
+
+            m.apply(Command::Latched(true));
+            assert_ne!(core_colour(&theme, &m), plain_core, "{}", theme.name);
+
+            m.apply(Command::Latched(false));
+            assert_eq!(core_colour(&theme, &m), plain_core, "{}", theme.name);
+            assert_eq!(glow_colour(&theme, &m), plain_glow, "{}", theme.name);
+        }
     }
 
     /// Every appearance decision has to agree about what is on screen while

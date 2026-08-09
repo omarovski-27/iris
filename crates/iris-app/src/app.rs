@@ -164,6 +164,98 @@ enum CaptureOutcome {
     QuitRequested,
 }
 
+/// The longest gap between the release of one tap and the press of the next
+/// that still counts as a hands-free-latch trigger — the double-click window
+/// most desktop UIs use, picked from the middle of that convention's usual
+/// 300-500 ms range.
+///
+/// Only a hold shorter than this window is even considered a candidate first
+/// tap in the first place (see `App::capture`'s hold loop): an ordinary
+/// hold-to-talk dictation is released well past it and finalises the instant
+/// the key comes up, with nothing added to its wait — unchanged from before
+/// this existed. The one case this constant does add latency to is a
+/// dictation itself shorter than the window (a very fast single word said
+/// and released quickly): it waits out the rest of the window to see whether
+/// a second tap follows before finalising. That is an accepted, unavoidable
+/// cost of any double-tap gesture — the same tradeoff every OS's
+/// double-click detection makes — not a regression of ordinary
+/// hold-to-talk, which this never touches.
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
+
+/// Safety bound on a hands-free latch: if nobody taps the hotkey again within
+/// this long, the hold auto-stops and finalises through the exact same path
+/// as a real key-up (see `LatchPhase::Latched` in `App::capture`'s hold loop)
+/// rather than discarding what was captured. A forgotten latch is a live
+/// hazard — an open microphone recording, and billing, indefinitely — so
+/// this is generous but finite: several minutes, comfortably longer than any
+/// real dictation, short enough that a forgotten latch does not run all day.
+///
+/// Overridable per-`App` by [`App::with_latch_cap`] so a test can exercise
+/// the cap firing without a five-minute wait, the same way
+/// [`App::with_final_timeout`] overrides the engine's own bound.
+const MAX_LATCH_DURATION: Duration = Duration::from_secs(5 * 60);
+
+/// How often `App::capture`'s hold loop checks [`App::quit_flag`] once the
+/// key is no longer physically down — [`LatchPhase::AwaitingSecondTap`] and
+/// [`LatchPhase::Latched`], never [`LatchPhase::Held`].
+///
+/// A held key bounds an ordinary hold-to-talk dictation to however long the
+/// user's own finger stays down, so `App::run`'s outer loop missing a tray
+/// Quit for that long (unread until this function returns) is the same
+/// tolerated gap `App::capture`'s finalise wait had before the tray-Quit fix
+/// — see `AGENTS.md`; `Held` keeps that same tolerated gap, unchanged. Once
+/// the key is up, though, that justification is gone — the user is no longer
+/// holding anything down — and a latch has no bound at all short of
+/// `MAX_LATCH_DURATION`, which alone could leave Quit unread for minutes.
+/// This tick is what closes that gap for both post-key-up phases — cheap,
+/// since it is armed only there (`Held` selects on `never()` here, same as
+/// every other conditional arm in this loop) — by breaking the hold exactly
+/// as an ordinary key-up would the moment it sees the flag, and letting the
+/// existing quit-during-finalise race (this function's doc comment) take it
+/// from there.
+const LATCH_QUIT_POLL: Duration = Duration::from_millis(100);
+
+/// Whether a hold released at `released_at` is short enough to be a
+/// candidate first tap of a double-tap latch, rather than an ordinary
+/// hold-to-talk release.
+///
+/// A free function so the exact boundary can be pinned by a unit test
+/// against synthetic instants, without waiting on real time or spinning up
+/// the full hold loop.
+fn is_candidate_tap(pressed_at: Instant, released_at: Instant) -> bool {
+    released_at.saturating_duration_since(pressed_at) <= DOUBLE_TAP_WINDOW
+}
+
+/// Where `App::capture`'s hold loop is in the tap sequence.
+///
+/// `Held` is the only phase an ordinary hold-to-talk dictation ever visits —
+/// real speech almost always outlasts [`DOUBLE_TAP_WINDOW`], so its `Up`
+/// breaks the loop immediately, exactly as before this existed. The other two
+/// phases exist only for a hold that released *inside* that window, which
+/// might be the first tap of a double-tap latch.
+#[derive(Debug, Clone, Copy)]
+enum LatchPhase {
+    /// Waiting for the matching key-up (or a stray repeat key-down, ignored
+    /// as before this existed).
+    Held,
+    /// The key came up within [`DOUBLE_TAP_WINDOW`] of the press. If a
+    /// `Down` follows before `up_at + DOUBLE_TAP_WINDOW`, this becomes
+    /// `Latched`; otherwise it was just a short, ordinary hold, and it
+    /// finalises with `up_at` the same as `Held` would have.
+    AwaitingSecondTap {
+        /// When the first tap's key-up landed.
+        up_at: Instant,
+    },
+    /// A double-tap landed: the hold continues with the key released. The
+    /// next `Down` is a single tap that stops it and finalises with that
+    /// instant; if none comes within the latch cap of `since`, the cap stops
+    /// it instead — see [`MAX_LATCH_DURATION`].
+    Latched {
+        /// When the latch engaged, the deadline for the auto-stop cap.
+        since: Instant,
+    },
+}
+
 /// The resident application state.
 ///
 /// Generic over the audio source so the whole loop can be driven offline from a
@@ -213,6 +305,10 @@ pub struct App<A: AudioSource> {
     /// runtime switches the wait with it instead of keeping the one the app
     /// started with.
     final_timeout: Option<Duration>,
+    /// Set only by [`App::with_latch_cap`]. Left `None`, every hands-free
+    /// latch auto-stops after [`MAX_LATCH_DURATION`]; a test overrides this
+    /// so it can exercise the cap firing without a five-minute wait.
+    latch_cap: Option<Duration>,
     /// Flipped by the tray the instant it sends [`Command::Quit`] — before
     /// `App::run`'s own select loop ever gets a turn, because that loop is
     /// blocked inside `dictate` for as long as a finalise is running (see
@@ -278,6 +374,7 @@ impl<A: AudioSource> App<A> {
             count: 0,
             report: false,
             final_timeout: None,
+            latch_cap: None,
             quit_flag: Arc::new(AtomicBool::new(false)),
             pending_finalize: None,
         })
@@ -394,6 +491,20 @@ impl<A: AudioSource> App<A> {
     fn final_timeout(&self) -> Duration {
         self.final_timeout
             .unwrap_or_else(|| self.engine.final_timeout())
+    }
+
+    /// Override the auto-stop cap on a hands-free latch, in place of
+    /// [`MAX_LATCH_DURATION`]. Test-only in practice — a real cap this small
+    /// would defeat the safety margin the constant exists for.
+    #[must_use]
+    pub fn with_latch_cap(mut self, cap: Duration) -> Self {
+        self.latch_cap = Some(cap);
+        self
+    }
+
+    /// The auto-stop cap in force for a hands-free latch.
+    fn latch_cap(&self) -> Duration {
+        self.latch_cap.unwrap_or(MAX_LATCH_DURATION)
     }
 
     /// The configuration as it stands on disk, when CLI flags overrode parts
@@ -938,13 +1049,52 @@ impl<A: AudioSource> App<A> {
         let mut frames_open = true;
         let mut mid_hold_failure: Option<anyhow::Error> = None;
 
+        // See `LatchPhase` for the tap-sequence states this drives through.
+        // `pressed_at` — this function's own parameter — is the very first
+        // `Down` of whichever tap sequence started this dictation.
+        let mut phase = LatchPhase::Held;
+
         let held = loop {
             let event_rx = if engine_events_open {
                 &events
             } else {
                 &never_events
             };
-            let frame_rx = if frames_open { frames } else { &never_frames };
+            // Paused (not failed — `frames_open` is untouched) while
+            // `AwaitingSecondTap`: whatever is sitting in the channel at the
+            // first tap's key-up is the tail an ordinary short dictation
+            // drains and feeds as one batch below, exactly as a plain
+            // hold-to-talk release always has. Feeding it here one frame at a
+            // time instead — which is what continuing to select on this arm
+            // during the wait would do — would drain that same backlog
+            // through the per-frame path before the loop ever gets back
+            // there, silently changing a real product behaviour (a batched
+            // flush an engine can treat differently from steady per-frame
+            // pushes) for every dictation short enough to reach
+            // `AwaitingSecondTap`, latch or not.
+            let frame_rx = if frames_open && !matches!(phase, LatchPhase::AwaitingSecondTap { .. })
+            {
+                frames
+            } else {
+                &never_frames
+            };
+            // Only `AwaitingSecondTap` and `Latched` ever arm a deadline — see
+            // `LatchPhase`. `Held` selects on `never()`, so an ordinary
+            // hold-to-talk dictation adds not one extra tick to its wait.
+            let timeout_rx = match phase {
+                LatchPhase::Held => crossbeam_channel::never(),
+                LatchPhase::AwaitingSecondTap { up_at } => {
+                    crossbeam_channel::at(up_at + DOUBLE_TAP_WINDOW)
+                }
+                LatchPhase::Latched { since } => crossbeam_channel::at(since + self.latch_cap()),
+            };
+            // Armed once the key is no longer physically down — see
+            // `LATCH_QUIT_POLL`. `Held` never selects on this at all.
+            let quit_poll_rx = if matches!(phase, LatchPhase::Held) {
+                crossbeam_channel::never()
+            } else {
+                crossbeam_channel::after(LATCH_QUIT_POLL)
+            };
             select! {
                 recv(frame_rx) -> frame => {
                     // The microphone stopping and the engine refusing the frame
@@ -988,15 +1138,94 @@ impl<A: AudioSource> App<A> {
                 },
                 recv(keys) -> event => {
                     match event.context("the hotkey thread stopped") {
-                        Ok(HotkeyEvent::Up(at)) => break Ok(at),
-                        // A repeat press we never saw the release of. Ignore it
-                        // rather than ending an utterance the user is still in.
-                        Ok(HotkeyEvent::Down(_)) => {}
-                        Err(e) => break Err(e),
+                        Ok(HotkeyEvent::Up(at)) => match phase {
+                            LatchPhase::Held => {
+                                if is_candidate_tap(pressed_at, at) {
+                                    // Short enough to maybe be the first tap
+                                    // of a double-tap latch — give it the
+                                    // window to find out. An ordinary hold
+                                    // released past the window never reaches
+                                    // this arm; see `DOUBLE_TAP_WINDOW`.
+                                    phase = LatchPhase::AwaitingSecondTap { up_at: at };
+                                } else {
+                                    break Ok(at);
+                                }
+                            }
+                            // The event that ends either of these phases is a
+                            // `Down` (the second tap, or the tap that stops a
+                            // latch), not an `Up`. A stray release here is
+                            // ignored, the same way a repeat `Down` is
+                            // ignored in `Held`.
+                            LatchPhase::AwaitingSecondTap { .. } | LatchPhase::Latched { .. } => {}
+                        },
+                        Ok(HotkeyEvent::Down(at)) => match phase {
+                            // A repeat press we never saw the release of.
+                            // Ignore it rather than ending an utterance the
+                            // user is still in.
+                            LatchPhase::Held => {}
+                            LatchPhase::AwaitingSecondTap { .. } => {
+                                // The double-tap: latch on, hands-free.
+                                self.pill.set_latched(true);
+                                phase = LatchPhase::Latched { since: at };
+                            }
+                            // The single tap that stops a latched recording.
+                            LatchPhase::Latched { .. } => break Ok(at),
+                        },
+                        Err(e) => match phase {
+                            LatchPhase::Held => break Err(e),
+                            // A confirmed `Up` already ended this utterance
+                            // legitimately (the arm above) — losing the
+                            // hotkey channel from here on cannot make that
+                            // any less true, so finalise with what already
+                            // happened instead of erroring an otherwise-
+                            // ordinary short dictation. This is exactly the
+                            // gap a single-shot channel that closes right
+                            // after its one `Up` opens (`--demo-dictation`,
+                            // `Rig::dictate` in the test harness) — real
+                            // usage never sees this arm, because the
+                            // production hotkey channel outlives every
+                            // dictation.
+                            LatchPhase::AwaitingSecondTap { up_at } => break Ok(up_at),
+                            // No further tap can ever stop this latch;
+                            // finalise with what was captured rather than
+                            // losing it — the same "never discard audio"
+                            // rule the auto-stop cap follows.
+                            LatchPhase::Latched { .. } => break Ok(Instant::now()),
+                        },
+                    }
+                }
+                recv(timeout_rx) -> _ => {
+                    match phase {
+                        LatchPhase::Held => unreachable!("Held never arms a timeout"),
+                        // Nobody double-tapped in time: this was an ordinary,
+                        // if unusually short, hold-to-talk dictation.
+                        LatchPhase::AwaitingSecondTap { up_at } => break Ok(up_at),
+                        // Safety cap: finalise exactly like a real key-up
+                        // rather than discarding what was captured — see
+                        // `MAX_LATCH_DURATION`.
+                        LatchPhase::Latched { .. } => break Ok(Instant::now()),
+                    }
+                }
+                recv(quit_poll_rx) -> _ => {
+                    // Never fires while `Held` — see `LATCH_QUIT_POLL`. Quit
+                    // arriving while `AwaitingSecondTap` or `Latched` must not
+                    // wait out the rest of the double-tap window or the latch
+                    // cap: end the hold now, exactly as a real key-up would,
+                    // and let the quit-during-finalise race this function's
+                    // doc comment describes take over from here —
+                    // `MAX_LATCH_DURATION` still finalises normally, never
+                    // discards audio.
+                    if self.quit_flag.load(Ordering::Acquire) {
+                        break Ok(Instant::now());
                     }
                 }
             }
         };
+        // Whichever way the loop ended, the latch visual (if it was ever on)
+        // must not survive past it: `processing()` is next, and a latch that
+        // is still "on" in the overlay while the engine finalises would read
+        // as still-recording.
+        self.pill.set_latched(false);
 
         let released_at = match held {
             Ok(at) => at,
@@ -1443,5 +1672,41 @@ fn open_history(config: &Config, config_path: &std::path::Path) -> SessionLog {
         SessionLog::open(config.history_path(config_path), config.history.max_entries)
     } else {
         SessionLog::disabled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_candidate_tap` is private, so the exact boundary the double-tap
+    /// latch hinges on is pinned here rather than through the full hold loop
+    /// — a synthetic `Instant` pair is deterministic and needs no real wait,
+    /// unlike driving `App::capture` end to end would.
+    #[test]
+    fn is_candidate_tap_holds_exactly_through_the_window_and_no_further() {
+        let pressed = Instant::now();
+        assert!(
+            is_candidate_tap(pressed, pressed + DOUBLE_TAP_WINDOW),
+            "released exactly at the window boundary should still count"
+        );
+        assert!(
+            !is_candidate_tap(
+                pressed,
+                pressed + DOUBLE_TAP_WINDOW + Duration::from_millis(1)
+            ),
+            "one millisecond past the window must not count"
+        );
+        assert!(
+            is_candidate_tap(pressed, pressed + Duration::from_millis(50)),
+            "well inside the window"
+        );
+        assert!(
+            !is_candidate_tap(pressed, pressed + Duration::from_secs(2)),
+            "well outside the window — an ordinary hold-to-talk release"
+        );
+        // A release at the exact same instant as the press (the fastest a
+        // real tap can be) is trivially inside the window.
+        assert!(is_candidate_tap(pressed, pressed));
     }
 }

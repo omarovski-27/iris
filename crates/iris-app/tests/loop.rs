@@ -157,6 +157,13 @@ impl Rig {
         self
     }
 
+    /// Shorten the auto-stop cap on a hands-free latch, so a test can prove
+    /// the cap fires without a real several-minute wait.
+    fn with_latch_cap(mut self, cap: Duration) -> Self {
+        self.app = self.app.with_latch_cap(cap);
+        self
+    }
+
     /// Run one dictation to completion.
     fn dictate(&mut self) -> anyhow::Result<iris_app::Dictated> {
         let speaker = self.speak();
@@ -1961,6 +1968,277 @@ fn a_command_channel_that_closes_ends_the_loop() {
 
     // A tray that died must not leave a resident process with no way out.
     rig.app.run(&keys_rx, &commands_rx).expect("clean exit");
+}
+
+/// Send a `Down` immediately followed by an `Up` — a candidate first tap of
+/// a double-tap latch, with no audio in between. Used by more than one test
+/// below, so factored out rather than repeated.
+fn tap(keys: &Sender<HotkeyEvent>) {
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+}
+
+#[test]
+fn a_lone_quick_tap_never_latches_and_finalises_as_an_ordinary_short_hold() {
+    let mut rig = rig();
+    // Whitespace-only, like `silence_injects_nothing_and_claims_nothing`:
+    // the mock engine's canned transcript does not depend on how much audio
+    // was actually pushed, so an engine that really does answer with
+    // nothing is what proves this tap carried no words.
+    rig.app.set_engine(Arc::new(FixedEngine("   ")));
+    let pressed_at = Instant::now();
+    let keys = rig.keys.clone();
+    let armed = rig.armed.clone();
+    let releaser = std::thread::spawn(move || {
+        armed.recv().expect("capture never armed");
+        // Immediate release, no audio: a candidate tap with nothing to
+        // transcribe and nobody following up.
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+    let frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(pressed_at, &frames, &rig.keys_rx)
+        .expect("a lone quick tap with no audio is silence, not a failure");
+    releaser.join().expect("the releaser panicked");
+
+    assert!(!dictated.record.injected, "no audio, nothing to inject");
+    assert!(
+        !rig.pill.events().contains(&PillEvent::SetLatched(true)),
+        "a single tap with no follow-up must never read as latched"
+    );
+}
+
+#[test]
+fn a_real_hold_past_the_double_tap_window_never_reads_as_latched() {
+    // The one thing this whole feature must never touch: an ordinary
+    // hold-to-talk dictation, held well past the double-tap window before
+    // release, exactly the way it worked before double-tap existed.
+    let mut rig = rig();
+    let pressed_at = Instant::now();
+    let keys = rig.keys.clone();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let releaser = std::thread::spawn(move || {
+        armed.recv().expect("capture never armed");
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+        while !frames.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(450));
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+    });
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(pressed_at, &app_frames, &rig.keys_rx)
+        .expect("dictation");
+    releaser.join().expect("the releaser panicked");
+
+    assert!(dictated.record.injected, "a real hold must still deliver");
+    assert!(
+        !rig.pill.events().contains(&PillEvent::SetLatched(true)),
+        "an ordinary hold-to-talk dictation must never be read as latched"
+    );
+}
+
+#[test]
+fn a_double_tap_latches_hands_free_and_a_single_tap_stops_it() {
+    let mut rig = rig();
+    rig.app
+        .set_engine(Arc::new(FixedEngine("hands free words")));
+
+    let keys = rig.keys.clone();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let commands = rig.commands.clone();
+    let injector = rig.injector.clone();
+    let pill = rig.pill.clone();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    // Tap 1: quick press-release, no audio.
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    armed.recv().expect("tap 1 never armed capture");
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+
+    // Tap 2, well inside the double-tap window: the latch trigger.
+    std::thread::sleep(Duration::from_millis(30));
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    wait_for(|| pill.events().contains(&PillEvent::SetLatched(true)));
+
+    // Hands-free from here: key released, recording keeps going.
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+    for chunk in speech().chunks(320) {
+        frames.send(chunk.to_vec()).expect("frame");
+    }
+    while !frames.is_empty() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // A single tap stops it — the press alone, not its release.
+    tap(&keys);
+
+    wait_for(|| !injector.inserted().is_empty());
+    assert!(
+        injector.inserted()[0]
+            .to_ascii_lowercase()
+            .contains("hands free words"),
+        "the latched audio must reach the injector: {:?}",
+        injector.inserted()
+    );
+
+    commands.send(Command::Quit).unwrap();
+    let app = loop_thread
+        .join()
+        .expect("the loop panicked")
+        .expect("the loop failed");
+    assert_eq!(app.count(), 1, "the whole tap sequence is one dictation");
+
+    let events = pill.events();
+    assert!(events.contains(&PillEvent::SetLatched(true)));
+    assert!(
+        events.contains(&PillEvent::SetLatched(false)),
+        "the latch visual must clear once the recording stops"
+    );
+}
+
+#[test]
+fn the_auto_stop_cap_finalises_a_forgotten_latch_without_discarding_audio() {
+    let mut rig = rig().with_latch_cap(Duration::from_millis(80));
+    rig.app
+        .set_engine(Arc::new(FixedEngine("forgotten latch words")));
+
+    let keys = rig.keys.clone();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let commands = rig.commands.clone();
+    let injector = rig.injector.clone();
+    let pill = rig.pill.clone();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    armed.recv().expect("tap 1 never armed capture");
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    wait_for(|| pill.events().contains(&PillEvent::SetLatched(true)));
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+
+    // Speak, then never tap again: the 80ms cap, not a stop tap, has to end
+    // this hold.
+    for chunk in speech().chunks(320) {
+        frames.send(chunk.to_vec()).expect("frame");
+    }
+    while !frames.is_empty() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    wait_for(|| !injector.inserted().is_empty());
+    assert!(
+        injector.inserted()[0]
+            .to_ascii_lowercase()
+            .contains("forgotten latch words"),
+        "the cap must deliver the captured words, never discard them: {:?}",
+        injector.inserted()
+    );
+
+    commands.send(Command::Quit).unwrap();
+    let app = loop_thread
+        .join()
+        .expect("the loop panicked")
+        .expect("the loop failed");
+    assert_eq!(app.count(), 1);
+    assert!(
+        pill.events().contains(&PillEvent::SetLatched(false)),
+        "the latch visual must clear once the cap fires"
+    );
+}
+
+#[test]
+fn a_tray_quit_while_latched_does_not_wait_for_the_cap() {
+    // Mirrors `a_tray_quit_does_not_wait_for_an_in_flight_finalise`, but the
+    // quit lands while a hands-free latch is still recording — well before
+    // either a stop tap or a deliberately huge cap — rather than during an
+    // ordinary finalise. A latched recording must not reopen the hang PR #29
+    // just fixed for the finalise wait.
+    let mut rig = rig()
+        .with_latch_cap(Duration::from_secs(60))
+        .with_final_timeout(Duration::from_secs(2));
+    rig.app.set_engine(Arc::new(SlowFinalizeEngine {
+        delay: Duration::from_millis(300),
+        text: "quit mid latch",
+    }));
+    let quit_flag = rig.app.quit_flag();
+
+    let keys = rig.keys.clone();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let commands = rig.commands.clone();
+    let injector = rig.injector.clone();
+    let pill = rig.pill.clone();
+    let history_path = rig.history_path.clone();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    armed.recv().expect("tap 1 never armed capture");
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    wait_for(|| pill.events().contains(&PillEvent::SetLatched(true)));
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+
+    for chunk in speech().chunks(320) {
+        frames.send(chunk.to_vec()).expect("frame");
+    }
+    while !frames.is_empty() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Quit arrives mid-latch — the tray's own ordering, per
+    // `a_tray_quit_does_not_wait_for_an_in_flight_finalise`.
+    let quit_sent_at = Instant::now();
+    quit_flag.store(true, Ordering::Release);
+    commands.send(Command::Quit).unwrap();
+
+    let app = loop_thread
+        .join()
+        .expect("the loop panicked")
+        .expect("the loop failed");
+    let responded_in = quit_sent_at.elapsed();
+    assert!(
+        responded_in < Duration::from_millis(250),
+        "Quit must not wait out a forgotten latch: took {responded_in:?}"
+    );
+    assert_eq!(app.count(), 1);
+
+    // The words are not abandoned for the sake of a fast exit: delivery
+    // keeps running on a detached thread, same as the ordinary
+    // quit-during-finalise case.
+    wait_for(|| !injector.inserted().is_empty());
+    assert!(injector.inserted()[0]
+        .to_ascii_lowercase()
+        .contains("quit mid latch"));
+    wait_for(|| SessionLog::read_all(&history_path).is_ok_and(|records| !records.is_empty()));
 }
 
 fn wait_for(mut condition: impl FnMut() -> bool) {
