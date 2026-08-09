@@ -146,6 +146,43 @@ Load-bearing beyond that crate:
   does *not* change: the length of the wait itself (Deepgram's `CONNECT_TIMEOUT`
   8s is an accepted tradeoff, not a bug — see the Deepgram section above), only
   that it now always ends in something the user can see.
+- **A tray Quit clicked while a dictation is finalising no longer waits for
+  `Dictation::finish` to return.** `Engine::final_timeout`'s own doc comment
+  used to be literally true — "no tray command, Quit included, is serviced" —
+  because `App::run`'s select loop only reads `control`/`window_commands`
+  *between* calls to `App::dictate`, and `finish` runs straight on that same
+  thread inside `App::capture`. A 2026-08-03 assessment judged the exposure
+  "nil" for Deepgram specifically because its bound looked short next to
+  Groq's/local's; that undercounted it twice — even the 6s ordinary case is a
+  visible freeze, and by the time this was revisited the connect-grace
+  extension above had already pushed Deepgram's own worst case to ~14s. The
+  fix does not touch `Dictation::finish`, any engine's `final_timeout`, or the
+  finalize-ack/`WaitBound` machinery above — shortening any of those is still
+  off the table. Instead `App::capture` runs `finish` on a spawned thread and
+  polls its result against `App`'s `quit_flag` (an `Arc<AtomicBool>`) instead
+  of blocking on it outright; `tray::spawn`'s menu handler flips that flag at
+  the same instant it sends `Command::Quit` (not after — a flag flipped after
+  the send could still lose the race to the poll noticing it), which is what
+  lets it be seen without waiting for `App::run`'s own turn on `control`. If
+  Quit wins, the still-running finalise is handed off to a second, detached
+  thread — cloned `injector`/`polisher`/`notice`/`history`/`config`, no pill —
+  that keeps delivering (polish, inject, log) once the engine actually
+  answers; `App::pending_finalize` is the `JoinHandle` `main`'s `run` takes
+  and joins *after* dropping the tray/overlay/window (in that order, so the
+  app already looks closed before this invisible wait), which is what stops
+  the words from being lost for the sake of a fast exit. Neither half is
+  optional: joining before the drop reintroduces the exact lag this exists to
+  fix, and not joining at all loses transcripts on every quit that races a
+  finalise. `crates/iris-app/tests/loop.rs`'s
+  `a_tray_quit_does_not_wait_for_an_in_flight_finalise` pins both — Quit
+  returns in well under an artificially slow finalise, and the transcript
+  still reaches the injector and the session log afterward — and reproduces
+  the tray's own flag-then-send ordering rather than `App::apply`'s, since
+  driving it the other way could not have caught the ordering bug this fix
+  depends on getting right. What this does *not* change: a *second*
+  dictation still cannot start until the first's finalise (and, now, its
+  detached delivery) is done — only Quit was carved out, not general
+  concurrency.
 - **`iris-engine-local` is real, tested code, not a stub — but is not part of
   the shipped Windows binary.** `EngineChoice::Local` and a genuine
   `LocalAdapter` (`iris-app/src/engines.rs`) implementing `Engine`/`Session`
@@ -301,19 +338,23 @@ its 6s is streaming evidence. An engine that works after key-up — Groq's uploa
 generous, provisional value, because there the expiry costs the whole
 utterance (`streams_partials` is false, so nothing can be salvaged). Every
 caller of `Dictation::finish` asks the engine; `App` re-asks per dictation, so
-switching engines switches the wait. That per-engine bound is also a bound on
-the whole UI: `finish` blocks the resident loop, so Groq (28s) or the local
-engine (20s) can leave the pill frozen and Quit unserviced for that long. The
-numbers are accepted, not trimmed — with `streams_partials` false an early
-expiry costs the whole utterance — and on the default path, Deepgram, the
-ordinary bound is 6s. Deepgram's worst case is not 6s: on a hold that was still
-connecting with nothing salvageable, the connect grace below can hold the loop
-for the connect budget (8s from key-down) *plus* a re-based 6s finalise from the
-moment the socket comes up, ~14s — and a partial arriving after that grace was
-bought stops it growing without giving any of it back, so a dictation that ends
-up with words can pay it too. Quote that number, not the 6s, whenever this
-exposure is weighed. A non-blocking finalise is the real fix and is tracked
-elsewhere; do not approximate it by lowering a ceiling.
+switching engines switches the wait. That per-engine bound still freezes the
+pill and blocks a *second* dictation from starting for its full length —
+`finish` genuinely takes that long regardless of engine. It is no longer also
+a bound on Quit: see `iris-app`'s "Quit during an in-flight finalise" entry
+below for why a tray Quit clicked mid-wait (Groq's 28s, the local engine's
+20s, Deepgram's 6-14s below, all included) no longer has to wait for it. The
+numbers here are still accepted, not trimmed — with `streams_partials` false
+an early expiry costs the whole utterance — and on the default path,
+Deepgram, the ordinary bound is 6s. Deepgram's worst case is not 6s: on a hold
+that was still connecting with nothing salvageable, the connect grace below
+can hold the *finalise itself* for the connect budget (8s from key-down)
+*plus* a re-based 6s finalise from the moment the socket comes up, ~14s — and
+a partial arriving after that grace was bought stops it growing without
+giving any of it back, so a dictation that ends up with words can pay it too.
+Quote that number, not the 6s, whenever this dictation's own latency is
+weighed. Shortening any of these remains off the table — see the Quit entry
+below for why that is a different question from Quit's own responsiveness.
 
 **The outer bound may never end a session that is still legitimately
 connecting.** The two clocks do not start together — `CONNECT_TIMEOUT` (8s)

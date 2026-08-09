@@ -314,6 +314,18 @@ fn run(
     if let Some(overlay) = resident.overlay.take() {
         overlay.shutdown();
     }
+    // A dictation whose finalise was still running when Quit arrived keeps
+    // delivering (inject + log) on a detached thread instead of blocking
+    // `run` above — see `App::capture`'s doc comment. Take the handle and
+    // drop everything visible (tray icon, hotkey hook, single-instance lock)
+    // *before* joining it, so the app already looks closed while this
+    // invisibly waits for the words to actually land; joining before the
+    // drop would bring back the exact lag this exists to fix.
+    let pending_finalize = resident.app.take_pending_finalize();
+    drop(resident);
+    if let Some(handle) = pending_finalize {
+        let _ = handle.join();
+    }
     result.inspect_err(report_run_failure)
 }
 
@@ -351,7 +363,11 @@ fn start_resident(
     let devices = iris_core::capture::list_devices()
         .map(|d| d.into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
-    let (tray, commands) = tray::spawn(&config, config_path, devices)?;
+    // Shared with `App` below (`App::with_quit_flag`) so the tray can flip it
+    // the instant it sends `Command::Quit` — see `App::capture`'s doc comment
+    // for why that needs to happen outside the `control` channel itself.
+    let quit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tray, commands) = tray::spawn(&config, config_path, devices, Arc::clone(&quit_flag))?;
 
     let (listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
         .context("installing the push-to-talk hook")?;
@@ -400,7 +416,8 @@ fn start_resident(
         .with_window(window)
         .with_window_commands(window_commands_rx, window_outcomes_tx)
         .with_reopen_signal(reopen)
-        .with_failure_notice(notice);
+        .with_failure_notice(notice)
+        .with_quit_flag(quit_flag);
 
     Ok(Resident {
         app,

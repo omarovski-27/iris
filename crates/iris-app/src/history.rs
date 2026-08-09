@@ -165,7 +165,14 @@ fn timestamp() -> String {
 }
 
 /// An append-only, size-capped jsonl file.
-#[derive(Debug)]
+///
+/// `Clone` exists for [`crate::app::App`]'s quit-during-finalize path: a
+/// dictation whose finalise is still running when the tray quits is finished
+/// on a detached thread (see `App::capture`'s doc comment), which needs its
+/// own handle to append the eventual record. The clone's `entries` count can
+/// drift from the original's if both append around the same moment, which
+/// only blurs *when* the next trim happens, not correctness.
+#[derive(Debug, Clone)]
 pub struct SessionLog {
     path: PathBuf,
     max_entries: usize,

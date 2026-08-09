@@ -11,6 +11,7 @@
 //! is why `SystemInjector` is never constructed here, and why the loop takes an
 //! injector rather than calling `iris_core::inject` directly.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1148,6 +1149,83 @@ fn the_loop_runs_until_it_is_told_to_quit() {
 }
 
 #[test]
+fn a_tray_quit_does_not_wait_for_an_in_flight_finalise() {
+    // Regression for the captain's report: "closing Iris lags or does not
+    // close." `App::run`'s select loop only services `Command::Quit` between
+    // dictations; `Dictation::finish`'s finalise wait used to run straight on
+    // that same thread inside `App::capture`, so a Quit clicked while a
+    // dictation was still finalising sat unread until `finish()` returned —
+    // see `Engine::final_timeout`'s doc comment and `App::capture`'s. Real
+    // Deepgram's wait is 6s typical, ~14s worst case (AGENTS.md);
+    // `SlowFinalizeEngine` models the same shape — connects, then answers the
+    // finalise late — compressed to 300ms so the test stays fast.
+    //
+    // This drives `App::run` directly (not `App::dictate`) and reproduces
+    // the tray's own ordering (`tray::win::run`: flip `quit_flag`, then send
+    // `Command::Quit`) rather than `App::apply`'s, because the whole point of
+    // `quit_flag` is to be visible to a finalise wait *before* `App::run`
+    // ever gets a turn to read the channel.
+    let mut rig = rig().with_final_timeout(Duration::from_secs(2));
+    rig.app.set_engine(Arc::new(SlowFinalizeEngine {
+        delay: Duration::from_millis(300),
+        text: "hello there",
+    }));
+    let quit_flag = rig.app.quit_flag();
+
+    let keys = rig.keys.clone();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let commands = rig.commands.clone();
+    let injector = rig.injector.clone();
+    let history_path = rig.history_path.clone();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    armed.recv().expect("the dictation never armed capture");
+    for chunk in speech().chunks(320) {
+        frames.send(chunk.to_vec()).unwrap();
+    }
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+
+    let quit_sent_at = Instant::now();
+    quit_flag.store(true, Ordering::Release);
+    commands.send(Command::Quit).unwrap();
+
+    let app = loop_thread
+        .join()
+        .expect("the loop panicked")
+        .expect("the loop failed");
+    let responded_in = quit_sent_at.elapsed();
+    assert!(
+        responded_in < Duration::from_millis(150),
+        "Quit must not wait for a 300ms finalise to complete: took {responded_in:?}"
+    );
+    assert_eq!(app.count(), 1);
+
+    // The transcript is not abandoned for the sake of a fast exit: delivery
+    // keeps running on a detached thread even though `run` already returned
+    // (see `App::capture`'s doc comment) — proven here the same way `main`
+    // would eventually observe it, by waiting for the effects a normal
+    // delivery produces, not by reaching into `App::take_pending_finalize`
+    // (that handle is `main`'s to join, not this test's).
+    wait_for(|| !injector.inserted().is_empty());
+    // Polished (capitalised, punctuated) by the same rule polisher every
+    // other dictation goes through — this path is not skipping it.
+    assert_eq!(injector.inserted(), ["Hello there. ".to_string()]);
+    wait_for(|| SessionLog::read_all(&history_path).is_ok_and(|records| !records.is_empty()));
+    let records = SessionLog::read_all(&history_path).expect("reading the session log");
+    assert_eq!(records.len(), 1);
+    assert!(records[0].injected);
+    assert_eq!(records[0].text, "Hello there.");
+}
+
+#[test]
 fn a_tray_command_changes_and_persists_the_setting() {
     let rig = rig();
     let keys_rx = rig.keys_rx.clone();
@@ -2277,6 +2355,60 @@ impl Session for ConnectsLateSession {
         &self.events
     }
     fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Connects immediately, then answers `Session::finish` with a real
+/// transcript only after `delay` — a compressed model of Deepgram's own
+/// connect-then-finalize-late shape (`AGENTS.md`: 6s typical, ~14s worst
+/// case), for `a_tray_quit_does_not_wait_for_an_in_flight_finalise`.
+struct SlowFinalizeEngine {
+    delay: Duration,
+    text: &'static str,
+}
+
+struct SlowFinalizeSession {
+    events: Receiver<TranscriptEvent>,
+    tx: Sender<TranscriptEvent>,
+    delay: Duration,
+    text: &'static str,
+}
+
+impl Engine for SlowFinalizeEngine {
+    fn name(&self) -> &'static str {
+        "slow-finalize"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(SlowFinalizeSession {
+            events: rx,
+            tx,
+            delay: self.delay,
+            text: self.text,
+        }))
+    }
+}
+
+impl Session for SlowFinalizeSession {
+    fn push(&mut self, _pcm: &[i16]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.events
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        let tx = self.tx.clone();
+        let delay = self.delay;
+        let text = self.text;
+        // Fire-and-forget, like `NeverConcludesEngine`'s kept `Sender`: this
+        // models the wait *between* `Session::finish` and `Final`, which is
+        // exactly the window `App::capture`'s quit-vs-finalise race runs in.
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = tx.send(TranscriptEvent::Final(text.to_string()));
+        });
         Ok(())
     }
 }

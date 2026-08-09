@@ -30,6 +30,8 @@
 //! Windows-first product.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 
@@ -302,20 +304,25 @@ pub struct Tray {
 /// `devices` is the list of input device names for the microphone picker;
 /// enumerating them is the caller's job because it is a Windows-only call and
 /// this function has to compile everywhere. `config_path` is only ever shown —
-/// it is the file [`demo_notice`] points a first-run user at.
+/// it is the file [`demo_notice`] points a first-run user at. `quit_flag` is
+/// flipped the instant the tray sends `Command::Quit`, which is the same
+/// instant `App::quit_flag` needs it flipped by — see
+/// [`crate::app::App::capture`]'s doc comment for why a plain channel send is
+/// not early enough on its own.
 pub fn spawn(
     config: &Config,
     config_path: &Path,
     devices: Vec<String>,
+    quit_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<(Tray, Receiver<Command>)> {
     #[cfg(windows)]
     {
-        let (inner, commands) = win::spawn(config, config_path, devices)?;
+        let (inner, commands) = win::spawn(config, config_path, devices, quit_flag)?;
         Ok((Tray { _inner: inner }, commands))
     }
     #[cfg(not(windows))]
     {
-        let _ = (config, config_path, devices);
+        let _ = (config, config_path, devices, quit_flag);
         // A channel that never carries anything: the sender lives in the
         // returned `Tray`, so the loop selects on the receiver forever and the
         // app is driven entirely by the hotkey — the right behaviour on a
@@ -330,6 +337,9 @@ pub fn spawn(
 // the tray icon needs, and there is no safe wrapper for them.
 #[allow(unsafe_code)]
 mod win {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
     use anyhow::{Context, Result};
     use crossbeam_channel::{Receiver, Sender};
     use tray_icon::menu::{
@@ -375,6 +385,7 @@ mod win {
         config: &Config,
         config_path: &std::path::Path,
         devices: Vec<String>,
+        quit_flag: Arc<AtomicBool>,
     ) -> Result<(TrayThread, Receiver<Command>)> {
         let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -387,7 +398,7 @@ mod win {
         let handle = std::thread::Builder::new()
             .name("iris-tray".into())
             .spawn(move || {
-                let result = run(&config, &config_path, devices, commands_tx);
+                let result = run(&config, &config_path, devices, commands_tx, quit_flag);
                 match result {
                     Ok(pump) => {
                         let _ = ready_tx.send(Ok(unsafe {
@@ -424,6 +435,7 @@ mod win {
         config_path: &std::path::Path,
         devices: Vec<String>,
         commands: Sender<Command>,
+        quit_flag: Arc<AtomicBool>,
     ) -> Result<impl FnOnce()> {
         let menu = Menu::new();
 
@@ -570,6 +582,15 @@ mod win {
                             polish_now = enabled;
                         }
                         let quit = command == Command::Quit;
+                        if quit {
+                            // Flipped before the send below, not after: a
+                            // dictation whose finalise is running right now
+                            // polls this flag instead of blocking on
+                            // `control` (see `App::capture`'s doc comment),
+                            // and it must see this before it can possibly
+                            // see the message that follows.
+                            quit_flag.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         if commands.send(command).is_err() || quit {
                             return;
                         }
@@ -806,6 +827,7 @@ mod tests {
             &Config::default(),
             Path::new("/tmp/iris/config.toml"),
             Vec::new(),
+            Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
         // Empty and Disconnected are both `Err`; the loop exits on the latter,
