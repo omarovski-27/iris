@@ -111,18 +111,54 @@ impl AudioSource for ChannelAudio {
     }
 }
 
+/// Below this RMS, in dBFS, a frame reads as the meter's floor (`0.0`) — room
+/// tone or an open mic with nobody talking, not speech.
+const SILENCE_FLOOR_DBFS: f64 = -50.0;
+
+/// At or above this RMS, in dBFS, a frame reads as the meter's ceiling
+/// (`1.0`) — loud but pre-clipping speech, close enough to full scale that
+/// there is no more travel left to show.
+const LOUD_CEILING_DBFS: f64 = -8.0;
+
 /// Root-mean-square level of a frame, mapped to `0.0..=1.0` for a meter.
 ///
-/// Speech sits far below full scale, so a linear RMS reading would leave the
-/// meter permanently near zero. The square root expands the quiet end, which is
-/// where all the interesting variation in a voice actually is.
+/// This used to be `sqrt(rms / i16::MAX)`: a single square root applied to
+/// the *linear* RMS fraction. That is expansive (it lifts quiet values more
+/// than loud ones), but not expansive enough — measured against synthetic
+/// PCM at calibrated dBFS levels (see
+/// `level_spans_most_of_its_range_across_realistic_speech_levels` below),
+/// ordinary conversational speech (-23 dBFS RMS) landed at `0.27`; loud
+/// speech (-13 dBFS RMS) only reached `0.46`. The whole dynamic range a
+/// captain will ever produce sat inside a narrow band well short of `1.0`,
+/// which then compounded with the overlay's own response curve
+/// (`WAVE_RESPONSE_EXPONENT` in `iris-overlay`) crushing that narrow band
+/// further toward its own floor — see
+/// `crates/iris-overlay/docs/voice-level-evidence/README.md` for the visible
+/// result, before and after this fix.
+///
+/// Human loudness perception — and every VU/level meter built on it — is
+/// logarithmic, not a fixed power of the linear signal. Mapping dBFS linearly
+/// between a calibrated floor and ceiling is the standard construction for
+/// exactly this problem, and unlike a hand-picked exponent it is
+/// parameterised by two numbers that describe real acoustic levels rather
+/// than a curve shape tuned to whatever narrow band happened to be measured.
+/// `SILENCE_FLOOR_DBFS` sits above typical unprocessed room tone so genuine
+/// silence still reads as `0.0`; `LOUD_CEILING_DBFS` sits a little below full
+/// scale so a mic being driven hard — but not clipping — still has room to
+/// read as louder than ordinary conversation, without requiring the captain
+/// to nearly saturate the input to ever see `1.0`.
 pub fn level(pcm: &[i16]) -> f32 {
     if pcm.is_empty() {
         return 0.0;
     }
     let sum: f64 = pcm.iter().map(|s| (*s as f64).powi(2)).sum();
     let rms = (sum / pcm.len() as f64).sqrt() / f64::from(i16::MAX);
-    (rms.sqrt() as f32).clamp(0.0, 1.0)
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    let dbfs = 20.0 * rms.log10();
+    let normalized = (dbfs - SILENCE_FLOOR_DBFS) / (LOUD_CEILING_DBFS - SILENCE_FLOOR_DBFS);
+    normalized.clamp(0.0, 1.0) as f32
 }
 
 #[cfg(windows)]
@@ -261,5 +297,64 @@ mod tests {
         assert!(quiet > 0.0);
         assert!(loud > quiet, "quiet {quiet} loud {loud}");
         assert!(loud <= 1.0);
+    }
+
+    /// A full-scale sine at the given peak amplitude fraction (`0.0..=1.0`),
+    /// long enough (10 ms at 16 kHz) that the RMS calculation is not
+    /// dominated by edge effects. RMS-based level detection only cares about
+    /// a frame's energy, not its exact waveform, so a sine tone calibrated to
+    /// a target dBFS is as representative as any other shape for exercising
+    /// [`level`] — what matters is the RMS it produces, and a sine's RMS
+    /// (`peak / sqrt(2)`) is exactly known, which lets each test case state
+    /// the dBFS level it means to test rather than an opaque sample value.
+    fn sine_at_peak_fraction(peak_fraction: f32) -> Vec<i16> {
+        let peak = (f32::from(i16::MAX) * peak_fraction) as f64;
+        (0..160)
+            .map(|n| {
+                let t = n as f64 / 16_000.0;
+                (peak * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    /// Measured dBFS RMS for each case, computed as `peak_fraction / sqrt(2)`
+    /// then to dB: quiet room ≈ -55 dBFS (below the floor, reads as silence),
+    /// quiet speech ≈ -37 dBFS, normal conversational speech ≈ -23 dBFS, loud
+    /// speech ≈ -13 dBFS, near-clipping ≈ -5 dBFS (above the ceiling, reads
+    /// as full scale). These are the numbers the module doc on [`level`]
+    /// cites as motivation for the dBFS mapping over the old double-`sqrt`.
+    #[test]
+    fn level_spans_most_of_its_range_across_realistic_speech_levels() {
+        let room_noise = level(&sine_at_peak_fraction(0.002)); // ~-55 dBFS
+        let quiet_speech = level(&sine_at_peak_fraction(0.02)); // ~-37 dBFS
+        let normal_speech = level(&sine_at_peak_fraction(0.1)); // ~-23 dBFS
+        let loud_speech = level(&sine_at_peak_fraction(0.3)); // ~-13 dBFS
+        let near_clipping = level(&sine_at_peak_fraction(0.8)); // ~-5 dBFS
+
+        assert_eq!(room_noise, 0.0, "room tone below the floor must read flat");
+        assert!(
+            (0.25..0.40).contains(&quiet_speech),
+            "quiet speech {quiet_speech} should sit in the lower-middle of the range"
+        );
+        assert!(
+            (0.55..0.72).contains(&normal_speech),
+            "normal conversational speech {normal_speech} should clearly outrun quiet speech \
+             and reach well past the middle of the range"
+        );
+        assert!(
+            (0.80..0.95).contains(&loud_speech),
+            "loud speech {loud_speech} should be near the top of the range"
+        );
+        assert_eq!(
+            near_clipping, 1.0,
+            "near-clipping audio should hit the meter's ceiling"
+        );
+
+        assert!(quiet_speech < normal_speech, "monotonic quiet < normal");
+        assert!(normal_speech < loud_speech, "monotonic normal < loud");
+        assert!(
+            loud_speech < near_clipping,
+            "monotonic loud < near-clipping"
+        );
     }
 }
