@@ -26,6 +26,7 @@
 //! failed. That log is the user's only way to recover words that did not make
 //! it onto the screen.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -146,6 +147,20 @@ pub struct Dictated {
     pub timeline: Timeline,
 }
 
+/// What [`App::capture`] has to report back to [`App::dictate`].
+///
+/// A second variant beyond a plain `Dictated` only because a finalise can
+/// lose its race with a tray Quit — see [`App::capture`]'s doc comment for
+/// why that race exists and what wins it when.
+enum CaptureOutcome {
+    /// The ordinary case: a transcript (or a recorded failure) is in hand.
+    Dictated(Dictated),
+    /// Quit arrived before the finalise did. Delivery continues on a
+    /// detached thread (see [`App::pending_finalize`]); this dictation adds
+    /// nothing further to the pill or the session log itself.
+    QuitRequested,
+}
+
 /// The resident application state.
 ///
 /// Generic over the audio source so the whole loop can be driven offline from a
@@ -195,6 +210,20 @@ pub struct App<A: AudioSource> {
     /// runtime switches the wait with it instead of keeping the one the app
     /// started with.
     final_timeout: Option<Duration>,
+    /// Flipped by the tray the instant it sends [`Command::Quit`] — before
+    /// `App::run`'s own select loop ever gets a turn, because that loop is
+    /// blocked inside `dictate` for as long as a finalise is running (see
+    /// [`App::capture`]'s doc comment). Polling this from inside a finalise
+    /// wait is what lets Quit cut that wait short without touching `control`
+    /// itself, which stays untouched for `App::run` to break its loop on
+    /// normally once `dictate` returns.
+    quit_flag: Arc<AtomicBool>,
+    /// A dictation whose finalise outlived a Quit: still delivering (inject +
+    /// log) on a detached thread. `main` joins this after tearing down the
+    /// tray/overlay/window — so the app looks closed immediately while the
+    /// words are still guaranteed to land, never dropped for the sake of a
+    /// fast exit. See [`App::capture`]'s doc comment.
+    pending_finalize: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<A: AudioSource> App<A> {
@@ -246,7 +275,40 @@ impl<A: AudioSource> App<A> {
             count: 0,
             report: false,
             final_timeout: None,
+            quit_flag: Arc::new(AtomicBool::new(false)),
+            pending_finalize: None,
         })
+    }
+
+    /// Share the tray's quit flag with this app, in place of the private one
+    /// [`App::new`] creates. The real resident loop wires the same
+    /// [`Arc`] into `tray::spawn` so a click on Quit is visible to a
+    /// finalise wait already in progress; see [`App::capture`]'s doc
+    /// comment. Tests that only send [`Command::Quit`] on `control` do not
+    /// need this — that path is unaffected.
+    #[must_use]
+    pub fn with_quit_flag(mut self, quit_flag: Arc<AtomicBool>) -> Self {
+        self.quit_flag = quit_flag;
+        self
+    }
+
+    /// The flag a tray Quit flips. Handed to `tray::spawn` by the real
+    /// resident loop; see [`App::with_quit_flag`].
+    #[must_use]
+    pub fn quit_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.quit_flag)
+    }
+
+    /// Take the handle to a dictation still finishing in the background after
+    /// a quit-during-finalize (`None` when the last dictation, if any, was
+    /// already fully delivered before `run` returned).
+    ///
+    /// The caller — `main`'s resident `run`, right after tearing down the
+    /// tray/overlay/window so the app already looks closed — must join this
+    /// before the process actually exits, or the words the engine was still
+    /// finalising are lost with it. See [`App::capture`]'s doc comment.
+    pub fn take_pending_finalize(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.pending_finalize.take()
     }
 
     /// Give the loop a live settings window to open on [`Command::OpenSettings`].
@@ -457,7 +519,10 @@ impl<A: AudioSource> App<A> {
         // Matched by reference so every arm that touches the config can go
         // through `Command::apply_to` rather than naming the field itself.
         match &command {
-            Command::Quit => return Ok(std::ops::ControlFlow::Break(())),
+            Command::Quit => {
+                self.quit_flag.store(true, Ordering::Release);
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
             Command::SetEngine(choice) => {
                 let choice = *choice;
                 // Nothing to do only when the choice is *both* what is running
@@ -720,7 +785,21 @@ impl<A: AudioSource> App<A> {
         self.count += 1;
         self.pill.show_listening();
 
-        let outcome = self.capture(pressed_at, frames, keys);
+        let outcome = match self.capture(pressed_at, frames, keys) {
+            Ok(CaptureOutcome::QuitRequested) => {
+                // The finalise that was still running when Quit arrived is
+                // being delivered on a detached thread instead (see
+                // `App::capture`'s doc comment) — this call contributes
+                // nothing further: no pill update (the overlay is on its way
+                // down with the rest of the app) and no session-log append
+                // (the background thread owns that record and appends it
+                // itself once the engine answers).
+                self.audio.disarm();
+                anyhow::bail!("quitting: the pending dictation is finishing in the background");
+            }
+            Ok(CaptureOutcome::Dictated(dictated)) => Ok(dictated),
+            Err(e) => Err(e),
+        };
 
         // After a successful insert the overlay holds the confirmation (~550 ms)
         // then exits itself. Calling hide() immediately would cancel that.
@@ -775,12 +854,41 @@ impl<A: AudioSource> App<A> {
     /// transcript; a failure to *inject* one is recorded in the returned
     /// [`Dictated`] instead, because the words still exist and the user needs
     /// them.
+    ///
+    /// **The finalise wait (`dictation.finish`, below) is the one place a
+    /// dictation can make the resident loop miss a tray Quit.** Everything
+    /// before it — holding the key, feeding audio — is bounded by the user's
+    /// own key hold, but `finish` blocks its caller for up to the engine's
+    /// [`Engine::final_timeout`] (6s typical for Deepgram, ~14s when the
+    /// connect grace had to be bought first — see `AGENTS.md`), and
+    /// `App::run`'s select loop only services `control`/`window_commands`
+    /// *between* calls to `dictate`. A Quit clicked while that wait is still
+    /// running used to sit unread on the channel for the rest of it — visible
+    /// on the real desktop as a tray icon that does not go away, and exactly
+    /// what `Engine::final_timeout`'s own doc comment already warned this
+    /// shape would do.
+    ///
+    /// The fix does not touch `Dictation::finish` or its timeout — shortening
+    /// that trades data loss for responsiveness, which is off the table (see
+    /// `AGENTS.md`). Instead `finish` runs on a spawned thread here, and this
+    /// function polls that thread's result against [`App::quit_flag`] rather
+    /// than blocking on it outright: the flag is flipped by the tray at the
+    /// same instant it sends `Command::Quit` (see `tray::spawn`), so it can
+    /// be noticed without waiting for `App::run`'s own turn. If the flag wins
+    /// the race, this returns [`CaptureOutcome::QuitRequested`] immediately
+    /// and hands the still-running finalise to a second, detached thread that
+    /// delivers it (polish, inject, log) once the engine actually answers —
+    /// [`App::pending_finalize`] is `main`'s handle to wait for that before
+    /// the process truly exits, so the words are never lost, only delivered
+    /// after the tray icon is already gone. If `finish` wins the race first,
+    /// as it does on every dictation that is not racing a quit, behaviour is
+    /// unchanged from before this existed.
     fn capture(
         &mut self,
         pressed_at: Instant,
         frames: &Receiver<Vec<i16>>,
         keys: &Receiver<HotkeyEvent>,
-    ) -> Result<Dictated> {
+    ) -> Result<CaptureOutcome> {
         // The engine session first: for a streaming engine this starts the
         // websocket handshake, which then overlaps with everything below.
         //
@@ -896,7 +1004,10 @@ impl<A: AudioSource> App<A> {
                 // may still be mid-sentence; the words are reported, not typed.
                 let outcome = dictation.abandon(&mut |_| {});
                 let dictated = self.reported(outcome, format!("{e:#}"));
-                return Ok(note_mid_hold(dictated, mid_hold_failure));
+                return Ok(CaptureOutcome::Dictated(note_mid_hold(
+                    dictated,
+                    mid_hold_failure,
+                )));
             }
         };
 
@@ -918,21 +1029,104 @@ impl<A: AudioSource> App<A> {
             if !tail.is_empty() {
                 if let Err(e) = dictation.feed(&tail) {
                     let dictated = self.abandoned(dictation, e);
-                    return Ok(note_mid_hold(dictated, mid_hold_failure));
+                    return Ok(CaptureOutcome::Dictated(note_mid_hold(
+                        dictated,
+                        mid_hold_failure,
+                    )));
                 }
             }
         }
 
         self.pill.processing();
 
-        let finished = {
-            let timeout = self.final_timeout();
-            let pill = &mut self.pill;
-            dictation.finish(timeout, &mut |text: &str| {
-                iris_core::vlog!("~ {text}");
-                pill.set_partial_text(text);
+        // See this function's doc comment: `finish` runs off-thread so this
+        // loop can poll `quit_flag` instead of blocking on it outright.
+        let timeout = self.final_timeout();
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("iris-finalize".into())
+            .spawn(move || {
+                // Live-text-during-finalize (`set_partial_text` here) is not
+                // forwarded to the pill from this thread — plumbing it back
+                // would need a second channel, and `show_live_text` is off by
+                // default (`Config::show_live_text`), so nothing is visibly
+                // lost for the shipped default. A dictation that wins the
+                // race against `quit_flag` (the common case) never even
+                // reaches this trade-off from the user's side, since nothing
+                // upstream of the pill changed.
+                let outcome = dictation.finish(timeout, &mut |_text: &str| {});
+                let _ = result_tx.send(outcome);
             })
+            .expect("spawning the finalize thread");
+
+        const FINALIZE_POLL: Duration = Duration::from_millis(25);
+        let finished = loop {
+            match result_rx.recv_timeout(FINALIZE_POLL) {
+                Ok(outcome) => break Some(outcome),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if self.quit_flag.load(Ordering::Acquire) {
+                        break None;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    unreachable!("the finalize thread always sends before its sender drops")
+                }
+            }
         };
+
+        let Some(finished) = finished else {
+            // Quit won the race: hand the still-running finalise to a second,
+            // detached thread rather than waiting for it or dropping it —
+            // see this function's doc comment. Everything it needs is cloned
+            // out now, while `self` is still here to clone it from.
+            let engine_name = self.engine.name();
+            let config = self.config.clone();
+            let polisher = self.polisher.clone();
+            let injector = Arc::clone(&self.injector);
+            let notice = Arc::clone(&self.notice);
+            let mut history = self.history.clone();
+            let report = self.report;
+            let count = self.count;
+            let handle = std::thread::Builder::new()
+                .name("iris-finalize-deliver".into())
+                .spawn(move || {
+                    let Ok(finished) = result_rx.recv() else {
+                        return;
+                    };
+                    let dictated = match finished {
+                        Ok(outcome) => deliver_outcome(
+                            engine_name,
+                            outcome,
+                            &config,
+                            polisher.as_deref(),
+                            &*injector,
+                            &*notice,
+                            &history,
+                            |_latency_ms| {},
+                        ),
+                        Err(e) => {
+                            let message = format!("{e:#}");
+                            let never_connected = e.never_connected;
+                            failed_outcome(engine_name, &*notice, e.timeline, message, never_connected)
+                        }
+                    };
+                    if let Err(e) = history.append(&dictated.record) {
+                        eprintln!("  cannot write the session log: {e:#}");
+                    }
+                    if report {
+                        println!("{}", dictated.timeline.report(count));
+                    }
+                    if let Some(message) = &dictated.record.error {
+                        if !dictated.record.injected {
+                            eprintln!("  dictation failed while quitting: {message}");
+                        }
+                    }
+                })
+                .expect("spawning the deferred-delivery thread");
+            self.pending_finalize = Some(handle);
+            return Ok(CaptureOutcome::QuitRequested);
+        };
+
         let dictated = match finished {
             Ok(outcome) => self.deliver(outcome),
             Err(e) => {
@@ -951,7 +1145,10 @@ impl<A: AudioSource> App<A> {
         // that does not say so reads as an ordinary dictation that happened to
         // be short. The words the microphone never captured are invisible here
         // by definition; the cause is the only trace they leave.
-        Ok(note_mid_hold(dictated, mid_hold_failure))
+        Ok(CaptureOutcome::Dictated(note_mid_hold(
+            dictated,
+            mid_hold_failure,
+        )))
     }
 
     /// Polish the transcript, put it on screen, and record what happened.
@@ -967,77 +1164,17 @@ impl<A: AudioSource> App<A> {
     /// errored after two partials would record as a clean, unusually short
     /// dictation.
     fn deliver(&mut self, outcome: DictationOutcome) -> Dictated {
-        let DictationOutcome {
-            text: raw,
-            mut timeline,
-            cause,
-            never_connected,
-        } = outcome;
-        // `Dictation::finish` only ever produces `never_connected: true` on the
-        // branch with nothing to salvage, which returns `Err` and never reaches
-        // here — see `DictationOutcome::never_connected`'s doc. `App::failed` is
-        // the path that actually has to act on it.
-        debug_assert!(!never_connected, "a delivered outcome must have connected");
-        let raw = raw.trim().to_string();
-
-        let mut record = DictationRecord::now(self.engine.name(), &raw);
-        let dictated = if raw.is_empty() {
-            // Silence, or a key tapped by accident. Injecting nothing is right;
-            // so is not pretending to the overlay that text appeared.
-            record.latency = LatencyBreakdown::from_timeline(&timeline);
-            Dictated { record, timeline }
-        } else {
-            let (text, polished_info, polish_ms) = self.polish(&raw);
-            record.text = text.clone();
-            record.raw = (text != raw).then(|| raw.clone());
-            record.polish = polished_info;
-
-            let payload = text::prepare(&text, self.config.inject.trailing_space);
-            match self.injector.inject(&payload) {
-                Ok(()) => {
-                    timeline.mark(Mark::Injected);
-                    record.injected = true;
-                    // Key-release → text on screen: the number the pill prints.
-                    let latency_ms = timeline
-                        .perceived()
-                        .map(ms)
-                        .unwrap_or(0.0)
-                        .round()
-                        .clamp(0.0, f64::from(u32::MAX))
-                        as u32;
-                    self.pill.inserted(latency_ms);
-                }
-                Err(e) => {
-                    // The transcript is good; only the delivery failed. Say
-                    // so, and make sure the record below carries the text.
-                    // With history off there is no file to point at, so the
-                    // console gets the words themselves — they must be
-                    // recoverable from somewhere.
-                    eprintln!("  could not insert the text: {e:#}");
-                    if self.history.enabled() {
-                        eprintln!("  it is in {}", self.history.path().display());
-                    } else {
-                        eprintln!("  it was: {text}");
-                    }
-                    // The eprintln!s above are the whole story on a launch
-                    // with a console attached to read them; `self.notice` is
-                    // the same failure reaching a launch with none — the
-                    // GUI-subsystem double-click/Start Menu/Startup path most
-                    // users actually take. It decides for itself whether that
-                    // means the clipboard, a dialog, both or neither; see
-                    // `crate::notify`.
-                    self.notice
-                        .injection_failed(&text, &format!("{e:#}"), self.history.enabled());
-                    record.error = Some(format!("injection failed: {e:#}"));
-                }
-            }
-
-            record.latency = LatencyBreakdown::from_timeline(&timeline);
-            record.latency.polish_ms = polish_ms;
-            Dictated { record, timeline }
-        };
-
-        note_salvage(dictated, cause)
+        let pill = &mut self.pill;
+        deliver_outcome(
+            self.engine.name(),
+            outcome,
+            &self.config,
+            self.polisher.as_deref(),
+            &*self.injector,
+            &*self.notice,
+            &self.history,
+            |latency_ms| pill.inserted(latency_ms),
+        )
     }
 
     /// A hold that produced no transcript, recorded against the timeline as it
@@ -1057,14 +1194,13 @@ impl<A: AudioSource> App<A> {
     /// mechanism [`App::deliver`] already uses for a failed injection — not a
     /// second, invented channel.
     fn failed(&self, timeline: Timeline, message: String, never_connected: bool) -> Dictated {
-        let mut record = DictationRecord::now(self.engine.name(), "");
-        record.error = Some(message.clone());
-        record.connection_failed = never_connected;
-        record.latency = LatencyBreakdown::from_timeline(&timeline);
-        if never_connected {
-            self.notice.connection_failed(&message);
-        }
-        Dictated { record, timeline }
+        failed_outcome(
+            self.engine.name(),
+            &*self.notice,
+            timeline,
+            message,
+            never_connected,
+        )
     }
 
     /// A hold that has words but may never put them on screen: recorded in
@@ -1117,30 +1253,145 @@ impl<A: AudioSource> App<A> {
         note_cause(dictated, error)
     }
 
-    /// Clean up the transcript, falling back to the raw text on any failure.
-    ///
-    /// Returns `(text, how it was polished, milliseconds spent)`.
-    fn polish(&self, raw: &str) -> (String, Option<PolishInfo>, Option<f64>) {
-        let Some(polisher) = &self.polisher else {
-            return (raw.to_string(), None, None);
-        };
-        let request = PolishRequest::new(raw).with_hints(polish::hints(&self.config));
-        match polish::run(&**polisher, &request) {
-            Ok(polished) => {
-                let info = PolishInfo {
-                    source: polished.source.to_string(),
-                    fallback: polished.fallback.as_ref().map(ToString::to_string),
-                };
-                (polished.text, Some(info), Some(ms(polished.duration)))
-            }
-            Err(e) => {
-                // The transcript is still perfectly usable; polish is an
-                // improvement, never a gate.
-                eprintln!("  polish failed, inserting the raw transcript: {e:#}");
-                (raw.to_string(), None, None)
-            }
+}
+
+/// Clean up the transcript, falling back to the raw text on any failure.
+///
+/// Returns `(text, how it was polished, milliseconds spent)`. A free function
+/// rather than an `App` method so [`deliver_outcome`] can call it from a
+/// detached delivery thread — see [`App::capture`]'s doc comment — with a
+/// cloned `polisher`/`config` instead of `&self`.
+fn polish_text(
+    polisher: Option<&dyn Polisher>,
+    config: &Config,
+    raw: &str,
+) -> (String, Option<PolishInfo>, Option<f64>) {
+    let Some(polisher) = polisher else {
+        return (raw.to_string(), None, None);
+    };
+    let request = PolishRequest::new(raw).with_hints(polish::hints(config));
+    match polish::run(polisher, &request) {
+        Ok(polished) => {
+            let info = PolishInfo {
+                source: polished.source.to_string(),
+                fallback: polished.fallback.as_ref().map(ToString::to_string),
+            };
+            (polished.text, Some(info), Some(ms(polished.duration)))
+        }
+        Err(e) => {
+            // The transcript is still perfectly usable; polish is an
+            // improvement, never a gate.
+            eprintln!("  polish failed, inserting the raw transcript: {e:#}");
+            (raw.to_string(), None, None)
         }
     }
+}
+
+/// The shared core of [`App::deliver`]: polish, inject, stamp latency, note a
+/// salvage cause. A free function, not an `App` method, so the
+/// quit-during-finalize delivery thread in [`App::capture`] can call it too,
+/// with cloned Arc'd resources instead of `&mut self` — `on_inserted` is
+/// where the two paths actually differ, since the background one has no pill
+/// left to update.
+#[allow(clippy::too_many_arguments)]
+fn deliver_outcome(
+    engine_name: &'static str,
+    outcome: DictationOutcome,
+    config: &Config,
+    polisher: Option<&dyn Polisher>,
+    injector: &dyn Injector,
+    notice: &dyn FailureNotice,
+    history: &SessionLog,
+    mut on_inserted: impl FnMut(u32),
+) -> Dictated {
+    let DictationOutcome {
+        text: raw,
+        mut timeline,
+        cause,
+        never_connected,
+    } = outcome;
+    // `Dictation::finish` only ever produces `never_connected: true` on the
+    // branch with nothing to salvage, which returns `Err` and never reaches
+    // here — see `DictationOutcome::never_connected`'s doc. `failed_outcome`
+    // is the path that actually has to act on it.
+    debug_assert!(!never_connected, "a delivered outcome must have connected");
+    let raw = raw.trim().to_string();
+
+    let mut record = DictationRecord::now(engine_name, &raw);
+    let dictated = if raw.is_empty() {
+        // Silence, or a key tapped by accident. Injecting nothing is right;
+        // so is not pretending to the overlay that text appeared.
+        record.latency = LatencyBreakdown::from_timeline(&timeline);
+        Dictated { record, timeline }
+    } else {
+        let (text, polished_info, polish_ms) = polish_text(polisher, config, &raw);
+        record.text = text.clone();
+        record.raw = (text != raw).then(|| raw.clone());
+        record.polish = polished_info;
+
+        let payload = text::prepare(&text, config.inject.trailing_space);
+        match injector.inject(&payload) {
+            Ok(()) => {
+                timeline.mark(Mark::Injected);
+                record.injected = true;
+                // Key-release → text on screen: the number the pill prints.
+                let latency_ms = timeline
+                    .perceived()
+                    .map(ms)
+                    .unwrap_or(0.0)
+                    .round()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32;
+                on_inserted(latency_ms);
+            }
+            Err(e) => {
+                // The transcript is good; only the delivery failed. Say
+                // so, and make sure the record below carries the text.
+                // With history off there is no file to point at, so the
+                // console gets the words themselves — they must be
+                // recoverable from somewhere.
+                eprintln!("  could not insert the text: {e:#}");
+                if history.enabled() {
+                    eprintln!("  it is in {}", history.path().display());
+                } else {
+                    eprintln!("  it was: {text}");
+                }
+                // The eprintln!s above are the whole story on a launch
+                // with a console attached to read them; `notice` is the
+                // same failure reaching a launch with none — the
+                // GUI-subsystem double-click/Start Menu/Startup path most
+                // users actually take. It decides for itself whether that
+                // means the clipboard, a dialog, both or neither; see
+                // `crate::notify`.
+                notice.injection_failed(&text, &format!("{e:#}"), history.enabled());
+                record.error = Some(format!("injection failed: {e:#}"));
+            }
+        }
+
+        record.latency = LatencyBreakdown::from_timeline(&timeline);
+        record.latency.polish_ms = polish_ms;
+        Dictated { record, timeline }
+    };
+
+    note_salvage(dictated, cause)
+}
+
+/// The shared core of [`App::failed`] — see [`deliver_outcome`] for why this
+/// is a free function rather than a method.
+fn failed_outcome(
+    engine_name: &'static str,
+    notice: &dyn FailureNotice,
+    timeline: Timeline,
+    message: String,
+    never_connected: bool,
+) -> Dictated {
+    let mut record = DictationRecord::now(engine_name, "");
+    record.error = Some(message.clone());
+    record.connection_failed = never_connected;
+    record.latency = LatencyBreakdown::from_timeline(&timeline);
+    if never_connected {
+        notice.connection_failed(&message);
+    }
+    Dictated { record, timeline }
 }
 
 /// Name why a hold ended abnormally on the record it produced anyway.
