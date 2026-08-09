@@ -154,7 +154,10 @@ pub struct Dictated {
 /// why that race exists and what wins it when.
 enum CaptureOutcome {
     /// The ordinary case: a transcript (or a recorded failure) is in hand.
-    Dictated(Dictated),
+    /// Boxed: `QuitRequested` carries nothing, and clippy's `large_enum_variant`
+    /// is right that leaving it unboxed would size every `CaptureOutcome` —
+    /// including the common, no-quit case — to `Dictated`'s.
+    Dictated(Box<Dictated>),
     /// Quit arrived before the finalise did. Delivery continues on a
     /// detached thread (see [`App::pending_finalize`]); this dictation adds
     /// nothing further to the pill or the session log itself.
@@ -797,7 +800,7 @@ impl<A: AudioSource> App<A> {
                 self.audio.disarm();
                 anyhow::bail!("quitting: the pending dictation is finishing in the background");
             }
-            Ok(CaptureOutcome::Dictated(dictated)) => Ok(dictated),
+            Ok(CaptureOutcome::Dictated(dictated)) => Ok(*dictated),
             Err(e) => Err(e),
         };
 
@@ -1004,10 +1007,10 @@ impl<A: AudioSource> App<A> {
                 // may still be mid-sentence; the words are reported, not typed.
                 let outcome = dictation.abandon(&mut |_| {});
                 let dictated = self.reported(outcome, format!("{e:#}"));
-                return Ok(CaptureOutcome::Dictated(note_mid_hold(
+                return Ok(CaptureOutcome::Dictated(Box::new(note_mid_hold(
                     dictated,
                     mid_hold_failure,
-                )));
+                ))));
             }
         };
 
@@ -1029,10 +1032,10 @@ impl<A: AudioSource> App<A> {
             if !tail.is_empty() {
                 if let Err(e) = dictation.feed(&tail) {
                     let dictated = self.abandoned(dictation, e);
-                    return Ok(CaptureOutcome::Dictated(note_mid_hold(
+                    return Ok(CaptureOutcome::Dictated(Box::new(note_mid_hold(
                         dictated,
                         mid_hold_failure,
-                    )));
+                    ))));
                 }
             }
         }
@@ -1107,7 +1110,13 @@ impl<A: AudioSource> App<A> {
                         Err(e) => {
                             let message = format!("{e:#}");
                             let never_connected = e.never_connected;
-                            failed_outcome(engine_name, &*notice, e.timeline, message, never_connected)
+                            failed_outcome(
+                                engine_name,
+                                &*notice,
+                                e.timeline,
+                                message,
+                                never_connected,
+                            )
                         }
                     };
                     if let Err(e) = history.append(&dictated.record) {
@@ -1145,10 +1154,10 @@ impl<A: AudioSource> App<A> {
         // that does not say so reads as an ordinary dictation that happened to
         // be short. The words the microphone never captured are invisible here
         // by definition; the cause is the only trace they leave.
-        Ok(CaptureOutcome::Dictated(note_mid_hold(
+        Ok(CaptureOutcome::Dictated(Box::new(note_mid_hold(
             dictated,
             mid_hold_failure,
-        )))
+        ))))
     }
 
     /// Polish the transcript, put it on screen, and record what happened.
@@ -1252,7 +1261,6 @@ impl<A: AudioSource> App<A> {
         let dictated = self.deliver(outcome);
         note_cause(dictated, error)
     }
-
 }
 
 /// Clean up the transcript, falling back to the raw text on any failure.
