@@ -597,6 +597,24 @@ When updating this file, preserve this bar for all agents and keep entries conci
   file do) cannot catch this class of bug — it has no idle short-circuit to
   skip. A regression test must drive `tick`/`draw` the way the real loop does,
   skipping `draw` whenever `Model::is_idle()`.
+- **The wave row's height not tracking real speech volume (2026-08-09) was an
+  `iris-app` bug, not an `iris-overlay` one — check the input before retuning
+  render constants again.** The captain reported bars that moved but did not
+  read as "louder = taller". Root cause was `iris-app::audio::level()`
+  (`crates/iris-app/src/audio.rs`), which feeds the overlay: its old
+  `sqrt(rms / i16::MAX)` mapped realistic conversational-to-loud speech into
+  a narrow `0.27..0.46` band on the `0.0..=1.0` meter, so `iris-overlay`'s own
+  expansive response curve (`WAVE_RESPONSE_EXPONENT`, unchanged by this fix)
+  had almost no spread to work with regardless of its own tuning. Fixed by
+  mapping dBFS RMS linearly between a calibrated silence floor (`-50 dBFS`)
+  and a loud-but-not-clipping ceiling (`-8 dBFS`) — see the doc comment on
+  `audio::level` for the full reasoning and
+  `crates/iris-overlay/docs/voice-level-evidence/` for 1:1 before/after
+  evidence across a level sweep, both themes. If a future "the wave doesn't
+  track volume" report shows up again, measure `audio::level()`'s actual
+  output against representative PCM first — the compounding shape (an
+  upstream compressor plus a downstream expansive curve) is exactly what
+  made this one hard to see from the render code alone.
 - Geometry is one capsule whose width animates between the rest width
   (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) —
   `layout::ORB_D` is the shape's constant height, at every width. No solid
