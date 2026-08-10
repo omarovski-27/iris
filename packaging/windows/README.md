@@ -46,10 +46,10 @@ Iris that is currently running, deletes whatever Start Menu, Desktop and
 Startup shortcuts a previous run created, and replaces `%LOCALAPPDATA%\Iris`
 before copying the new build in. You never need to quit Iris or delete
 anything by hand first. Your settings and dictation history live in
-`%APPDATA%\iris`, a separate folder this script never touches, so an upgrade
-never resets your key or your history — and if re-running with different
-flags means a shortcut you had (say, the Startup one) is no longer requested,
-it is removed rather than left stale.
+`%LOCALAPPDATA%\IrisConfig`, a separate folder this script never touches, so an
+upgrade never resets your key or your history — and if re-running with
+different flags means a shortcut you had (say, the Startup one) is no longer
+requested, it is removed rather than left stale.
 
 3. Launch **Iris** from the Start Menu (or your shortcut). Its window (History,
    Settings, Insights) opens on screen — that is Iris, running; a tray icon
@@ -59,9 +59,9 @@ it is removed rather than left stale.
 
 ## First run
 
-First launch writes `%APPDATA%\iris\config.toml` — commented defaults, no key
-needed yet. Out of the box Iris runs the offline **mock** engine, so dictation
-"works" but the transcript is a stub, not what you said.
+First launch writes `%LOCALAPPDATA%\IrisConfig\iris\config.toml` — commented
+defaults, no key needed yet. Out of the box Iris runs the offline **mock**
+engine, so dictation "works" but the transcript is a stub, not what you said.
 
 To dictate for real, use the Iris window's **Settings** tab and its
 **Open config file** button, which hands `config.toml` to your editor — the key
@@ -114,7 +114,8 @@ older builds reject any setting they do not recognise — so an older Iris opens
 an **Iris could not start** dialog naming an unknown `version` field instead of
 starting.
 
-Fix it in one step: open `%APPDATA%\iris\config.toml` and delete the line
+Fix it in one step: open `%LOCALAPPDATA%\IrisConfig\iris\config.toml` and
+delete the line
 
 ```toml
 version = 1
@@ -144,8 +145,8 @@ that is not a bug.
    deletes every shortcut a previous install created — Start Menu, Desktop,
    and Startup (which is also what stops Iris starting at login). One step,
    nothing to hunt for by hand.
-2. Optional: delete `%APPDATA%\iris` as well. That folder holds your settings
-   (including any key you pasted in) and your dictation history —
+2. Optional: delete `%LOCALAPPDATA%\IrisConfig` as well. That folder holds
+   your settings (including any key you pasted in) and your dictation history —
    `-Uninstall` deliberately leaves it alone, so a reinstall picks it straight
    back up. Delete it yourself if you want a full wipe.
 

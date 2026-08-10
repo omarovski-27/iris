@@ -79,15 +79,61 @@ new build in — so upgrading or re-running with different flags never leaves a
 stale shortcut or a stale binary. `-Uninstall` does the removal half only.
 Both are safe by construction because `%LOCALAPPDATA%\Iris` never holds
 anything but `iris.exe` — `config.toml` and `history.jsonl` live in
-`%APPDATA%\iris`, which the script never touches — but `Assert-NoUserDataIn`
-checks that invariant before every recursive delete rather than trust it
-blindly; keep that guard if this script changes again.
+`%LOCALAPPDATA%\IrisConfig`, a sibling directory the script never touches —
+but `Assert-NoUserDataIn` checks that invariant before every recursive delete
+rather than trust it blindly; keep that guard if this script changes again.
+See "Config and history location" below for why the config directory moved
+under `%LOCALAPPDATA%` at all, and why it is `IrisConfig` and not a bare
+`%LOCALAPPDATA%` root or `%LOCALAPPDATA%\Iris` itself.
 
 After packaging a new build, work through
 `docs/first-run-checklist.md` on a real Windows machine — this repo has no WSL
 Windows-interop in most sandboxes, so nothing Windows-specific (`#[cfg(windows)]`
 paths: the banner, the hotkey hook, the overlay, injection) has ever actually
 executed here; only compiled, cross-compiled, and been reviewed.
+
+### Config and history location
+
+`config::config_dir()` (`crates/iris-app/src/config.rs`) resolves
+`%LOCALAPPDATA%\IrisConfig` on Windows, not `%APPDATA%` (Roaming) — a
+2026-08-10 fix for a real exposure on domain-joined machines with roaming
+profiles: Windows replicates the Roaming profile to a network share on every
+logon/logoff, and `config.toml` carries a plaintext Deepgram/Groq API key
+while `history.jsonl` is the user's full dictation history. Non-Windows paths
+(`$XDG_CONFIG_HOME`/`$HOME/.config`) are unchanged.
+
+**Not the bare `%LOCALAPPDATA%` root.** `default_path()` joins a literal
+`"iris"` onto whatever `config_dir()` returns, and `install.ps1` already owns
+`%LOCALAPPDATA%\Iris` for the binary, which it recursively deletes on every
+clean-replace install (`Remove-PreviousInstall`). NTFS compares folder names
+case-insensitively, so a bare root would make the config directory
+(`...\Local\iris`) and the install directory (`...\Local\Iris`) literally the
+same folder: `install.ps1`'s own `Assert-NoUserDataIn` guard would then
+refuse every future reinstall, or — without that guard — a clean-replace
+would silently delete the user's key and history on every upgrade, which is a
+worse outcome than the Roaming leak this exists to fix. The extra
+`IrisConfig` segment (`resolve_windows_config_dir` in `config.rs`) keeps the
+two as siblings under `%LOCALAPPDATA%`;
+`windows_config_dir_never_collides_with_the_install_dir` pins it. This
+`resolve_windows_config_dir` (and its Roaming counterpart,
+`legacy_windows_config_dir`) are deliberately **not** `#[cfg(windows)]`, so
+`cargo test --workspace` exercises Windows' own path logic natively on
+Linux — only the real env-var-reading call sites (`config_dir`,
+`migrate_default_location_from_roaming`) are gated.
+
+**Migration, not a silent switch.** `config::migrate_from_roaming` copies a
+pre-existing install's `iris/config.toml` and `iris/history.jsonl` from the
+legacy Roaming location to the new Local one on first launch after upgrading,
+so an existing user's key keeps working untouched instead of appearing to
+vanish. Runs per file, idempotently: a file already present at the new
+location is left alone, a missing legacy file is not an error, and a legacy
+file is only deleted once `fs::copy`'s reported byte count matches the
+source's own length — copy-verified-then-remove, not remove-then-copy. Wired
+into `main.rs` right before `Config::load_or_create_reporting`, and skipped
+entirely when `--config` or `$IRIS_CONFIG` names an explicit path (the caller
+already chose a layout; migrating underneath it would be a surprise). A
+migration failure is reported (the same dialog/eprintln path as a migration
+schema-version-save failure) but is not fatal to startup.
 
 ## The application
 

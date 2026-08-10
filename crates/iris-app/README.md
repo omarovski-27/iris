@@ -50,8 +50,14 @@ in `lib.rs`'s crate docs.
 
 ## Configuration
 
-`iris/config.toml` in the platform config directory (`%APPDATA%` on Windows,
-`$XDG_CONFIG_HOME` on Unix). `--config <path>` or `IRIS_CONFIG` moves it.
+`iris/config.toml` in the platform config directory (`%LOCALAPPDATA%\IrisConfig`
+on Windows — deliberately not Roaming, and not the bare `%LOCALAPPDATA%` root
+either, since that would collide with `install.ps1`'s `%LOCALAPPDATA%\Iris`
+binary directory on NTFS's case-insensitive names; see
+`config::config_dir`'s doc comment — `$XDG_CONFIG_HOME` on Unix).
+`--config <path>` or `IRIS_CONFIG` moves it. A pre-existing install's
+`%APPDATA%\iris\config.toml`/`history.jsonl` are migrated to the new location
+automatically on first launch; see `config::migrate_from_roaming`.
 
 ```toml
 version = 1               # written by Iris, not a setting; see below

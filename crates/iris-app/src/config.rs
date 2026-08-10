@@ -669,17 +669,37 @@ pub fn default_path() -> PathBuf {
 
 /// The platform configuration directory.
 ///
-/// - **Windows:** `%APPDATA%`, then `%USERPROFILE%\AppData\Roaming`
+/// - **Windows:** `%LOCALAPPDATA%\IrisConfig`, then `%USERPROFILE%\AppData\Local\IrisConfig`
 /// - **Unix:** `$XDG_CONFIG_HOME`, then `$HOME/.config`
 ///
 /// Unix deliberately ignores the Windows variables: under WSL both are
 /// inherited from the host, and a config written to a Windows path from a Linux
 /// test run would be invisible to the app that reads it.
+///
+/// Windows resolves under the **Local** profile, not Roaming, so that
+/// `config.toml` (a plaintext API key) and `history.jsonl` (the user's full
+/// dictation history) never leave the machine via a domain-joined roaming
+/// profile's logon/logoff sync — see [`migrate_default_location_from_roaming`]
+/// for the one-time move of a pre-existing install's files to here.
+///
+/// **Not the bare `%LOCALAPPDATA%` root** — [`default_path`] joins `"iris"`
+/// onto whatever this returns, and `install.ps1` already owns a
+/// `%LOCALAPPDATA%\Iris` directory for the binary that it recursively deletes
+/// on every clean-replace install (see that script's `Remove-PreviousInstall`
+/// and its `Assert-NoUserDataIn` guard). NTFS is case-insensitive, so a bare
+/// root here would make the config directory (`...\Local\iris`) and the
+/// install directory (`...\Local\Iris`) the exact same folder: `Assert-
+/// NoUserDataIn` would then refuse every future reinstall outright, and
+/// without that guard a clean-replace would delete the user's key and
+/// history on every upgrade — a worse outcome than the Roaming-profile leak
+/// this whole change exists to fix. The extra `IrisConfig` segment keeps them
+/// siblings; `windows_config_dir_never_collides_with_the_install_dir` below
+/// pins it.
 pub fn config_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        resolve_config_dir(
-            std::env::var("APPDATA").ok().as_deref(),
+        resolve_windows_config_dir(
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
             std::env::var("USERPROFILE").ok().as_deref(),
         )
     }
@@ -696,9 +716,41 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
+/// True when `$IRIS_CONFIG` names a real override — the same check
+/// [`default_path`] uses to skip its normal resolution. [`main`] uses this to
+/// decide whether the default location's migration applies: an explicit
+/// override, like an explicit `--config`, means the caller already chose a
+/// layout on purpose.
+pub fn path_overridden_by_env() -> bool {
+    non_empty(std::env::var(CONFIG_PATH_ENV).ok().as_deref()).is_some()
+}
+
 /// Pure so the fallback chain is testable without touching the environment.
-#[cfg(windows)]
-fn resolve_config_dir(appdata: Option<&str>, userprofile: Option<&str>) -> PathBuf {
+/// Not `#[cfg(windows)]`, unlike the real [`config_dir`] call site that uses
+/// it, so `cargo test --workspace` exercises Windows' own fallback chain (and
+/// the migration built on it) natively on Linux — see the module-level "Build
+/// and test" note on why that portability matters here.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_windows_config_dir(local_appdata: Option<&str>, userprofile: Option<&str>) -> PathBuf {
+    if let Some(dir) = non_empty(local_appdata) {
+        return PathBuf::from(dir).join("IrisConfig");
+    }
+    if let Some(home) = non_empty(userprofile) {
+        return PathBuf::from(home)
+            .join("AppData")
+            .join("Local")
+            .join("IrisConfig");
+    }
+    PathBuf::from(".")
+}
+
+/// Where `config_dir` resolved to before this change — `%APPDATA%`, the
+/// Roaming profile. Kept only so
+/// [`migrate_default_location_from_roaming`] can find a pre-existing
+/// install's files; nothing writes here anymore. Pure for the same testing
+/// reason as [`resolve_windows_config_dir`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn legacy_windows_config_dir(appdata: Option<&str>, userprofile: Option<&str>) -> PathBuf {
     if let Some(dir) = non_empty(appdata) {
         return PathBuf::from(dir);
     }
@@ -718,6 +770,76 @@ fn resolve_config_dir(xdg: Option<&str>, home: Option<&str>) -> PathBuf {
         return PathBuf::from(home).join(".config");
     }
     PathBuf::from(".")
+}
+
+/// The `iris/config.toml` and `iris/history.jsonl` filenames [`migrate_from_roaming`]
+/// looks for, relative to a config directory root.
+const MIGRATABLE_FILES: &[&str] = &["iris/config.toml", "iris/history.jsonl"];
+
+/// Copies a pre-existing install's config and history out of `legacy_dir`
+/// into `new_dir`, removing each source file only once its copy is verified —
+/// this is the "roaming profile leaks a plaintext key" fix's actual data
+/// move; [`config_dir`] switching to Local only changes where a *fresh*
+/// install writes.
+///
+/// Runs per file, independently and idempotently:
+/// - a file already present at the new location is left alone (some earlier
+///   run already migrated it, or this is genuinely a fresh install that
+///   happens to collide — either way, the new copy wins and the old one is
+///   never touched);
+/// - a missing legacy file is not an error — most installs are fresh, and
+///   `history.jsonl` in particular may never have been created yet;
+/// - a copy is only removed from the legacy location after the byte count
+///   [`std::fs::copy`] reports matches the source's own metadata length, so a
+///   truncated or otherwise short copy — which `fs::copy` returning `Ok`
+///   alone would not catch — never costs the user their only surviving copy
+///   of an API key.
+///
+/// Stops at the first error, leaving every file up to that point migrated
+/// (each is already a completed, independent move) and every file from that
+/// point on untouched, so a retried run on the next launch picks up exactly
+/// where this one left off.
+pub fn migrate_from_roaming(
+    legacy_dir: &Path,
+    new_dir: &Path,
+) -> std::io::Result<Vec<&'static str>> {
+    let mut moved = Vec::new();
+    for &name in MIGRATABLE_FILES {
+        let old = legacy_dir.join(name);
+        let new = new_dir.join(name);
+        if new.exists() || !old.exists() {
+            continue;
+        }
+        if let Some(parent) = new.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let old_len = std::fs::metadata(&old)?.len();
+        let copied_len = std::fs::copy(&old, &new)?;
+        if copied_len != old_len {
+            return Err(std::io::Error::other(format!(
+                "short copy of {}: wrote {copied_len} of {old_len} bytes to {}",
+                old.display(),
+                new.display()
+            )));
+        }
+        std::fs::remove_file(&old)?;
+        moved.push(name);
+    }
+    Ok(moved)
+}
+
+/// Runs [`migrate_from_roaming`] against the real environment's default
+/// legacy and current config directories. `#[cfg(windows)]` because
+/// Local-vs-Roaming is a Windows-only distinction and this is the one call
+/// site that reaches the real filesystem with real Windows env vars; the
+/// logic it calls is portable and unit-tested on every platform.
+#[cfg(windows)]
+pub fn migrate_default_location_from_roaming() -> std::io::Result<Vec<&'static str>> {
+    let legacy = legacy_windows_config_dir(
+        std::env::var("APPDATA").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+    );
+    migrate_from_roaming(&legacy, &config_dir())
 }
 
 /// Serde for types that already have `Display` + `FromStr`, which is how
@@ -1058,5 +1180,157 @@ mod tests {
             PathBuf::from("/home/u/.config")
         );
         assert_eq!(resolve_config_dir(None, None), PathBuf::from("."));
+    }
+
+    #[test]
+    fn windows_config_dir_prefers_local_appdata_then_falls_back_through_userprofile() {
+        assert_eq!(
+            resolve_windows_config_dir(Some(r"C:\Users\u\AppData\Local"), Some(r"C:\Users\u")),
+            PathBuf::from(r"C:\Users\u\AppData\Local").join("IrisConfig")
+        );
+        assert_eq!(
+            resolve_windows_config_dir(Some("  "), Some(r"C:\Users\u")),
+            PathBuf::from(r"C:\Users\u")
+                .join("AppData")
+                .join("Local")
+                .join("IrisConfig")
+        );
+        assert_eq!(resolve_windows_config_dir(None, None), PathBuf::from("."));
+    }
+
+    #[test]
+    fn windows_config_dir_never_collides_with_the_install_dir() {
+        // install.ps1's $installDir is `%LOCALAPPDATA%\Iris`, and it
+        // recursively deletes that directory on every clean-replace install.
+        // NTFS compares folder names case-insensitively, so this pins that
+        // `resolve_windows_config_dir`'s result can never normalise to the
+        // same folder — see the doc comment on `config_dir` for what goes
+        // wrong if it ever does.
+        let local_appdata = r"C:\Users\u\AppData\Local";
+        let config_dir = resolve_windows_config_dir(Some(local_appdata), None);
+        let install_dir = PathBuf::from(local_appdata).join("Iris");
+        assert_ne!(
+            config_dir.to_string_lossy().to_ascii_lowercase(),
+            install_dir.to_string_lossy().to_ascii_lowercase(),
+        );
+    }
+
+    #[test]
+    fn legacy_windows_config_dir_is_the_old_roaming_resolution() {
+        assert_eq!(
+            legacy_windows_config_dir(Some(r"C:\Users\u\AppData\Roaming"), Some(r"C:\Users\u")),
+            PathBuf::from(r"C:\Users\u\AppData\Roaming")
+        );
+        assert_eq!(
+            legacy_windows_config_dir(Some("  "), Some(r"C:\Users\u")),
+            PathBuf::from(r"C:\Users\u").join("AppData").join("Roaming")
+        );
+        assert_eq!(legacy_windows_config_dir(None, None), PathBuf::from("."));
+    }
+
+    #[test]
+    fn path_overridden_by_env_reflects_iris_config() {
+        // No other test in this module touches `IRIS_CONFIG`, so this can set
+        // and restore it without a cross-test lock.
+        let previous = std::env::var(CONFIG_PATH_ENV).ok();
+        std::env::remove_var(CONFIG_PATH_ENV);
+        assert!(!path_overridden_by_env());
+        std::env::set_var(CONFIG_PATH_ENV, "/some/path.toml");
+        assert!(path_overridden_by_env());
+        match previous {
+            Some(v) => std::env::set_var(CONFIG_PATH_ENV, v),
+            None => std::env::remove_var(CONFIG_PATH_ENV),
+        }
+    }
+
+    #[test]
+    fn fresh_install_migrates_both_files_and_removes_the_legacy_copies() {
+        let legacy = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(legacy.path().join("iris")).unwrap();
+        std::fs::write(
+            legacy.path().join("iris/config.toml"),
+            "engine = \"deepgram\"",
+        )
+        .unwrap();
+        std::fs::write(legacy.path().join("iris/history.jsonl"), "{}\n").unwrap();
+
+        let moved = migrate_from_roaming(legacy.path(), new.path()).unwrap();
+
+        assert_eq!(moved, vec!["iris/config.toml", "iris/history.jsonl"]);
+        assert_eq!(
+            std::fs::read_to_string(new.path().join("iris/config.toml")).unwrap(),
+            "engine = \"deepgram\""
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.path().join("iris/history.jsonl")).unwrap(),
+            "{}\n"
+        );
+        assert!(
+            !legacy.path().join("iris/config.toml").exists(),
+            "the plaintext key must not linger in the roaming profile"
+        );
+        assert!(!legacy.path().join("iris/history.jsonl").exists());
+    }
+
+    #[test]
+    fn no_legacy_files_is_not_an_error() {
+        let legacy = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+
+        let moved = migrate_from_roaming(legacy.path(), new.path()).unwrap();
+
+        assert!(moved.is_empty());
+        assert!(!new.path().join("iris/config.toml").exists());
+    }
+
+    #[test]
+    fn existing_new_install_is_never_overwritten_or_deleted_from_legacy() {
+        let legacy = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(legacy.path().join("iris")).unwrap();
+        std::fs::write(legacy.path().join("iris/config.toml"), "engine = \"groq\"").unwrap();
+        std::fs::create_dir_all(new.path().join("iris")).unwrap();
+        std::fs::write(new.path().join("iris/config.toml"), "engine = \"mock\"").unwrap();
+
+        let moved = migrate_from_roaming(legacy.path(), new.path()).unwrap();
+
+        assert!(moved.is_empty(), "the new install already owns this file");
+        assert_eq!(
+            std::fs::read_to_string(new.path().join("iris/config.toml")).unwrap(),
+            "engine = \"mock\"",
+            "an existing new-location file must never be clobbered"
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.path().join("iris/config.toml")).unwrap(),
+            "engine = \"groq\"",
+            "the legacy file must survive untouched since it was never copied"
+        );
+    }
+
+    #[test]
+    fn partial_migration_leaves_the_unmigrated_file_for_the_next_run() {
+        let legacy = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(legacy.path().join("iris")).unwrap();
+        std::fs::write(
+            legacy.path().join("iris/config.toml"),
+            "engine = \"deepgram\"",
+        )
+        .unwrap();
+
+        let moved = migrate_from_roaming(legacy.path(), new.path()).unwrap();
+        assert_eq!(moved, vec!["iris/config.toml"]);
+        assert!(!legacy.path().join("iris/config.toml").exists());
+
+        // A dictation happens between migrations; history now exists in the
+        // legacy location for the first time.
+        std::fs::write(legacy.path().join("iris/history.jsonl"), "{}\n").unwrap();
+        let moved = migrate_from_roaming(legacy.path(), new.path()).unwrap();
+        assert_eq!(
+            moved,
+            vec!["iris/history.jsonl"],
+            "config.toml is already at the new location and must be left alone"
+        );
     }
 }

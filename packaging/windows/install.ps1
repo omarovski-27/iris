@@ -12,8 +12,8 @@
     previous run of this script created, and replaces %LOCALAPPDATA%\Iris
     before copying the new build in - so upgrading, or re-running with
     different flags, never leaves a stale shortcut or a stale binary behind.
-    Your settings and dictation history live in %APPDATA%\iris, a separate
-    folder this script never touches; see -Uninstall.
+    Your settings and dictation history live in %LOCALAPPDATA%\IrisConfig, a
+    separate folder this script never touches; see -Uninstall.
 
 .PARAMETER Desktop
     Also add a Desktop shortcut.
@@ -24,8 +24,8 @@
 .PARAMETER Uninstall
     Remove Iris instead of installing it: quit it if running, delete
     %LOCALAPPDATA%\Iris and every shortcut this script creates, then exit.
-    Does not touch %APPDATA%\iris (your settings and dictation history) -
-    delete that yourself if you want a full wipe.
+    Does not touch %LOCALAPPDATA%\IrisConfig (your settings and dictation
+    history) - delete that yourself if you want a full wipe.
 
 .EXAMPLE
     .\install.ps1
@@ -76,13 +76,16 @@ function Test-PathIsInside($path, $dir) {
 }
 
 # config.toml and the *.jsonl dictation history only ever live in
-# %APPDATA%\iris, never in $installDir - this script owns $installDir
-# completely and normally puts nothing there but iris.exe. That separation is
-# what makes a clean-replace safe by construction, but "normally" is not a
-# promise: a custom --config pointing here, or a future mistake, would put
-# real user data in the path of a recursive delete. Check for it every time
-# rather than trust the invariant blindly, and refuse to remove anything
-# rather than guess.
+# %LOCALAPPDATA%\IrisConfig, never in $installDir - this script owns
+# $installDir completely and normally puts nothing there but iris.exe. That
+# separation is deliberate: both directories sit under %LOCALAPPDATA%, and
+# NTFS folder names compare case-insensitively, so config_dir() (iris-app's
+# Rust side) is built to never resolve anywhere under or equal to
+# $installDir - see iris-app::config::config_dir's doc comment. "Normally" is
+# not a promise, though: a custom --config pointing here, or a future
+# mistake, would put real user data in the path of a recursive delete. Check
+# for it every time rather than trust the invariant blindly, and refuse to
+# remove anything rather than guess.
 function Assert-NoUserDataIn($dir) {
     if (-not (Test-Path -LiteralPath $dir)) { return }
     $userFiles = Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue |
@@ -157,7 +160,7 @@ try {
         } else {
             Write-Host "Nothing to remove - Iris was not installed."
         }
-        Write-Host "Your settings and dictation history are untouched, at %APPDATA%\iris."
+        Write-Host "Your settings and dictation history are untouched, at %LOCALAPPDATA%\IrisConfig."
         return
     }
 
@@ -251,7 +254,7 @@ try {
     Write-Host "Launch it from the Start Menu, or directly:"
     Write-Host "  & `"$targetExe`""
     Write-Host ""
-    Write-Host "First run creates %APPDATA%\iris\config.toml with a commented"
+    Write-Host "First run creates %LOCALAPPDATA%\IrisConfig\iris\config.toml with a commented"
     Write-Host "example for adding a Deepgram or Groq key. See the README.md"
     Write-Host "next to this script, section `"First run`", for the full"
     Write-Host "walkthrough."
