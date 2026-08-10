@@ -11,7 +11,7 @@
 //! the architecture rather than the cost of the vendor. See
 //! `docs/spike-findings.md`.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel::Receiver;
 
 use crate::{audio, vlog};
@@ -87,9 +87,31 @@ impl std::fmt::Debug for GroqEngine {
     }
 }
 
+/// Validates [`IRIS_GROQ_URL`](GroqEngine::from_env)'s override, the same way
+/// `iris-polish`'s `LlmConfig::validate` guards `IRIS_LLM_BASE_URL` — except
+/// this connection is plain HTTPS (a `reqwest` POST, not a websocket), so
+/// `https://` is the only TLS-carrying scheme it actually accepts. A non-TLS
+/// override is rejected outright rather than silently replaced with the
+/// default — a user who set this deliberately needs to know their value was
+/// thrown out, not guess why their audio still went to the real endpoint.
+fn validate_groq_url(url: String) -> Result<String> {
+    if !url.starts_with("https://") {
+        bail!(
+            "IRIS_GROQ_URL must start with https://, got {url:?}. \
+             A non-TLS scheme would send your audio and API key over the \
+             network unencrypted."
+        );
+    }
+    Ok(url)
+}
+
 impl GroqEngine {
     pub fn from_env(opts: &EngineOptions) -> Result<Self> {
         let key = super::require_key("IRIS_GROQ_KEY", "groq", "https://console.groq.com/keys")?;
+        let url = match std::env::var("IRIS_GROQ_URL") {
+            Ok(url) => validate_groq_url(url)?,
+            Err(_) => DEFAULT_URL.to_string(),
+        };
         Ok(Self {
             key,
             model: opts
@@ -97,7 +119,7 @@ impl GroqEngine {
                 .clone()
                 .or_else(|| std::env::var("IRIS_GROQ_MODEL").ok())
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            url: std::env::var("IRIS_GROQ_URL").unwrap_or_else(|_| DEFAULT_URL.to_string()),
+            url,
             language: opts.language.clone(),
         })
     }
@@ -300,6 +322,33 @@ mod tests {
             "a batch engine needs more room than the streaming default, not less: {:?}",
             engine.final_timeout()
         );
+    }
+
+    #[test]
+    fn a_secure_override_is_accepted_unchanged() {
+        assert_eq!(
+            validate_groq_url("https://example.test/v1/audio/transcriptions".to_string()).unwrap(),
+            "https://example.test/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn a_plaintext_override_is_rejected_by_name_not_silently_dropped() {
+        let err = validate_groq_url("http://example.test/v1/audio/transcriptions".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IRIS_GROQ_URL"), "unhelpful error: {err}");
+        assert!(err.contains("https://"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn no_override_falls_back_to_the_default_https_url() {
+        // GroqEngine::from_env only calls validate_groq_url at all when
+        // IRIS_GROQ_URL is set — an absent override never reaches it and
+        // keeps DEFAULT_URL, which is itself https:// and would pass the
+        // same check.
+        assert!(DEFAULT_URL.starts_with("https://"));
+        assert!(validate_groq_url(DEFAULT_URL.to_string()).is_ok());
     }
 
     #[test]
