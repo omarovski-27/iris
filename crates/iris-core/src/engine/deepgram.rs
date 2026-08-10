@@ -215,7 +215,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -291,6 +291,27 @@ impl std::fmt::Debug for DeepgramEngine {
     }
 }
 
+/// Validates [`IRIS_DEEPGRAM_URL`](DeepgramEngine::from_env)'s override, the
+/// same way `iris-polish`'s `LlmConfig::validate` guards `IRIS_LLM_BASE_URL`
+/// — except the only TLS-carrying scheme this connection can actually use is
+/// `wss://`: this is a websocket handshake
+/// (`tokio_tungstenite::connect_async_tls_with_config` below), which rejects
+/// `https://` on its own terms, so accepting it here would only trade a clear
+/// refusal for a confusing one downstream. A non-TLS override is rejected
+/// outright rather than silently replaced with the default — a user who set
+/// this deliberately needs to know their value was thrown out, not guess why
+/// their audio still went to the real endpoint.
+fn validate_deepgram_url(url: String) -> Result<String> {
+    if !url.starts_with("wss://") {
+        bail!(
+            "IRIS_DEEPGRAM_URL must start with wss://, got {url:?}. \
+             A non-TLS scheme would send your audio and API key over the \
+             network unencrypted."
+        );
+    }
+    Ok(url)
+}
+
 impl DeepgramEngine {
     pub fn from_env(opts: &EngineOptions) -> Result<Self> {
         let key = super::require_key(
@@ -303,8 +324,10 @@ impl DeepgramEngine {
             .clone()
             .or_else(|| std::env::var("IRIS_DEEPGRAM_MODEL").ok())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        let base =
-            std::env::var("IRIS_DEEPGRAM_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let base = match std::env::var("IRIS_DEEPGRAM_URL") {
+            Ok(url) => validate_deepgram_url(url)?,
+            Err(_) => DEFAULT_BASE_URL.to_string(),
+        };
 
         let mut url = format!(
             "{base}?model={model}\
@@ -845,6 +868,33 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secure_override_is_accepted_unchanged() {
+        assert_eq!(
+            validate_deepgram_url("wss://example.test/v1/listen".to_string()).unwrap(),
+            "wss://example.test/v1/listen"
+        );
+    }
+
+    #[test]
+    fn a_plaintext_override_is_rejected_by_name_not_silently_dropped() {
+        let err = validate_deepgram_url("ws://example.test/v1/listen".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IRIS_DEEPGRAM_URL"), "unhelpful error: {err}");
+        assert!(err.contains("wss://"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn no_override_falls_back_to_the_default_wss_url() {
+        // DeepgramEngine::from_env only calls validate_deepgram_url at all
+        // when IRIS_DEEPGRAM_URL is set — an absent override never reaches
+        // it and keeps DEFAULT_BASE_URL, which is itself wss:// and would
+        // pass the same check.
+        assert!(DEFAULT_BASE_URL.starts_with("wss://"));
+        assert!(validate_deepgram_url(DEFAULT_BASE_URL.to_string()).is_ok());
+    }
 
     #[test]
     fn the_outer_wait_never_sits_below_the_connect_budget() {
