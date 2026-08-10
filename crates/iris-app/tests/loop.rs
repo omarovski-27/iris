@@ -1233,6 +1233,81 @@ fn a_tray_quit_does_not_wait_for_an_in_flight_finalise() {
 }
 
 #[test]
+fn a_window_close_does_not_wait_for_an_in_flight_finalise() {
+    // Companion to `a_tray_quit_does_not_wait_for_an_in_flight_finalise`.
+    // The earlier fix (#29) wired `quit_flag` into the tray only — a Quit
+    // arriving on the *window's* channel (from the settings window's close
+    // button: `X`, Alt+F4, or the taskbar's "Close window") still raced the
+    // finalise wait unprotected, which is why the captain could still not
+    // close Iris after that fix landed. `window::state::Env::request_quit`
+    // now performs the identical flip-then-send ordering the tray already
+    // did, just over `window_commands` instead of `control`; this
+    // reproduces that exact ordering directly against `App`, which is the
+    // half of the fix a real Windows window is needed to exercise
+    // end-to-end (see the PR description for what remains unverified).
+    let mut rig = rig().with_final_timeout(Duration::from_secs(2));
+    rig.app.set_engine(Arc::new(SlowFinalizeEngine {
+        delay: Duration::from_millis(300),
+        text: "hello there",
+    }));
+    let quit_flag = rig.app.quit_flag();
+
+    let keys = rig.keys.clone();
+    let frames = rig.frames.clone();
+    let armed = rig.armed.clone();
+    let injector = rig.injector.clone();
+    let history_path = rig.history_path.clone();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let (window_commands_tx, window_commands_rx) = crossbeam_channel::unbounded();
+    let (outcomes_tx, _outcomes_rx) = crossbeam_channel::unbounded();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig
+            .app
+            .with_window_commands(window_commands_rx, outcomes_tx);
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+
+    keys.send(HotkeyEvent::Down(Instant::now())).unwrap();
+    armed.recv().expect("the dictation never armed capture");
+    for chunk in speech().chunks(320) {
+        frames.send(chunk.to_vec()).unwrap();
+    }
+    keys.send(HotkeyEvent::Up(Instant::now())).unwrap();
+
+    let quit_sent_at = Instant::now();
+    // `Env::request_quit`'s own ordering: flip before send.
+    quit_flag.store(true, Ordering::Release);
+    window_commands_tx
+        .send((CommandId::next(), Command::Quit))
+        .unwrap();
+
+    let app = loop_thread
+        .join()
+        .expect("the loop panicked")
+        .expect("the loop failed");
+    let responded_in = quit_sent_at.elapsed();
+    assert!(
+        responded_in < Duration::from_millis(150),
+        "closing the window must not wait for a 300ms finalise to complete: took {responded_in:?}"
+    );
+    assert_eq!(app.count(), 1);
+
+    // Delivery keeps running on a detached thread even though `run` already
+    // returned, exactly as it does for a tray quit — see that test's own
+    // comment for why this is observed through its effects rather than
+    // `App::take_pending_finalize`.
+    wait_for(|| !injector.inserted().is_empty());
+    assert_eq!(injector.inserted(), ["Hello there. ".to_string()]);
+    wait_for(|| SessionLog::read_all(&history_path).is_ok_and(|records| !records.is_empty()));
+    let records = SessionLog::read_all(&history_path).expect("reading the session log");
+    assert_eq!(records.len(), 1);
+    assert!(records[0].injected);
+    assert_eq!(records[0].text, "Hello there.");
+}
+
+#[test]
 fn a_tray_command_changes_and_persists_the_setting() {
     let rig = rig();
     let keys_rx = rig.keys_rx.clone();

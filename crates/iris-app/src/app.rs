@@ -138,6 +138,22 @@ pub enum CommandOutcome {
     Rejected(String),
 }
 
+/// Flip `quit_flag` — the one step every UI surface that can end the app
+/// must perform *before* sending [`Command::Quit`] anywhere, never after.
+///
+/// A dictation whose finalise is already running polls this flag directly
+/// (see [`App::capture`]'s doc comment) instead of waiting for its turn on a
+/// command channel, so it must be able to observe the flip before it can
+/// possibly observe the message that follows it. The tray's Quit item
+/// (`tray::spawn`) and the settings window's close button
+/// (`crate::window::state::Env::request_quit` — `X`, Alt+F4, and the
+/// taskbar's "Close window" all arrive there as the same signal) both call
+/// this rather than storing the flag directly, so a close path added later
+/// cannot reintroduce the narrower, tray-only fix this replaces.
+pub fn flip_quit_flag(quit_flag: &AtomicBool) {
+    quit_flag.store(true, Ordering::Release);
+}
+
 /// What one dictation produced.
 #[derive(Debug, Clone)]
 pub struct Dictated {
@@ -200,8 +216,8 @@ const MAX_LATCH_DURATION: Duration = Duration::from_secs(5 * 60);
 /// [`LatchPhase::Latched`], never [`LatchPhase::Held`].
 ///
 /// A held key bounds an ordinary hold-to-talk dictation to however long the
-/// user's own finger stays down, so `App::run`'s outer loop missing a tray
-/// Quit for that long (unread until this function returns) is the same
+/// user's own finger stays down, so `App::run`'s outer loop missing a Quit
+/// for that long (unread until this function returns) is the same
 /// tolerated gap `App::capture`'s finalise wait had before the tray-Quit fix
 /// — see `AGENTS.md`; `Held` keeps that same tolerated gap, unchanged. Once
 /// the key is up, though, that justification is gone — the user is no longer
@@ -309,13 +325,15 @@ pub struct App<A: AudioSource> {
     /// latch auto-stops after [`MAX_LATCH_DURATION`]; a test overrides this
     /// so it can exercise the cap firing without a five-minute wait.
     latch_cap: Option<Duration>,
-    /// Flipped by the tray the instant it sends [`Command::Quit`] — before
-    /// `App::run`'s own select loop ever gets a turn, because that loop is
-    /// blocked inside `dictate` for as long as a finalise is running (see
+    /// Flipped by whichever UI surface sends [`Command::Quit`] — the tray's
+    /// Quit item, or the settings window's close button — the instant it
+    /// sends it, via [`flip_quit_flag`]. Both flip before `App::run`'s own
+    /// select loop ever gets a turn, because that loop is blocked inside
+    /// `dictate` for as long as a finalise is running (see
     /// [`App::capture`]'s doc comment). Polling this from inside a finalise
     /// wait is what lets Quit cut that wait short without touching `control`
-    /// itself, which stays untouched for `App::run` to break its loop on
-    /// normally once `dictate` returns.
+    /// or `window_commands` themselves, which stay untouched for `App::run`
+    /// to break its loop on normally once `dictate` returns.
     quit_flag: Arc<AtomicBool>,
     /// A dictation whose finalise outlived a Quit: still delivering (inject +
     /// log) on a detached thread. `main` joins this after tearing down the
@@ -380,20 +398,22 @@ impl<A: AudioSource> App<A> {
         })
     }
 
-    /// Share the tray's quit flag with this app, in place of the private one
-    /// [`App::new`] creates. The real resident loop wires the same
-    /// [`Arc`] into `tray::spawn` so a click on Quit is visible to a
-    /// finalise wait already in progress; see [`App::capture`]'s doc
-    /// comment. Tests that only send [`Command::Quit`] on `control` do not
-    /// need this — that path is unaffected.
+    /// Share the app's quit flag with this app, in place of the private one
+    /// [`App::new`] creates. The real resident loop wires the same [`Arc`]
+    /// into both `tray::spawn` and `window::spawn`, so a click on Quit —
+    /// from the tray *or* the settings window's close button — is visible
+    /// to a finalise wait already in progress; see [`App::capture`]'s doc
+    /// comment. Tests that only send [`Command::Quit`] on `control` or
+    /// `window_commands` do not need this — that path is unaffected.
     #[must_use]
     pub fn with_quit_flag(mut self, quit_flag: Arc<AtomicBool>) -> Self {
         self.quit_flag = quit_flag;
         self
     }
 
-    /// The flag a tray Quit flips. Handed to `tray::spawn` by the real
-    /// resident loop; see [`App::with_quit_flag`].
+    /// The flag every close path flips via [`flip_quit_flag`]. Handed to
+    /// `tray::spawn` and `window::spawn` by the real resident loop; see
+    /// [`App::with_quit_flag`].
     #[must_use]
     pub fn quit_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.quit_flag)
@@ -634,7 +654,7 @@ impl<A: AudioSource> App<A> {
         // through `Command::apply_to` rather than naming the field itself.
         match &command {
             Command::Quit => {
-                self.quit_flag.store(true, Ordering::Release);
+                flip_quit_flag(&self.quit_flag);
                 return Ok(std::ops::ControlFlow::Break(()));
             }
             Command::SetEngine(choice) => {
@@ -970,7 +990,7 @@ impl<A: AudioSource> App<A> {
     /// them.
     ///
     /// **The finalise wait (`dictation.finish`, below) is the one place a
-    /// dictation can make the resident loop miss a tray Quit.** Everything
+    /// dictation can make the resident loop miss a Quit.** Everything
     /// before it — holding the key, feeding audio — is bounded by the user's
     /// own key hold, but `finish` blocks its caller for up to the engine's
     /// [`Engine::final_timeout`] (6s typical for Deepgram, ~14s when the
@@ -978,25 +998,29 @@ impl<A: AudioSource> App<A> {
     /// `App::run`'s select loop only services `control`/`window_commands`
     /// *between* calls to `dictate`. A Quit clicked while that wait is still
     /// running used to sit unread on the channel for the rest of it — visible
-    /// on the real desktop as a tray icon that does not go away, and exactly
-    /// what `Engine::final_timeout`'s own doc comment already warned this
-    /// shape would do.
+    /// on the real desktop as a tray icon (or a settings window) that does
+    /// not go away, and exactly what `Engine::final_timeout`'s own doc
+    /// comment already warned this shape would do.
     ///
     /// The fix does not touch `Dictation::finish` or its timeout — shortening
     /// that trades data loss for responsiveness, which is off the table (see
     /// `AGENTS.md`). Instead `finish` runs on a spawned thread here, and this
     /// function polls that thread's result against [`App::quit_flag`] rather
-    /// than blocking on it outright: the flag is flipped by the tray at the
-    /// same instant it sends `Command::Quit` (see `tray::spawn`), so it can
-    /// be noticed without waiting for `App::run`'s own turn. If the flag wins
-    /// the race, this returns [`CaptureOutcome::QuitRequested`] immediately
-    /// and hands the still-running finalise to a second, detached thread that
-    /// delivers it (polish, inject, log) once the engine actually answers —
+    /// than blocking on it outright: the flag is flipped via
+    /// [`flip_quit_flag`] by whichever UI surface sends `Command::Quit` — the
+    /// tray (`tray::spawn`) or the settings window's close button
+    /// (`window::state::Env::request_quit`) — at the same instant it sends
+    /// it, so it can be noticed without waiting for `App::run`'s own turn.
+    /// If the flag wins the race, this returns
+    /// [`CaptureOutcome::QuitRequested`] immediately and hands the
+    /// still-running finalise to a second, detached thread that delivers it
+    /// (polish, inject, log) once the engine actually answers —
     /// [`App::pending_finalize`] is `main`'s handle to wait for that before
     /// the process truly exits, so the words are never lost, only delivered
-    /// after the tray icon is already gone. If `finish` wins the race first,
-    /// as it does on every dictation that is not racing a quit, behaviour is
-    /// unchanged from before this existed.
+    /// after the tray icon (and the window, if it was open) are already
+    /// gone. If `finish` wins the race first, as it does on every dictation
+    /// that is not racing a quit, behaviour is unchanged from before this
+    /// existed.
     fn capture(
         &mut self,
         pressed_at: Instant,

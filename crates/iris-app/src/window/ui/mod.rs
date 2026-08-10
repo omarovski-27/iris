@@ -8,9 +8,13 @@
 //! `crate::window::state`'s tests (the data it renders) and by eye — rendered
 //! evidence lives in the PR, and `iris --demo-window` (see `main.rs`) is the
 //! manual verification path, the same split `iris-overlay` uses for its own
-//! window shell. The one exception is
+//! window shell. The exceptions are
 //! `tests::every_glyph_in_the_view_is_covered_by_the_embedded_fonts`, which
-//! catches the single thing eyeballing the source reliably misses.
+//! catches the single thing eyeballing the source reliably misses, and
+//! `tests::closing_the_window_requests_quit_the_same_as_a_tray_quit`, which
+//! drives [`draw_root`] through a headless `egui::Context` to prove the
+//! close-button wiring without a real OS window — see that test's doc
+//! comment for exactly what it does and does not prove.
 
 pub mod chrome;
 mod history_tab;
@@ -34,10 +38,22 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 
 /// Draw one frame of the whole window.
 ///
-/// Order: pick up a pending "focus me" request from a second `open()` call,
-/// take in what the loop did with the changes already sent, refresh from disk
-/// on the state's own timer, apply the theme, then paint the background wash,
-/// the nav sidebar and the active tab.
+/// Order: end the app if this frame is the window closing, pick up a pending
+/// "focus me" request from a second `open()` call, take in what the loop did
+/// with the changes already sent, refresh from disk on the state's own
+/// timer, apply the theme, then paint the background wash, the nav sidebar
+/// and the active tab.
+///
+/// **The window's close is the whole app's close, not just this window's.**
+/// `X`, Alt+F4, and the taskbar's "Close window" all reach here as the same
+/// `close_requested` signal on the root viewport (there is exactly one), so
+/// [`Env::request_quit`] runs for all three and — deliberately — the close is
+/// never cancelled: the window disappears immediately on this frame, the same
+/// way it always did, while `request_quit` hands the dictation loop
+/// `Command::Quit` to unwind in the background. Before this, closing the
+/// window only hid it — the resident loop kept running with no visible way
+/// left to reach it except the tray, which is what the captain reported as
+/// "cannot be closed".
 ///
 /// The reopen answer un-minimizes before it focuses, and the order is
 /// load-bearing: winit declines to focus a minimized window outright, so
@@ -46,6 +62,9 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 /// hand. Both commands run on the event loop thread in the order they are
 /// queued, so the restore has already landed when the focus is attempted.
 pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
+    if ctx.input(|i| i.viewport().close_requested()) {
+        env.request_quit();
+    }
     while env.reopen_signal.try_recv().is_ok() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -245,5 +264,79 @@ mod tests {
              (·, ×, —, …, the curly quotes and the whole Latin-1 range are covered):\n  {}",
             missing.join("\n  ")
         );
+    }
+
+    /// Regression for the captain's report on `iris-v0.1.0-2026-08-10`: with
+    /// the tray-only fix in place, the tray's Quit closed the app promptly
+    /// but every other way of closing it — the settings window's `X` above
+    /// all — still did not. `draw_root` is portable `egui`, no `eframe`
+    /// window required, so this drives it through a headless
+    /// `egui::Context::run` with a synthetic `close_requested` on the root
+    /// viewport — the same signal `winit` reports for the window's `X`,
+    /// Alt+F4, and the taskbar's "Close window" alike (confirmed by reading
+    /// `winit` 0.30's own `WM_CLOSE`/`WM_SYSCOMMAND` handling; there is no
+    /// Windows host here to click any of them for real) — and checks that it
+    /// runs the exact same flip-then-send `Env::request_quit` performs,
+    /// matching the tray's own ordering.
+    ///
+    /// What this does **not** prove: that a real `eframe`/`winit` window on
+    /// real Windows actually reports `close_requested` for all three
+    /// gestures, or that `App::run` (a separate crate boundary) reacts to the
+    /// `Command::Quit` this sends the way it does to the tray's — that half
+    /// is `crate::app`'s `a_window_close_does_not_wait_for_an_in_flight_finalise`,
+    /// exercised end to end against the real `App`.
+    #[test]
+    fn closing_the_window_requests_quit_the_same_as_a_tray_quit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        use crate::app::Command;
+        use crate::window::{Env, InForce, WindowState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let (_outcomes_tx, outcomes_rx) = crossbeam_channel::unbounded();
+        let reopen_signal: crossbeam_channel::Receiver<()> = crossbeam_channel::never();
+        let devices = || Vec::new();
+        let open_config_file = |_: &std::path::Path| Ok(());
+        let quit_flag = Arc::new(AtomicBool::new(false));
+
+        let env = Env {
+            config_path: &config_path,
+            commands: &commands_tx,
+            outcomes: &outcomes_rx,
+            list_devices: &devices,
+            open_config_file: &open_config_file,
+            reopen_signal: &reopen_signal,
+            utc_offset_seconds: 0,
+            hotkey: InForce {
+                running: iris_core::hotkey::Key::default(),
+                at_startup: iris_core::hotkey::Key::default(),
+            },
+            overlay_enabled: InForce {
+                running: true,
+                at_startup: true,
+            },
+            quit_flag: Arc::clone(&quit_flag),
+        };
+        let mut state = WindowState::new(&env);
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                events: vec![egui::ViewportEvent::Close],
+                ..Default::default()
+            },
+        );
+        let _ = ctx.run(input, |ctx| super::draw_root(ctx, &mut state, &env));
+
+        assert!(
+            quit_flag.load(Ordering::Acquire),
+            "the window's close must flip the same flag a finalise polls"
+        );
+        assert_eq!(commands_rx.try_recv().unwrap().1, Command::Quit);
     }
 }

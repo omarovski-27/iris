@@ -16,6 +16,13 @@
 //! a click landing after the window's last frame would otherwise be waiting
 //! for this thread's `recv` and reopen the window the user has just closed,
 //! so a closed window's leftover signals are dropped before it waits again.
+//!
+//! This thread going back to waiting is *not* the app staying open: closing
+//! this window (`X`, Alt+F4, or the taskbar's "Close window") ends the whole
+//! resident app the same way the tray's Quit item does — see
+//! [`super::ui::draw_root`]'s doc comment and [`super::Env::request_quit`].
+//! The window thread itself just idles here afterwards the same as always;
+//! it is the dictation loop, torn down from `main`, that actually exits.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,11 +89,15 @@ impl WindowSink for WindowHandle {
 /// Start the settings-window thread. Returns immediately; the window itself
 /// only appears once [`WindowSink::open`] is called (from the tray's
 /// `Settings` item).
+///
+/// `quit_flag` is handed through to every window instance this thread runs;
+/// see [`super::spawn`]'s doc comment.
 pub fn spawn(
     config_path: PathBuf,
     commands: Sender<(CommandId, Command)>,
     outcomes: Receiver<(CommandId, CommandOutcome)>,
     startup: Startup,
+    quit_flag: Arc<AtomicBool>,
 ) -> Result<Box<dyn WindowSink>> {
     let (open_tx, open_rx) = crossbeam_channel::unbounded::<()>();
     let ctx: SharedContext = Arc::new(Mutex::new(None));
@@ -113,6 +124,7 @@ pub fn spawn(
                     outcomes.clone(),
                     startup,
                     &thread_ctx,
+                    Arc::clone(&quit_flag),
                 ) {
                     // The window this thread just ran was the other reader of
                     // this channel. A click it never got to drain — one that
@@ -156,6 +168,7 @@ fn run_window(
     outcomes: Receiver<(CommandId, CommandOutcome)>,
     startup: Startup,
     ctx: &SharedContext,
+    quit_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     // Best-effort: a config that fails to load just draws the default-theme
     // icon rather than blocking the window from opening at all.
@@ -197,6 +210,7 @@ fn run_window(
         utc_offset_seconds: local_utc_offset_seconds(),
         ctx: Arc::clone(ctx),
         state: None,
+        quit_flag,
     };
 
     let result = eframe::run_native(
@@ -229,6 +243,8 @@ struct SettingsApp {
     /// Built lazily on the first frame — `Env` borrows the fields above, so
     /// it cannot be constructed until `self` exists.
     state: Option<WindowState>,
+    /// The flag this window's close button flips — see [`super::Env::request_quit`].
+    quit_flag: Arc<AtomicBool>,
 }
 
 impl eframe::App for SettingsApp {
@@ -252,6 +268,7 @@ impl eframe::App for SettingsApp {
                 running: self.startup.overlay_enabled,
                 at_startup: self.startup.saved_overlay_enabled,
             },
+            quit_flag: Arc::clone(&self.quit_flag),
         };
         let state = self.state.get_or_insert_with(|| WindowState::new(&env));
         ui::draw_root(ctx, state, &env);
