@@ -146,6 +146,44 @@ Load-bearing beyond that crate:
   does *not* change: the length of the wait itself (Deepgram's `CONNECT_TIMEOUT`
   8s is an accepted tradeoff, not a bug — see the Deepgram section above), only
   that it now always ends in something the user can see.
+- **Every close path — not only the tray — flips the same quit flag before
+  sending `Command::Quit`, via the shared `app::flip_quit_flag`.** A
+  2026-08-10 follow-up report ("closing Iris still freezes and lags; only
+  the tray works") landed *after* the tray-only fix below had already
+  shipped, because that fix's scope matched the original diagnosis, not the
+  actual bug: closing the settings window (`X`, Alt+F4, or the taskbar's
+  "Close window" — all three arrive as the same `close_requested` signal on
+  the root viewport, confirmed by reading `winit` 0.30's own
+  `WM_CLOSE`/`WM_SYSCOMMAND` handling) only ever hid that window — nothing
+  sent `Command::Quit` at all, so the resident app kept running with no
+  visible way left to reach it except the tray icon. `window::state::
+  Env::request_quit` (called from `window::ui::draw_root` once a frame
+  reports the close) now performs the identical flip-then-send ordering the
+  tray-only fix introduced, just over `window_commands` instead of
+  `control` — `App::apply` already treated `Command::Quit` the same
+  regardless of which channel it arrived on, so the App-level half of this
+  was already correct; the missing piece was purely that nothing on the
+  window side ever exercised it. Covered by test at two levels:
+  `window::ui::tests::closing_the_window_requests_quit_the_same_as_a_tray_quit`
+  drives `draw_root` through a headless `egui::Context` with a synthetic
+  `close_requested` (no `eframe`/OS window needed) to prove the wiring, and
+  `crates/iris-app/tests/loop.rs`'s
+  `a_window_close_does_not_wait_for_an_in_flight_finalise` mirrors the
+  tray's own finalise-race test but over `window_commands`. **Neither test
+  — nor anything else in this repo — can click a real window on real
+  Windows**, so the actual `eframe`/`winit` event on a live desktop is
+  verified by source inspection only, not exercised end-to-end; if a future
+  report says the window's `X` still doesn't close the app, re-check that
+  premise first. Two close paths remain deliberately unaddressed, both
+  reasoned rather than fixed: `WM_QUERYENDSESSION`/`WM_ENDSESSION`
+  (Windows shutdown/sign-out) have no support in `winit` 0.30 at all (grepped
+  its source; nothing references either message), and intercepting them would
+  need an unsafe, untestable-from-here window-subclass hook, so a session end
+  can still kill Iris without running any shutdown path; Task Manager "End
+  task" on a tray-only process (no window open) most likely calls
+  `TerminateProcess` directly rather than `WM_CLOSE`, which is an OS decision
+  no application code can intercept. Both are named, not silently assumed
+  fixed.
 - **A tray Quit clicked while a dictation is finalising no longer waits for
   `Dictation::finish` to return.** `Engine::final_timeout`'s own doc comment
   used to be literally true — "no tray command, Quit included, is serviced" —

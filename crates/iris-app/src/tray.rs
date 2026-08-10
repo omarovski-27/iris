@@ -583,13 +583,10 @@ mod win {
                         }
                         let quit = command == Command::Quit;
                         if quit {
-                            // Flipped before the send below, not after: a
-                            // dictation whose finalise is running right now
-                            // polls this flag instead of blocking on
-                            // `control` (see `App::capture`'s doc comment),
-                            // and it must see this before it can possibly
-                            // see the message that follows.
-                            quit_flag.store(true, std::sync::atomic::Ordering::Release);
+                            // Flipped before the send below, not after — see
+                            // `crate::app::flip_quit_flag`'s doc comment for
+                            // why the ordering is load-bearing.
+                            crate::app::flip_quit_flag(&quit_flag);
                         }
                         if commands.send(command).is_err() || quit {
                             return;

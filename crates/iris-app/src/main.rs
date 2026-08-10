@@ -408,6 +408,7 @@ fn start_resident(
         window_commands_tx,
         window_outcomes_rx,
         startup,
+        Arc::clone(&quit_flag),
     );
 
     let app = App::new(config, config_path, audio, injector, pill)?
@@ -665,6 +666,12 @@ fn demo_window() -> Result<()> {
             saved_hotkey: config.hotkey,
             saved_overlay_enabled: config.overlay_enabled,
         },
+        // No `App` is running in this demo to poll it, but closing the demo
+        // window (`X`) still flips it and sends `Command::Quit` on
+        // `commands_tx` — the stand-in loop above shrugs it off the same way
+        // `Command::apply_to` does (`Quit` writes no field), same as every
+        // other command this demo cannot really apply.
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
     handle.open();
 

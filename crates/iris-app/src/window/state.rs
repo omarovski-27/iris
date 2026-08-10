@@ -24,11 +24,13 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
-use crate::app::{Command, CommandId, CommandOutcome};
+use crate::app::{flip_quit_flag, Command, CommandId, CommandOutcome};
 use crate::config::{Config, EngineChoice, Theme};
 use crate::history::{DictationRecord, SessionLog};
 use iris_core::hotkey::Key;
@@ -111,6 +113,11 @@ pub struct Env<'a> {
     pub hotkey: InForce<Key>,
     /// Whether the overlay is really up this run, on the same footing.
     pub overlay_enabled: InForce<bool>,
+    /// The same flag `tray::spawn` flips on Quit — shared via [`Arc`] rather
+    /// than borrowed so this window's own thread can hold it for the life of
+    /// the process, the same way `tray::spawn` does. See
+    /// [`Env::request_quit`].
+    pub quit_flag: Arc<AtomicBool>,
 }
 
 impl Env<'_> {
@@ -122,6 +129,23 @@ impl Env<'_> {
             hotkey: self.hotkey.pending(&saved.hotkey),
             overlay_enabled: self.overlay_enabled.pending(&saved.overlay_enabled),
         }
+    }
+
+    /// Flip [`Env::quit_flag`] and hand the loop `Command::Quit` — the exact
+    /// sequence the tray's Quit item already performs
+    /// (`crate::app::flip_quit_flag`'s doc comment has the ordering rule),
+    /// so the app ends the same way whichever one sent it. Not tracked in
+    /// [`WindowState::inflight`] like an ordinary setting: `App::apply`
+    /// answers `Quit` on neither channel, so there is no outcome to poll for.
+    ///
+    /// The one caller is `super::ui::draw_root`, once per frame it sees the
+    /// window's close requested — the single signal behind the `X`, Alt+F4,
+    /// and the taskbar's "Close window", so all three end the whole app
+    /// exactly as the tray already does, instead of only hiding this one
+    /// window.
+    pub fn request_quit(&self) {
+        flip_quit_flag(&self.quit_flag);
+        let _ = self.commands.send((CommandId::next(), Command::Quit));
     }
 }
 
@@ -742,6 +766,7 @@ mod tests {
                 running: true,
                 at_startup: true,
             },
+            quit_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1716,5 +1741,28 @@ mod tests {
         assert!(message.contains("Could not open"), "{message}");
         assert!(message.contains("launching the editor"), "{message}");
         assert!(message.contains("no desktop in a test"), "{message}");
+    }
+
+    /// The window's close button (`super::ui::draw_root` calling this) must
+    /// end the app exactly the way the tray's Quit item does: the flag flips
+    /// before `Command::Quit` goes out, not after — see
+    /// `crate::app::flip_quit_flag`'s doc comment for why the order is
+    /// load-bearing to a finalise already polling it.
+    #[test]
+    fn request_quit_flips_the_flag_before_sending_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let mut env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let quit_flag = Arc::new(AtomicBool::new(false));
+        env.quit_flag = Arc::clone(&quit_flag);
+
+        env.request_quit();
+
+        assert!(quit_flag.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(rx.try_recv().unwrap().1, Command::Quit);
     }
 }

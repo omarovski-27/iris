@@ -255,19 +255,26 @@ pub struct Startup {
 /// so the window can report what actually happened rather than what it asked
 /// for, and only for the commands it sent itself. See
 /// [`crate::App::with_window_commands`].
+///
+/// `quit_flag` is the same [`std::sync::Arc`] the real resident loop hands
+/// `tray::spawn` — see [`crate::app::flip_quit_flag`]'s doc comment. The
+/// window flips it the instant its close button (`X`, Alt+F4, or the
+/// taskbar's "Close window") is used, so a finalise already in flight sees it
+/// exactly as promptly as a tray Quit.
 pub fn spawn(
     config_path: std::path::PathBuf,
     commands: crossbeam_channel::Sender<(crate::app::CommandId, crate::app::Command)>,
     outcomes: crossbeam_channel::Receiver<(crate::app::CommandId, crate::app::CommandOutcome)>,
     startup: Startup,
+    quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Box<dyn WindowSink>> {
     #[cfg(windows)]
     {
-        shell::spawn(config_path, commands, outcomes, startup)
+        shell::spawn(config_path, commands, outcomes, startup, quit_flag)
     }
     #[cfg(not(windows))]
     {
-        let _ = (config_path, commands, outcomes, startup);
+        let _ = (config_path, commands, outcomes, startup, quit_flag);
         Ok(Box::new(NoopWindow))
     }
 }
@@ -286,8 +293,9 @@ pub fn spawn_or_editor(
     commands: crossbeam_channel::Sender<(crate::app::CommandId, crate::app::Command)>,
     outcomes: crossbeam_channel::Receiver<(crate::app::CommandId, crate::app::CommandOutcome)>,
     startup: Startup,
+    quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Box<dyn WindowSink> {
-    let spawned = spawn(config_path.clone(), commands, outcomes, startup);
+    let spawned = spawn(config_path.clone(), commands, outcomes, startup, quit_flag);
     or_editor(spawned, config_path, open_config_file)
 }
 
