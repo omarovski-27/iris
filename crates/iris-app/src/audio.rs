@@ -129,7 +129,7 @@ const LOUD_CEILING_DBFS: f64 = -8.0;
 /// `level_spans_most_of_its_range_across_realistic_speech_levels` below),
 /// ordinary conversational speech (-23 dBFS RMS) landed at `0.27`; loud
 /// speech (-13 dBFS RMS) only reached `0.46`. The whole dynamic range a
-/// captain will ever produce sat inside a narrow band well short of `1.0`,
+/// speaker will ever produce sat inside a narrow band well short of `1.0`,
 /// which then compounded with the overlay's own response curve
 /// (`WAVE_RESPONSE_EXPONENT` in `iris-overlay`) crushing that narrow band
 /// further toward its own floor — see
@@ -145,7 +145,7 @@ const LOUD_CEILING_DBFS: f64 = -8.0;
 /// `SILENCE_FLOOR_DBFS` sits above typical unprocessed room tone so genuine
 /// silence still reads as `0.0`; `LOUD_CEILING_DBFS` sits a little below full
 /// scale so a mic being driven hard — but not clipping — still has room to
-/// read as louder than ordinary conversation, without requiring the captain
+/// read as louder than ordinary conversation, without requiring the speaker
 /// to nearly saturate the input to ever see `1.0`.
 pub fn level(pcm: &[i16]) -> f32 {
     if pcm.is_empty() {

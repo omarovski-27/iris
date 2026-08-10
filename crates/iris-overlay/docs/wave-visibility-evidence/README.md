@@ -1,13 +1,13 @@
 # Wave visibility evidence
 
-The captain's report on the installed build (`iris-v0.1.0-2026-08-08`, main
+The maintainer's report on the installed build (`iris-v0.1.0-2026-08-08`, main
 `99988fc`): *"I like that the font is smaller. But there are no sound waves.
 The dashes are just plain and nothing is moving. Or no. They are moving, but
 they are so small and they are clear colored. So they aren't visible."*
 
 `../round5-evidence/` documents the wave row's motion and its own regenerated
 stills, but every image there is 528×102 px composited large in whatever
-viewer opens it — which is exactly the trap the captain's own feedback names:
+viewer opens it — which is exactly the trap the maintainer's own feedback names:
 a rendering that was actually judged zoomed in, where a faint bar looks
 obvious, reads as invisible on a real monitor. These files exist to remove
 that trap: each PNG is the same kind of frame, composited onto a
@@ -28,7 +28,7 @@ moving signal by chance.
   theme) on a dark desktop, held at level `0.04` / `0.85`.
 - `porcelain-quiet-1x1-desktop.png` / `porcelain-loud-1x1-desktop.png` —
   Porcelain (light theme) on a light desktop, same levels. This is the pairing
-  the captain's "clear colored" complaint most likely singles out: pastel
+  the maintainer's "clear colored" complaint most likely singles out: pastel
   spectrum stops against a near-white glass shell is the lowest-contrast
   combination this design has.
 - `*-BEFORE.png` — the same four shots, rendered from the code as shipped in

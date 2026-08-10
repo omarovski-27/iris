@@ -109,7 +109,7 @@ Load-bearing beyond that crate:
   cancel/empty/error only. Theme: `Dark→PRISM_DARK`, `Light→PORCELAIN_LIGHT`.
 - **The console is quiet by default; that is a product requirement, not an
   oversight.** No per-dictation output, no millisecond figures, no raw
-  transcript — the captain rejected that as "AI-slop indicators" a finished
+  transcript — the maintainer rejected that as "AI-slop indicators" a finished
   product does not show a user. `--report` opts into `Timeline::report`'s
   full per-span table on stdout; `--verbose` opts into diagnostics on stderr
   (`iris_core::vlog!`, `iris-core/src/log.rs`). Keep new console output
@@ -396,7 +396,7 @@ That finding does not rule out *actively* holding a connection open — an
 actively-kept-alive spare (`WarmPool`, Deepgram's `KeepAlive` control frame,
 bounded to a few minutes' idle window) was built, tagged `warmpool-v1-withdrawn`
 (pushed to origin, so it survives a squash-merge or branch deletion), and
-withdrawn before ever reaching the captain: three
+withdrawn before ever reaching the maintainer: three
 review rounds kept surfacing data-loss-class lifecycle defects in the same
 abstraction (a stale-handoff replay that could still outrun the outer wait
 bound, an ack window sized for the wrong traffic shape, a "fixed" spare-
@@ -664,8 +664,8 @@ When updating this file, preserve this bar for all agents and keep entries conci
   `crates/iris-overlay/README.md` for the full design record, rendering, and
   WSL notes — that file is the authority on exact geometry and colour tokens,
   not this one.
-- The design is **captain-decided** (2026-07-31, superseding the prior
-  captain-locked fixed capsule of the same date; round 3 on 2026-08-01
+- The design is **maintainer-decided** (2026-07-31, superseding the prior
+  maintainer-locked fixed capsule of the same date; round 3 on 2026-08-01
   changed the default and the resting shape; round 4 on 2026-08-07 reversed
   round 3's shape and wave-row decisions; round 5 on 2026-08-07/08 answered
   round 4's two escalated open questions and brought the wave row back on a
@@ -673,21 +673,21 @@ When updating this file, preserve this bar for all agents and keep entries conci
   into a live-text ribbon, Prism dark default, Porcelain light,
   prism-triangle icon unchanged (tray uses the same mark via
   `tray::icon_rgba`). Full rationale and the two rejected alternatives:
-  `data/iris-ui-directions/report.md` in the fleet's records.
+  an internal early-stage UI-direction report, not part of this repository.
 - **Round 3 (2026-08-01):** `show_live_text` defaults to `false`
   (`iris-app::config::Config`) — unchanged since, still the shipped default.
   Round 3 also widened the resting shape into a capsule holding a wave row
   and a large timer; round 4 reversed both, round 5 (below) partly reversed
   round 4.
-- **Round 4 (2026-08-07):** the captain used round 3's shipped capsule and
+- **Round 4 (2026-08-07):** the maintainer used round 3's shipped capsule and
   rejected it — *"I don't like the dashes... I like the design of the
   previous circle... I don't want the huge font."* Deleted the wave row
   outright and moved the timer to its own small `layout::TIMER_FONT` (10, not
-  the live-text `TEXT_FONT` 15). The captain had only ever seen round 3's
+  the live-text `TEXT_FONT` 15). The maintainer had only ever seen round 3's
   build (PR #22 was still unmerged), which round 5 (immediately below)
   discovered and corrected for.
 - **Round 5 (2026-08-07/08,
-  `/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`):**
+  an internal design-direction memo, not part of this repository):**
   answered round 4's two escalated questions from three rendered options —
   *"the timeline you asked for [is] the sound wave itself... the marks
   become a real audio waveform that moves with your voice."* The wave row is
@@ -702,7 +702,7 @@ When updating this file, preserve this bar for all agents and keep entries conci
   wave_history`, or `layout::REST_W` — and do not reintroduce a
   single-current-level-fanned-out bar row; that shape is what "dashes" means
   in every round's own words.
-- **Legibility retune (2026-08-09):** round 5 shipped and the captain,
+- **Legibility retune (2026-08-09):** round 5 shipped and the maintainer,
   reviewing the real installed build rather than zoomed evidence stills,
   reported the wave row moved but was too small and "clear colored" to see.
   Root cause was three of round 5's own `WAVE_*` constants compounding: bar
@@ -745,7 +745,7 @@ When updating this file, preserve this bar for all agents and keep entries conci
   skipping `draw` whenever `Model::is_idle()`.
 - **The wave row's height not tracking real speech volume (2026-08-09) was an
   `iris-app` bug, not an `iris-overlay` one — check the input before retuning
-  render constants again.** The captain reported bars that moved but did not
+  render constants again.** The maintainer reported bars that moved but did not
   read as "louder = taller". Root cause was `iris-app::audio::level()`
   (`crates/iris-app/src/audio.rs`), which feeds the overlay: its old
   `sqrt(rms / i16::MAX)` mapped realistic conversational-to-loud speech into
@@ -765,7 +765,7 @@ When updating this file, preserve this bar for all agents and keep entries conci
   (`layout::REST_W`) and an open ribbon (`layout::RIBBON_MAX_W`) —
   `layout::ORB_D` is the shape's constant height, at every width. No solid
   rec-red (mint/sky live core). Motion timings in `motion.rs` are unchanged
-  and stay captain criteria; every one is imported by the new shape, not
+  and stay maintainer criteria; every one is imported by the new shape, not
   copied.
 - Geometry and motion are single-sourced; a `Theme` is colour only. Keep it that
   way or "same geometry, swapped tokens" stops holding.
@@ -775,7 +775,7 @@ When updating this file, preserve this bar for all agents and keep entries conci
 - The pill is a display: it never activates, never hit-tests, and never
   injects input. It **can** hold the live transcript text on screen while the
   ribbon is open, gated behind the opt-in `show_live_text` config flag (off by
-  default since round 3) — a deliberate, captain-approved reversal of the
+  default since round 3) — a deliberate, maintainer-approved reversal of the
   original "never holds transcript text" rule. See
   `crates/iris-overlay/README.md` "The contract changed, and here is why"
   before touching this again.
@@ -790,7 +790,7 @@ When updating this file, preserve this bar for all agents and keep entries conci
   `tray`/`iris-overlay`. `--background` is the one exception, carried only by
   the Startup-folder shortcut `install.ps1` creates (`-RunAtLogin`): a
   boot-time autostart must stay quietly in the tray, not put a window on
-  screen at every login — a captain-decided split (2026-08-07), not left to
+  screen at every login — a maintainer-decided split (2026-08-07), not left to
   guess. The toolkit choice (`egui`/`eframe` over a WebView shell, a retained
   Win32 toolkit, or extending `iris-overlay`'s renderer) and the evidence for
   it are in `window/mod.rs`'s module docs — read that before reconsidering it.

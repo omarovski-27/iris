@@ -27,7 +27,7 @@ pub enum TextPaint {
     /// opt-in live ribbon text.
     Solid(Rgba),
     /// A left-to-right ramp across the whole run. Unused by the product
-    /// since the latency caption that used it was removed (captain's second
+    /// since the latency caption that used it was removed (the maintainer's second
     /// visual pass: "developer information on a user surface"), kept because
     /// it is a real capability of this general-purpose rasteriser, not
     /// design-specific dead weight — `render::text`'s own tests exercise it

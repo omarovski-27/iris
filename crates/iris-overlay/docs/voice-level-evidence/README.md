@@ -1,10 +1,10 @@
 # Voice-level evidence
 
-The captain's report on the installed build (`iris-v0.1.0-2026-08-09`, main
+The maintainer's report on the installed build (`iris-v0.1.0-2026-08-09`, main
 `9ee805f`): *"Would be better if the waves are moving when there is speech...
 the waves are higher whenever the volume is higher."* Round 5 and the
 legibility retune (see `../round5-evidence/` and `../wave-visibility-evidence/`)
-made the bars visible; they did not make their *height* track the captain's
+made the bars visible; they did not make their *height* track the speaker's
 actual volume — normal-to-loud speech all landed in a narrow middle band of
 the bar's travel, so louder speech barely looked louder.
 
@@ -27,7 +27,7 @@ test):
 
 Ordinary conversational speech never got past `0.27` on a `0.0..=1.0` meter,
 and even loud speech reached only `0.46` — half the bar's travel unclaimed
-regardless of how loud the captain got, short of nearly clipping the mic. The
+regardless of how loud the speaker got, short of nearly clipping the mic. The
 overlay's own response curve (`WAVE_RESPONSE_EXPONENT` in
 `crates/iris-overlay/src/render/mod.rs`, unchanged by this fix) then further
 compresses whatever narrow band it is handed, compounding the problem instead
@@ -97,5 +97,5 @@ demonstrates end-to-end behaviour against a live captured voice — only that
 (a) `audio::level()` now measurably spreads realistic speech RMS across most
 of `0.0..=1.0` rather than a narrow middle band (unit-tested), and (b) the
 existing, unmodified wave renderer visibly reflects that wider input range at
-true desktop scale (this evidence set). Confirming it against a real captain
+true desktop scale (this evidence set). Confirming it against a real person
 speaking needs `docs/first-run-checklist.md` on real Windows hardware.

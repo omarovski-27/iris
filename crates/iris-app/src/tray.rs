@@ -93,7 +93,7 @@ pub fn theme_id(theme: Theme) -> String {
     format!("{THEME_PREFIX}{theme}")
 }
 
-/// A 32×32 RGBA tray icon: the captain-locked **prism triangle** mark.
+/// A 32×32 RGBA tray icon: the maintainer-locked **prism triangle** mark.
 ///
 /// Rasterised in code from the same geometry as `iris-overlay`'s
 /// `assets/iris-prism.svg` (the filled wedge only — at tray sizes the rays and

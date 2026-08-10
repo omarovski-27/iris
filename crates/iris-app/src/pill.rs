@@ -187,7 +187,7 @@ impl PillSink for LogPill {
     }
 }
 
-/// Map the app's dark/light setting onto the captain-locked overlay palettes.
+/// Map the app's dark/light setting onto the maintainer-locked overlay palettes.
 #[must_use]
 pub fn overlay_theme(theme: Theme) -> iris_overlay::Theme {
     match theme {

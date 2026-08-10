@@ -83,9 +83,9 @@ const SCRIM_PAD_Y: f32 = 3.0;
 // varying bar to bar — a synchronised, static-looking fan, not sound. Round 4
 // deleted it outright rather than retune it, on the wording it had at the
 // time ("I don't want the dashes"). Round 5
-// (`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`)
+// (an internal design-direction memo, not part of this repository)
 // answered both open questions from that round at once: "the timeline" the
-// captain asked for *is* a sound wave, and what makes it read as one is each
+// maintainer asked for *is* a sound wave, and what makes it read as one is each
 // bar showing a genuinely different moment, not a different position.
 //
 // So each bar now reads one sample from a short rolling history of recent
@@ -96,7 +96,7 @@ const SCRIM_PAD_Y: f32 = 3.0;
 // There is no positional taper: whatever shape the row has is the shape the
 // last few seconds of audio actually had.
 const WAVE_INSET: f32 = 6.0;
-/// A firstmate visual review of the first cut of this round found the bars
+/// An internal visual review of the first cut of this round found the bars
 /// reading as a row of dots rather than a waveform: too few, too wide
 /// relative to their pitch, capped rounded enough to read as circles. Pitch
 /// and bar-width-fraction both dropped so the same compact width holds more,
@@ -106,7 +106,7 @@ const WAVE_INSET: f32 = 6.0;
 const WAVE_TARGET_PITCH: f32 = 5.0;
 const WAVE_MIN_BARS: usize = 8;
 const WAVE_MAX_BARS: usize = 48;
-/// Wide enough to actually read as ink at real desktop scale (a firstmate
+/// Wide enough to actually read as ink at real desktop scale (an internal
 /// visual review of the installed build found bars invisible on a real
 /// monitor — see `WAVE_IDLE_FLOOR` and the alpha note in [`draw_wave`] for
 /// the other two levers this same review corrected), narrow enough that a
@@ -136,8 +136,8 @@ const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
 /// one.
 ///
 /// Was `0.05` — at [`WAVE_MAX_H_REST`] that floors a quiet bar at ~1 device
-/// px at 100% DPI, and at [`WAVE_MAX_H_RIBBON`] at a fraction of one; a
-/// firstmate visual review of the installed build (round 5, squashed as
+/// px at 100% DPI, and at [`WAVE_MAX_H_RIBBON`] at a fraction of one; an
+/// internal visual review of the installed build (round 5, squashed as
 /// `a33769b`) found exactly that: bars that moved but were too short and
 /// too faint to see on a real desktop. Raised so a quiet bar keeps a
 /// legible sliver of height instead of anti-aliasing away to nothing —
@@ -147,11 +147,11 @@ const WAVE_Y_OFFSET_RIBBON: f32 = 12.5;
 /// same bug: alpha was tied to this same collapsing value).
 const WAVE_IDLE_FLOOR: f32 = 0.22;
 /// Exponent [`wave_bar_scale`] raises a real level to. Round 1 shipped
-/// `1.6`; a firstmate review pushed it to `2.4` for stronger tall-to-short
+/// `1.6`; an internal review pushed it to `2.4` for stronger tall-to-short
 /// contrast, but combined with the old, much lower [`WAVE_IDLE_FLOOR`] and
 /// the alpha-tied-to-height bug ([`WAVE_BAR_ALPHA_FLOOR`]) that made every
 /// quiet-to-moderate level collapse toward invisible rather than merely
-/// short. Settled between the two: still clearly expansive (captain, round
+/// short. Settled between the two: still clearly expansive (maintainer, round
 /// 1: "so it's showing that it's clearly hearing you"), without crushing
 /// moderate levels into the noise floor the way `2.4` did once the floor
 /// itself was this much higher.
@@ -162,7 +162,7 @@ const WAVE_RESPONSE_EXPONENT: f32 = 1.7;
 /// loud bar's own range (`1.0 - WAVE_IDLE_FLOOR`), so it is felt as texture
 /// on a quiet bar and vanishes under a loud one, never the other way round.
 /// Raised from an initial `0.07` once a rendered silence frame still read as
-/// too uniform even with texture present — firstmate visual review.
+/// too uniform even with texture present — found by an internal visual review.
 const WAVE_TEXTURE_AMPLITUDE: f32 = 0.11;
 /// Floor on a bar's own opacity, as a fraction of the row's overall
 /// [`wave_alpha`] — see [`draw_wave`], which blends `WAVE_BAR_ALPHA_FLOOR ..=
@@ -174,7 +174,7 @@ const WAVE_TEXTURE_AMPLITUDE: f32 = 0.11;
 /// height. A quiet bar was therefore both short **and** faint at once, and
 /// the two multiply: at `scale` near [`WAVE_IDLE_FLOOR`]'s old `0.05` a bar
 /// was 5% tall *and* 5% opaque, which is indistinguishable from not drawn.
-/// This is firstmate's own read of the captain's "clear colored" — alpha
+/// This is an internal reviewer's own read of the maintainer's "clear colored" — alpha
 /// tied to amplitude was a reasonable idea in isolation (round 5 review:
 /// "quiet/silent samples should fade toward near-transparent instead of
 /// drawing uniform dashes"), but stacked with a height that was *already*
@@ -238,7 +238,7 @@ fn wave_ripple(i: f32, now_ms: u64) -> f32 {
 /// decorrelates the idle ripple (and the quiet-real-sample texture, below)
 /// between neighbouring bars.
 ///
-/// A firstmate visual review of the first cut of this caught silence
+/// An internal visual review of the first cut of this caught silence
 /// rendering as a row of *identical* marks — every bar reading the same
 /// near-zero level with literally nothing to vary it, which is
 /// indistinguishable from round 3's rejected "dashes" regardless of the
@@ -251,9 +251,9 @@ fn wave_bar_scale(sample: Option<f32>, i: f32, now_ms: u64) -> f32 {
     match sample {
         Some(level) => {
             // Expansive, not linear: widens the gap between quiet and loud
-            // instead of compressing it (captain, round 1: "so it's showing
+            // instead of compressing it (maintainer, round 1: "so it's showing
             // that it's clearly hearing you"), and pushed further still in
-            // round 5 (firstmate review: bar-to-bar contrast read too weak
+            // round 5 (internal review: bar-to-bar contrast read too weak
             // to look like sound rather than a row of similar dots).
             let response = level.clamp(0.0, 1.0).powf(WAVE_RESPONSE_EXPONENT);
             let base = WAVE_IDLE_FLOOR + response * (1.0 - WAVE_IDLE_FLOOR);
@@ -1173,7 +1173,7 @@ fn core_colour(theme: &Theme, model: &Model) -> Rgba {
 /// off an edge rather than a fixed decal.
 ///
 /// This is the survivor of three structurally different treatments rendered
-/// for the captain's second visual pass, after the first glass attempt was
+/// for the maintainer's second visual pass, after the first glass attempt was
 /// rejected outright ("just one colour, normal, boring" — real translucency
 /// was there, but the surface still read as a flat grey-black slab). The
 /// other two — a soft mint wash with a drifting radial highlight, and a
@@ -1433,7 +1433,7 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 /// than sitting under it — this design's second round rejected an under-pill
 /// caption outright, and the fix here is not to resurrect that placement in
 /// a new form. Drawn at [`crate::layout::TIMER_FONT`], its own small size —
-/// round 4 (captain, live-desktop review of round 3's shipped capsule):
+/// round 4 (maintainer, live-desktop review of round 3's shipped capsule):
 /// "the timer is very big... I don't want the huge font", the concrete
 /// shape of round 3 having reused the live-text size for this run. `alpha`
 /// is [`timer_alpha`], *not* the [`glyph_alpha`] the centred glyph uses:
@@ -1449,7 +1449,7 @@ fn draw_glyph(pixmap: &mut Pixmap, ctx: &Ctx<'_>, alpha: f32) {
 /// [`format_timer`] saturates, so the width reserved against the glyph is the
 /// width the run can ever have.
 ///
-/// Legibility is solved without a dark backing plate — the captain's
+/// Legibility is solved without a dark backing plate — the maintainer's
 /// complaint this round is specifically that something black behind text
 /// ruins the glass, and `theme.text_scrim` (the token that does carry a
 /// contrast promise) is gated on live text and stays that way. Instead the
@@ -1643,7 +1643,7 @@ fn draw_ribbon(
     );
 }
 
-// No caption: the captain's second visual pass rejected the under-pill
+// No caption: the maintainer's second visual pass rejected the under-pill
 // engine/model line and its geometry outright — "developer information on a
 // user surface" — and the latency figure that occupied the same slot went
 // with it as a direct consequence, not a separate decision (there was only
@@ -1858,7 +1858,7 @@ mod tests {
 
     /// The counterpart to the test above: a real sample near the floor
     /// *must* vary by position, on purpose — this is the fix for silence
-    /// rendering as a row of identical marks (firstmate review of the first
+    /// rendering as a row of identical marks (an internal review of the first
     /// round-5 cut), and it would be indistinguishable from the bug it fixes
     /// if this ever collapsed back to one value.
     #[test]
@@ -1880,7 +1880,7 @@ mod tests {
         );
     }
 
-    /// The expansive response curve the captain asked for in round 1 ("so
+    /// The expansive response curve the maintainer asked for in round 1 ("so
     /// it's showing that it's clearly hearing you") must still hold per
     /// sample: loud reads clearly taller than quiet.
     #[test]
@@ -2184,7 +2184,7 @@ mod tests {
         );
     }
 
-    /// The captain's round-3 complaint was specifically the black band behind
+    /// The maintainer's round-3 complaint was specifically the black band behind
     /// live text ruining the glass. Turning live text off by default (the
     /// fix) only holds if the scrim genuinely never paints without it: this
     /// drives the shipped default (no `PartialText` ever sent) through a full
@@ -2283,7 +2283,7 @@ mod tests {
 
     /// A tall bar sits close to the timer's reserved zone by construction —
     /// the margin `draw_wave`'s `usable` computation leaves is exactly
-    /// `WAVE_INSET`, not a generous one — and a firstmate visual review
+    /// `WAVE_INSET`, not a generous one — and an internal visual review
     /// flagged what looked like a collision in a rendered ramp-up frame.
     ///
     /// A first cut of this test compared the timer zone's raw pixel colours
@@ -2661,7 +2661,7 @@ mod tests {
     /// The one visual cue a hands-free latch has: the halo and the core dot
     /// both swap from the mint `Listening` reads normally to the same sky
     /// `theme.accent` `Processing` uses, in both themes. This is what a
-    /// captain glancing at the pill actually sees — a latch that changed
+    /// user glancing at the pill actually sees — a latch that changed
     /// `Model::latched()` but produced no visible difference would defeat
     /// the whole point of the feature (a silently-still-recording
     /// microphone).

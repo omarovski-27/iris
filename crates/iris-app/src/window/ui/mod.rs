@@ -52,7 +52,7 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 /// way it always did, while `request_quit` hands the dictation loop
 /// `Command::Quit` to unwind in the background. Before this, closing the
 /// window only hid it — the resident loop kept running with no visible way
-/// left to reach it except the tray, which is what the captain reported as
+/// left to reach it except the tray, which is what the maintainer reported as
 /// "cannot be closed".
 ///
 /// The reopen answer un-minimizes before it focuses, and the order is
@@ -266,7 +266,7 @@ mod tests {
         );
     }
 
-    /// Regression for the captain's report on `iris-v0.1.0-2026-08-10`: with
+    /// Regression for the maintainer's report on `iris-v0.1.0-2026-08-10`: with
     /// the tray-only fix in place, the tray's Quit closed the app promptly
     /// but every other way of closing it — the settings window's `X` above
     /// all — still did not. `draw_root` is portable `egui`, no `eframe`

@@ -63,8 +63,8 @@ in a crash dump." Both changed with this design.
 waveform — was signed off, then rejected on sight the same day: *"I don't
 like the UI, we need to change it, transform it completely, but I like the
 motions and smoothness of it."* Three redesigns were rendered for real
-(`data/iris-ui-directions/report.md` in the fleet's records is the design
-history, kept as the record of *why*, not duplicated here); the captain chose
+(an internal early-stage UI-direction report is the design
+history, kept as the record of *why*, not duplicated here); the maintainer chose
 this one — an orb that opens into a live-text ribbon — specifically *because*
 it shows the words. Shipping the shape without the text would have been a
 different, weaker direction than the one that was actually chosen.
@@ -125,10 +125,10 @@ timing are unchanged from before.
 
 ## Design provenance
 
-The captain's decision, recorded 2026-07-31: orb → live-text ribbon, "make it
+The maintainer's decision, recorded 2026-07-31: orb → live-text ribbon, "make it
 exceptionally beautiful", live text on by default with a config opt-out (round
 3 kept the feature and flipped that default to off — see "Round 3", below). It
-supersedes the earlier captain-locked pill geometry (168×34 fixed capsule,
+supersedes the earlier maintainer-locked pill geometry (168×34 fixed capsule,
 28-bar spectrum, listening-only telemetry chip) recorded in `CLAUDE.md`'s
 history — that geometry is gone from this crate; the Prism/Porcelain palettes
 and the motion budget are not.
@@ -165,7 +165,7 @@ and it must not be "simplified" away.
 ## Glass
 
 A first pass of this shell shipped nearly opaque and dropped the 28-bar
-waveform for a plain pulsing dot. Direct captain feedback after living with
+waveform for a plain pulsing dot. Direct maintainer feedback after living with
 it on a real desktop, across two rounds: round 1 asked for glass, the waves
 back, and a more dramatic volume response; round 2 rejected round 1's glass
 outright ("just one colour, normal, boring") and asked for the under-pill
@@ -197,7 +197,7 @@ guarantees legibility now; the shell fill is free to be purely aesthetic.
 on a different foundation.** Round 1's `draw_wave` was a new,
 independently-tuned bar row, not a port of the deleted `spectrum.rs`: a taper
 with a floor instead of one that hit zero at both ends (the old row's failure
-the captain named as "the waves... get cut off about 75%"), and an expansive
+the maintainer named as "the waves... get cut off about 75%"), and an expansive
 `powf(1.6)` response curve so quiet and loud read as clearly different. Round
 3 gave it two sizes, centred on the shape at rest and in a band above the
 live text once the ribbon opened — but every bar in that row read the *same*
@@ -211,7 +211,7 @@ clearance) are unchanged from round 3.
 
 ## Round 3: text off by default, a narrower capsule, and a timer
 
-Direct captain feedback after living with the orb-to-ribbon design on a real
+Direct maintainer feedback after living with the orb-to-ribbon design on a real
 desktop, round 3 (2026-08-01): *"I'm pretty sure it's better, to remove the
 transcription, because it's very slow. ... I like it more if it's not just a
 dot or a circle, more like the pipe thing. ... We need to narrow it down. But
@@ -223,7 +223,7 @@ course."*
 
 **Superseded by round 4, below, on the shape and the wave row specifically —
 kept here because the timer legibility mechanism it built is still exactly
-what ships.** The captain lived with this round's wide capsule and its waves
+what ships.** The maintainer lived with this round's wide capsule and its waves
 and asked for both gone; "the pipe thing, not a circle or a dot" is no longer
 the instruction. What follows is what round 3 actually built and why; treat
 the shape and wave claims as history, not the current state.
@@ -237,7 +237,7 @@ the shape and wave claims as history, not the current state.
   (`the_face_is_monospaced` pins this, with the timer named in the test
   itself), so the digits never jitter as seconds tick over.
 
-  **Legibility, without a dark backing plate.** A plate is the captain's exact
+  **Legibility, without a dark backing plate.** A plate is the maintainer's exact
   complaint this round, and `theme.text_scrim` — the token that does carry a
   contrast promise — is gated on live text and stays that way, so the timer
   cannot borrow it. The first attempt drew the run a second time at a
@@ -322,7 +322,7 @@ the shape and wave claims as history, not the current state.
 
 ## Round 4: back to the circle, the wave row gone, a small timer
 
-Direct captain feedback after living with round 3's capsule on a real desktop:
+Direct maintainer feedback after living with round 3's capsule on a real desktop:
 *"First impressions, it looks hideous. I don't like it at all... For the
 design the timer is very big. I don't like that. It should be smaller. I told
 you we need a minimalistic design. And I don't like the dashes that are next
@@ -331,7 +331,7 @@ want to add to it the timeline. That's it. I don't want the dashes. I don't
 want the huge font. I don't want huge size."*
 
 This reverses round 3's own instruction ("not just a dot or a circle, more
-like the pipe thing"), not by accident: the captain used the round-3 capsule
+like the pipe thing"), not by accident: the maintainer used the round-3 capsule
 and rejected the result, which supersedes the earlier pick. "The previous
 circle" is the round-1/round-2 orb-to-ribbon resting shape — the only shape in
 this crate's history actually described as a circle (`layout::ORB_D`-wide,
@@ -357,7 +357,7 @@ Two changes:
   `layout::TIMER_FONT` (10, logical px) replaces `TEXT_FONT` (15) as what
   `draw_timer` and the live width measurement in `Renderer::draw` size the
   run at — matching the original signed-off pill's telemetry-text size
-  (`data/iris-ui-directions/report.md`, "Typography"), the last time this
+  (an internal early-stage UI-direction report, "Typography"), the last time this
   crate shipped a small secondary readout. `layout::REST_W` drops from round
   3's 128 to 102: as close to the pre-round-3 true circle as clearing the
   core glyph for the timer's own run requires, with no wave row left to make
@@ -378,10 +378,10 @@ above; only the font size and the geometry it drives changed.
 
 ## Round 5: the timeline answered — a real scrolling waveform, not dashes
 
-The captain, on round 4's PR while it was still unmerged, was looking at
+The maintainer, on round 4's PR while it was still unmerged, was looking at
 round 3's build (static dashes, the 15px timer) and said so again — read at
 face value this looked like a regression, but the direction that followed
-(`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`)
+(an internal design-direction memo, not part of this repository)
 settled both open questions round 4 had escalated rather than guessed at,
 from three rendered options: *"Keep it small and minimal like the circle you
 liked, but the marks become a real audio waveform that moves with your
@@ -393,16 +393,16 @@ for as the sound wave itself."*
 1. **"Timeline" = the sound wave**, not a separate element and not (as round
    4's README speculated) simply a second name for the timer. Round 4's
    textual analysis is superseded, not vindicated in different words — stop
-   re-deriving this from the design report; the captain has now defined it
+   re-deriving this from the design report; the maintainer has now defined it
    directly.
-2. **The marks come back** — but the captain was explicit that *what* comes
+2. **The marks come back** — but the maintainer was explicit that *what* comes
    back has to differ from round 3: "the reason round 3's was rejected as
    dashes is that it did not read as sound. It must read as a waveform."
 3. **Shape stays compact.** `layout::REST_W` grows from round 4's 102 to 118
    to give the row a real, minimal usable span — still clearly short of
    round 3's 128, not creeping back toward it (`the_rest_width_stays_compact_
    not_round_3s_128`, `the_resting_shape_stays_compact_not_round_3s_capsule`).
-4. **Timer unchanged.** `layout::TIMER_FONT` stays 10px; the captain's "the
+4. **Timer unchanged.** `layout::TIMER_FONT` stays 10px; the maintainer's "the
    font of the timer is pretty big" was about the round-3 build they had, not
    this branch.
 

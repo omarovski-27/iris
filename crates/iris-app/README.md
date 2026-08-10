@@ -257,7 +257,7 @@ says the short version, for the same reason.
 The labels reflect startup state and are never rebuilt, so switching engine from
 the tray leaves them up until a restart — see "Known limitations" below.
 
-The icon is the captain-locked **prism triangle** (spectrum wedge on a plate),
+The icon is the maintainer-locked **prism triangle** (spectrum wedge on a plate),
 drawn in code (`tray::icon_rgba`) from the same mark as
 `iris-overlay/assets/iris-prism.svg`. No binary `.ico` to keep in step with the
 theme and no file to fail to find next to the `.exe`. The `.exe`'s own icon is

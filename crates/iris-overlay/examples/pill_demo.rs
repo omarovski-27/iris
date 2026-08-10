@@ -486,7 +486,7 @@ const SPEECH_END: u64 = RAMP_END + SPEECH_MS;
 const DECAY_MS: u64 = 4_000;
 
 /// Round 5's own required evidence
-/// (`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`):
+/// (an internal design-direction memo, not part of this repository):
 /// "render the wave row across a sequence of level histories (silence,
 /// ramp-up, speech-like varying, decay)... so the motion is judgeable from
 /// stills" — a single frozen frame is exactly what round 3 and round 4 both

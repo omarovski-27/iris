@@ -1,7 +1,7 @@
 //! Colour tokens.
 //!
 //! Geometry and motion are *not* theme properties — they live in [`crate::layout`]
-//! and [`crate::motion`] and are identical for every theme. The captain's locked
+//! and [`crate::motion`] and are identical for every theme. The maintainer's locked
 //! decision was "Prism dark default, Porcelain light day one, **same geometry,
 //! swapped tokens**", so a [`Theme`] is colour and nothing else. Swapping themes
 //! never moves a pixel.
@@ -247,7 +247,7 @@ pub struct Theme {
 
 /// Prism — the locked v1 dark default.
 ///
-/// Glass, not flat black — the captain's own words on the first pass of this
+/// Glass, not flat black — the maintainer's own words on the first pass of this
 /// shell: "it's now just black". Shell stops carry alpha rather than being
 /// fully opaque, so the desktop shows through exactly the way a real layered
 /// window composites (no backdrop sampling, no faked blur — see
@@ -658,7 +658,7 @@ mod tests {
         const { assert!(!PORCELAIN_LIGHT.dark) };
     }
 
-    /// Captain desk rule: solid UI accents must never read as rec-red.
+    /// Design rule: solid UI accents must never read as rec-red.
     /// Spectrum may carry multi-hue on the live path only; the core, ring, and
     /// listening glow stay cool mint/sky.
     #[test]

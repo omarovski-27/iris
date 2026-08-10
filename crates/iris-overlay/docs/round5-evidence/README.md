@@ -1,7 +1,7 @@
 # Round 5 evidence
 
-Review screenshots for the captain's round-5 decision on the overlay
-(`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`):
+Review screenshots for the maintainer's round-5 decision on the overlay
+(an internal design-direction memo, not part of this repository):
 *"Keep it small and minimal like the circle you liked, but the marks become a
 real audio waveform that moves with your voice, with a small timer beside
 it... this treats the 'timeline' you asked for as the sound wave itself."*
@@ -33,9 +33,9 @@ current level, so a sustained loud stretch produced a flat-topped plateau,
 never a peak. That contrast is `round3-dashes-vs-round5-waveform.png`,
 composited from this build's `2b-speech-loud` frame against a real screenshot
 of round 3's shipped, rejected row at a sustained loud level — left is the
-"dashes" the captain rejected, right is what replaced it.
+"dashes" the maintainer rejected, right is what replaced it.
 
-**A firstmate visual review of the first cut of this set caught three
+**An internal visual review of the first cut of this set caught three
 problems the renderer's own author had missed** — the same failure mode that
 got rounds 3 and 4 rejected: frames that looked fine to whoever rendered them
 and wrong to the person judging them. Fixed before this set was regenerated:
@@ -100,7 +100,7 @@ and wrong to the person judging them. Fixed before this set was regenerated:
 
 ## Legibility retune (post-install correction)
 
-Round 5 shipped (`a33769b`) and the captain, reviewing the real installed
+Round 5 shipped (`a33769b`) and the maintainer, reviewing the real installed
 build rather than these zoomed evidence stills, reported the wave row was
 present but not usable: *"there are no sound waves. The dashes are just
 plain and nothing is moving. Or no. They are moving, but they are so small
@@ -135,7 +135,7 @@ constant in `render/mod.rs` for the full reasoning.
 **Why this set's own stills didn't catch it first**: every frame here is
 528×102 px, already close to the real ~224×106 device-px overlay window, but
 composited large enough in a docs viewer or diff tool to read as bigger than
-its real on-screen footprint — the same trap the captain's own feedback
+its real on-screen footprint — the same trap the maintainer's own feedback
 named. `../wave-visibility-evidence/` composites the same kind of frame onto
 a full simulated desktop at true, unscaled 1:1 pixel density specifically to
 avoid that trap; look there, not here, to judge whether a bar is actually
