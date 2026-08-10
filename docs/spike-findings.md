@@ -197,13 +197,13 @@ The short-utterance case it was meant to help is covered instead by the
 *Tried and withdrawn (2026-08):* an *actively* kept-alive spare connection
 (`WarmPool`, Deepgram's `KeepAlive` control frame, rather than a passive
 prewarmed one) was built, reviewed, and pulled back out before ever shipping
-to the captain. Three separate review rounds kept surfacing data-loss-class
+to the maintainer. Three separate review rounds kept surfacing data-loss-class
 lifecycle defects in the same abstraction — a stale-handoff replay that could
 outrun the outer wait bound, an ack window sized for the wrong traffic shape,
 a "fixed" spare-replacement-promptness bug that turned out not to be fixed —
 and its measured benefit (~1.1-1.7s of connect time, from a localhost harness,
 never confirmed against the real endpoint in production) did not apply to the
-failure actually hurting the captain: every observed "almost no audio" case
+failure actually hurting the maintainer: every observed "almost no audio" case
 followed a gap well past any plausible warm-connection window, so a spare
 would not have been there regardless (see `AGENTS.md`, "almost no audio").
 A component whose fixes keep silently failing to hold is a signal to redesign

@@ -13,11 +13,11 @@
 //! no separate "orb shape" and "ribbon shape", only one shape whose width
 //! animates. Height never changes. [`ORB_D`] is the height, at every width.
 //!
-//! **Round 4** (captain, on round 3's capsule): asked for the wave row gone
+//! **Round 4** (maintainer, on round 3's capsule): asked for the wave row gone
 //! outright and the shape back near the pre-round-3 circle. Built exactly
-//! that — then the captain, having only ever seen round 3's build (PR #22
-//! was still unmerged), clarified in **round 5**
-//! (`/home/omar/firstmate/data/iris-overlay-back-to-circle/round5-direction.md`)
+//! that — then the maintainer, having only ever seen round 3's build (PR #22
+//! was still unmerged), clarified in **round 5** (an internal design-direction
+//! memo, not part of this repository)
 //! that "the timeline" they asked for *is* a sound wave, not the bare
 //! circle-plus-digits round 4 shipped: *"the marks become a real audio
 //! waveform that moves with your voice, with a small timer beside it... this
@@ -73,10 +73,10 @@ pub const TEXT_FONT: f32 = 15.0;
 /// The elapsed-recording timer's font size — deliberately its own, much
 /// smaller constant, not [`TEXT_FONT`]. Round 3 reused the live-text size for
 /// the timer, which is the concrete shape of "the timer is very big... I
-/// don't want the huge font" (captain, round 4): a four-character clock
+/// don't want the huge font" (maintainer, round 4): a four-character clock
 /// reading at sentence-sized type. Matches the original signed-off pill's
-/// telemetry-text size (`data/iris-ui-directions/report.md`, "Typography":
-/// "the old pill's telemetry text (10–11 px)") — the last time this crate
+/// telemetry-text size (an internal early-stage UI-direction report,
+/// "Typography": "the old pill's telemetry text (10–11 px)") — the last time this crate
 /// shipped a small secondary readout, this is the size that was.
 pub const TIMER_FONT: f32 = 10.0;
 
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(WORK_AREA_GAP, 58.0, "placement anchor stays unchanged");
     }
 
-    /// Round 5 (captain, `round5-direction.md`): "compact... hold the line
+    /// Round 5 (maintainer, internal round-5 design-direction memo): "compact... hold the line
     /// near [round 4's 102] and do not let the wave row push it back toward
     /// 128." `REST_W` can't be round 4's exact 102 any more — the wave row
     /// needs its own minimal usable span alongside the glyph and timer — but

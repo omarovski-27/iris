@@ -232,7 +232,7 @@ const DEFAULT_BASE_URL: &str = "wss://api.deepgram.com/v1/listen";
 /// How long to wait for the socket to come up before giving up.
 ///
 /// Sized for margin over a real connect, not to fit inside anything: the worst
-/// successful connect in the captain's session log was 4.85s (during a
+/// successful connect in the maintainer's session log was 4.85s (during a
 /// degraded-network window; every other one under ~4.1s), so this leaves ~3.15s
 /// of headroom. Squeezing it under `DEFAULT_FINAL_TIMEOUT` was tried and
 /// reverted — the two clocks start at different instants (this one at key-down,
@@ -1530,7 +1530,7 @@ mod tests {
         );
     }
 
-    /// The captain's own `short-hold-bypasses-catchup` finding: the prior
+    /// The maintainer's own `short-hold-bypasses-catchup` finding: the prior
     /// mechanism never engaged at all for a hold at or under its own rounding
     /// tolerance, reopening the exact bug this module exists to close for a
     /// quick press. This drives a genuinely short hold (well under 0.5s, the

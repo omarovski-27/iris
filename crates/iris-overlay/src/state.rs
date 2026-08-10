@@ -56,8 +56,8 @@ pub enum Command {
     /// Report the current partial-transcript text.
     ///
     /// This is the overlay's one deliberate reversal of the earlier rule that
-    /// it never holds transcript content — see `README.md` and the design
-    /// report at `data/iris-ui-directions/report.md` for why. The overlay
+    /// it never holds transcript content — see `README.md` and the internal
+    /// early-stage UI-direction report it references for why. The overlay
     /// holds this string for exactly as long as it is on screen and never
     /// persists, transmits, or logs it.
     PartialText(String),
@@ -418,7 +418,7 @@ const TIMER_CEILING_S: u64 = 9 * 60 + 59;
 ///
 /// This is the pill's timer: `render::Renderer::draw` calls it every frame on
 /// [`Model::listening_ms`] and `render::draw_timer` puts the result on screen
-/// beside the wave row (captain, round 3: "the timer beside it, of course").
+/// beside the wave row (maintainer, round 3: "the timer beside it, of course").
 /// It went a round unrendered — the ribbon showed words there instead — which
 /// is why the round-3 timer needed no new state machinery, only a draw step.
 ///

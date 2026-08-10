@@ -74,7 +74,7 @@ pub use theme::{Rgba, Theme, PORCELAIN_LIGHT, PRISM_DARK, THEMES};
 
 /// The app icon: a prism triangle, light in and spectrum out.
 ///
-/// The captain's locked mark. Shipped as source so a packaging step can render
+/// The maintainer's locked mark. Shipped as source so a packaging step can render
 /// it to `.ico` at whatever sizes it needs; the crate itself never draws it.
 pub const APP_ICON_SVG: &str = include_str!("../assets/iris-prism.svg");
 

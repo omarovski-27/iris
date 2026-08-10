@@ -30,7 +30,7 @@ pub const CHECK_DRAW_MS: u32 = 240;
 /// How long `inserted` stays on screen before the exit animation starts.
 ///
 /// The Prism spec card says 500 ms and Porcelain's says 600 ms; the report's
-/// shared constraint is "inserted hold ~500–600 ms then exit". The captain's
+/// shared constraint is "inserted hold ~500–600 ms then exit". The maintainer's
 /// brief locked ~550 ms, the midpoint, and that is what ships. Total time from
 /// `inserted()` to a blank screen is therefore `INSERTED_HOLD_MS + EXIT_MS`.
 pub const INSERTED_HOLD_MS: u32 = 550;
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn locked_timings_are_what_the_report_specifies() {
         // If any of these change, the pill no longer matches the approved
-        // mockup and the change needs a captain decision, not a commit.
+        // mockup and the change needs a maintainer decision, not a commit.
         assert_eq!(ENTER_MS, 130);
         assert_eq!(EXIT_MS, 150);
         assert_eq!(STATE_CROSS_MS, 90);

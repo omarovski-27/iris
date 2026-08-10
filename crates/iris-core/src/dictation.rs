@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn default_final_timeout_is_capped_well_below_the_old_ten_seconds() {
         // Regression guard for the 2026-08-02 latency investigation: this is
-        // the bound that actually ended the captain's pathological 10015ms
+        // the bound that actually ended the maintainer's pathological 10015ms
         // dictation — not FINALIZE_ACK_TIMEOUT or FINALIZE_TIMEOUT in
         // engine/deepgram.rs, both of which stayed well inside their own
         // budget while the engine session itself never concluded. Keeping
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn a_stalled_engine_error_still_carries_the_real_timeline() {
-        // Regression: the captain's two zero-audio failures on 2026-08-02
+        // Regression: the maintainer's two zero-audio failures on 2026-08-02
         // logged `audio_secs: 0.0` even though real audio had almost
         // certainly been captured — an artifact of the caller (iris-app's
         // `capture()`) building a blank Timeline on any error instead of

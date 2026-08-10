@@ -464,7 +464,7 @@ fn an_engine_failure_is_reported_and_recorded() {
 
 #[test]
 fn a_stalled_dictation_still_logs_the_real_audio_captured() {
-    // Regression: the captain's session log on 2026-08-02 showed two
+    // Regression: the maintainer's session log on 2026-08-02 showed two
     // consecutive dictations with `audio_secs: 0.0` right after a pathological
     // 10-second one, which read as if capture itself had broken. The real
     // errors on those two entries were a Deepgram connect timeout and a DNS
@@ -502,7 +502,7 @@ fn a_stalled_dictation_still_logs_the_real_audio_captured() {
 
 #[test]
 fn an_offline_dictation_notifies_promptly_and_is_tagged_in_the_log() {
-    // The captain's report: with no internet, a dictation must not silently
+    // The maintainer's report: with no internet, a dictation must not silently
     // produce nothing. This models the offline shape specifically — an engine
     // that publishes a real connect budget (like Deepgram) and never gets
     // anywhere near it: no `Connected`, no error, nothing at all — and checks
@@ -541,7 +541,7 @@ fn an_offline_dictation_notifies_promptly_and_is_tagged_in_the_log() {
 
 #[test]
 fn a_short_hold_against_a_slow_connect_still_gets_its_words_typed() {
-    // The captain's two zero-audio dictations were connection failures. This
+    // The maintainer's two zero-audio dictations were connection failures. This
     // is the same shape that *succeeds*, late: the socket comes up after the
     // final-transcript deadline has already gone by but well inside the
     // engine's own connect budget, flushes the audio it was holding, and
@@ -1157,7 +1157,7 @@ fn the_loop_runs_until_it_is_told_to_quit() {
 
 #[test]
 fn a_tray_quit_does_not_wait_for_an_in_flight_finalise() {
-    // Regression for the captain's report: "closing Iris lags or does not
+    // Regression for the maintainer's report: "closing Iris lags or does not
     // close." `App::run`'s select loop only services `Command::Quit` between
     // dictations; `Dictation::finish`'s finalise wait used to run straight on
     // that same thread inside `App::capture`, so a Quit clicked while a
@@ -1238,7 +1238,7 @@ fn a_window_close_does_not_wait_for_an_in_flight_finalise() {
     // The earlier fix (#29) wired `quit_flag` into the tray only — a Quit
     // arriving on the *window's* channel (from the settings window's close
     // button: `X`, Alt+F4, or the taskbar's "Close window") still raced the
-    // finalise wait unprotected, which is why the captain could still not
+    // finalise wait unprotected, which is why the maintainer could still not
     // close Iris after that fix landed. `window::state::Env::request_quit`
     // now performs the identical flip-then-send ordering the tray already
     // did, just over `window_commands` instead of `control`; this

@@ -401,7 +401,7 @@ pub struct Config {
     /// Show the live partial transcript in the overlay's ribbon while
     /// listening.
     ///
-    /// Off by default (captain feedback, round 3: "maybe we could remove
+    /// Off by default (maintainer feedback, round 3: "maybe we could remove
     /// that feature" — ambivalent, not certain, so the toggle stays and the
     /// feature stays reachable, but it no longer opts a user in by surprise).
     /// The overlay design that made live text the reason to ship (see
@@ -524,7 +524,7 @@ impl Config {
     /// ran a previous build has `show_live_text = true` pinned on disk by
     /// [`Config::save`], whether or not the user ever wanted it. A `true` from
     /// before the stamp existed is therefore evidence of the old default, not
-    /// of a choice, and leaving it would mean the captain's round-3 decision —
+    /// of a choice, and leaving it would mean the maintainer's round-3 decision —
     /// live text is opt-in — never reached a single existing user. A `true`
     /// written at [`CURRENT_VERSION`] *is* a choice and is left alone; so the
     /// reset happens once per install and never again, because the stamp that
@@ -754,7 +754,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_the_captain_approved_ones() {
+    fn defaults_are_the_maintainer_approved_ones() {
         let config = Config::default();
         assert_eq!(config.engine, EngineChoice::Mock);
         assert_eq!(config.hotkey, Key::RightCtrl);
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(config.theme, Theme::Dark);
         assert!(
             !config.show_live_text,
-            "live text is off by default per captain feedback round 3"
+            "live text is off by default per maintainer feedback round 3"
         );
         assert!(config.overlay_enabled);
         assert!(config.polish.enabled);
