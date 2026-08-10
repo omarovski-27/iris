@@ -22,9 +22,10 @@ That document —
 [`packaging/windows/README.md`](packaging/windows/README.md), staged into the
 zip — is the single source of truth for the end-user path: the SmartScreen
 "Windows protected your PC" prompt, running `install.ps1` (and its `-Desktop`
-/ `-RunAtLogin` flags), where `%APPDATA%\iris\config.toml` lives, and how to
-switch off the mock engine and add a Deepgram or Groq key. A recipient never
-needs this repository. The rest of this README is the developer path.
+/ `-RunAtLogin` flags), where `%LOCALAPPDATA%\IrisConfig\iris\config.toml`
+lives, and how to switch off the mock engine and add a Deepgram or Groq key. A
+recipient never needs this repository. The rest of this README is the
+developer path.
 
 ### Why a zip and not an installer
 
@@ -69,7 +70,7 @@ First dictation:
 
 | Platform | Path |
 | --- | --- |
-| Windows | `%APPDATA%\iris\config.toml` |
+| Windows | `%LOCALAPPDATA%\IrisConfig\iris\config.toml` |
 | Linux / macOS | `$XDG_CONFIG_HOME/iris/config.toml` (or `~/.config/iris/config.toml`) |
 
 Override with `--config <path>` or `IRIS_CONFIG`.

@@ -82,9 +82,9 @@ on the machine you're actually going to use Iris on.
       them) — confirm nothing of Iris is left running, launchable or listed
       (Settings → Apps → Installed apps stays empty; `install.ps1` writes no
       registry entry, uninstall or not).
-- [ ] `install.ps1 -Uninstall` leaves `%APPDATA%\iris\config.toml` and
-      `history.jsonl` untouched — a real key you pasted in and real dictation
-      history must both survive an uninstall.
+- [ ] `install.ps1 -Uninstall` leaves `%LOCALAPPDATA%\IrisConfig\iris\config.toml`
+      and `history.jsonl` untouched — a real key you pasted in and real
+      dictation history must both survive an uninstall.
 - [ ] Put a `config.toml` or a `*.jsonl` file directly inside
       `%LOCALAPPDATA%\Iris` by hand (simulating the one way user data could
       end up somewhere a clean replace would otherwise delete), then run
@@ -93,9 +93,23 @@ on the machine you're actually going to use Iris on.
 
 ## First-run config
 
-- [ ] `%APPDATA%\iris\config.toml` is created on first launch, with the
-      header comment readable and the `[keys]` example easy to follow for
-      someone who has never opened a TOML file.
+- [ ] `%LOCALAPPDATA%\IrisConfig\iris\config.toml` is created on first
+      launch, with the header comment readable and the `[keys]` example easy
+      to follow for someone who has never opened a TOML file.
+- [ ] **Roaming-to-Local migration** (`config::migrate_from_roaming`): before
+      launching, hand-create `%APPDATA%\iris\config.toml` (with a real-looking
+      `[keys]` entry) and `%APPDATA%\iris\history.jsonl`, and make sure
+      `%LOCALAPPDATA%\IrisConfig` does not yet exist. Launch Iris: both files
+      must appear at `%LOCALAPPDATA%\IrisConfig\iris\` with identical
+      contents, the key must still work without re-entering it, and the
+      `%APPDATA%\iris` originals must be gone afterward (not merely
+      duplicated — the whole point is the plaintext key no longer lives
+      somewhere a roaming profile sync can reach). Confirm nothing printed to
+      a console on this launch path, and that a second launch afterward is a
+      silent no-op (nothing left in `%APPDATA%\iris` to migrate again).
+- [ ] Fresh install, no `%APPDATA%\iris` ever created: first launch must not
+      error or show any migration-related dialog — the migration step is a
+      no-op when there is nothing to migrate.
 - [ ] With no key configured, the app runs on the mock engine without
       crashing (dictation "works" but transcribes to a stub).
 - [ ] Launched from the Start Menu shortcut — no console exists on this launch
@@ -104,7 +118,8 @@ on the machine you're actually going to use Iris on.
       disabled lines above everything else (`tray::demo_notice`): the "Demo
       mode: transcripts are stubs" headline, the two numbered edits (change
       the existing `engine = "mock"` line; add a `[keys]` block at the very
-      end), and the line naming `%APPDATA%\iris\config.toml` and the restart.
+      end), and the line naming `%LOCALAPPDATA%\IrisConfig\iris\config.toml`
+      and the restart.
       Check they fit and read rather than being clipped — the path line is the
       long one — and that hovering the icon says the short version. This is
       the only in-app explanation a first-run user gets on that launch path,
@@ -143,12 +158,13 @@ on the machine you're actually going to use Iris on.
       Everything else in the file survives, and a `show_live_text = true` set
       by hand afterwards sticks across restarts. `iris --verbose` from an open
       PowerShell prompt is where that one-time rewrite is reported. If the
-      rewrite fails, the cause is `%APPDATA%\iris` not being writable —
-      permissions, a read-only location, or a full disk — and the symptom is
-      wider than a missed stamp: *every* settings change goes through the same
-      write, so a tray → Engine switch or anything else Iris persists silently
-      fails too, and the `show_live_text` reset runs again on every launch.
-      If settings will not stick, check that `%APPDATA%\iris` is writable.
+      rewrite fails, the cause is `%LOCALAPPDATA%\IrisConfig` not being
+      writable — permissions, a read-only location, or a full disk — and the
+      symptom is wider than a missed stamp: *every* settings change goes
+      through the same write, so a tray → Engine switch or anything else Iris
+      persists silently fails too, and the `show_live_text` reset runs again
+      on every launch. If settings will not stick, check that
+      `%LOCALAPPDATA%\IrisConfig` is writable.
       Going back to an older build needs the `version` line deleted first —
       the zip README's "Downgrading to an older Iris"
       (`packaging/windows/README.md`) is the copy of that path to keep

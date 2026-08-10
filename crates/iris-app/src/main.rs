@@ -144,6 +144,20 @@ fn main() -> Result<()> {
     iris_core::log::set_verbose(args.verbose);
 
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    // Only the plain default location is eligible: an explicit `--config` or
+    // `$IRIS_CONFIG` means the caller already chose a layout on purpose, and
+    // moving files underneath that would be a surprise, not a safety net.
+    // Not fatal to startup — reported the same two ways as the migration-save
+    // failure just below, then `Config::load_or_create_reporting` proceeds
+    // against whatever `config_path` holds regardless.
+    #[cfg(windows)]
+    if args.config.is_none() && !config::path_overridden_by_env() {
+        if let Err(e) = config::migrate_default_location_from_roaming() {
+            let err = anyhow::Error::new(e);
+            eprintln!("could not migrate settings out of the Roaming profile: {err:#}");
+            report_failure("Iris could not migrate your settings", &err);
+        }
+    }
     // Kept as loaded: `config` below takes the CLI overrides, which are
     // run-only and must never be written back to the file.
     //
