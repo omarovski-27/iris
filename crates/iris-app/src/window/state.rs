@@ -296,6 +296,15 @@ pub struct WindowState {
     /// How many matches the History tab is currently drawing. See
     /// [`WindowState::visible_count`].
     visible: usize,
+    /// The Settings tab's vocabulary text box: one term per line, edited
+    /// freely before being sent as a [`Command::SetVocabulary`]. See
+    /// [`WindowState::sync_vocabulary_input`] for how this stays in step
+    /// with `config.vocabulary` without clobbering an edit in progress.
+    pub vocabulary_input: String,
+    /// The vocabulary list `vocabulary_input` was last derived from — not
+    /// necessarily saved, just the last value the two agreed on. See
+    /// [`WindowState::sync_vocabulary_input`].
+    vocabulary_input_synced_with: Vec<String>,
 }
 
 impl WindowState {
@@ -336,6 +345,8 @@ impl WindowState {
         let insights_day = local_day(env.utc_offset_seconds);
         let insights = Insights::compute(&history, &insights_day);
         let devices = (env.list_devices)();
+        let vocabulary_input = config.vocabulary.join("\n");
+        let vocabulary_input_synced_with = config.vocabulary.clone();
         let mut state = Self {
             tab: Tab::History,
             search: String::new(),
@@ -352,6 +363,8 @@ impl WindowState {
             filtered: Vec::new(),
             filtered_for: None,
             visible: HISTORY_PAGE,
+            vocabulary_input,
+            vocabulary_input_synced_with,
         };
         // History last: it is the tab that opens, so when both files are
         // unreadable its failure is the one the user needs on screen.
@@ -580,6 +593,57 @@ impl WindowState {
             Command::SetOverlayEnabled(enabled),
             "Saved — restart Iris for this to take effect",
         );
+    }
+
+    /// Parse [`WindowState::vocabulary_input`] into the list [`Command::SetVocabulary`]
+    /// would send: one term per line, blank lines and surrounding whitespace
+    /// dropped so the box's own formatting never reaches the engine or the
+    /// saved file. The engines each apply their own provider-specific limit
+    /// on top of this — see `iris_core::engine::EngineOptions::vocabulary`.
+    #[must_use]
+    pub fn parsed_vocabulary(&self) -> Vec<String> {
+        self.vocabulary_input
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether the vocabulary box holds an edit that has not been saved —
+    /// what the Save button in the Vocabulary section is gated on.
+    #[must_use]
+    pub fn vocabulary_dirty(&self) -> bool {
+        self.parsed_vocabulary() != self.config.vocabulary
+    }
+
+    /// Keep [`WindowState::vocabulary_input`] in step with `config.vocabulary`
+    /// without clobbering an edit in progress.
+    ///
+    /// `config` is reloaded from disk every [`REFRESH_INTERVAL`] (see
+    /// [`WindowState::refresh`]) whether or not anything changed, so this
+    /// cannot simply copy `config.vocabulary` into the box on every call —
+    /// that would erase whatever the user is mid-typing every two seconds.
+    /// Instead it only resyncs when `config.vocabulary` has actually moved
+    /// since the last time the two matched: on open, after
+    /// [`WindowState::set_vocabulary`] is confirmed applied (see
+    /// [`WindowState::absorb`]), or if `config.toml` is edited by hand while
+    /// the window is open. Called once a frame by the Settings tab, the same
+    /// way [`WindowState::sync_filter`] keeps the History search in step.
+    pub fn sync_vocabulary_input(&mut self) {
+        if self.vocabulary_input_synced_with != self.config.vocabulary {
+            self.vocabulary_input = self.config.vocabulary.join("\n");
+            self.vocabulary_input_synced_with = self.config.vocabulary.clone();
+        }
+    }
+
+    /// Send [`WindowState::parsed_vocabulary`] to the loop. Applied by the
+    /// loop, which rebuilds the active engine so the new list reaches it
+    /// immediately — unlike the hotkey and overlay toggle, this is not read
+    /// once at startup and needs no restart.
+    pub fn set_vocabulary(&mut self, env: &Env) {
+        let terms = self.parsed_vocabulary();
+        self.dispatch(env, Command::SetVocabulary(terms), "Saved");
     }
 
     /// Called once, the first time the window's close hides it rather than
@@ -1236,6 +1300,95 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().1, Command::SetOverlayEnabled(false));
         take_everything(&mut state, &env, &outcomes_tx);
         assert!(state.status_text().unwrap().contains("restart"));
+    }
+
+    #[test]
+    fn parsed_vocabulary_drops_blank_lines_and_trims_each_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.vocabulary_input = "  Deepgram  \n\n Zipformer\n   \n".to_string();
+        assert_eq!(
+            state.parsed_vocabulary(),
+            vec!["Deepgram".to_string(), "Zipformer".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_untouched_vocabulary_box_is_never_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let state = WindowState::new(&env);
+
+        assert!(state.config.vocabulary.is_empty(), "an empty default config");
+        assert!(state.vocabulary_input.is_empty());
+        assert!(!state.vocabulary_dirty());
+    }
+
+    #[test]
+    fn set_vocabulary_sends_a_command_and_moves_only_once_the_loop_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let (outcomes_tx, outcomes) = crossbeam_channel::unbounded();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.vocabulary_input = "Deepgram\nZipformer".to_string();
+        assert!(state.vocabulary_dirty());
+
+        state.set_vocabulary(&env);
+        assert_eq!(
+            rx.try_recv().unwrap().1,
+            Command::SetVocabulary(vec!["Deepgram".to_string(), "Zipformer".to_string()])
+        );
+        assert!(
+            state.config.vocabulary.is_empty(),
+            "the list may not move on a command that has only been queued"
+        );
+
+        take_everything(&mut state, &env, &outcomes_tx);
+        assert_eq!(
+            state.config.vocabulary,
+            vec!["Deepgram".to_string(), "Zipformer".to_string()]
+        );
+        assert_eq!(state.status_text(), Some("Saved"));
+        assert!(
+            !state.vocabulary_dirty(),
+            "sync_vocabulary_input must catch up once the box is drawn again"
+        );
+    }
+
+    #[test]
+    fn sync_vocabulary_input_does_not_clobber_an_edit_in_progress() {
+        // The refresh loop rereads config.toml every couple of seconds
+        // whether or not anything changed; typing into the box must survive
+        // that as long as the confirmed list has not actually moved.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let mut state = WindowState::new(&env);
+
+        state.vocabulary_input = "still typing".to_string();
+        state.sync_vocabulary_input();
+        assert_eq!(state.vocabulary_input, "still typing");
     }
 
     /// The whole point of the outcome channel: a change the loop refuses says

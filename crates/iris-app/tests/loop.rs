@@ -1389,6 +1389,71 @@ fn a_tray_command_changes_and_persists_the_setting() {
     assert!(!saved.polish.enabled);
 }
 
+/// `SetVocabulary` takes effect immediately (unlike `SetHotkey` and
+/// `SetOverlayEnabled` below): it rebuilds the active engine on the same
+/// footing as `SetEngine` and `SetPolish`, because the list is read at
+/// engine-build time rather than once at startup.
+#[test]
+fn a_tray_command_sets_and_persists_the_vocabulary() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    commands
+        .send(Command::SetVocabulary(vec![
+            "Deepgram".to_string(),
+            "Zipformer".to_string(),
+        ]))
+        .unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert_eq!(
+        app.config().vocabulary,
+        vec!["Deepgram".to_string(), "Zipformer".to_string()]
+    );
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert_eq!(
+        saved.vocabulary,
+        vec!["Deepgram".to_string(), "Zipformer".to_string()]
+    );
+}
+
+/// An empty vocabulary is the default and must round-trip as a true no-op:
+/// nothing written to the file (see `config.rs`'s `skip_serializing_if`) and
+/// the engine still builds exactly as it would with no vocabulary command
+/// ever sent.
+#[test]
+fn an_empty_vocabulary_command_is_a_no_op() {
+    let rig = rig();
+    let keys_rx = rig.keys_rx.clone();
+    let commands_rx = rig.commands_rx.clone();
+    let commands = rig.commands.clone();
+    let config_path = rig.config_path.clone();
+
+    commands.send(Command::SetVocabulary(Vec::new())).unwrap();
+    commands.send(Command::Quit).unwrap();
+
+    let loop_thread = std::thread::spawn(move || {
+        let mut app = rig.app;
+        app.run(&keys_rx, &commands_rx).map(|()| app)
+    });
+    let app = loop_thread.join().expect("the loop panicked").unwrap();
+
+    assert!(app.config().vocabulary.is_empty());
+    let saved = Config::load(&config_path).expect("the config was written");
+    assert!(saved.vocabulary.is_empty());
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!text.contains("vocabulary ="), "{text}");
+}
+
 /// `SetHotkey` and `SetOverlayEnabled` are the two settings this window adds
 /// beyond what the tray already exposed. Both are restart-gated (the hook
 /// and the overlay are both set up once in `main`), so the acceptance bar
