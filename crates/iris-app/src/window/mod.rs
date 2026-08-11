@@ -53,10 +53,13 @@
 //!
 //! [`spawn`] starts one OS thread that lives for the process, mirroring
 //! `tray::spawn` and `iris_overlay::spawn`. The thread waits for an
-//! [`WindowSink::open`] signal, runs the window until it is closed, then goes
-//! back to waiting — so opening, closing and reopening never spawns a second
-//! window, and closing it never touches the dictation loop, which owns its
-//! own thread throughout.
+//! [`WindowSink::open`] signal, then runs the window — for the ordinary
+//! close/reopen cycle, for the rest of the process's life: the window's `X`,
+//! Alt+F4 and the taskbar's "Close window" hide it rather than tearing it
+//! down (see `ui::draw_root`'s doc comment), so opening, hiding and reopening
+//! all act on the same window instance and never spawn a second one, and
+//! none of the three touches the dictation loop's `Command::Quit` — see
+//! `state::Env::request_quit`, which only the tray's own Quit item calls.
 
 mod egui_theme;
 mod insights;

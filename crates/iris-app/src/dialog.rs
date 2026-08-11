@@ -1,5 +1,4 @@
-//! A native "something went wrong" message box for a launch with no console
-//! to print to.
+//! A native message box for a launch with no console to print to.
 //!
 //! `iris` is a GUI-subsystem binary, so a double-click, the Start Menu
 //! shortcut and the Startup shortcut all give it no console at all — nothing
@@ -7,10 +6,12 @@
 //! library crate rather than in the `iris` binary specifically so both
 //! `main`'s startup/run-failure reporting and [`crate::notify`]'s
 //! injection-failure notice can reach the same mechanism instead of keeping
-//! two copies that could drift.
+//! two copies that could drift. [`show_info`] is the same mechanism for a
+//! notice that isn't reporting a failure — the settings window's "still
+//! running in the tray" hint — so it does not borrow the error icon.
 
-/// Show `message` under `caption` in a message box, unless someone is
-/// watching a console that will outlive the process.
+/// Show `message` under `caption` in an error-styled message box, unless
+/// someone is watching a console that will outlive the process.
 ///
 /// A missing key, an unparseable config file, a microphone that is not
 /// there, a hook Windows took away, a dictation that could not be typed:
@@ -21,17 +22,50 @@
 /// redundant; `GetConsoleProcessList` reporting more than one process — us
 /// and the shell that launched us — is what tells the two launch paths
 /// apart.
+#[cfg(windows)]
+pub fn show(caption: &str, message: &str) {
+    show_with_icon(
+        caption,
+        message,
+        windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+    );
+}
+
+/// Off Windows there is no console-less launch path and no dialog to show.
+#[cfg(not(windows))]
+pub fn show(_caption: &str, _message: &str) {}
+
+/// Show `message` under `caption` in an information-styled message box — the
+/// same mechanism as [`show`], for a notice rather than a failure. Subject to
+/// the same shared-console suppression; see [`show`]'s doc comment.
+#[cfg(windows)]
+pub fn show_info(caption: &str, message: &str) {
+    show_with_icon(
+        caption,
+        message,
+        windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
+    );
+}
+
+/// Off Windows there is no console-less launch path and no dialog to show.
+#[cfg(not(windows))]
+pub fn show_info(_caption: &str, _message: &str) {}
+
 // `MessageBoxW` and `GetConsoleProcessList` have no safe wrapper. Both calls
 // are self-contained — one fills a stack buffer we own, the other shows a
 // modal with NUL-terminated strings that outlive it — so the opt-in is one
 // function wide.
 #[allow(unsafe_code)]
 #[cfg(windows)]
-pub fn show(caption: &str, message: &str) {
+fn show_with_icon(
+    caption: &str,
+    message: &str,
+    icon: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
+) {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Console::GetConsoleProcessList;
     use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        MessageBoxW, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
     };
 
     let mut pids = [0u32; 2];
@@ -56,11 +90,7 @@ pub fn show(caption: &str, message: &str) {
             None,
             PCWSTR(text.as_ptr()),
             PCWSTR(caption.as_ptr()),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            MB_OK | icon | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
-
-/// Off Windows there is no console-less launch path and no dialog to show.
-#[cfg(not(windows))]
-pub fn show(_caption: &str, _message: &str) {}

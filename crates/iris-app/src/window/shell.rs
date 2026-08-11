@@ -6,23 +6,33 @@
 //!
 //! One thread, started by [`spawn`] and kept for the life of the process
 //! (mirroring `tray::spawn` and `iris_overlay::spawn`). It waits for an
-//! `open` signal, runs `eframe::run_native` — which blocks this thread until
-//! the window is closed — then goes back to waiting. A second `open` while
-//! the window is already showing does not race the waiting `recv`: it is
-//! picked up by [`super::ui::draw_root`]'s per-frame drain of the same
-//! signal and turned into [`egui::ViewportCommand::Focus`] instead, since
-//! that drain is the only thing polling the channel while the window is up.
-//! The handover between those two readers is closed at the other end too:
-//! a click landing after the window's last frame would otherwise be waiting
-//! for this thread's `recv` and reopen the window the user has just closed,
-//! so a closed window's leftover signals are dropped before it waits again.
+//! `open` signal, then runs `eframe::run_native` — which blocks this thread
+//! for as long as the window exists.
 //!
-//! This thread going back to waiting is *not* the app staying open: closing
-//! this window (`X`, Alt+F4, or the taskbar's "Close window") ends the whole
-//! resident app the same way the tray's Quit item does — see
-//! [`super::ui::draw_root`]'s doc comment and [`super::Env::request_quit`].
-//! The window thread itself just idles here afterwards the same as always;
-//! it is the dictation loop, torn down from `main`, that actually exits.
+//! **The window's close (`X`, Alt+F4, the taskbar's "Close window") does not
+//! end that call.** [`super::ui::draw_root`] cancels the close outright
+//! (`ViewportCommand::CancelClose`) and hides the window instead
+//! (`ViewportCommand::Visible(false)`) — see its doc comment for why, and for
+//! the earlier fix this reverses part of. So for the ordinary hide/show cycle
+//! `eframe::run_native` never returns at all: the same window instance, and
+//! the same [`WindowState`], sit hidden and are simply made visible again on
+//! the next `open()`. A second `open()` while the window is already showing
+//! (hidden or not) does not race the waiting `recv` either way: it is picked
+//! up by `draw_root`'s per-frame drain of the same signal and turned into
+//! [`egui::ViewportCommand::Visible`]/[`egui::ViewportCommand::Focus`]
+//! instead, since that drain is the only thing polling the channel while a
+//! window instance is alive. The handover between those two readers is
+//! closed at the other end too: a click landing after the window's last
+//! frame would otherwise be waiting for this thread's `recv` and reopen a
+//! window instance that no longer exists, so a dead window's leftover
+//! signals are dropped before this thread waits again.
+//!
+//! `run_native` returning at all is now the failure case, not the ordinary
+//! close path: an `eframe` panic unwinds this thread alone (the `unusable`
+//! fallback below takes over from there) — nothing in this crate ever sends
+//! [`egui::ViewportCommand::Close`] itself. Ending the whole resident app is
+//! the tray's Quit item alone; see [`super::Env::request_quit`], which the
+//! window's close handling deliberately no longer calls.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,10 +279,37 @@ impl eframe::App for SettingsApp {
                 at_startup: self.startup.saved_overlay_enabled,
             },
             quit_flag: Arc::clone(&self.quit_flag),
+            show_close_hint: &show_close_hint,
         };
         let state = self.state.get_or_insert_with(|| WindowState::new(&env));
         ui::draw_root(ctx, state, &env);
     }
+}
+
+/// Show the settings window's one-time "still running in the tray" hint.
+///
+/// The real notice — an information-styled message box, [`crate::dialog`]'s
+/// existing console-less-launch mechanism — rather than a bespoke tray
+/// balloon: attaching a balloon to the tray's own icon needs its internal
+/// notify-icon id, which `tray-icon` does not expose past its own module,
+/// and standing up a second, throwaway notify icon purely to carry one
+/// balloon is a small bespoke notification pipeline for what the module docs
+/// on [`super::state::WindowState::note_hidden_to_tray`] ask to stay minimal.
+/// `dialog::show_info` is already real, already reviewed, and already the
+/// answer for "something the user needs to see with no console to print to".
+///
+/// Fired on a detached thread rather than called inline: `draw_root` runs
+/// inside `ctx.run`'s closure, which only *builds* this frame's output —
+/// `eframe` does not apply the `Visible(false)`/`CancelClose` commands it
+/// queued in the very same frame until the closure returns. `MessageBoxW` is
+/// modal, so calling it inline would block this frame from ever finishing,
+/// which would block the hide it is announcing. Detaching is what keeps the
+/// window's close "immediate and non-blocking" even though the hint itself
+/// waits on the user to dismiss it.
+fn show_close_hint(title: &str, message: &str) {
+    let title = title.to_string();
+    let message = message.to_string();
+    std::thread::spawn(move || crate::dialog::show_info(&title, &message));
 }
 
 /// Enumerate input devices for the Settings tab's microphone picker. Empty

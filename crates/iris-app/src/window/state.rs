@@ -118,6 +118,11 @@ pub struct Env<'a> {
     /// the process, the same way `tray::spawn` does. See
     /// [`Env::request_quit`].
     pub quit_flag: Arc<AtomicBool>,
+    /// Show a native notice carrying `(title, message)`. The one caller is
+    /// [`WindowState::note_hidden_to_tray`]; kept as a callback, like
+    /// [`Env::open_config_file`], because showing it is a Windows-only
+    /// operation and this module has to stay portable.
+    pub show_close_hint: &'a dyn Fn(&str, &str),
 }
 
 impl Env<'_> {
@@ -148,6 +153,14 @@ impl Env<'_> {
         let _ = self.commands.send((CommandId::next(), Command::Quit));
     }
 }
+
+/// The one-time hint's title and body — named constants so
+/// [`WindowState::note_hidden_to_tray`] and its test say the same thing.
+pub const CLOSE_HINT_TITLE: &str = "Iris is still running";
+/// See [`CLOSE_HINT_TITLE`].
+pub const CLOSE_HINT_MESSAGE: &str =
+    "Closing this window keeps Iris running in the background. Look for the \
+     prism icon in the system tray to reopen Settings or to Quit Iris.";
 
 /// One restart-gated setting in the two forms the window has to tell apart:
 /// what this process is really running on, and what `config.toml` held when
@@ -569,6 +582,30 @@ impl WindowState {
         );
     }
 
+    /// Called once, the first time the window's close hides it rather than
+    /// quitting the app (see `crate::window::ui::draw_root`'s doc comment for
+    /// why closing no longer quits): shows the "still running in the tray"
+    /// hint and remembers that it has been shown, so it never shows again.
+    ///
+    /// Not routed through [`WindowState::dispatch`] like an ordinary
+    /// setting — the same reasoning as [`Env::request_quit`]: the window is
+    /// disappearing on this same frame, so there is no picker to hold back
+    /// and no status line worth flashing, and there is no answer worth
+    /// polling for. `self.config.tray_close_hint_shown` is flipped locally
+    /// before the command that persists it is even sent, so a second close
+    /// later in the same run — before the file round-trip completes — still
+    /// reads as "already shown" rather than firing twice.
+    pub fn note_hidden_to_tray(&mut self, env: &Env) {
+        if self.config.tray_close_hint_shown {
+            return;
+        }
+        self.config.tray_close_hint_shown = true;
+        (env.show_close_hint)(CLOSE_HINT_TITLE, CLOSE_HINT_MESSAGE);
+        let _ = env
+            .commands
+            .send((CommandId::next(), Command::AcknowledgeTrayHint));
+    }
+
     /// Hand `command` to the loop and wait to be told what became of it.
     ///
     /// Nothing here claims success: a queued command is not an applied one,
@@ -743,6 +780,10 @@ mod tests {
         Err(anyhow::anyhow!("no desktop in a test")).context("launching the editor")
     }
 
+    /// Never pops a real notice — no test may depend on or exercise the real
+    /// mechanism, the same rule `refuse_to_open` follows for the editor.
+    fn no_close_hint(_title: &str, _message: &str) {}
+
     fn env_with<'a>(
         config_path: &'a Path,
         commands: &'a Sender<(CommandId, Command)>,
@@ -767,6 +808,7 @@ mod tests {
                 at_startup: true,
             },
             quit_flag: Arc::new(AtomicBool::new(false)),
+            show_close_hint: &no_close_hint,
         }
     }
 
@@ -1764,5 +1806,58 @@ mod tests {
 
         assert!(quit_flag.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(rx.try_recv().unwrap().1, Command::Quit);
+    }
+
+    #[test]
+    fn note_hidden_to_tray_shows_the_hint_once_and_persists_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let mut env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let calls = std::cell::Cell::new(0u32);
+        let hint = |_title: &str, _message: &str| calls.set(calls.get() + 1);
+        env.show_close_hint = &hint;
+
+        let mut state = WindowState::new(&env);
+        assert!(!state.config.tray_close_hint_shown);
+
+        state.note_hidden_to_tray(&env);
+        assert_eq!(calls.get(), 1);
+        assert!(state.config.tray_close_hint_shown);
+        assert_eq!(
+            rx.try_recv().unwrap().1,
+            Command::AcknowledgeTrayHint,
+            "the flag must be persisted, not just held in memory"
+        );
+
+        // A second close in the same run must not show the hint again, and
+        // must not send a second command either.
+        state.note_hidden_to_tray(&env);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn a_config_that_already_saw_the_hint_does_not_show_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "tray_close_hint_shown = true\n").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let devices = || Vec::new();
+        let reopen_signal = no_reopen();
+        let outcomes = no_outcomes();
+        let mut env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
+        let calls = std::cell::Cell::new(0u32);
+        let hint = |_title: &str, _message: &str| calls.set(calls.get() + 1);
+        env.show_close_hint = &hint;
+
+        let mut state = WindowState::new(&env);
+        state.note_hidden_to_tray(&env);
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 }

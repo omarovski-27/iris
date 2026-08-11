@@ -11,7 +11,7 @@
 //! window shell. The exceptions are
 //! `tests::every_glyph_in_the_view_is_covered_by_the_embedded_fonts`, which
 //! catches the single thing eyeballing the source reliably misses, and
-//! `tests::closing_the_window_requests_quit_the_same_as_a_tray_quit`, which
+//! `tests::closing_the_window_hides_it_and_leaves_the_app_running`, which
 //! drives [`draw_root`] through a headless `egui::Context` to prove the
 //! close-button wiring without a real OS window — see that test's doc
 //! comment for exactly what it does and does not prove.
@@ -38,34 +38,50 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 
 /// Draw one frame of the whole window.
 ///
-/// Order: end the app if this frame is the window closing, pick up a pending
-/// "focus me" request from a second `open()` call, take in what the loop did
-/// with the changes already sent, refresh from disk on the state's own
-/// timer, apply the theme, then paint the background wash, the nav sidebar
-/// and the active tab.
+/// Order: hide the window if this frame is its close being requested, pick up
+/// a pending "focus me" request from a second `open()` call, take in what the
+/// loop did with the changes already sent, refresh from disk on the state's
+/// own timer, apply the theme, then paint the background wash, the nav
+/// sidebar and the active tab.
 ///
-/// **The window's close is the whole app's close, not just this window's.**
-/// `X`, Alt+F4, and the taskbar's "Close window" all reach here as the same
-/// `close_requested` signal on the root viewport (there is exactly one), so
-/// [`Env::request_quit`] runs for all three and — deliberately — the close is
-/// never cancelled: the window disappears immediately on this frame, the same
-/// way it always did, while `request_quit` hands the dictation loop
-/// `Command::Quit` to unwind in the background. Before this, closing the
-/// window only hid it — the resident loop kept running with no visible way
-/// left to reach it except the tray, which is what the maintainer reported as
-/// "cannot be closed".
+/// **The window's close hides it and leaves Iris running, the way Wispr Flow
+/// does — it does not quit the app.** `X`, Alt+F4, and the taskbar's "Close
+/// window" all reach here as the same `close_requested` signal on the root
+/// viewport (there is exactly one), so all three take the same path: `egui`
+/// is told to cancel the close outright (`ViewportCommand::CancelClose`, or
+/// the window — and the whole process, since this is the root viewport —
+/// would actually tear down) and the window is hidden instead
+/// (`ViewportCommand::Visible(false)`). The dictation loop is never told
+/// about this at all; the hotkey, the tray and dictation itself keep running
+/// exactly as if the window had never been open. [`WindowState::
+/// note_hidden_to_tray`] shows a one-time "still running" hint the first time
+/// this happens, so a click on `X` does not read as "Iris closed".
 ///
-/// The reopen answer un-minimizes before it focuses, and the order is
-/// load-bearing: winit declines to focus a minimized window outright, so
-/// `Focus` alone would drain the signal and do nothing at all — the tray's
-/// `Settings` item would read as dead until the user restored the window by
-/// hand. Both commands run on the event loop thread in the order they are
-/// queued, so the restore has already landed when the focus is attempted.
+/// This reverses part of an earlier fix that made every one of these three
+/// gestures quit the whole app (see `AGENTS.md`'s "Every close path..."
+/// entry). That fix was built on a misdiagnosis: the maintainer's report of
+/// "cannot be closed" was actually about a *freeze* on close (fixed
+/// separately — see `App::capture`'s Quit-during-finalise handling), not
+/// about wanting the app to exit. Hiding to the tray was the correct
+/// behaviour the whole time; [`Env::request_quit`] and `flip_quit_flag`
+/// are unchanged and still exist for the tray's own Quit item, which is the
+/// one place that must still end the process.
+///
+/// The reopen answer makes the window visible and un-minimizes before it
+/// focuses, and the order is load-bearing: winit declines to focus a hidden
+/// or minimized window outright, so `Focus` alone would drain the signal and
+/// do nothing at all — the tray's `Settings` item would read as dead until
+/// the user found the window some other way. All three commands run on the
+/// event loop thread in the order they are queued, so each has already landed
+/// when the next is attempted.
 pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
     if ctx.input(|i| i.viewport().close_requested()) {
-        env.request_quit();
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        state.note_hidden_to_tray(env);
     }
     while env.reopen_signal.try_recv().is_ok() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
@@ -266,27 +282,30 @@ mod tests {
         );
     }
 
-    /// Regression for the maintainer's report on `iris-v0.1.0-2026-08-10`: with
-    /// the tray-only fix in place, the tray's Quit closed the app promptly
-    /// but every other way of closing it — the settings window's `X` above
-    /// all — still did not. `draw_root` is portable `egui`, no `eframe`
-    /// window required, so this drives it through a headless
-    /// `egui::Context::run` with a synthetic `close_requested` on the root
-    /// viewport — the same signal `winit` reports for the window's `X`,
-    /// Alt+F4, and the taskbar's "Close window" alike (confirmed by reading
-    /// `winit` 0.30's own `WM_CLOSE`/`WM_SYSCOMMAND` handling; there is no
-    /// Windows host here to click any of them for real) — and checks that it
-    /// runs the exact same flip-then-send `Env::request_quit` performs,
-    /// matching the tray's own ordering.
+    /// Regression for the captain's 2026-08-11 request: closing the settings
+    /// window ("click the X button") must leave Iris running in the tray,
+    /// the way Wispr Flow behaves, rather than quitting the whole app (which
+    /// is what an earlier fix, in response to a different report, made every
+    /// close path do — see `draw_root`'s doc comment for the full story).
+    /// `draw_root` is portable `egui`, no `eframe` window required, so this
+    /// drives it through a headless `egui::Context::run` with a synthetic
+    /// `close_requested` on the root viewport — the same signal `winit`
+    /// reports for the window's `X`, Alt+F4, and the taskbar's "Close
+    /// window" alike (confirmed by reading `winit` 0.30's own
+    /// `WM_CLOSE`/`WM_SYSCOMMAND` handling; there is no Windows host here to
+    /// click any of them for real) — and checks that it cancels the close,
+    /// hides the viewport, shows the one-time hint, and never touches
+    /// `Command::Quit` or the quit flag.
     ///
     /// What this does **not** prove: that a real `eframe`/`winit` window on
     /// real Windows actually reports `close_requested` for all three
-    /// gestures, or that `App::run` (a separate crate boundary) reacts to the
-    /// `Command::Quit` this sends the way it does to the tray's — that half
-    /// is `crate::app`'s `a_window_close_does_not_wait_for_an_in_flight_finalise`,
-    /// exercised end to end against the real `App`.
+    /// gestures, or that hiding via `ViewportCommand::Visible(false)` after
+    /// `CancelClose` really keeps the native window alive rather than
+    /// destroying it — that half is reasoned from `eframe`'s own source (see
+    /// `window::shell`'s module docs), not exercised end to end, because
+    /// there is no Windows host here to open a real window on.
     #[test]
-    fn closing_the_window_requests_quit_the_same_as_a_tray_quit() {
+    fn closing_the_window_hides_it_and_leaves_the_app_running() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -301,6 +320,8 @@ mod tests {
         let devices = || Vec::new();
         let open_config_file = |_: &std::path::Path| Ok(());
         let quit_flag = Arc::new(AtomicBool::new(false));
+        let hint_calls = std::cell::Cell::new(0u32);
+        let show_close_hint = |_title: &str, _message: &str| hint_calls.set(hint_calls.get() + 1);
 
         let env = Env {
             config_path: &config_path,
@@ -319,6 +340,7 @@ mod tests {
                 at_startup: true,
             },
             quit_flag: Arc::clone(&quit_flag),
+            show_close_hint: &show_close_hint,
         };
         let mut state = WindowState::new(&env);
 
@@ -331,12 +353,32 @@ mod tests {
                 ..Default::default()
             },
         );
-        let _ = ctx.run(input, |ctx| super::draw_root(ctx, &mut state, &env));
+        let output = ctx.run(input, |ctx| super::draw_root(ctx, &mut state, &env));
 
         assert!(
-            quit_flag.load(Ordering::Acquire),
-            "the window's close must flip the same flag a finalise polls"
+            !quit_flag.load(Ordering::Acquire),
+            "closing the window must not flip the quit flag — it only hides"
         );
-        assert_eq!(commands_rx.try_recv().unwrap().1, Command::Quit);
+        assert_eq!(
+            commands_rx.try_recv().unwrap().1,
+            Command::AcknowledgeTrayHint,
+            "the only command a close may send is the hint acknowledgement"
+        );
+        assert_eq!(
+            commands_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty),
+            "and never a second one, especially not Quit"
+        );
+        let root_commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            root_commands.contains(&egui::ViewportCommand::CancelClose),
+            "the close must be cancelled or the root viewport — the whole \
+             process — would actually tear down"
+        );
+        assert!(
+            root_commands.contains(&egui::ViewportCommand::Visible(false)),
+            "and the window hidden instead"
+        );
+        assert_eq!(hint_calls.get(), 1, "the one-time hint must show");
     }
 }
