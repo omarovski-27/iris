@@ -356,8 +356,11 @@ every login. Three sections, in priority order:
 - **History** — the session log below, newest first, with a search box and a
   one-click copy per entry; a failed injection shows its reason in place, not
   buried, because this is the recovery path.
-- **Settings** — engine, input device, theme, polish, the overlay toggle and
-  hotkey rebinding, all written through `Config`. Never renders an API key;
+- **Settings** — engine, input device, theme, polish, the overlay toggle,
+  hotkey rebinding, and a Vocabulary card (one term per line — names, jargon,
+  acronyms fed to whichever engine is active as a hint; see `Command::SetVocabulary`
+  and `iris_core::engine::EngineOptions::vocabulary`), all written through
+  `Config`. Never renders an API key;
   "Open config file" hands `config.toml` to the user's editor instead, which
   is still where the keys are set. `hotkey` and `overlay_enabled` are read
   once at startup, so the window is given the *running* values too — the
@@ -395,9 +398,12 @@ loop. Only `window::shell` — the `eframe`/`winit` bootstrap and the OS thread
 
 **The window never writes `config.toml`.** A change sends a `Command` on a
 channel `App::run` selects on alongside the tray's — the same commands the
-tray sends for engine/device/theme/polish, plus two new ones (`SetHotkey`,
-`SetOverlayEnabled`) that follow the same shape. `App` stays the one writer,
-so a window change and a tray change can never race to overwrite each other.
+tray sends for engine/device/theme/polish, plus three new ones (`SetHotkey`,
+`SetOverlayEnabled`, `SetVocabulary`) that follow the same shape. Unlike the
+first two, `SetVocabulary` needs no restart: the list is read at engine-build
+time, so `App::apply` rebuilds the active engine the same way it does for
+`SetEngine`. `App` stays the one writer, so a window change and a tray change
+can never race to overwrite each other.
 `WindowState::refresh` re-reads the file and the log every couple of seconds,
 so external changes (the tray, a hand edit) show up here too — the tray's own
 known-limitations trade-off, inherited rather than solved differently.

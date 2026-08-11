@@ -92,6 +92,7 @@ impl Args {
         EngineOptions {
             model: self.model.clone(),
             language: self.language.clone(),
+            ..EngineOptions::default()
         }
     }
 }

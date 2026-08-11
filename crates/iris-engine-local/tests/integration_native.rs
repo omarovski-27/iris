@@ -41,6 +41,7 @@ mod native {
             vad_path: w.vad,
             language: Some("en".into()),
             num_threads: 4,
+            initial_prompt: None,
         })
         .expect("whisper load");
         LayeredLocalEngine::new(LayeredLocalEngineConfig {
@@ -116,6 +117,7 @@ mod native {
             vad_path: w.vad,
             language: Some("en".into()),
             num_threads: 4,
+            initial_prompt: None,
         })
         .expect("whisper load");
 

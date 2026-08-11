@@ -34,6 +34,8 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
         .show(ui, |ui| {
             dictation_section(ui, state, env, theme);
             ui.add_space(12.0);
+            vocabulary_section(ui, state, env, theme);
+            ui.add_space(12.0);
             appearance_section(ui, state, env, theme);
             ui.add_space(12.0);
             cleanup_section(ui, state, env, theme);
@@ -112,6 +114,55 @@ fn dictation_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &ir
                 .clicked()
             {
                 state.refresh_devices(env);
+            }
+        });
+    });
+}
+
+/// Names, jargon and acronyms Iris should listen for. See
+/// `crate::app::Command::SetVocabulary` for how a save reaches the engine and
+/// `iris_core::engine::EngineOptions::vocabulary` for what each engine does
+/// with the list.
+fn vocabulary_section(
+    ui: &mut Ui,
+    state: &mut WindowState,
+    env: &Env,
+    theme: &iris_overlay::Theme,
+) {
+    state.sync_vocabulary_input();
+    chrome::card(theme).show(ui, |ui| {
+        chrome::section_label(ui, theme, "Vocabulary");
+        ui.add_space(8.0);
+        caption(
+            ui,
+            theme,
+            "Names, jargon and acronyms Iris often mishears. One per line — sent to the \
+             transcription engine as a hint, not forced into the transcript. A very long list \
+             is trimmed to whatever the engine allows.",
+        );
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut state.vocabulary_input)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .hint_text("Deepgram\nZipformer\nWhisper.cpp"),
+        );
+        ui.add_space(6.0);
+        let dirty = state.vocabulary_dirty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
+                state.set_vocabulary(env);
+            }
+            let count = state.config.vocabulary.len();
+            if count > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{count} term{} active",
+                        if count == 1 { "" } else { "s" }
+                    ))
+                    .size(11.0)
+                    .color(chrome::ink_faint(theme)),
+                );
             }
         });
     });

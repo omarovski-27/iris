@@ -17,12 +17,15 @@ use crate::config::{Config, EngineChoice};
 /// API keys are read from the environment, so [`Config::promote_keys`] must
 /// have run first.
 pub fn build(config: &Config) -> Result<Arc<dyn Engine>> {
-    let options = EngineOptions::default();
+    let options = EngineOptions {
+        vocabulary: config.vocabulary.clone(),
+        ..EngineOptions::default()
+    };
     let engine: Arc<dyn Engine> = match config.engine {
         EngineChoice::Mock => iris_core::engine::build(EngineSpec::Mock, &options)?.into(),
         EngineChoice::Deepgram => iris_core::engine::build(EngineSpec::Deepgram, &options)?.into(),
         EngineChoice::Groq => iris_core::engine::build(EngineSpec::Groq, &options)?.into(),
-        EngineChoice::Local => Arc::new(local::build()?),
+        EngineChoice::Local => Arc::new(local::build(&options.vocabulary)?),
     };
     Ok(engine)
 }
@@ -41,7 +44,13 @@ mod local {
     /// Model download is not on any latency path — it happens when the engine
     /// is selected, not when the hotkey is pressed — but it is the one thing in
     /// this program that can take minutes, so it reports progress.
-    pub fn build() -> Result<super::LocalAdapter> {
+    ///
+    /// `vocabulary` is the user's configured hint list; `iris-engine-local`
+    /// does not depend on `iris-core`, so this joins it into whisper.cpp's
+    /// one initial-prompt string with `iris_core::engine::vocabulary_prompt`
+    /// before handing it to `FinalizerConfig` — see that function's doc
+    /// comment for the word-budget reasoning.
+    pub fn build(vocabulary: &[String]) -> Result<super::LocalAdapter> {
         let dir = models::default_model_dir();
         let progress: models::ProgressFn = Box::new(|name: &str, done: u64, total: u64| {
             eprintln!("[iris] model {name}: {done}/{total} bytes");
@@ -59,6 +68,10 @@ mod local {
             vad_path: whisper.vad,
             language: Some("en".into()),
             num_threads: 4,
+            initial_prompt: iris_core::engine::vocabulary_prompt(
+                vocabulary,
+                iris_core::engine::MAX_VOCABULARY_PROMPT_WORDS,
+            ),
         })
         .context("loading the Whisper finalizer")?;
 
@@ -77,7 +90,7 @@ mod local {
 
     /// Without the native engines there is nothing to run locally, and quietly
     /// substituting the mock would be a lie about where the user's audio goes.
-    pub fn build() -> Result<super::LocalAdapter> {
+    pub fn build(_vocabulary: &[String]) -> Result<super::LocalAdapter> {
         anyhow::bail!(
             "the local engine needs the `local-native` feature, which pulls in sherpa-onnx and \
              whisper.cpp:\n    cargo build --release --features local-native\n\

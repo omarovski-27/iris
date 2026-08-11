@@ -195,6 +195,84 @@ pub struct EngineOptions {
     pub model: Option<String>,
     /// Language hint, e.g. `en`. `None` lets the engine decide.
     pub language: Option<String>,
+    /// User-maintained words and phrases (names, jargon, acronyms) that
+    /// should come back spelled the way the user meant. `Vec::is_empty` is
+    /// the "no vocabulary configured" case, and every engine must treat it as
+    /// a complete no-op: no extra request field, no added latency.
+    ///
+    /// Each engine consumes this the only way its own API allows, so the
+    /// *effect* differs by engine, not just the wiring:
+    /// - [`deepgram::DeepgramEngine`] sends it as `keyterm` query parameters —
+    ///   nova-3's keyterm prompting
+    ///   (<https://developers.deepgram.com/docs/keyterm>, checked 2026-08-11).
+    ///   The older `keywords` parameter is nova-2-and-earlier only and does
+    ///   not exist for the `nova-3` model this engine defaults to, so this is
+    ///   the current mechanism for the model Iris actually ships, not a
+    ///   downgrade from it.
+    /// - [`groq::GroqEngine`] and the local Whisper finalizer
+    ///   (`iris-engine-local`) have no keyword-list mechanism at all — their
+    ///   APIs only accept one initial-prompt string — so both join the list
+    ///   into a prompt via [`vocabulary_prompt`] instead.
+    /// - The mock engine ignores this field entirely: it is a scripted,
+    ///   offline stand-in, not a real transcriber a hint could improve.
+    ///
+    /// Every consumer also caps how much of the list it actually sends,
+    /// because the providers cap it too (Deepgram: 500 tokens per keyterm
+    /// request; Groq: a 224-token prompt) — see [`vocabulary_prompt`] and
+    /// `deepgram`'s own token cap constant. An oversized list is quietly
+    /// shortened, never a failed dictation.
+    pub vocabulary: Vec<String>,
+}
+
+/// A word-count budget for [`vocabulary_prompt`], conservative enough to sit
+/// under both `groq::GroqEngine`'s 224-token Whisper `prompt` field and the
+/// local Whisper finalizer's initial prompt (`iris-engine-local`, which has
+/// no independently documented limit but runs the same underlying model
+/// family) — see [`vocabulary_prompt`]'s own doc comment for why word count
+/// is a proxy for tokens, not an exact measure. Shared rather than
+/// per-engine so the two prompt-based consumers do not silently drift apart
+/// on how conservative they are.
+pub const MAX_VOCABULARY_PROMPT_WORDS: usize = 150;
+
+/// Turns a vocabulary list into a single initial-prompt string for engines
+/// that only accept one (Groq, the local Whisper finalizer) rather than a
+/// keyword list — see [`EngineOptions::vocabulary`]. Terms are joined with a
+/// comma, Whisper's own documented convention for listing proper nouns in a
+/// prompt.
+///
+/// `max_words` bounds the result by word count, a proxy for the provider's
+/// token limit: no tokenizer is available here, and English words average
+/// somewhat more than one token each, so a caller should pick `max_words`
+/// with headroom under the real token cap rather than equal to it. Truncating
+/// this way — quietly, before the request goes out — is what keeps an
+/// oversized vocabulary from turning into a rejected request or a
+/// mid-word-truncated prompt on the provider's side.
+///
+/// Returns `None` for an empty (or all-blank) vocabulary, so a caller can
+/// tell "no prompt" from "empty string prompt" without inspecting the list
+/// itself — the distinction a request builder needs to add no field at all
+/// when nothing was configured.
+#[must_use]
+pub fn vocabulary_prompt(vocabulary: &[String], max_words: usize) -> Option<String> {
+    let mut words_used = 0usize;
+    let mut terms = Vec::new();
+    for term in vocabulary {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let words = term.split_whitespace().count().max(1);
+        if words_used + words > max_words {
+            break;
+        }
+        words_used += words;
+        terms.push(term);
+    }
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(", "))
+    }
 }
 
 /// Build an engine, reading API keys from the environment.
@@ -253,5 +331,34 @@ mod tests {
     fn mock_builds_without_any_environment() {
         let e = build(EngineSpec::Mock, &EngineOptions::default()).unwrap();
         assert_eq!(e.name(), "mock");
+    }
+
+    #[test]
+    fn vocabulary_prompt_is_none_for_empty_or_blank_lists() {
+        assert_eq!(vocabulary_prompt(&[], 100), None);
+        assert_eq!(
+            vocabulary_prompt(&["  ".into(), "".into()], 100),
+            None,
+            "whitespace-only entries must not produce an empty-string prompt"
+        );
+    }
+
+    #[test]
+    fn vocabulary_prompt_joins_trimmed_terms_with_commas() {
+        let vocabulary = vec!["  Deepgram  ".into(), "Zipformer".into()];
+        assert_eq!(
+            vocabulary_prompt(&vocabulary, 100),
+            Some("Deepgram, Zipformer".into())
+        );
+    }
+
+    #[test]
+    fn vocabulary_prompt_stops_once_the_word_budget_is_spent() {
+        let vocabulary = vec!["one two".into(), "three".into(), "four".into()];
+        // "one two" spends 2 of a 3-word budget, "three" spends the last word,
+        // "four" no longer fits and must not appear.
+        let prompt = vocabulary_prompt(&vocabulary, 3).unwrap();
+        assert_eq!(prompt, "one two, three");
+        assert!(!prompt.contains("four"));
     }
 }

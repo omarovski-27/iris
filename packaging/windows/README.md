@@ -106,6 +106,26 @@ running on the engine Iris started with.
 Then hold **Right-Ctrl**, speak, release. Your words appear in whatever window
 had focus.
 
+## Custom vocabulary
+
+If Iris keeps mishearing the same word — your name, a product, a technical
+term, an acronym — you can teach it what to expect. Open the Iris window,
+go to the **Settings** tab, and find the **Vocabulary** card: type each word
+or phrase on its own line, then click **Save**. It takes effect on your next
+dictation, no restart needed.
+
+This is a hint, not a guarantee — it makes the engine more likely to spell a
+name or a term the way you meant, not a rule that forces it into what you
+say. If you add a very long list, Iris quietly uses as much of it as the
+engine allows rather than failing your dictation.
+
+You never need to edit `config.toml` for this — the Settings window does it
+for you — but if you ever open the file by hand, this is what it looks like:
+
+```toml
+vocabulary = ["Deepgram", "Zipformer", "Kubernetes"]
+```
+
 ## Downgrading to an older Iris
 
 Going *back* to a release older than this one needs one edit first. Iris stamps

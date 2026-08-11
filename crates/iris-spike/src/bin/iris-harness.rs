@@ -176,6 +176,7 @@ fn build_engine(args: &Args) -> Result<Box<dyn engine::Engine>> {
         &EngineOptions {
             model: args.model.clone(),
             language: args.language.clone(),
+            ..EngineOptions::default()
         },
     )
 }

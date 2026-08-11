@@ -70,6 +70,10 @@ pub enum Command {
     /// Show or hide the pill overlay. Persisted immediately; needs
     /// a restart, because the overlay is spawned once in `main`.
     SetOverlayEnabled(bool),
+    /// Replace the vocabulary hint list and rebuild the active engine so it
+    /// takes effect immediately — unlike the hotkey and overlay toggle, this
+    /// is read at engine-build time, not once at startup.
+    SetVocabulary(Vec<String>),
     /// Open the settings window, or focus it if already open.
     OpenSettings,
     /// Re-read the config file, applying anything edited by hand.
@@ -100,6 +104,7 @@ impl Command {
             Command::SetTheme(theme) => config.theme = *theme,
             Command::SetHotkey(key) => config.hotkey = *key,
             Command::SetOverlayEnabled(enabled) => config.overlay_enabled = *enabled,
+            Command::SetVocabulary(terms) => config.vocabulary = terms.clone(),
             Command::AcknowledgeTrayHint => config.tray_close_hint_shown = true,
             Command::OpenSettings | Command::Reload | Command::Quit => return false,
         }
@@ -783,6 +788,28 @@ impl<A: AudioSource> App<A> {
                         if enabled { "on" } else { "off" }
                     ),
                     Err(e) => outcome = Self::persist_failed(&e),
+                }
+            }
+            Command::SetVocabulary(terms) => {
+                let count = terms.len();
+                let previous = self.config.vocabulary.clone();
+                command.apply_to(&mut self.config);
+                match engines::build(&self.config) {
+                    Ok(engine) => {
+                        self.pill.set_engine(engine.name());
+                        self.engine = engine;
+                        match self.persist(&command) {
+                            // Term count only — never the terms themselves.
+                            Ok(()) => println!("  vocabulary: {count} term(s)"),
+                            Err(e) => outcome = Self::persist_failed(&e),
+                        }
+                    }
+                    Err(e) => {
+                        self.config.vocabulary = previous;
+                        eprintln!("  cannot update vocabulary: {e:#}");
+                        outcome =
+                            CommandOutcome::Rejected(format!("cannot update vocabulary: {e:#}"));
+                    }
                 }
             }
             Command::AcknowledgeTrayHint => {

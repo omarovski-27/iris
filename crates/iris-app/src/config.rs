@@ -36,12 +36,15 @@ const HEADER: &str = "\
 # Edited by hand or by the tray menu; Iris rewrites this file when you change a
 # setting from the tray, which drops any comments you added below this header.
 #
-#   engine   mock | deepgram | groq | local
-#   hotkey   rctrl, lctrl, rshift, ralt, rwin, capslock, scrolllock, pause, f8, f9, f10
-#   theme    dark | light
+#   engine       mock | deepgram | groq | local
+#   hotkey       rctrl, lctrl, rshift, ralt, rwin, capslock, scrolllock, pause, f8, f9, f10
+#   theme        dark | light
+#   vocabulary   [\"Term\", \"Another term\"] — names, jargon and acronyms fed
+#                to the transcription engine as a hint. Empty by default.
 #
-# engine, hotkey, input device, theme, polish and overlay_enabled can all be
-# changed from the Settings window (tray icon -> Settings) as well as by hand.
+# engine, hotkey, input device, theme, polish, overlay_enabled and vocabulary
+# can all be changed from the Settings window (tray icon -> Settings) as well
+# as by hand.
 #
 # Iris starts on the mock engine (offline, no key needed) until you configure
 # a real one. To use Deepgram:
@@ -430,6 +433,21 @@ pub struct Config {
     pub inject: InjectConfig,
     /// The local dictation history.
     pub history: HistoryConfig,
+    /// User-maintained words and phrases fed to the transcription engine as a
+    /// hint, so names, jargon and acronyms are more likely to come back
+    /// spelled the way the user meant. One term per line in the Settings
+    /// window's Vocabulary section; empty by default, which changes nothing
+    /// about a dictation — no request field is even added.
+    ///
+    /// Not every engine consumes this the same way — see
+    /// `iris_core::engine::EngineOptions::vocabulary`'s doc comment for how
+    /// each one actually uses the list, and what happens when it is longer
+    /// than a provider allows. This is deliberately a flat list rather than a
+    /// richer structure: a future "learn terms from corrections" feature
+    /// (out of scope today) can append to it or add a sibling field without
+    /// needing to reshape this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vocabulary: Vec<String>,
     /// API keys. Prefer the environment; see the module docs.
     ///
     /// Skipped when empty, so a config Iris wrote itself has no `[keys]`
@@ -457,6 +475,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             inject: InjectConfig::default(),
             history: HistoryConfig::default(),
+            vocabulary: Vec::new(),
             keys: Keys::default(),
             tray_close_hint_shown: false,
         }
@@ -895,6 +914,7 @@ mod tests {
         assert!(config.overlay_enabled);
         assert!(config.polish.enabled);
         assert_eq!(config.inject.method, Method::SendInput);
+        assert!(config.vocabulary.is_empty());
     }
 
     #[test]
@@ -906,6 +926,39 @@ mod tests {
             .to_toml()
             .unwrap()
             .contains("overlay_enabled = false"));
+    }
+
+    #[test]
+    fn vocabulary_defaults_empty_and_round_trips() {
+        assert!(Config::from_toml("").unwrap().vocabulary.is_empty());
+
+        let config = Config {
+            vocabulary: vec!["Deepgram".into(), "Zipformer".into()],
+            ..Config::default()
+        };
+        let text = config.to_toml().unwrap();
+        assert!(text.contains("vocabulary = ["), "{text}");
+        assert_eq!(Config::from_toml(&text).unwrap(), config);
+    }
+
+    /// A file written before this field existed — no `vocabulary` key at all,
+    /// not even an empty array — must still parse, per this module's first
+    /// rule that a partial or older file is not an error.
+    #[test]
+    fn a_file_without_a_vocabulary_section_still_parses() {
+        let config = Config::from_toml("engine = \"deepgram\"\nhotkey = \"f9\"\n").unwrap();
+        assert!(config.vocabulary.is_empty());
+        assert_eq!(config.engine, EngineChoice::Deepgram);
+    }
+
+    #[test]
+    fn an_empty_vocabulary_is_not_written_to_the_file() {
+        // Same reasoning as `keys`: a config Iris wrote itself should carry
+        // no `vocabulary = []` for a user who never set one, so there is
+        // nothing suggesting they ought to. The header mentions the word in
+        // its explanatory prose, so this checks for the actual key line.
+        let text = Config::default().to_toml().unwrap();
+        assert!(!text.contains("vocabulary ="), "{text}");
     }
 
     #[test]

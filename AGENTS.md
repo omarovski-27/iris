@@ -945,13 +945,36 @@ When updating this file, preserve this bar for all agents and keep entries conci
   native window/GL call.
 - **The window never writes `config.toml`.** Every setting change sends a
   `Command` — the same ones the tray sends (`SetEngine`/`SetDevice`/
-  `SetTheme`/`SetPolish`) plus two new ones this window introduced
-  (`SetHotkey`, `SetOverlayEnabled`) — on a channel `App::run` selects on
-  alongside the tray's. `App` stays the sole writer; see `window::state`'s
-  module docs for why a second writer would race it. `App` answers each of
-  those commands with a `CommandOutcome`, and the window moves the control
-  and says "Saved" only on that answer — `App::apply` can decline `SetEngine`
-  and `SetDevice`, so a queued command is not an applied one.
+  `SetTheme`/`SetPolish`) plus three new ones this window introduced
+  (`SetHotkey`, `SetOverlayEnabled`, `SetVocabulary`) — on a channel `App::run`
+  selects on alongside the tray's. `App` stays the sole writer; see
+  `window::state`'s module docs for why a second writer would race it. `App`
+  answers each of those commands with a `CommandOutcome`, and the window moves
+  the control and says "Saved" only on that answer — `App::apply` can decline
+  `SetEngine` and `SetDevice`, so a queued command is not an applied one.
+  `SetVocabulary` is on the live-immediately footing (`SetEngine`/`SetPolish`),
+  not the restart-gated one below: the list is read at engine-build time, so
+  `App::apply` rebuilds the active engine the same way `SetEngine` does.
+- **Vocabulary card.** `window::ui::settings_tab::vocabulary_section` is a
+  free-text "one term per line" box plus a Save button, backed by
+  `WindowState::vocabulary_input` — a separate buffer from
+  `config.vocabulary`, not bound directly to it, because
+  `WindowState::refresh` reloads `config` from disk every
+  `REFRESH_INTERVAL` regardless of whether anything changed, and a direct
+  binding would erase whatever the user is mid-typing every two seconds.
+  `WindowState::sync_vocabulary_input` (called once a frame, the same
+  pattern `sync_filter` uses for the History search) only overwrites the box
+  when `config.vocabulary` has actually moved since the two last agreed,
+  which is what lets an in-progress edit survive the periodic refresh while
+  still picking up a hand-edited file or a confirmed save. See
+  `iris_core::engine::EngineOptions::vocabulary` for what reaches each engine
+  and why: Deepgram's `keyterm` prompting (nova-3 only — the older `keywords`
+  parameter does not support nova-3, which is `DEFAULT_MODEL`; checked
+  against Deepgram's live docs 2026-08-11, not assumed from memory), Groq and
+  the local Whisper finalizer's one `prompt`/`initial_prompt` field via a
+  shared `vocabulary_prompt` word-budget helper. Every consumer keeps the
+  vocabulary out of its own `Debug` impl (counts only), the same discipline
+  `Keys` already uses for API keys.
 - `Config::overlay_enabled` gates whether `main` spawns `iris-overlay` at all;
   like `hotkey`, changing it needs a restart (both are read once at startup).
   `main` therefore hands `window::spawn` a `Startup` snapshot: what the

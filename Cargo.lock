@@ -2085,6 +2085,7 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "hound",
+ "percent-encoding",
  "reqwest",
  "rustls",
  "serde",
