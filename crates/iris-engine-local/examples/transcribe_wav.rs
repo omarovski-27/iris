@@ -191,6 +191,7 @@ fn build_native(model_dir: Option<&Path>) -> Result<LayeredLocalEngine> {
                 vad_path: w_paths.vad,
                 language: Some("en".into()),
                 num_threads: 4,
+                initial_prompt: None,
             })?;
 
         return Ok(LayeredLocalEngine::new(LayeredLocalEngineConfig {

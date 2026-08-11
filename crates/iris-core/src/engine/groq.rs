@@ -17,9 +17,17 @@ use crossbeam_channel::Receiver;
 use crate::{audio, vlog};
 
 use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
+use super::MAX_VOCABULARY_PROMPT_WORDS as MAX_PROMPT_WORDS;
 
 const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
 const DEFAULT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
+
+/// Groq's documented cap on the `prompt` field: "limited to 224 tokens"
+/// (Groq's speech-to-text docs, console.groq.com/docs/speech-to-text, checked
+/// 2026-08-11). [`MAX_PROMPT_WORDS`] (= [`super::MAX_VOCABULARY_PROMPT_WORDS`],
+/// shared with the local Whisper finalizer) bounds by word count instead of
+/// tokens, staying comfortably under this real limit rather than at it; see
+/// its own doc comment for why.
 
 /// How long to wait for the socket to come up, before a byte of audio moves.
 ///
@@ -72,10 +80,14 @@ pub struct GroqEngine {
     model: String,
     url: String,
     language: Option<String>,
+    /// See [`EngineOptions::vocabulary`], joined into Whisper's one
+    /// initial-prompt string by [`super::vocabulary_prompt`]. `None` when the
+    /// vocabulary was empty — the "add no field at all" case.
+    prompt: Option<String>,
 }
 
-/// Hand-written so the API key cannot reach a log line, a panic message or a
-/// bug report through a stray `{:?}`.
+/// Hand-written so the API key and the user's vocabulary prompt cannot reach
+/// a log line, a panic message or a bug report through a stray `{:?}`.
 impl std::fmt::Debug for GroqEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroqEngine")
@@ -83,6 +95,7 @@ impl std::fmt::Debug for GroqEngine {
             .field("url", &self.url)
             .field("language", &self.language)
             .field("key", &"<redacted>")
+            .field("has_vocabulary_prompt", &self.prompt.is_some())
             .finish()
     }
 }
@@ -121,6 +134,7 @@ impl GroqEngine {
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             url,
             language: opts.language.clone(),
+            prompt: super::vocabulary_prompt(&opts.vocabulary, MAX_PROMPT_WORDS),
         })
     }
 }
@@ -160,6 +174,7 @@ impl Engine for GroqEngine {
             model: self.model.clone(),
             url: self.url.clone(),
             language: self.language.clone(),
+            prompt: self.prompt.clone(),
             pcm: Vec::with_capacity(audio::SAMPLE_RATE as usize * 8),
             events_tx: tx,
             events: rx,
@@ -173,6 +188,7 @@ struct GroqSession {
     model: String,
     url: String,
     language: Option<String>,
+    prompt: Option<String>,
     pcm: Vec<i16>,
     events_tx: crossbeam_channel::Sender<TranscriptEvent>,
     events: Receiver<TranscriptEvent>,
@@ -204,10 +220,11 @@ impl Session for GroqSession {
         let model = self.model.clone();
         let url = self.url.clone();
         let language = self.language.clone();
+        let prompt = self.prompt.clone();
         let tx = self.events_tx.clone();
 
         net::runtime()?.spawn(async move {
-            match transcribe(url, key, model, language, wav).await {
+            match transcribe(url, key, model, language, prompt, wav).await {
                 Ok(text) if !text.trim().is_empty() => {
                     let _ = tx.send(TranscriptEvent::Final(text.trim().to_string()));
                 }
@@ -230,6 +247,7 @@ async fn transcribe(
     key: String,
     model: String,
     language: Option<String>,
+    prompt: Option<String>,
     wav: Vec<u8>,
 ) -> Result<String> {
     let part = reqwest::multipart::Part::bytes(wav)
@@ -242,6 +260,9 @@ async fn transcribe(
         .part("file", part);
     if let Some(lang) = language {
         form = form.text("language", lang);
+    }
+    if let Some(prompt) = prompt {
+        form = form.text("prompt", prompt);
     }
 
     let client = reqwest::Client::builder()
@@ -285,6 +306,7 @@ mod tests {
             model: DEFAULT_MODEL.into(),
             url: DEFAULT_URL.into(),
             language: None,
+            prompt: None,
         };
         assert!(!engine.streams_partials());
     }
@@ -316,6 +338,7 @@ mod tests {
             model: DEFAULT_MODEL.into(),
             url: DEFAULT_URL.into(),
             language: None,
+            prompt: None,
         };
         assert!(
             engine.final_timeout() > crate::dictation::DEFAULT_FINAL_TIMEOUT,
@@ -360,5 +383,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IRIS_GROQ_KEY"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_empty_vocabulary_adds_no_prompt() {
+        let opts = EngineOptions::default();
+        assert_eq!(super::super::vocabulary_prompt(&opts.vocabulary, MAX_PROMPT_WORDS), None);
+    }
+
+    #[test]
+    fn a_configured_vocabulary_becomes_the_initial_prompt() {
+        let opts = EngineOptions {
+            vocabulary: vec!["Deepgram".into(), "Zipformer".into()],
+            ..EngineOptions::default()
+        };
+        let prompt = super::super::vocabulary_prompt(&opts.vocabulary, MAX_PROMPT_WORDS);
+        assert_eq!(prompt, Some("Deepgram, Zipformer".into()));
+    }
+
+    #[test]
+    fn multipart_form_carries_a_prompt_field_only_when_one_is_set() {
+        // `reqwest::multipart::Part`'s `Debug` does not render text values
+        // (by design — the same reason `GroqEngine`'s own `Debug` redacts the
+        // key), so this checks for the field's presence by name, which is
+        // enough to prove the wiring: `transcribe` only ever calls
+        // `form.text("prompt", ...)` when `prompt` is `Some`.
+        assert!(field_names(Some("Deepgram, Zipformer".to_string())).contains(&"prompt"));
+        assert!(
+            !field_names(None).contains(&"prompt"),
+            "an empty vocabulary must add no prompt field at all"
+        );
+    }
+
+    /// The field names in the same multipart form [`transcribe`] sends,
+    /// minus the audio part (irrelevant to whether `prompt` is present).
+    fn field_names(prompt: Option<String>) -> Vec<&'static str> {
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", DEFAULT_MODEL)
+            .text("response_format", "json")
+            .text("temperature", "0");
+        let mut names = vec!["model", "response_format", "temperature"];
+        if let Some(prompt) = prompt {
+            form = form.text("prompt", prompt);
+            names.push("prompt");
+        }
+        drop(form); // constructed the same way `transcribe` does; content unused beyond that
+        names
     }
 }

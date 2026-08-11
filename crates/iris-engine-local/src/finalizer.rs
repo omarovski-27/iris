@@ -23,6 +23,13 @@ pub struct FinalizerConfig {
     pub vad_path: std::path::PathBuf,
     pub language: Option<String>,
     pub num_threads: i32,
+    /// The user's vocabulary (names, jargon, acronyms), already joined into
+    /// one initial-prompt string by `iris_core::engine::vocabulary_prompt` —
+    /// this crate does not depend on `iris-core`, so the caller (`iris-app`'s
+    /// engine adapter) does that joining and hands over a plain `Option`.
+    /// `None` for an empty vocabulary, so an unconfigured user adds no
+    /// initial prompt at all rather than an empty one.
+    pub initial_prompt: Option<String>,
 }
 
 /// Batch finalizer interface (not streaming).
@@ -71,6 +78,7 @@ pub struct WhisperFinalizer {
     vad: std::sync::Mutex<whisper_rs::WhisperVadContext>,
     language: Option<String>,
     num_threads: i32,
+    initial_prompt: Option<String>,
 }
 
 #[cfg(feature = "whisper")]
@@ -99,6 +107,7 @@ impl WhisperFinalizer {
             vad: std::sync::Mutex::new(vad),
             language: config.language.or_else(|| Some("en".into())),
             num_threads: config.num_threads,
+            initial_prompt: config.initial_prompt,
         })
     }
 
@@ -159,6 +168,9 @@ impl BatchFinalizer for WhisperFinalizer {
             whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
         if let Some(lang) = &self.language {
             params.set_language(Some(lang.as_str()));
+        }
+        if let Some(prompt) = &self.initial_prompt {
+            params.set_initial_prompt(prompt);
         }
         params.set_n_threads(self.num_threads);
         params.set_print_special(false);

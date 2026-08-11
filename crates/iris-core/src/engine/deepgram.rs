@@ -296,18 +296,37 @@ const FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// rejected stall-detector design shipped with.
 const NEGLIGIBLE_AUDIO_SECS: f64 = 0.1;
 
+/// Deepgram's documented cap on keyterm prompting: 500 tokens combined across
+/// every `keyterm` in one request
+/// (<https://developers.deepgram.com/docs/keyterm>, checked 2026-08-11) —
+/// exceeding it "will return an error", which this project treats as a
+/// dictation failure it must not cause. No tokenizer is available here, so
+/// [`keyterm_query_params`] approximates a token as one whitespace-separated
+/// word, which undercounts multi-syllable words but never overcounts; an
+/// undercount only means the real server-side cap (which still applies)
+/// arrives a little later than this local one does.
+const MAX_KEYTERM_TOKENS: usize = 500;
+
 pub struct DeepgramEngine {
     key: String,
     url: String,
+    /// See [`EngineOptions::vocabulary`]. Kept off [`DeepgramEngine`]'s `url`
+    /// field (and out of its `Debug` impl below) so this user data cannot
+    /// reach a log line, a panic message or a bug report the way a stray
+    /// `{:?}` on the whole engine already cannot leak the key — the full
+    /// connect URL, keyterms included, is only ever assembled locally inside
+    /// [`DeepgramEngine::open`].
+    vocabulary: Vec<String>,
 }
 
-/// Hand-written so the API key cannot reach a log line, a panic message or a
-/// bug report through a stray `{:?}`.
+/// Hand-written so the API key and the user's vocabulary cannot reach a log
+/// line, a panic message or a bug report through a stray `{:?}`.
 impl std::fmt::Debug for DeepgramEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeepgramEngine")
             .field("url", &self.url)
             .field("key", &"<redacted>")
+            .field("vocabulary_terms", &self.vocabulary.len())
             .finish()
     }
 }
@@ -361,8 +380,62 @@ impl DeepgramEngine {
             url.push_str(&format!("&language={lang}"));
         }
 
-        Ok(Self { key, url })
+        Ok(Self {
+            key,
+            url,
+            vocabulary: opts.vocabulary.clone(),
+        })
     }
+
+    /// The URL actually used to connect: [`DeepgramEngine::url`] plus this
+    /// session's `keyterm` parameters, assembled fresh here rather than once
+    /// in [`DeepgramEngine::from_env`] — see the field doc on `vocabulary`
+    /// for why keeping them apart matters.
+    fn connect_url(&self) -> String {
+        format!("{}{}", self.url, keyterm_query_params(&self.vocabulary))
+    }
+}
+
+/// Appends Deepgram's `keyterm` query parameters for nova-3's keyterm
+/// prompting (see [`EngineOptions::vocabulary`]'s doc comment for why this is
+/// the current mechanism for the model this engine defaults to). Truncates
+/// rather than erroring past [`MAX_KEYTERM_TOKENS`] — Deepgram's own
+/// server-side cap turns an over-long list into a failed connection, and a
+/// quietly shorter hint list is the better trade.
+///
+/// Each term becomes its own repeated `keyterm=` parameter and is
+/// percent-encoded individually, since `keyterm` does not accept a
+/// comma/semicolon-separated list — only a repeated parameter, per the same
+/// docs — and a term can itself contain spaces or punctuation.
+fn keyterm_query_params(vocabulary: &[String]) -> String {
+    let mut out = String::new();
+    let mut tokens_used = 0usize;
+    let mut truncated = false;
+    for term in vocabulary {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let tokens = term.split_whitespace().count().max(1);
+        if tokens_used + tokens > MAX_KEYTERM_TOKENS {
+            truncated = true;
+            break;
+        }
+        tokens_used += tokens;
+        out.push_str("&keyterm=");
+        out.push_str(&percent_encoding::utf8_percent_encode(
+            term,
+            percent_encoding::NON_ALPHANUMERIC,
+        ).to_string());
+    }
+    if truncated {
+        // Counts only — never the terms themselves, per this module's own
+        // no-leak rule for the vocabulary.
+        vlog!(
+            "deepgram: vocabulary trimmed to fit the {MAX_KEYTERM_TOKENS}-token keyterm limit"
+        );
+    }
+    out
 }
 
 impl Engine for DeepgramEngine {
@@ -385,7 +458,7 @@ impl Engine for DeepgramEngine {
         let (audio_tx, audio_rx) = unbounded_channel::<Command>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
-        let url = self.url.clone();
+        let url = self.connect_url();
         let key = self.key.clone();
         let tx = event_tx.clone();
         rt.spawn(async move {
@@ -1018,6 +1091,7 @@ mod tests {
         let engine = DeepgramEngine {
             key: "x".into(),
             url: DEFAULT_BASE_URL.into(),
+            vocabulary: Vec::new(),
         };
         assert!(
             engine.connect_budget() == Some(CONNECT_TIMEOUT)
@@ -1520,6 +1594,69 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_vocabulary_adds_no_query_params() {
+        assert_eq!(keyterm_query_params(&[]), "");
+        assert_eq!(
+            keyterm_query_params(&["  ".into(), "".into()]),
+            "",
+            "whitespace-only entries must not become an empty keyterm"
+        );
+    }
+
+    #[test]
+    fn each_term_becomes_its_own_percent_encoded_keyterm_param() {
+        let vocabulary = vec!["Deepgram".into(), "iris app".into()];
+        let query = keyterm_query_params(&vocabulary);
+        assert_eq!(query, "&keyterm=Deepgram&keyterm=iris%20app");
+    }
+
+    #[test]
+    fn a_vocabulary_over_the_token_cap_is_truncated_not_rejected() {
+        // Each term is 4 words, so 130 terms is 520 tokens — over the
+        // 500-token cap — and the 126th term (504 tokens) is where it stops.
+        let vocabulary: Vec<String> = (0..130).map(|i| format!("term {i} alpha beta")).collect();
+        let query = keyterm_query_params(&vocabulary);
+        let count = query.matches("&keyterm=").count();
+        assert!(count < 130, "the oversized list must be shortened: {count} terms sent");
+        assert!(count > 0, "a truncated list must still carry what fits");
+    }
+
+    #[test]
+    fn connect_url_appends_keyterms_to_the_base_url_and_empty_vocabulary_is_unchanged() {
+        let base = DeepgramEngine {
+            key: "x".into(),
+            url: DEFAULT_BASE_URL.into(),
+            vocabulary: Vec::new(),
+        };
+        assert_eq!(base.connect_url(), DEFAULT_BASE_URL, "empty vocabulary must not touch the URL");
+
+        let with_terms = DeepgramEngine {
+            key: "x".into(),
+            url: DEFAULT_BASE_URL.into(),
+            vocabulary: vec!["Zipformer".into()],
+        };
+        assert_eq!(
+            with_terms.connect_url(),
+            format!("{DEFAULT_BASE_URL}&keyterm=Zipformer")
+        );
+    }
+
+    #[test]
+    fn from_env_carries_the_configured_vocabulary_through_to_connect_url() {
+        // Bypasses the environment entirely (no IRIS_DEEPGRAM_KEY needed, and
+        // no risk of racing another test's env var) by building the same
+        // struct `from_env` would, then exercising the real `connect_url`.
+        let engine = DeepgramEngine {
+            key: "x".into(),
+            url: DEFAULT_BASE_URL.into(),
+            vocabulary: vec!["Deepgram".into(), "Iris".into()],
+        };
+        let url = engine.connect_url();
+        assert!(url.contains("keyterm=Deepgram"), "{url}");
+        assert!(url.contains("keyterm=Iris"), "{url}");
     }
 
     #[test]

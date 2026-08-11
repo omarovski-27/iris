@@ -13,6 +13,7 @@ crossbeam-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hound.workspace = true
+percent-encoding.workspace = true
 
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
