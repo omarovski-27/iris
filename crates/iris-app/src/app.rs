@@ -76,6 +76,11 @@ pub enum Command {
     Reload,
     /// Leave the loop and exit.
     Quit,
+    /// Record that the "Iris is still running in the tray" hint has been
+    /// shown, so it never shows again. Sent once, the first time the
+    /// settings window's close hides it — see
+    /// `crate::window::state::WindowState::note_hidden_to_tray`.
+    AcknowledgeTrayHint,
 }
 
 impl Command {
@@ -95,6 +100,7 @@ impl Command {
             Command::SetTheme(theme) => config.theme = *theme,
             Command::SetHotkey(key) => config.hotkey = *key,
             Command::SetOverlayEnabled(enabled) => config.overlay_enabled = *enabled,
+            Command::AcknowledgeTrayHint => config.tray_close_hint_shown = true,
             Command::OpenSettings | Command::Reload | Command::Quit => return false,
         }
         true
@@ -145,11 +151,17 @@ pub enum CommandOutcome {
 /// (see [`App::capture`]'s doc comment) instead of waiting for its turn on a
 /// command channel, so it must be able to observe the flip before it can
 /// possibly observe the message that follows it. The tray's Quit item
-/// (`tray::spawn`) and the settings window's close button
-/// (`crate::window::state::Env::request_quit` — `X`, Alt+F4, and the
-/// taskbar's "Close window" all arrive there as the same signal) both call
-/// this rather than storing the flag directly, so a close path added later
-/// cannot reintroduce the narrower, tray-only fix this replaces.
+/// (`tray::spawn`) calls this rather than storing the flag directly, so a
+/// close path added later cannot reintroduce the narrower, tray-only fix
+/// this replaces.
+///
+/// `crate::window::state::Env::request_quit` is the same sequence for a
+/// window-driven quit and still exists for that purpose, but the settings
+/// window's own close button (`X`, Alt+F4, the taskbar's "Close window") no
+/// longer calls it — closing that window hides it and leaves Iris running,
+/// deliberately, per the captain's 2026-08-11 request; see
+/// `window::ui::draw_root`'s doc comment for the full story and `AGENTS.md`.
+/// The tray's Quit item is today the only caller that actually ends the app.
 pub fn flip_quit_flag(quit_flag: &AtomicBool) {
     quit_flag.store(true, Ordering::Release);
 }
@@ -325,9 +337,10 @@ pub struct App<A: AudioSource> {
     /// latch auto-stops after [`MAX_LATCH_DURATION`]; a test overrides this
     /// so it can exercise the cap firing without a five-minute wait.
     latch_cap: Option<Duration>,
-    /// Flipped by whichever UI surface sends [`Command::Quit`] — the tray's
-    /// Quit item, or the settings window's close button — the instant it
-    /// sends it, via [`flip_quit_flag`]. Both flip before `App::run`'s own
+    /// Flipped by whichever UI surface sends [`Command::Quit`] — today only
+    /// the tray's Quit item; the settings window's close button no longer
+    /// sends it, see [`flip_quit_flag`]'s doc comment — the instant it sends
+    /// it, via [`flip_quit_flag`]. That flips before `App::run`'s own
     /// select loop ever gets a turn, because that loop is blocked inside
     /// `dictate` for as long as a finalise is running (see
     /// [`App::capture`]'s doc comment). Polling this from inside a finalise
@@ -400,10 +413,11 @@ impl<A: AudioSource> App<A> {
 
     /// Share the app's quit flag with this app, in place of the private one
     /// [`App::new`] creates. The real resident loop wires the same [`Arc`]
-    /// into both `tray::spawn` and `window::spawn`, so a click on Quit —
-    /// from the tray *or* the settings window's close button — is visible
-    /// to a finalise wait already in progress; see [`App::capture`]'s doc
-    /// comment. Tests that only send [`Command::Quit`] on `control` or
+    /// into both `tray::spawn` and `window::spawn` (the window keeps a copy
+    /// even though its close button no longer flips it — see
+    /// [`flip_quit_flag`]'s doc comment), so a click on the tray's Quit is
+    /// visible to a finalise wait already in progress; see [`App::capture`]'s
+    /// doc comment. Tests that only send [`Command::Quit`] on `control` or
     /// `window_commands` do not need this — that path is unaffected.
     #[must_use]
     pub fn with_quit_flag(mut self, quit_flag: Arc<AtomicBool>) -> Self {
@@ -748,6 +762,16 @@ impl<A: AudioSource> App<A> {
                     Err(e) => outcome = Self::persist_failed(&e),
                 }
             }
+            Command::AcknowledgeTrayHint => {
+                // Book-keeping only: no restart, no rebuild, and quiet on
+                // success — the console stays quiet by product decision and
+                // nobody but a future migration needs to know this ran. See
+                // `Command::apply_to`.
+                command.apply_to(&mut self.config);
+                if let Err(e) = self.persist(&command) {
+                    outcome = Self::persist_failed(&e);
+                }
+            }
             Command::OpenSettings => self.window.open(),
             Command::Reload => match Config::load(&self.config_path) {
                 Ok(loaded) => {
@@ -1007,10 +1031,11 @@ impl<A: AudioSource> App<A> {
     /// `AGENTS.md`). Instead `finish` runs on a spawned thread here, and this
     /// function polls that thread's result against [`App::quit_flag`] rather
     /// than blocking on it outright: the flag is flipped via
-    /// [`flip_quit_flag`] by whichever UI surface sends `Command::Quit` — the
-    /// tray (`tray::spawn`) or the settings window's close button
-    /// (`window::state::Env::request_quit`) — at the same instant it sends
-    /// it, so it can be noticed without waiting for `App::run`'s own turn.
+    /// [`flip_quit_flag`] by whichever UI surface sends `Command::Quit` —
+    /// today only the tray (`tray::spawn`); see `flip_quit_flag`'s doc
+    /// comment for why the settings window's close button no longer does —
+    /// at the same instant it sends it, so it can be noticed without waiting
+    /// for `App::run`'s own turn.
     /// If the flag wins the race, this returns
     /// [`CaptureOutcome::QuitRequested`] immediately and hands the
     /// still-running finalise to a second, detached thread that delivers it

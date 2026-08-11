@@ -436,6 +436,11 @@ pub struct Config {
     /// section at all — nothing suggesting the user ought to paste one in.
     #[serde(skip_serializing_if = "Keys::is_empty")]
     pub keys: Keys,
+    /// Whether the settings window's "Iris is still running in the tray"
+    /// hint has already been shown once. Internal book-keeping, not a
+    /// setting meant to be hand-edited — see
+    /// `crate::window::state::WindowState::note_hidden_to_tray`.
+    pub tray_close_hint_shown: bool,
 }
 
 impl Default for Config {
@@ -453,6 +458,7 @@ impl Default for Config {
             inject: InjectConfig::default(),
             history: HistoryConfig::default(),
             keys: Keys::default(),
+            tray_close_hint_shown: false,
         }
     }
 }
@@ -903,12 +909,24 @@ mod tests {
     }
 
     #[test]
+    fn tray_close_hint_shown_defaults_off_and_round_trips_on() {
+        assert!(!Config::from_toml("").unwrap().tray_close_hint_shown);
+        let config = Config::from_toml("tray_close_hint_shown = true\n").unwrap();
+        assert!(config.tray_close_hint_shown);
+        assert!(config
+            .to_toml()
+            .unwrap()
+            .contains("tray_close_hint_shown = true"));
+    }
+
+    #[test]
     fn round_trips_through_toml() {
         let mut config = Config {
             engine: EngineChoice::Deepgram,
             hotkey: Key::F9,
             theme: Theme::Light,
             show_live_text: true,
+            tray_close_hint_shown: true,
             ..Config::default()
         };
         config.polish.budget_ms = 220;

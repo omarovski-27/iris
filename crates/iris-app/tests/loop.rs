@@ -1236,15 +1236,17 @@ fn a_tray_quit_does_not_wait_for_an_in_flight_finalise() {
 fn a_window_close_does_not_wait_for_an_in_flight_finalise() {
     // Companion to `a_tray_quit_does_not_wait_for_an_in_flight_finalise`.
     // The earlier fix (#29) wired `quit_flag` into the tray only — a Quit
-    // arriving on the *window's* channel (from the settings window's close
-    // button: `X`, Alt+F4, or the taskbar's "Close window") still raced the
-    // finalise wait unprotected, which is why the maintainer could still not
-    // close Iris after that fix landed. `window::state::Env::request_quit`
-    // now performs the identical flip-then-send ordering the tray already
-    // did, just over `window_commands` instead of `control`; this
-    // reproduces that exact ordering directly against `App`, which is the
-    // half of the fix a real Windows window is needed to exercise
-    // end-to-end (see the PR description for what remains unverified).
+    // arriving on the *window's* channel still raced the finalise wait
+    // unprotected. #31 fixed that by giving `window::state::Env::
+    // request_quit` the identical flip-then-send ordering the tray already
+    // used, over `window_commands` instead of `control`. The settings
+    // window's own close button (`X`, Alt+F4, the taskbar's "Close window")
+    // no longer calls `request_quit` at all — closing it now hides the
+    // window and leaves Iris running (see `window::ui::draw_root`'s doc
+    // comment) — but `App` must still handle a `Command::Quit` arriving on
+    // `window_commands` exactly this way if anything else ever sends one,
+    // so this keeps exercising that ordering directly against `App` rather
+    // than deleting coverage the settings window itself no longer provides.
     let mut rig = rig().with_final_timeout(Duration::from_secs(2));
     rig.app.set_engine(Arc::new(SlowFinalizeEngine {
         delay: Duration::from_millis(300),
