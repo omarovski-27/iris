@@ -91,6 +91,17 @@ Set `engine = "deepgram"` / `"groq"` / `"mock"` / `"local"` in the config (or `-
 
 `local` needs `--features local-native` and a native Windows build (sherpa/whisper do not cross-compile from WSL). See [`crates/iris-engine-local/README.md`](crates/iris-engine-local/README.md).
 
+### Custom vocabulary
+
+Names, jargon and acronyms Iris keeps mishearing go in the Settings window's
+**Vocabulary** card — one term per line — or directly in `config.toml` as
+`vocabulary = ["Term", "Another term"]`. Deepgram gets these as `keyterm`
+hints (nova-3's keyterm prompting); Groq and the local Whisper engine have no
+keyword-list mechanism, so they get the list folded into their one initial
+prompt instead. Empty by default, which changes nothing; a very long list is
+trimmed to whatever the active engine allows rather than failing the
+dictation.
+
 ### Offline smoke (any platform)
 
 ```bash
