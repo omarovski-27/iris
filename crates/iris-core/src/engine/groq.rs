@@ -16,18 +16,15 @@ use crossbeam_channel::Receiver;
 
 use crate::{audio, vlog};
 
-use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
+/// Groq's documented cap on the `prompt` field: "limited to 224 tokens"
+/// (Groq's speech-to-text docs, console.groq.com/docs/speech-to-text, checked
+/// 2026-08-11). Shared with the local Whisper finalizer, which bounds by word
+/// count instead of tokens — see its own doc comment for why.
 use super::MAX_VOCABULARY_PROMPT_WORDS as MAX_PROMPT_WORDS;
+use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
 
 const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
 const DEFAULT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
-
-/// Groq's documented cap on the `prompt` field: "limited to 224 tokens"
-/// (Groq's speech-to-text docs, console.groq.com/docs/speech-to-text, checked
-/// 2026-08-11). [`MAX_PROMPT_WORDS`] (= [`super::MAX_VOCABULARY_PROMPT_WORDS`],
-/// shared with the local Whisper finalizer) bounds by word count instead of
-/// tokens, staying comfortably under this real limit rather than at it; see
-/// its own doc comment for why.
 
 /// How long to wait for the socket to come up, before a byte of audio moves.
 ///
@@ -388,7 +385,10 @@ mod tests {
     #[test]
     fn an_empty_vocabulary_adds_no_prompt() {
         let opts = EngineOptions::default();
-        assert_eq!(super::super::vocabulary_prompt(&opts.vocabulary, MAX_PROMPT_WORDS), None);
+        assert_eq!(
+            super::super::vocabulary_prompt(&opts.vocabulary, MAX_PROMPT_WORDS),
+            None
+        );
     }
 
     #[test]

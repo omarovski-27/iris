@@ -1331,7 +1331,10 @@ mod tests {
         let env = env_with(&config_path, &tx, &outcomes, &devices, &reopen_signal);
         let state = WindowState::new(&env);
 
-        assert!(state.config.vocabulary.is_empty(), "an empty default config");
+        assert!(
+            state.config.vocabulary.is_empty(),
+            "an empty default config"
+        );
         assert!(state.vocabulary_input.is_empty());
         assert!(!state.vocabulary_dirty());
     }

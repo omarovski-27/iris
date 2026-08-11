@@ -156,9 +156,12 @@ fn vocabulary_section(
             let count = state.config.vocabulary.len();
             if count > 0 {
                 ui.label(
-                    RichText::new(format!("{count} term{} active", if count == 1 { "" } else { "s" }))
-                        .size(11.0)
-                        .color(chrome::ink_faint(theme)),
+                    RichText::new(format!(
+                        "{count} term{} active",
+                        if count == 1 { "" } else { "s" }
+                    ))
+                    .size(11.0)
+                    .color(chrome::ink_faint(theme)),
                 );
             }
         });

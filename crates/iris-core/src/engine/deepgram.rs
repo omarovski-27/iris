@@ -423,17 +423,15 @@ fn keyterm_query_params(vocabulary: &[String]) -> String {
         }
         tokens_used += tokens;
         out.push_str("&keyterm=");
-        out.push_str(&percent_encoding::utf8_percent_encode(
-            term,
-            percent_encoding::NON_ALPHANUMERIC,
-        ).to_string());
+        out.push_str(
+            &percent_encoding::utf8_percent_encode(term, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        );
     }
     if truncated {
         // Counts only — never the terms themselves, per this module's own
         // no-leak rule for the vocabulary.
-        vlog!(
-            "deepgram: vocabulary trimmed to fit the {MAX_KEYTERM_TOKENS}-token keyterm limit"
-        );
+        vlog!("deepgram: vocabulary trimmed to fit the {MAX_KEYTERM_TOKENS}-token keyterm limit");
     }
     out
 }
@@ -1620,7 +1618,10 @@ mod tests {
         let vocabulary: Vec<String> = (0..130).map(|i| format!("term {i} alpha beta")).collect();
         let query = keyterm_query_params(&vocabulary);
         let count = query.matches("&keyterm=").count();
-        assert!(count < 130, "the oversized list must be shortened: {count} terms sent");
+        assert!(
+            count < 130,
+            "the oversized list must be shortened: {count} terms sent"
+        );
         assert!(count > 0, "a truncated list must still carry what fits");
     }
 
@@ -1631,7 +1632,11 @@ mod tests {
             url: DEFAULT_BASE_URL.into(),
             vocabulary: Vec::new(),
         };
-        assert_eq!(base.connect_url(), DEFAULT_BASE_URL, "empty vocabulary must not touch the URL");
+        assert_eq!(
+            base.connect_url(),
+            DEFAULT_BASE_URL,
+            "empty vocabulary must not touch the URL"
+        );
 
         let with_terms = DeepgramEngine {
             key: "x".into(),

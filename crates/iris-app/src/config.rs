@@ -946,8 +946,7 @@ mod tests {
     /// rule that a partial or older file is not an error.
     #[test]
     fn a_file_without_a_vocabulary_section_still_parses() {
-        let config =
-            Config::from_toml("engine = \"deepgram\"\nhotkey = \"f9\"\n").unwrap();
+        let config = Config::from_toml("engine = \"deepgram\"\nhotkey = \"f9\"\n").unwrap();
         assert!(config.vocabulary.is_empty());
         assert_eq!(config.engine, EngineChoice::Deepgram);
     }
