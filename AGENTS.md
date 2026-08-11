@@ -504,6 +504,38 @@ wrongly-deleted word is worse than a duplicated one. Containment rather than
 overlap, and where the one tolerance constant may and may not be applied, are
 load-bearing; the reasoning is in the same module doc.
 
+**Keeping a not-fully-covered re-emission whole can still leave an exact
+duplicate at the seam — `strip_seam_duplicate` (`deepgram.rs`) closes that
+specific gap, separately from the keep/suppress decision above.** A
+2026-08-04 report of garbled multi-sentence dictation (several final
+segments, each one an extra seam) traced — by code inspection and synthetic
+reproduction, not the captain's real log; see below — to exactly the case the
+containment module doc already named as its own accepted cost: `[0.0, 1.5]
+"the quick brown fox"` followed by `[1.4, 5.0] "fox jumps over the lazy
+dog"` is correctly kept whole (dropping it would lose six real words), but
+the repeated `"fox"` at the seam used to survive into the transcript
+unchanged. The fix only ever removes an *exact*, case/punctuation-insensitive
+match, and only when the two segments' spans independently overlap by more
+than `SPAN_TOLERANCE_SECS` — text equality alone is not trusted, same reason
+`is_fully_covered` is not either, which is what keeps a genuine "No. No." (no
+span overlap) or "Wait. Wait, that's not right." untouched. It never revises
+`prev_text` (already shown to the user) and never touches `is_fully_covered`
+or the keep/suppress threshold itself — tightening *that* needs live
+Deepgram traffic this sandboxed environment cannot obtain, which is exactly
+`iris-dedup-verify-live-spans`'s separately-tracked job, not this fix's. A
+re-emission that *reworks* the overlapping words rather than repeating them
+verbatim is still unaddressed by either mechanism.
+
+**The captain's real `history.jsonl` is not reachable from a Linux dev
+sandbox — treat any task that leans on it as needing a different diagnostic
+path.** It lives under `%LOCALAPPDATA%\IrisConfig\iris\` on the captain's own
+Windows machine; this repo's dev/CI environments have no Windows interop, so
+a from-scratch filesystem search here finds nothing (confirmed, not merely
+assumed, while investigating the report above). When a task brief cites that
+log as the evidence source, expect to substitute code inspection plus a
+synthetic reproduction (built from invented text, never real transcript
+content) and say so explicitly rather than fabricating log-derived numbers.
+
 **`FINALIZE_ACK_TIMEOUT` and `FINALIZE_TIMEOUT` do not bound how long a
 dictation can hang.** They bound `deepgram.rs`'s own internal wait
 (ack-before-`CloseStream`, then silence-after-`CloseStream` — the second is

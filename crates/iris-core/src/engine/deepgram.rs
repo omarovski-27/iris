@@ -129,9 +129,25 @@
 //! a word, and that is the cheaper error by the rule this whole feature
 //! exists under (a wrongly-deleted word is strictly worse than a duplicated
 //! one). What is *not* done is trimming the covered prefix off such a
-//! segment before keeping it: cutting words out of a transcript by timing
-//! arithmetic is a bigger risk than the duplicate it would avoid, and more
-//! machinery than this guard is meant to carry.
+//! segment by **timing arithmetic** before keeping it: cutting words out of a
+//! transcript by computing a cutoff instant is a bigger risk than the
+//! duplicate it would avoid, and more machinery than this guard is meant to
+//! carry.
+//!
+//! That seam duplicate compounds: a several-sentence dictation produces one
+//! segment per natural pause, so every additional sentence is another seam
+//! and another chance for a boundary revision to leave a repeated word or
+//! short phrase in the output — the shape a 2026-08 garbled-multi-sentence
+//! report traced back to. [`strip_seam_duplicate`] closes that specific gap
+//! without touching the keep/suppress decision above, and without the timing
+//! arithmetic just ruled out: it removes a run of *exactly*-repeated words
+//! from the start of the segment being kept only when the two segments'
+//! spans independently overlap — text equality alone is not trusted, for the
+//! same "No. No." reason `is_fully_covered` is not either — and it never
+//! revises `prev_text`, which is already on the user's screen. It is
+//! deliberately narrower than a general fix: it cannot help a re-emission
+//! that reworks the overlapping words rather than repeating them verbatim,
+//! only the exact-repeat case the worked example above shows.
 //!
 //! No comparison in that containment test adds slack anywhere, and that is
 //! what enforces the direction rather than any claim about it. The coverage
@@ -187,12 +203,17 @@
 //! that is how they were written, not because it was observed in captured
 //! traffic. If real re-emissions instead arrive with slightly wider
 //! boundaries than the finals they repeat, this guard never fires and the
-//! duplicate still reaches the user. That is the conservative end of the
-//! tradeoff this feature accepts, and it is deliberately not widened to
-//! catch more — a duplicate is cheaper than a deletion. The `--verbose` log
-//! line on the suppressed branch is what would settle it against a real
-//! session; until then the containment shape is an assumption, not a
-//! measurement.
+//! duplicate still reaches the user — [`strip_seam_duplicate`] cleans up the
+//! exact-repeat case at the seam, but a re-emission with *reworded* overlap
+//! is untouched by either mechanism. That is the conservative end of the
+//! tradeoff this feature accepts, and it is deliberately not widened to catch
+//! more — a duplicate is cheaper than a deletion. The `--verbose` log line on
+//! the suppressed branch is what would settle it against a real session;
+//! until then the containment shape is an assumption, not a measurement. That
+//! verification is `iris-dedup-verify-live-spans`'s job, not this one's:
+//! tightening `is_fully_covered` itself needs live traffic this codebase does
+//! not have, so this fix stops at the text-level seam cleanup, which needed
+//! none.
 //!
 //! Missing or unusable timing — no `start`/`duration` on the message, a
 //! non-finite value, a negative `start`, or a non-positive `duration` (a
@@ -756,6 +777,79 @@ fn is_fully_covered(new_span: (f64, f64), mut accepted: Vec<(f64, f64)>) -> bool
     false
 }
 
+/// Whether two spans share more than a hairline of audio — weaker than
+/// [`is_fully_covered`], which asks whether one is *entirely* explained by
+/// the other. Used only as supporting evidence for [`strip_seam_duplicate`],
+/// never for the keep/suppress decision itself.
+///
+/// Requires the shared amount to exceed [`SPAN_TOLERANCE_SECS`], for the same
+/// reason `is_fully_covered` treats a span that short as unusable evidence: a
+/// segment boundary reported as two independently rounded decimals can overlap
+/// by a fraction of a millisecond purely from rounding noise. Without this
+/// floor, the module doc's own "No." / "No." hairline-boundary case —
+/// `[0.0, 0.4400001]` followed by `[0.44, 0.88]`, overlapping by `0.0000001`s —
+/// would read as "real" overlap and delete a genuinely repeated word, exactly
+/// the failure class this whole guard exists to prevent.
+fn spans_overlap(a: (f64, f64), b: (f64, f64)) -> bool {
+    let shared = a.1.min(b.1) - a.0.max(b.0);
+    shared > SPAN_TOLERANCE_SECS
+}
+
+/// When a final segment is kept (not suppressed — see [`is_fully_covered`]) but
+/// its leading words exactly repeat the trailing words of the previously
+/// accepted segment, and the two segments' spans actually overlap, drop the
+/// duplicated leading words from `new_text` before it is appended.
+///
+/// This is the seam the module doc's "Suppressing a re-emitted segment"
+/// section names directly: `[0.0, 1.5] "the quick brown fox"` followed by
+/// `[1.4, 5.0] "fox jumps over the lazy dog"` is not fully covered, so it is
+/// rightly kept in full rather than dropped — but the repeated `"fox"` at the
+/// seam is still a legible, exact, evidence-backed duplicate, and this closes
+/// exactly that gap.
+///
+/// Deliberately narrower than [`is_fully_covered`]'s job: it never decides
+/// *whether* to keep a segment, only cleans up the join once that answer is
+/// already "keep it", and it never touches `prev_text` — text already shown
+/// to the user is never revised, matching the rule the module doc already
+/// states for this reason. Two independent conditions must both hold before
+/// anything is removed:
+///
+/// - **Exact text match** (case- and surrounding-punctuation-insensitive) —
+///   never a guess, never a partial or fuzzy match.
+/// - **Overlapping spans** — direct evidence the repeat is the same instant of
+///   audio being described twice, not two words the speaker genuinely said
+///   back to back. This is what leaves a genuine "Wait. Wait, that's not
+///   right." — whose spans do not overlap — untouched: text equality alone
+///   authorized the previous, now-removed dedup guard, and this crate does
+///   not repeat that mistake.
+fn strip_seam_duplicate(
+    prev_text: &str,
+    prev_span: (f64, f64),
+    new_text: &str,
+    new_span: (f64, f64),
+) -> String {
+    if !spans_overlap(prev_span, new_span) {
+        return new_text.to_string();
+    }
+    let prev_words: Vec<&str> = prev_text.split_whitespace().collect();
+    let new_words: Vec<&str> = new_text.split_whitespace().collect();
+    let normalize = |w: &str| {
+        w.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    let max_run = prev_words.len().min(new_words.len());
+    let overlap = (1..=max_run)
+        .rev()
+        .find(|&n| {
+            prev_words[prev_words.len() - n..]
+                .iter()
+                .map(|w| normalize(w))
+                .eq(new_words[..n].iter().map(|w| normalize(w)))
+        })
+        .unwrap_or(0);
+    new_words[overlap..].join(" ")
+}
+
 /// Accumulates Deepgram's segmented results into one transcript.
 ///
 /// Deepgram sends interim hypotheses for the current segment and then a final
@@ -826,7 +920,20 @@ impl Transcript {
                         );
                         suppressed = true;
                     }
-                    None => self.finals.push(FinalSegment { text, span }),
+                    None => {
+                        let text = match (span, self.finals.last()) {
+                            (Some(new_span), Some(prev)) => match prev.span {
+                                Some(prev_span) => {
+                                    strip_seam_duplicate(&prev.text, prev_span, &text, new_span)
+                                }
+                                None => text,
+                            },
+                            _ => text,
+                        };
+                        if !text.is_empty() {
+                            self.finals.push(FinalSegment { text, span });
+                        }
+                    }
                 }
             }
             // A re-emission of already-accepted audio says nothing about the
@@ -1127,16 +1234,118 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_running_past_accepted_coverage_is_kept_whole() {
+    fn a_segment_running_past_accepted_coverage_is_kept_whole_and_the_seam_is_cleaned() {
         // A revised or merged boundary that starts inside accepted audio and
         // then runs on into speech nobody has transcribed: keeping it whole
-        // may duplicate a word at the seam, and that is the cheaper error.
+        // is right (dropping it would lose "jumps over the lazy dog"), but
+        // the exact repeated word at the seam — evidenced by the overlapping
+        // spans, not guessed — is no longer left in.
         let mut t = Transcript::default();
         t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
         t.absorb(&results_with_span("fox jumps over the lazy dog", 1.4, 3.6));
         assert_eq!(
             t.finished_text(),
+            "the quick brown fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn a_seam_repeat_of_several_words_is_collapsed_not_just_one() {
+        // The overlap can be a whole phrase, not only the last word — every
+        // additional sentence in a long dictation is another seam like this.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("I went to the store and", 0.0, 2.0));
+        t.absorb(&results_with_span(
+            "the store and bought some milk",
+            1.8,
+            3.0,
+        ));
+        assert_eq!(
+            t.finished_text(),
+            "I went to the store and bought some milk"
+        );
+    }
+
+    #[test]
+    fn a_seam_repeat_ignores_case_and_trailing_punctuation() {
+        // Deepgram's per-segment smart-formatting can capitalise or punctuate
+        // the same word differently across a revised boundary; the match must
+        // still fire so the duplicate does not survive on a formatting
+        // technicality.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("I saw a Fox.", 0.0, 1.5));
+        t.absorb(&results_with_span("fox run across the yard", 1.4, 3.0));
+        assert_eq!(t.finished_text(), "I saw a Fox. run across the yard");
+    }
+
+    #[test]
+    fn a_genuine_repeated_word_with_no_span_overlap_is_never_touched() {
+        // "No. No." — the exact case the module doc's whole discriminator is
+        // built to protect. Text equality alone must never remove this: only
+        // overlapping spans authorize a seam collapse, and these do not
+        // overlap at all (the second "No." starts only once the first ends).
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("Wait.", 0.0, 0.4));
+        t.absorb(&results_with_span("Wait, that's not right.", 0.4, 1.6));
+        assert_eq!(t.finished_text(), "Wait. Wait, that's not right.");
+    }
+
+    #[test]
+    fn a_seam_collapse_never_revises_already_shown_text() {
+        // Only the newly-kept segment's leading words are ever dropped; the
+        // previously accepted segment is untouched, matching the rule that a
+        // re-emission never revises text already on the user's screen.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick brown Fox", 0.0, 1.5));
+        t.absorb(&results_with_span("fox jumps over the lazy dog", 1.4, 3.6));
+        assert!(
+            t.finished_text().starts_with("the quick brown Fox"),
+            "the accepted segment's own casing must survive: {}",
+            t.finished_text()
+        );
+    }
+
+    #[test]
+    fn missing_span_on_either_segment_skips_the_seam_collapse() {
+        // Ambiguous evidence is kept, not guessed at — same bias as the rest
+        // of the module. No span on the new segment:
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the quick brown fox", 0.0, 1.5));
+        t.absorb(&results("fox jumps over the lazy dog", true));
+        assert_eq!(
+            t.finished_text(),
             "the quick brown fox fox jumps over the lazy dog"
+        );
+
+        // No span on the previously accepted segment:
+        let mut t = Transcript::default();
+        t.absorb(&results("the quick brown fox", true));
+        t.absorb(&results_with_span("fox jumps over the lazy dog", 1.4, 3.6));
+        assert_eq!(
+            t.finished_text(),
+            "the quick brown fox fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn seam_collapse_compounds_across_a_several_sentence_dictation() {
+        // The failure this guards against grows with sentence count: every
+        // additional final segment is another seam, and a boundary revision
+        // at each one would otherwise leave a growing trail of duplicated
+        // words — the "sentences run together" shape a real multi-sentence
+        // hold can produce. A short, single-segment dictation never reaches
+        // this code path at all, which is why it is unaffected.
+        let mut t = Transcript::default();
+        t.absorb(&results_with_span("the first sentence ends", 0.0, 2.0));
+        t.absorb(&results_with_span("ends and the second begins", 1.8, 4.0));
+        t.absorb(&results_with_span(
+            "begins right before the third",
+            3.8,
+            6.0,
+        ));
+        assert_eq!(
+            t.finished_text(),
+            "the first sentence ends and the second begins right before the third"
         );
     }
 
@@ -1154,12 +1363,15 @@ mod tests {
     fn a_segment_running_past_coverage_by_less_than_the_tolerance_is_still_kept() {
         // The tolerance is never added to what counts as covered: an end that
         // exceeds the accepted coverage by even a fraction of a millisecond
-        // keeps the segment. This test fails if that direction is flipped.
+        // keeps the segment rather than suppressing it outright — this test
+        // fails if that direction is flipped. But kept is not the same as
+        // duplicated: the two spans share a full second of real audio and the
+        // text is an exact repeat, so the seam collapse still cleans it up.
         let mut t = Transcript::default();
         t.absorb(&results_with_span("hello there", 0.0, 1.5));
         let overshoot = SPAN_TOLERANCE_SECS / 5.0;
         t.absorb(&results_with_span("hello there", 0.5, 1.0 + overshoot));
-        assert_eq!(t.finished_text(), "hello there hello there");
+        assert_eq!(t.finished_text(), "hello there");
     }
 
     #[test]
