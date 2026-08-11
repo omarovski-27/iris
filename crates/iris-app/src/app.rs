@@ -243,6 +243,29 @@ const MAX_LATCH_DURATION: Duration = Duration::from_secs(5 * 60);
 /// from there.
 const LATCH_QUIT_POLL: Duration = Duration::from_millis(100);
 
+/// Bounded extra wait for the very first capture frames on a hold that ends
+/// having produced none at all — see `App::capture`'s tail-feed comment.
+///
+/// A warm microphone (`Config::audio.warm`, on by default) keeps its capture
+/// stream open for the app's whole life specifically so a dictation never
+/// pays a cold-open cost — but "the stream object is open" is not the same
+/// claim as "a frame is in the channel the instant the key comes up", and a
+/// short hold is exactly where the gap between those two shows: real-world
+/// session logs show the failures tagged "almost no audio reached the
+/// transcription engine" cluster overwhelmingly under ~2s of held key, median
+/// ~0.9s, while successful dictations run a median 9.3s — the same short-hold
+/// population, not a random slice of all dictations. A 9s hold loses nothing
+/// from a startup lag this size; a 1s hold can lose the entire utterance to
+/// it. This constant does not explain *why* the first frame is sometimes
+/// late (that needs live Windows telemetry this repo cannot gather — see
+/// `AGENTS.md`'s "almost no audio" entry), only that a short, bounded second
+/// chance for it costs nothing on every dictation that does not need it: the
+/// tail-feed's normal non-blocking drain runs first and unconditionally, and
+/// this extra wait is only entered when that drain still leaves the whole
+/// dictation at exactly zero captured samples — the one situation where the
+/// entire transcript is riding on whatever arrives next.
+const CAPTURE_START_GRACE: Duration = Duration::from_millis(300);
+
 /// Whether a hold released at `released_at` is short enough to be a
 /// candidate first tap of a double-tap latch, rather than an ordinary
 /// hold-to-talk release.
@@ -1306,6 +1329,21 @@ impl<A: AudioSource> App<A> {
             let mut tail = Vec::new();
             while let Ok(frame) = frames.try_recv() {
                 tail.extend_from_slice(&frame);
+            }
+            // Every frame already queued is drained above with no added
+            // latency, win or lose. Only when that leaves this dictation at
+            // literally zero captured samples — nothing fed during the whole
+            // hold and nothing sitting in the channel at key-up either — is
+            // there anything to gain from waiting: a hold with any real audio
+            // already has words to lose nothing by finalising now, so this
+            // never adds a millisecond to an ordinary dictation. See
+            // `CAPTURE_START_GRACE`'s doc comment for why a short hold is
+            // exactly the case this exists for.
+            if dictation.audio_secs() == 0.0 && tail.is_empty() {
+                let deadline = Instant::now() + CAPTURE_START_GRACE;
+                while let Ok(frame) = frames.recv_deadline(deadline) {
+                    tail.extend_from_slice(&frame);
+                }
             }
             if !tail.is_empty() {
                 if let Err(e) = dictation.feed(&tail) {
