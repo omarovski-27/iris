@@ -749,6 +749,36 @@ the hold collected, but never typed.
   assume it is fixed, and do not read the pre-`5e53f96` root-cause finding
   above as covering this failure mode too — they are different mechanisms
   that happen to share an error family.
+- **A 2026-08-11 fix (`CAPTURE_START_GRACE`, `app.rs`) closes one concrete,
+  test-provable gap in this failure family, without claiming to explain the
+  WASAPI-staleness theory above — that still needs live Windows telemetry
+  this repo cannot gather.** A 111-dictation, 42-failure session-log audit
+  found the "almost no audio" / "no transcript (silence)" / "heard audio but
+  no words" failures cluster overwhelmingly under ~2s of held key (median
+  ~0.9s), against a ~9.3s median for dictations that succeeded — the same
+  short-hold population, not a random slice. Regardless of *why* the
+  capture pipeline is sometimes slow to deliver its first frame (warm-mic
+  scheduling, or the WASAPI dormancy theory above), `App::capture`'s
+  tail-feed used to be a single non-blocking `try_recv` drain taken at the
+  exact instant of key-up: audio still in flight through the pipeline at
+  that instant was lost permanently, with no compensating wait analogous to
+  the connect-budget extension that already protects the *network* side of
+  this same short-hold shape (see `Dictation::extend_while_nothing_to_salvage`
+  above). The fix is narrow and provably zero-cost on every dictation that
+  does not need it: only when the fast drain still leaves the dictation at
+  *exactly zero* captured samples does it wait up to 300ms more for a first
+  frame — a hold that already has any real audio already has words to lose
+  nothing by finalising immediately. Proven by a portable regression test,
+  `a_short_hold_whose_first_frame_lands_just_after_key_up_still_transcribes`
+  (`iris-app/tests/loop.rs`), using a new `AudioGatedEngine` test double that
+  reproduces Deepgram's own `sent_secs < NEGLIGIBLE_AUDIO_SECS` gate
+  (`deepgram.rs`) without a real network — confirmed to fail without the fix
+  (via `git stash`) and pass with it. What this does *not* establish: the
+  real-hardware first-frame latency (unmeasurable from this sandbox — no
+  Windows, no microphone), whether it is worse after an idle gap, or whether
+  the separately-tracked "no transcript (silence)" / "heard audio but no
+  words" failures (real audio reached Deepgram, just no words back) share
+  this cause at all — treat those as open per the entry above.
 
 ## Maintaining this file
 

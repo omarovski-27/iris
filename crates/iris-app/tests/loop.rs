@@ -1101,6 +1101,60 @@ fn audio_captured_before_the_key_press_is_discarded() {
 }
 
 #[test]
+fn a_short_hold_whose_first_frame_lands_just_after_key_up_still_transcribes() {
+    // Reproduction for the maintainer's "almost no audio reached the
+    // transcription engine" failures: real session logs showed these
+    // clustered under ~2s of held key (median ~0.9s), against a ~9.3s median
+    // for dictations that succeeded — the same short-hold population, not a
+    // random slice of all dictations. A warm microphone keeps its capture
+    // stream open for the app's whole life, but "the stream is open" is not
+    // "a frame is already in the channel": before `CAPTURE_START_GRACE`
+    // (`app.rs`), `App::capture`'s tail-feed was a single non-blocking drain
+    // taken at the exact instant of key-up, so a hold that ends before the
+    // capture pipeline's first frame has landed lost the entire utterance —
+    // permanently, with no compensating wait, unlike the connect-budget
+    // extension that already protects the network side of the same shape.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(AudioGatedEngine));
+    let pressed_at = Instant::now();
+    let keys = rig.keys.clone();
+    let armed = rig.armed.clone();
+    let frames = rig.frames.clone();
+    let speaker = std::thread::spawn(move || {
+        armed.recv().expect("capture never armed");
+        // Held long enough to rule out the double-tap candidate window, but
+        // released with zero audio captured — the exact "almost no audio"
+        // shape: the key came up before the capture pipeline delivered
+        // anything.
+        std::thread::sleep(Duration::from_millis(450));
+        keys.send(HotkeyEvent::Up(Instant::now())).expect("key up");
+        // The capture pipeline's first frame lands a beat later — well
+        // inside the grace window, exactly like a warm mic that took a
+        // little longer than usual to actually start delivering audio.
+        std::thread::sleep(Duration::from_millis(50));
+        for chunk in speech().chunks(320) {
+            frames.send(chunk.to_vec()).expect("frame");
+        }
+    });
+
+    let app_frames = rig.app.frames();
+    let dictated = rig
+        .app
+        .dictate(pressed_at, &app_frames, &rig.keys_rx)
+        .expect("a late-starting capture must still produce a transcript");
+    speaker.join().expect("the speaker panicked");
+
+    assert_eq!(
+        dictated.record.text, TRANSCRIPT,
+        "the late-arriving audio must still reach the transcript"
+    );
+    assert!(
+        dictated.record.injected,
+        "the recovered words must be typed"
+    );
+}
+
+#[test]
 fn the_session_log_is_capped() {
     let mut rig = rig_with(|config| config.history.max_entries = 2);
     for _ in 0..4 {
@@ -2364,6 +2418,56 @@ impl Session for FixedSession {
     }
     fn finish(&mut self) -> anyhow::Result<()> {
         self.tx.send(TranscriptEvent::Final(self.text.into()))?;
+        Ok(())
+    }
+}
+
+/// Models the one piece of Deepgram's real behaviour this file's short-hold
+/// reproduction depends on: an empty transcript is not automatically "no
+/// speech" — `deepgram.rs`'s `conclude` reports "almost no audio reached the
+/// transcription engine" specifically when `finish()` is reached having had
+/// under 0.1s of real audio pushed to it, exactly the signature behind the
+/// maintainer's real session-log failures. `finish()` here looks at what
+/// `push()` actually received, the same way Deepgram's `sent_secs` does —
+/// not at wall-clock time, so this stays deterministic.
+struct AudioGatedEngine;
+
+struct AudioGatedSession {
+    samples: usize,
+    tx: Sender<TranscriptEvent>,
+    rx: Receiver<TranscriptEvent>,
+}
+
+impl Engine for AudioGatedEngine {
+    fn name(&self) -> &'static str {
+        "audio-gated"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        Ok(Box::new(AudioGatedSession { samples: 0, tx, rx }))
+    }
+}
+
+impl Session for AudioGatedSession {
+    fn push(&mut self, pcm: &[i16]) -> anyhow::Result<()> {
+        self.samples += pcm.len();
+        Ok(())
+    }
+    fn events(&self) -> &Receiver<TranscriptEvent> {
+        &self.rx
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        let event = if iris_core::audio::secs(self.samples) < 0.1 {
+            TranscriptEvent::Error(
+                "almost no audio reached the transcription engine — the key was likely \
+                 released before recording could start"
+                    .into(),
+            )
+        } else {
+            TranscriptEvent::Final(TRANSCRIPT.to_string())
+        };
+        self.tx.send(event)?;
         Ok(())
     }
 }
