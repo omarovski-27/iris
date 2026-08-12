@@ -211,22 +211,33 @@ Load-bearing beyond that crate:
   docs for why `eframe::run_native` then never returns during the ordinary
   hide/show cycle. `Env::request_quit` and `app::flip_quit_flag` are
   unchanged and still exist — the tray's Quit item is today the only caller
-  that reaches either. A one-time "Iris is still running" hint
-  (`crate::dialog::show_info`, fired on a detached thread so the modal
-  cannot block the hide it is announcing — see `window::shell::
-  show_close_hint`'s doc comment) shows the first time a close hides the
-  window, and `Config::tray_close_hint_shown` remembers that across
-  restarts via a new `Command::AcknowledgeTrayHint`, following the window's
-  usual "send a `Command`, never write `config.toml` directly" rule. Covered
-  by `window::ui::tests::closing_the_window_hides_it_and_leaves_the_app_running`
+  that reaches either. **Closing the window shows no notification.** An
+  earlier revision of this same feature added a one-time "Iris is still
+  running" hint on the first close (`crate::dialog::show_info`,
+  `Config::tray_close_hint_shown`, `Command::AcknowledgeTrayHint`) —
+  firstmate's own addition, not something the captain asked for. Removed
+  2026-08-12 at the captain's explicit request ("remove the windows
+  notification that pops up when i close it"); do not reintroduce it. The
+  hide-to-tray behaviour itself is unchanged, only the popup is gone.
+  `dialog::show_info` (the mechanism the hint used) was removed with it,
+  since nothing else called it; `dialog::show` (the error-styled message box
+  `main`'s panic/failure reporting and `notify.rs` use) is untouched. An
+  existing user's `config.toml` may still carry the now-dead
+  `tray_close_hint_shown` key from before this removal; `Config` keeps an
+  unread, `skip_serializing` field of that name (`pub` only so
+  `..Config::default()` construction elsewhere in the crate still compiles,
+  not because anything reads it) so `deny_unknown_fields` still tolerates
+  the old key instead of failing to parse, and saving the file drops it for
+  good — see the field's own doc comment in `config.rs`. Covered by
+  `window::ui::tests::closing_the_window_hides_it_and_leaves_the_app_running`
   (headless `egui::Context`, synthetic `close_requested`, asserts
   `CancelClose`+`Visible(false)` are queued, the quit flag stays clear, and
-  exactly one `Command::AcknowledgeTrayHint` goes out) and
-  `window::state::tests::note_hidden_to_tray_*`. **Nothing here — nor
-  anything else in this repo — can click a real window on real Windows**, so
-  whether `Visible(false)` after `CancelClose` really keeps the native
-  window alive rather than destroying it is reasoned from `eframe`'s own
-  source, not exercised end-to-end.
+  no command goes out at all) and
+  `config::tests::an_old_config_with_the_removed_tray_close_hint_key_still_parses`.
+  **Nothing here — nor anything else in this repo — can click a real window
+  on real Windows**, so whether `Visible(false)` after `CancelClose` really
+  keeps the native window alive rather than destroying it is reasoned from
+  `eframe`'s own source, not exercised end-to-end.
 - **Every close path — not only the tray — flips the same quit flag before
   sending `Command::Quit`, via the shared `app::flip_quit_flag`.** Superseded
   by the entry above for the settings window's own close button, which no

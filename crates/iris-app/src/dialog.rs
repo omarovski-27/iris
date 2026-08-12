@@ -6,9 +6,7 @@
 //! library crate rather than in the `iris` binary specifically so both
 //! `main`'s startup/run-failure reporting and [`crate::notify`]'s
 //! injection-failure notice can reach the same mechanism instead of keeping
-//! two copies that could drift. [`show_info`] is the same mechanism for a
-//! notice that isn't reporting a failure — the settings window's "still
-//! running in the tray" hint — so it does not borrow the error icon.
+//! two copies that could drift.
 
 /// Show `message` under `caption` in an error-styled message box, unless
 /// someone is watching a console that will outlive the process.
@@ -24,32 +22,12 @@
 /// apart.
 #[cfg(windows)]
 pub fn show(caption: &str, message: &str) {
-    show_with_icon(
-        caption,
-        message,
-        windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
-    );
+    show_with_icon(caption, message);
 }
 
 /// Off Windows there is no console-less launch path and no dialog to show.
 #[cfg(not(windows))]
 pub fn show(_caption: &str, _message: &str) {}
-
-/// Show `message` under `caption` in an information-styled message box — the
-/// same mechanism as [`show`], for a notice rather than a failure. Subject to
-/// the same shared-console suppression; see [`show`]'s doc comment.
-#[cfg(windows)]
-pub fn show_info(caption: &str, message: &str) {
-    show_with_icon(
-        caption,
-        message,
-        windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
-    );
-}
-
-/// Off Windows there is no console-less launch path and no dialog to show.
-#[cfg(not(windows))]
-pub fn show_info(_caption: &str, _message: &str) {}
 
 // `MessageBoxW` and `GetConsoleProcessList` have no safe wrapper. Both calls
 // are self-contained — one fills a stack buffer we own, the other shows a
@@ -57,15 +35,11 @@ pub fn show_info(_caption: &str, _message: &str) {}
 // function wide.
 #[allow(unsafe_code)]
 #[cfg(windows)]
-fn show_with_icon(
-    caption: &str,
-    message: &str,
-    icon: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
-) {
+fn show_with_icon(caption: &str, message: &str) {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Console::GetConsoleProcessList;
     use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
     };
 
     let mut pids = [0u32; 2];
@@ -90,7 +64,7 @@ fn show_with_icon(
             None,
             PCWSTR(text.as_ptr()),
             PCWSTR(caption.as_ptr()),
-            MB_OK | icon | MB_SETFOREGROUND | MB_TOPMOST,
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }

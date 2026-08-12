@@ -454,10 +454,14 @@ pub struct Config {
     /// section at all — nothing suggesting the user ought to paste one in.
     #[serde(skip_serializing_if = "Keys::is_empty")]
     pub keys: Keys,
-    /// Whether the settings window's "Iris is still running in the tray"
-    /// hint has already been shown once. Internal book-keeping, not a
-    /// setting meant to be hand-edited — see
-    /// `crate::window::state::WindowState::note_hidden_to_tray`.
+    /// No longer used — backed the settings window's one-time "still running
+    /// in the tray" close hint, which was removed. Kept, unread, only so a
+    /// `config.toml` written before the removal still parses under
+    /// `deny_unknown_fields` instead of erroring; never serialized back out,
+    /// so saving the file drops the key for good. `pub` only because
+    /// `..Config::default()` construction elsewhere in the crate needs every
+    /// field visible, not because anything reads it.
+    #[serde(skip_serializing)]
     pub tray_close_hint_shown: bool,
 }
 
@@ -962,14 +966,14 @@ mod tests {
     }
 
     #[test]
-    fn tray_close_hint_shown_defaults_off_and_round_trips_on() {
-        assert!(!Config::from_toml("").unwrap().tray_close_hint_shown);
+    fn an_old_config_with_the_removed_tray_close_hint_key_still_parses() {
+        // The settings window's one-time "still running in the tray" close
+        // hint was removed, but an existing user's config.toml may still
+        // carry the key it used to persist — deny_unknown_fields must not
+        // turn that into a parse failure, and the key must not survive a
+        // re-save.
         let config = Config::from_toml("tray_close_hint_shown = true\n").unwrap();
-        assert!(config.tray_close_hint_shown);
-        assert!(config
-            .to_toml()
-            .unwrap()
-            .contains("tray_close_hint_shown = true"));
+        assert!(!config.to_toml().unwrap().contains("tray_close_hint_shown"));
     }
 
     #[test]
@@ -979,7 +983,6 @@ mod tests {
             hotkey: Key::F9,
             theme: Theme::Light,
             show_live_text: true,
-            tray_close_hint_shown: true,
             ..Config::default()
         };
         config.polish.budget_ms = 220;

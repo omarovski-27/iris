@@ -80,11 +80,6 @@ pub enum Command {
     Reload,
     /// Leave the loop and exit.
     Quit,
-    /// Record that the "Iris is still running in the tray" hint has been
-    /// shown, so it never shows again. Sent once, the first time the
-    /// settings window's close hides it — see
-    /// `crate::window::state::WindowState::note_hidden_to_tray`.
-    AcknowledgeTrayHint,
 }
 
 impl Command {
@@ -105,7 +100,6 @@ impl Command {
             Command::SetHotkey(key) => config.hotkey = *key,
             Command::SetOverlayEnabled(enabled) => config.overlay_enabled = *enabled,
             Command::SetVocabulary(terms) => config.vocabulary = terms.clone(),
-            Command::AcknowledgeTrayHint => config.tray_close_hint_shown = true,
             Command::OpenSettings | Command::Reload | Command::Quit => return false,
         }
         true
@@ -810,16 +804,6 @@ impl<A: AudioSource> App<A> {
                         outcome =
                             CommandOutcome::Rejected(format!("cannot update vocabulary: {e:#}"));
                     }
-                }
-            }
-            Command::AcknowledgeTrayHint => {
-                // Book-keeping only: no restart, no rebuild, and quiet on
-                // success — the console stays quiet by product decision and
-                // nobody but a future migration needs to know this ran. See
-                // `Command::apply_to`.
-                command.apply_to(&mut self.config);
-                if let Err(e) = self.persist(&command) {
-                    outcome = Self::persist_failed(&e);
                 }
             }
             Command::OpenSettings => self.window.open(),

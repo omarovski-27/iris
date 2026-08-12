@@ -279,37 +279,10 @@ impl eframe::App for SettingsApp {
                 at_startup: self.startup.saved_overlay_enabled,
             },
             quit_flag: Arc::clone(&self.quit_flag),
-            show_close_hint: &show_close_hint,
         };
         let state = self.state.get_or_insert_with(|| WindowState::new(&env));
         ui::draw_root(ctx, state, &env);
     }
-}
-
-/// Show the settings window's one-time "still running in the tray" hint.
-///
-/// The real notice — an information-styled message box, [`crate::dialog`]'s
-/// existing console-less-launch mechanism — rather than a bespoke tray
-/// balloon: attaching a balloon to the tray's own icon needs its internal
-/// notify-icon id, which `tray-icon` does not expose past its own module,
-/// and standing up a second, throwaway notify icon purely to carry one
-/// balloon is a small bespoke notification pipeline for what the module docs
-/// on [`super::state::WindowState::note_hidden_to_tray`] ask to stay minimal.
-/// `dialog::show_info` is already real, already reviewed, and already the
-/// answer for "something the user needs to see with no console to print to".
-///
-/// Fired on a detached thread rather than called inline: `draw_root` runs
-/// inside `ctx.run`'s closure, which only *builds* this frame's output —
-/// `eframe` does not apply the `Visible(false)`/`CancelClose` commands it
-/// queued in the very same frame until the closure returns. `MessageBoxW` is
-/// modal, so calling it inline would block this frame from ever finishing,
-/// which would block the hide it is announcing. Detaching is what keeps the
-/// window's close "immediate and non-blocking" even though the hint itself
-/// waits on the user to dismiss it.
-fn show_close_hint(title: &str, message: &str) {
-    let title = title.to_string();
-    let message = message.to_string();
-    std::thread::spawn(move || crate::dialog::show_info(&title, &message));
 }
 
 /// Enumerate input devices for the Settings tab's microphone picker. Empty
