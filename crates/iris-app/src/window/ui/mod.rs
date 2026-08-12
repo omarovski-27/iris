@@ -53,9 +53,10 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 /// would actually tear down) and the window is hidden instead
 /// (`ViewportCommand::Visible(false)`). The dictation loop is never told
 /// about this at all; the hotkey, the tray and dictation itself keep running
-/// exactly as if the window had never been open. [`WindowState::
-/// note_hidden_to_tray`] shows a one-time "still running" hint the first time
-/// this happens, so a click on `X` does not read as "Iris closed".
+/// exactly as if the window had never been open. An earlier revision showed
+/// a one-time "still running" notification the first time this happened;
+/// removed 2026-08-12 at the captain's request (see `AGENTS.md`) — the hide
+/// itself is unchanged, only the popup is gone.
 ///
 /// This reverses part of an earlier fix that made every one of these three
 /// gestures quit the whole app (see `AGENTS.md`'s "Every close path..."
@@ -78,7 +79,6 @@ pub fn draw_root(ctx: &egui::Context, state: &mut WindowState, env: &Env) {
     if ctx.input(|i| i.viewport().close_requested()) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        state.note_hidden_to_tray(env);
     }
     while env.reopen_signal.try_recv().is_ok() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -294,8 +294,8 @@ mod tests {
     /// window" alike (confirmed by reading `winit` 0.30's own
     /// `WM_CLOSE`/`WM_SYSCOMMAND` handling; there is no Windows host here to
     /// click any of them for real) — and checks that it cancels the close,
-    /// hides the viewport, shows the one-time hint, and never touches
-    /// `Command::Quit` or the quit flag.
+    /// hides the viewport, sends no command, and never touches `Command::Quit`
+    /// or the quit flag.
     ///
     /// What this does **not** prove: that a real `eframe`/`winit` window on
     /// real Windows actually reports `close_requested` for all three
@@ -309,7 +309,6 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        use crate::app::Command;
         use crate::window::{Env, InForce, WindowState};
 
         let dir = tempfile::tempdir().unwrap();
@@ -320,8 +319,6 @@ mod tests {
         let devices = || Vec::new();
         let open_config_file = |_: &std::path::Path| Ok(());
         let quit_flag = Arc::new(AtomicBool::new(false));
-        let hint_calls = std::cell::Cell::new(0u32);
-        let show_close_hint = |_title: &str, _message: &str| hint_calls.set(hint_calls.get() + 1);
 
         let env = Env {
             config_path: &config_path,
@@ -340,7 +337,6 @@ mod tests {
                 at_startup: true,
             },
             quit_flag: Arc::clone(&quit_flag),
-            show_close_hint: &show_close_hint,
         };
         let mut state = WindowState::new(&env);
 
@@ -360,14 +356,9 @@ mod tests {
             "closing the window must not flip the quit flag — it only hides"
         );
         assert_eq!(
-            commands_rx.try_recv().unwrap().1,
-            Command::AcknowledgeTrayHint,
-            "the only command a close may send is the hint acknowledgement"
-        );
-        assert_eq!(
             commands_rx.try_recv(),
             Err(crossbeam_channel::TryRecvError::Empty),
-            "and never a second one, especially not Quit"
+            "closing the window must not send any command, especially not Quit"
         );
         let root_commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
         assert!(
@@ -379,6 +370,5 @@ mod tests {
             root_commands.contains(&egui::ViewportCommand::Visible(false)),
             "and the window hidden instead"
         );
-        assert_eq!(hint_calls.get(), 1, "the one-time hint must show");
     }
 }
