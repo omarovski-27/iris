@@ -106,6 +106,23 @@ running on the engine Iris started with.
 Then hold **Right-Ctrl**, speak, release. Your words appear in whatever window
 had focus.
 
+## Hands-free dictation (optional)
+
+Don't want to hold the key down the whole time? Double-tap **Right-Ctrl** —
+press, release, press again, all within about 400 ms — and Iris keeps
+listening with the key up. Tap **Right-Ctrl** once more to stop; your words
+are inserted exactly as they would be on a normal release.
+
+While it's listening hands-free, the pill overlay's centre dot changes colour
+**and** grows a ring around it — look for the ring specifically, since it is
+the cue that still shows even if the colour change is hard to see.
+
+If you forget to stop it, Iris stops listening on its own after 5 minutes and
+still inserts whatever you said — nothing is thrown away.
+
+Holding the key down and releasing it, as above, still works exactly the same
+if you never double-tap.
+
 ## Custom vocabulary
 
 If Iris keeps mishearing the same word — your name, a product, a technical
