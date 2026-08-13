@@ -245,7 +245,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::vlog;
 
-use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
+use super::{net, Engine, EngineOptions, Failure, FailureCause, Session, TranscriptEvent};
 
 const DEFAULT_MODEL: &str = "nova-3";
 const DEFAULT_BASE_URL: &str = "wss://api.deepgram.com/v1/listen";
@@ -461,7 +461,7 @@ impl Engine for DeepgramEngine {
         let tx = event_tx.clone();
         rt.spawn(async move {
             if let Err(e) = pump(url, key, audio_rx, tx.clone()).await {
-                let _ = tx.send(TranscriptEvent::Error(format!("{e:#}")));
+                let _ = tx.send(e.into_event());
             }
         });
 
@@ -522,8 +522,90 @@ async fn pump(
     key: String,
     audio: UnboundedReceiver<Command>,
     events: Sender<TranscriptEvent>,
-) -> Result<()> {
+) -> Result<(), Failure> {
     pump_inner(url, key, audio, events, FINALIZE_ACK_TIMEOUT).await
+}
+
+/// The env var and account-management URL named in every classified failure
+/// message this module produces — see [`FailureCause::message`].
+const KEY_ENV: &str = "IRIS_DEEPGRAM_KEY";
+const CONSOLE_URL: &str = "https://console.deepgram.com";
+const PROVIDER: &str = "Deepgram";
+
+/// Classify a Deepgram handshake rejection by its HTTP status alone, per
+/// Deepgram's documented error codes
+/// (<https://developers.deepgram.com/docs/errors>, checked 2026-08-13):
+///
+/// - `401` covers both `INVALID_AUTH` ("Invalid credentials.") — the key
+///   itself is wrong — and `INSUFFICIENT_PERMISSIONS` — the key is valid but
+///   the project cannot use the requested model or feature.
+/// - `403` is `INSUFFICIENT_PERMISSIONS` again, same meaning as the `401`
+///   case above.
+///
+///   Both fold into [`FailureCause::InvalidKey`] because the fix a user can
+///   take is identical either way — check the key and the Deepgram account
+///   it belongs to — never "check your internet connection".
+/// - `402` is `ASR_PAYMENT_REQUIRED`: the project has run out of credit.
+/// - `429` is `TOO_MANY_REQUESTS`: rate limited.
+///
+/// Every other status is [`FailureCause::Unknown`] rather than a guess —
+/// this function only reads the status code, never the JSON error body, so
+/// it cannot be fooled by a body shape Deepgram has not documented.
+fn classify_handshake_status(status: u16) -> FailureCause {
+    match status {
+        401 | 403 => FailureCause::InvalidKey,
+        402 => FailureCause::ExhaustedCredit,
+        429 => FailureCause::RateLimited,
+        _ => FailureCause::Unknown,
+    }
+}
+
+/// Turn a failed handshake attempt into a [`Failure`], classifying what can
+/// be classified and falling back to the plain, unclassified shape for
+/// everything else. Never reads or repeats the API key: the key lives only
+/// in the request's `Authorization` header, which neither branch below
+/// touches — only the response Deepgram sent back, or the I/O error that
+/// meant no response ever arrived.
+fn classify_connect_error(err: tokio_tungstenite::tungstenite::Error) -> Failure {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    match &err {
+        // A non-101 handshake response: Deepgram explicitly rejected the
+        // connection, and its status is the evidence — see
+        // `classify_handshake_status`.
+        WsError::Http(response) => {
+            let status = response.status().as_u16();
+            let cause = classify_handshake_status(status);
+            let mut detail = format!("HTTP {status}");
+            if let Some(body) = response.body().as_deref() {
+                let body = String::from_utf8_lossy(body);
+                let body = body.trim();
+                if !body.is_empty() {
+                    detail.push_str(": ");
+                    detail.push_str(body);
+                }
+            }
+            Failure::Classified {
+                message: cause.message(PROVIDER, KEY_ENV, CONSOLE_URL, Some(&detail)),
+                cause,
+            }
+        }
+        // tungstenite's `Error::Io` carries `#[from] std::io::Error` from the
+        // underlying `TcpStream::connect` — DNS failure, connection refused,
+        // no route — the shape of "no network", not a provider rejection.
+        WsError::Io(io_err) => Failure::Classified {
+            cause: FailureCause::NetworkUnreachable,
+            message: FailureCause::NetworkUnreachable.message(
+                PROVIDER,
+                KEY_ENV,
+                CONSOLE_URL,
+                Some(&io_err.to_string()),
+            ),
+        },
+        // TLS, protocol, URL and format errors: real failures with no
+        // confident classification, so this stays the plain, unclassified
+        // shape every engine failure has always taken.
+        _ => Failure::Other(anyhow::Error::new(err).context("connecting to Deepgram")),
+    }
 }
 
 async fn pump_inner(
@@ -532,7 +614,7 @@ async fn pump_inner(
     mut audio: UnboundedReceiver<Command>,
     events: Sender<TranscriptEvent>,
     finalize_ack_timeout: Duration,
-) -> Result<()> {
+) -> Result<(), Failure> {
     let mut request = url
         .as_str()
         .into_client_request()
@@ -548,7 +630,7 @@ async fn pump_inner(
     // a session on the second and later connect in this process's lifetime
     // instead of paying a full handshake every single dictation.
     let connector = net::tls_connector();
-    let (mut socket, response) = tokio::time::timeout(
+    let connect_attempt = tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_tungstenite::connect_async_tls_with_config(
             request,
@@ -557,9 +639,24 @@ async fn pump_inner(
             Some(tokio_tungstenite::Connector::Rustls(connector)),
         ),
     )
-    .await
-    .context("timed out connecting to Deepgram")?
-    .context("connecting to Deepgram (check IRIS_DEEPGRAM_KEY)")?;
+    .await;
+
+    let (mut socket, response) = match connect_attempt {
+        Err(_elapsed) => {
+            let detail = format!("{CONNECT_TIMEOUT:?}");
+            return Err(Failure::Classified {
+                message: FailureCause::Timeout.message(
+                    PROVIDER,
+                    KEY_ENV,
+                    CONSOLE_URL,
+                    Some(&detail),
+                ),
+                cause: FailureCause::Timeout,
+            });
+        }
+        Ok(Err(e)) => return Err(classify_connect_error(e)),
+        Ok(Ok(pair)) => pair,
+    };
 
     vlog!("deepgram connected: HTTP {}", response.status());
     let _ = events.send(TranscriptEvent::Connected);
@@ -1072,6 +1169,116 @@ mod tests {
         // pass the same check.
         assert!(DEFAULT_BASE_URL.starts_with("wss://"));
         assert!(validate_deepgram_url(DEFAULT_BASE_URL.to_string()).is_ok());
+    }
+
+    #[test]
+    fn handshake_status_codes_classify_per_deepgrams_documented_error_reference() {
+        // https://developers.deepgram.com/docs/errors, checked 2026-08-13.
+        assert_eq!(classify_handshake_status(401), FailureCause::InvalidKey);
+        assert_eq!(classify_handshake_status(403), FailureCause::InvalidKey);
+        assert_eq!(
+            classify_handshake_status(402),
+            FailureCause::ExhaustedCredit
+        );
+        assert_eq!(classify_handshake_status(429), FailureCause::RateLimited);
+        // Undocumented for this endpoint — must never be stretched into a guess.
+        assert_eq!(classify_handshake_status(500), FailureCause::Unknown);
+        assert_eq!(classify_handshake_status(404), FailureCause::Unknown);
+    }
+
+    /// Build the same `tungstenite::Error::Http` shape a rejected handshake
+    /// produces, without a real socket — see `Error::Http`'s definition
+    /// (`Box<http::Response<Option<Vec<u8>>>>`).
+    fn http_rejection(status: u16, body: Option<&str>) -> tokio_tungstenite::tungstenite::Error {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(status)
+            .body(body.map(|b| b.as_bytes().to_vec()))
+            .unwrap();
+        tokio_tungstenite::tungstenite::Error::Http(Box::new(response))
+    }
+
+    #[test]
+    fn a_401_handshake_rejection_is_classified_as_an_invalid_key_and_never_leaks_the_key() {
+        let failure = classify_connect_error(http_rejection(
+            401,
+            Some(r#"{"err_msg":"Invalid credentials."}"#),
+        ));
+        match failure {
+            Failure::Classified { message, cause } => {
+                assert_eq!(cause, FailureCause::InvalidKey);
+                assert!(message.contains("Deepgram"), "{message}");
+                assert!(message.contains(KEY_ENV), "{message}");
+                assert!(message.contains("401"), "{message}");
+                assert!(
+                    !message.contains("Token "),
+                    "must never echo the Authorization header: {message}"
+                );
+            }
+            Failure::Other(e) => panic!("expected a classified failure, got {e:#}"),
+        }
+    }
+
+    #[test]
+    fn a_402_handshake_rejection_names_the_exhausted_balance_and_the_console_url() {
+        let failure = classify_connect_error(http_rejection(
+            402,
+            Some("Project does not have enough credits"),
+        ));
+        match failure {
+            Failure::Classified { message, cause } => {
+                assert_eq!(cause, FailureCause::ExhaustedCredit);
+                assert!(message.contains("balance"), "{message}");
+                assert!(message.contains(CONSOLE_URL), "{message}");
+            }
+            Failure::Other(e) => panic!("expected a classified failure, got {e:#}"),
+        }
+    }
+
+    #[test]
+    fn a_429_handshake_rejection_is_classified_as_rate_limited() {
+        let failure = classify_connect_error(http_rejection(429, None));
+        match failure {
+            Failure::Classified { cause, .. } => assert_eq!(cause, FailureCause::RateLimited),
+            Failure::Other(e) => panic!("expected a classified failure, got {e:#}"),
+        }
+    }
+
+    #[test]
+    fn an_undocumented_status_is_reported_as_unknown_rather_than_a_guess() {
+        // Still a real HTTP rejection — Deepgram did answer, just with a
+        // status this module has no documented meaning for — so it is still
+        // worth telling the user, just without claiming a specific cause the
+        // evidence does not support.
+        let failure = classify_connect_error(http_rejection(500, Some("internal error")));
+        match failure {
+            Failure::Classified { cause, message } => {
+                assert_eq!(cause, FailureCause::Unknown);
+                assert!(message.contains("500"), "{message}");
+                assert!(
+                    !message.contains(KEY_ENV),
+                    "an unclassified status must not guess it is a key problem: {message}"
+                );
+            }
+            Failure::Other(e) => panic!("expected a classified-but-Unknown failure, got {e:#}"),
+        }
+    }
+
+    #[test]
+    fn an_io_failure_reaching_the_handshake_is_classified_as_network_unreachable() {
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let failure = classify_connect_error(tokio_tungstenite::tungstenite::Error::Io(io_err));
+        match failure {
+            Failure::Classified { message, cause } => {
+                assert_eq!(cause, FailureCause::NetworkUnreachable);
+                assert!(message.contains("Deepgram"), "{message}");
+                assert!(
+                    !message.contains(KEY_ENV),
+                    "a network failure is not a key problem: {message}"
+                );
+            }
+            Failure::Other(e) => panic!("expected a classified failure, got {e:#}"),
+        }
     }
 
     #[test]

@@ -36,11 +36,14 @@ use anyhow::{bail, Result};
 use crossbeam_channel::Receiver;
 
 pub mod deepgram;
+mod failure;
 pub mod groq;
 pub mod mock;
 pub mod net;
 
 pub use deepgram::DeepgramEngine;
+pub(crate) use failure::Failure;
+pub use failure::FailureCause;
 pub use groq::GroqEngine;
 pub use mock::{MockConfig, MockEngine};
 
@@ -73,6 +76,22 @@ pub enum TranscriptEvent {
     /// The session failed. After `finish()`, [`crate::dictation::Dictation`]
     /// may still salvage a non-empty partial instead of surfacing the error.
     Error(String),
+    /// The session failed for a specific, classified reason — a rejected key,
+    /// an exhausted balance, a rate limit, an unreachable network, or a
+    /// connect timeout — as opposed to [`TranscriptEvent::Error`], which
+    /// covers every failure this project cannot currently classify (a
+    /// mid-stream socket death, a malformed protocol message, `finish()`
+    /// itself failing). Kept as its own variant rather than widening `Error`
+    /// with an `Option<FailureCause>` so every existing `Error` call site —
+    /// the local engine adapter, the mock engine, every test that constructs
+    /// a plain string failure — keeps compiling unchanged; only the call
+    /// sites in [`deepgram`] and [`groq`] that can actually name a cause opt
+    /// in. See [`FailureCause`] for why this classification exists and how
+    /// each engine derives it from the provider's own response.
+    Failed {
+        message: String,
+        cause: FailureCause,
+    },
 }
 
 /// A transcription backend.

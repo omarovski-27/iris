@@ -192,6 +192,53 @@ Load-bearing beyond that crate:
   does *not* change: the length of the wait itself (Deepgram's `CONNECT_TIMEOUT`
   8s is an accepted tradeoff, not a bug — see the Deepgram section above), only
   that it now always ends in something the user can see.
+- **A connect/request failure carries a classified cause, not just a generic
+  message.** `never_connected` above only ever says *that* the service was
+  unreachable; it says nothing about *why*, so an exhausted Deepgram balance
+  used to produce the identical message as a dead wifi connection (the
+  captain would check their router while the real problem was billing).
+  `iris_core::engine::FailureCause` (`iris-core/src/engine/failure.rs`) is
+  the fix: `InvalidKey` / `ExhaustedCredit` / `RateLimited` /
+  `NetworkUnreachable` / `Timeout` / `Unknown`, each with its own actionable,
+  provider-naming message (`FailureCause::message`) and a stable log label
+  (`FailureCause::retryable`/`::label`). `deepgram.rs`'s
+  `classify_handshake_status` and `groq.rs`'s `classify_response_status`
+  derive it from each provider's own documented status codes (Deepgram:
+  <https://developers.deepgram.com/docs/errors>; Groq:
+  <https://console.groq.com/docs/errors> +
+  <https://console.groq.com/docs/rate-limits>; both checked 2026-08-13 —
+  re-check before trusting an old status-code mapping here) — status code
+  alone, never the response body, so a body shape a provider's docs do not
+  cover cannot produce a wrong classification. Groq has no documented
+  billing/quota status distinct from `429`, so it has no `ExhaustedCredit`
+  case; do not invent one without a citation. A classified failure travels as
+  `TranscriptEvent::Failed { message, cause }` (a new variant alongside the
+  original `TranscriptEvent::Error(String)`, which every other failure —
+  mid-stream socket death, `finish()` itself failing, the local engine, the
+  mock engine — still uses unchanged) through `Dictation`'s `Ending::Error`,
+  `DictationOutcome::failure_cause` / `DictationError::failure_cause`, to
+  `App::failed`/`failed_outcome` (`app.rs`), which both tags
+  `DictationRecord::connection_cause` (`history.rs`, the label, e.g.
+  `"exhausted_credit"` — separate from and independent of
+  `connection_failed` above) and calls the *same*
+  `FailureNotice::connection_failed` `never_connected` already uses — not a
+  second notification path — but now on `never_connected || failure_cause.is_some()`,
+  so a batch engine like Groq (which never satisfies `never_connected`'s
+  connect-budget gate) still notifies. `SystemFailureNotice::connection_failed`
+  (`notify.rs`) no longer prepends a hardcoded "check your internet
+  connection" — that was the same generic-message bug at the dialog layer —
+  and just shows the classified message as-is. Classification is unit-tested
+  from synthetic status codes/bodies/io-errors (`deepgram.rs`, `groq.rs`,
+  including a real local `ConnectionRefused` via a dropped `TcpListener` for
+  Groq's `NetworkUnreachable` path) and an app-layer test drives a
+  no-connect-budget engine through the real loop
+  (`a_classified_engine_rejection_notifies_and_tags_its_cause_even_without_a_connect_budget`,
+  `iris-app/tests/loop.rs`) — none of it against a real failing key, which
+  this sandbox cannot reach (see "The captain's real `history.jsonl`" below).
+  `retryable()` exists so the classification is complete and testable but is
+  not wired to anything: Iris has no automatic retry anywhere in its capture
+  path today, so a permanent cause (`InvalidKey`/`ExhaustedCredit`) is never
+  retried by construction, not by a check that could be gotten wrong.
 - **The settings window's close (`X`, Alt+F4, the taskbar's "Close window")
   hides the window and leaves Iris running in the tray — it does not quit
   the app.** This is the 2026-08-11 state, and it reverses part of an
