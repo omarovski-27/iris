@@ -66,6 +66,17 @@ First dictation:
 3. The Prism pill appears bottom-centre while you talk — a quiet glass capsule that pulses with your voice (set `show_live_text = true` to also open a ribbon showing your words as they are heard); text is polished and injected into the focused window.
 4. Session history lands in `history.jsonl` beside the config.
 
+### Hands-free dictation
+
+Double-tap **Right-Ctrl** (within 400 ms) instead of holding it, and Iris
+keeps listening with the key up — no need to keep your finger down. Tap
+**Right-Ctrl** once more to stop; the text is inserted exactly as it would be
+on a normal release. While latched, the pill's core dot changes colour and
+gains a ring around it, so a live microphone is obvious at a glance even from
+across the room. Forget to stop it and Iris stops itself after 5 minutes,
+finalising normally rather than discarding anything captured. Ordinary
+hold-to-talk is unchanged if you never double-tap.
+
 ### Config location
 
 | Platform | Path |
