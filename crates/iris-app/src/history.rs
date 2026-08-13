@@ -130,6 +130,22 @@ pub struct DictationRecord {
     /// still parses.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub connection_failed: bool,
+    /// The specific, classified reason this dictation could not reach or use
+    /// the transcription service — a short, stable, greppable label
+    /// (`"invalid_key"`, `"exhausted_credit"`, `"rate_limited"`,
+    /// `"network_unreachable"`, `"timeout"`; see
+    /// `iris_core::engine::FailureCause::label`) — separate from
+    /// `connection_failed`: that field is about whether a real network
+    /// connection was ever reached (see its own doc comment), whereas this
+    /// one is set whenever the provider itself named a specific cause,
+    /// whether or not the engine's own connect bookkeeping considers this a
+    /// "never connected" case. Groq, which never sets `connection_failed`
+    /// (it has no real connect step to measure), can still set this field.
+    /// `None` for an unclassified failure or an ordinary successful
+    /// dictation — never a guess. `#[serde(default)]` so a session log
+    /// written before this field existed still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_cause: Option<String>,
     /// The latency breakdown.
     pub latency: LatencyBreakdown,
 }
@@ -146,6 +162,7 @@ impl DictationRecord {
             injected: false,
             error: None,
             connection_failed: false,
+            connection_cause: None,
             latency: LatencyBreakdown::default(),
         }
     }

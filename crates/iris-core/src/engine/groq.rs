@@ -21,7 +21,7 @@ use crate::{audio, vlog};
 /// 2026-08-11). Shared with the local Whisper finalizer, which bounds by word
 /// count instead of tokens — see its own doc comment for why.
 use super::MAX_VOCABULARY_PROMPT_WORDS as MAX_PROMPT_WORDS;
-use super::{net, Engine, EngineOptions, Session, TranscriptEvent};
+use super::{net, Engine, EngineOptions, Failure, FailureCause, Session, TranscriptEvent};
 
 const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
 const DEFAULT_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -231,11 +231,66 @@ impl Session for GroqSession {
                     ));
                 }
                 Err(e) => {
-                    let _ = tx.send(TranscriptEvent::Error(format!("{e:#}")));
+                    let _ = tx.send(e.into_event());
                 }
             }
         });
         Ok(())
+    }
+}
+
+/// The env var and account-management URL named in every classified failure
+/// message this module produces — see [`FailureCause::message`].
+const KEY_ENV: &str = "IRIS_GROQ_KEY";
+const CONSOLE_URL: &str = "https://console.groq.com/keys";
+const PROVIDER: &str = "Groq";
+
+/// Classify a Groq API rejection by its HTTP status, per Groq's documented
+/// status codes (<https://console.groq.com/docs/errors>, checked
+/// 2026-08-13):
+///
+/// - `401` — missing or invalid API key.
+/// - `403` — insufficient permissions for the resource. Folded into the same
+///   [`FailureCause::InvalidKey`] as `401`, same reasoning as Deepgram's
+///   `403`: the fix is checking the key and the account it belongs to.
+/// - `429` — rate limit exceeded.
+/// - `498` (Groq's own custom code) — flex-tier capacity exceeded, "retry
+///   later"; grouped with `429` under [`FailureCause::RateLimited`] since
+///   both mean "try again shortly", not "fix your key or your balance".
+///
+/// Groq's error reference documents no separate status for an exhausted
+/// balance or quota — unlike Deepgram's `402`, its docs state billing and
+/// quota issues surface "through existing status codes" (in practice, `429`
+/// per Groq's own rate-limits page, which lists per-day token/request caps
+/// alongside the per-minute ones). So this engine has no
+/// [`FailureCause::ExhaustedCredit`] case at all: there is no status code to
+/// key it off without guessing, which this module does not do.
+///
+/// Every other status is [`FailureCause::Unknown`].
+fn classify_response_status(status: u16) -> FailureCause {
+    match status {
+        401 | 403 => FailureCause::InvalidKey,
+        429 | 498 => FailureCause::RateLimited,
+        _ => FailureCause::Unknown,
+    }
+}
+
+/// Classify a failure to even get a response — no HTTP status to read,
+/// because the request never completed. `reqwest::Error`'s own
+/// `is_timeout`/`is_connect` predicates are its public, documented way to
+/// tell these apart; anything else (a build-time TLS misconfiguration, a
+/// redirect-policy error) has no confident classification here.
+fn classify_send_error(err: reqwest::Error) -> Failure {
+    let cause = if err.is_timeout() {
+        FailureCause::Timeout
+    } else if err.is_connect() {
+        FailureCause::NetworkUnreachable
+    } else {
+        return Failure::Other(anyhow::Error::new(err).context("posting audio to Groq"));
+    };
+    Failure::Classified {
+        message: cause.message(PROVIDER, KEY_ENV, CONSOLE_URL, Some(&err.to_string())),
+        cause,
     }
 }
 
@@ -246,10 +301,11 @@ async fn transcribe(
     language: Option<String>,
     prompt: Option<String>,
     wav: Vec<u8>,
-) -> Result<String> {
+) -> Result<String, Failure> {
     let part = reqwest::multipart::Part::bytes(wav)
         .file_name("audio.wav")
-        .mime_str("audio/wav")?;
+        .mime_str("audio/wav")
+        .context("building the audio part")?;
     let mut form = reqwest::multipart::Form::new()
         .text("model", model)
         .text("response_format", "json")
@@ -268,18 +324,26 @@ async fn transcribe(
         .build()
         .context("building the Groq HTTP client")?;
 
-    let response = client
+    let response = match client
         .post(&url)
         .bearer_auth(key)
         .multipart(form)
         .send()
         .await
-        .context("posting audio to Groq")?;
+    {
+        Ok(response) => response,
+        Err(e) => return Err(classify_send_error(e)),
+    };
 
     let status = response.status();
     let body = response.text().await.context("reading the Groq response")?;
     if !status.is_success() {
-        anyhow::bail!("Groq returned HTTP {status}: {}", body.trim());
+        let cause = classify_response_status(status.as_u16());
+        let detail = format!("HTTP {status}: {}", body.trim());
+        return Err(Failure::Classified {
+            message: cause.message(PROVIDER, KEY_ENV, CONSOLE_URL, Some(&detail)),
+            cause,
+        });
     }
 
     let parsed: serde_json::Value =
@@ -306,6 +370,78 @@ mod tests {
             prompt: None,
         };
         assert!(!engine.streams_partials());
+    }
+
+    #[test]
+    fn response_status_codes_classify_per_groqs_documented_error_reference() {
+        // https://console.groq.com/docs/errors and
+        // https://console.groq.com/docs/rate-limits, checked 2026-08-13. Groq
+        // documents no separate billing/quota status (see
+        // `classify_response_status`'s doc comment), so there is no
+        // ExhaustedCredit case to assert here.
+        assert_eq!(classify_response_status(401), FailureCause::InvalidKey);
+        assert_eq!(classify_response_status(403), FailureCause::InvalidKey);
+        assert_eq!(classify_response_status(429), FailureCause::RateLimited);
+        assert_eq!(classify_response_status(498), FailureCause::RateLimited);
+        // Undocumented for this endpoint — must never be stretched into a guess.
+        assert_eq!(classify_response_status(500), FailureCause::Unknown);
+        assert_eq!(classify_response_status(404), FailureCause::Unknown);
+    }
+
+    #[test]
+    fn a_401_response_never_leaks_the_key_and_keeps_the_raw_status_for_diagnosis() {
+        let cause = classify_response_status(401);
+        let message = cause.message(
+            PROVIDER,
+            KEY_ENV,
+            CONSOLE_URL,
+            Some("HTTP 401: invalid_api_key"),
+        );
+        assert!(message.contains("Groq"), "{message}");
+        assert!(message.contains(KEY_ENV), "{message}");
+        assert!(message.contains("401"), "{message}");
+        assert!(
+            !message.contains("Bearer "),
+            "must never echo the Authorization header: {message}"
+        );
+    }
+
+    /// A real `reqwest::Error` with `is_connect() == true`, from an actual
+    /// failed connect to a closed local port — no internet needed, and
+    /// deterministic: nothing listens on a freshly-bound-then-dropped
+    /// loopback port.
+    #[tokio::test]
+    async fn a_connection_refused_send_error_is_classified_as_network_unreachable() {
+        net::init_crypto();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // nothing is listening on `addr` from here on
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_connect(),
+            "test setup did not produce a connect failure: {err:#}"
+        );
+
+        match classify_send_error(err) {
+            Failure::Classified { message, cause } => {
+                assert_eq!(cause, FailureCause::NetworkUnreachable);
+                assert!(message.contains("Groq"), "{message}");
+                assert!(
+                    !message.contains(KEY_ENV),
+                    "a network failure is not a key problem: {message}"
+                );
+            }
+            Failure::Other(e) => panic!("expected a classified failure, got {e:#}"),
+        }
     }
 
     #[test]

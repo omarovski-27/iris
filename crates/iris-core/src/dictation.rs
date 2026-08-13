@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::audio;
-use crate::engine::{Engine, Session, TranscriptEvent};
+use crate::engine::{Engine, FailureCause, Session, TranscriptEvent};
 use crate::latency::{Mark, Timeline};
 use crate::vlog;
 
@@ -107,6 +107,15 @@ pub struct DictationOutcome {
     /// non-empty `text`: nothing can be salvaged before a real connection
     /// exists for the engines this flag is meaningful for.
     pub never_connected: bool,
+    /// Set when the engine itself reported a specific, classified reason for
+    /// this failure — see [`TranscriptEvent::Failed`]. Unlike
+    /// `never_connected`, this is not gated on `Engine::connect_budget`: a
+    /// batch engine like Groq never reaches `Mark::StreamReady` in the sense
+    /// that flag means, but it can still name a specific reason its one
+    /// request failed. Always `None` alongside a non-empty `text`, for the
+    /// same reason `never_connected` is: nothing is salvageable from a
+    /// session that never produced usable text in the first place.
+    pub failure_cause: Option<FailureCause>,
 }
 
 /// [`Dictation::finish`] failed to produce a transcript, but real capture may
@@ -130,6 +139,10 @@ pub struct DictationError {
     /// path where [`Session::finish`] itself failed outright rather than the
     /// wait running out.
     pub never_connected: bool,
+    /// See [`DictationOutcome::failure_cause`] — the same signal, for the
+    /// path where [`Dictation::finish`] returns an error rather than an
+    /// outcome.
+    pub failure_cause: Option<FailureCause>,
 }
 
 impl DictationError {
@@ -141,12 +154,14 @@ impl DictationError {
         message: String,
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
         never_connected: bool,
+        failure_cause: Option<FailureCause>,
     ) -> Box<Self> {
         Box::new(Self {
             message,
             source,
             timeline,
             never_connected,
+            failure_cause,
         })
     }
 }
@@ -199,7 +214,9 @@ pub struct Dictation {
 
 enum Ending {
     Final(String),
-    Error(String),
+    /// `cause` is `Some` only when [`TranscriptEvent::Failed`] produced this
+    /// ending; a plain [`TranscriptEvent::Error`] always carries `None`.
+    Error(String, Option<FailureCause>),
     Closed,
 }
 
@@ -338,18 +355,21 @@ impl Dictation {
         // one thing here the engine cannot know. An engine error seen on the
         // way out is the exception, and it travels rather than being dropped
         // in favour of the caller's account.
-        let cause = match &self.ended {
-            Some(Ending::Error(message)) => {
-                Some(format!("{} engine: {message}", self.timeline.engine))
-            }
-            _ => None,
+        let (cause, failure_cause) = match &self.ended {
+            Some(Ending::Error(message, failure_cause)) => (
+                Some(format!("{} engine: {message}", self.timeline.engine)),
+                *failure_cause,
+            ),
+            _ => (None, None),
         };
         let never_connected = self.never_connected() && text.is_empty();
+        let failure_cause = failure_cause.filter(|_| text.is_empty());
         DictationOutcome {
             text,
             timeline: self.timeline,
             cause,
             never_connected,
+            failure_cause,
         }
     }
 
@@ -465,7 +485,10 @@ impl Dictation {
                 // Errors are real even mid-hold (missing key, socket death).
                 // Keep the richest partial we saw so finish can salvage words
                 // when the engine died after producing useful text.
-                self.ended = Some(Ending::Error(message));
+                self.ended = Some(Ending::Error(message, None));
+            }
+            TranscriptEvent::Failed { message, cause } => {
+                self.ended = Some(Ending::Error(message, Some(cause)));
             }
         }
     }
@@ -547,6 +570,9 @@ impl Dictation {
                     // the log with no chain behind it to supply the context.
                     cause: Some(format!("{e:#}")),
                     never_connected,
+                    // `session.finish()` failing outright is not a classified
+                    // provider response — nothing here to name a cause from.
+                    failure_cause: None,
                 });
             }
             // Says what this layer knows and stops there; the engine's account
@@ -558,6 +584,7 @@ impl Dictation {
                 message,
                 Some(e.into()),
                 never_connected,
+                None,
             ));
         }
         vlog!("finalising after {:.2}s of audio", self.audio_secs());
@@ -596,9 +623,13 @@ impl Dictation {
         // same way whether it ends up as the transcript or as the error: the
         // caller decides what to do with the words, never what to call them.
         let ended = self.ended.take();
+        let failure_cause = match &ended {
+            Some(Ending::Error(_, failure_cause)) => *failure_cause,
+            _ => None,
+        };
         let cause = match &ended {
             Some(Ending::Final(_)) => None,
-            Some(Ending::Error(message)) => {
+            Some(Ending::Error(message, _)) => {
                 Some(format!("{} engine: {message}", self.timeline.engine))
             }
             Some(Ending::Closed) => Some(format!(
@@ -634,6 +665,7 @@ impl Dictation {
                     timeline: self.timeline,
                     cause: None,
                     never_connected: false,
+                    failure_cause: None,
                 })
             }
             (_, Some(text)) => {
@@ -655,6 +687,13 @@ impl Dictation {
                     // silently mislabelling a real partial as a connectivity
                     // failure.
                     never_connected: false,
+                    // Same reasoning as `never_connected` immediately above: a
+                    // classified failure never coexists with salvaged text in
+                    // practice (see `DictationOutcome::failure_cause`'s doc),
+                    // but this arm is reached with non-empty `text`, so drop it
+                    // explicitly rather than let it travel from `Ending::Error`
+                    // where the invariant does not apply.
+                    failure_cause: None,
                 })
             }
             (_, None) => Err(DictationError::fail(
@@ -662,6 +701,7 @@ impl Dictation {
                 cause.unwrap_or_default(),
                 None,
                 never_connected,
+                failure_cause,
             )),
         }
     }
@@ -824,6 +864,90 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no key"), "{err}");
+    }
+
+    #[test]
+    fn a_classified_engine_failure_carries_its_cause_through_finish() {
+        struct RejectsTheKey;
+        struct RejectsTheKeySession {
+            events: crossbeam_channel::Receiver<TranscriptEvent>,
+        }
+        impl Engine for RejectsTheKey {
+            fn name(&self) -> &'static str {
+                "rejects-the-key"
+            }
+            fn connect_budget(&self) -> Option<Duration> {
+                Some(Duration::from_secs(1))
+            }
+            fn open(&self) -> Result<Box<dyn Session>> {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                tx.send(TranscriptEvent::Failed {
+                    message: "Deepgram rejected the configured API key".into(),
+                    cause: FailureCause::InvalidKey,
+                })
+                .unwrap();
+                Ok(Box::new(RejectsTheKeySession { events: rx }))
+            }
+        }
+        impl Session for RejectsTheKeySession {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.events
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let dictation = Dictation::start(&RejectsTheKey).unwrap();
+        let err = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.failure_cause, Some(FailureCause::InvalidKey));
+        assert!(
+            err.to_string().contains("rejected the configured API key"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_plain_error_event_carries_no_failure_cause() {
+        // The counterpart to the test above: an ordinary, unclassified
+        // TranscriptEvent::Error must never be mistaken for a classified one.
+        struct Failing;
+        struct FailingSession {
+            events: crossbeam_channel::Receiver<TranscriptEvent>,
+        }
+        impl Engine for Failing {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+            fn open(&self) -> Result<Box<dyn Session>> {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                tx.send(TranscriptEvent::Error("the socket died".into()))
+                    .unwrap();
+                Ok(Box::new(FailingSession { events: rx }))
+            }
+        }
+        impl Session for FailingSession {
+            fn push(&mut self, _: &[i16]) -> Result<()> {
+                Ok(())
+            }
+            fn events(&self) -> &crossbeam_channel::Receiver<TranscriptEvent> {
+                &self.events
+            }
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let dictation = Dictation::start(&Failing).unwrap();
+        let err = dictation
+            .finish(Duration::from_millis(50), &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.failure_cause, None);
     }
 
     #[test]

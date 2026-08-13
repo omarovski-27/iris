@@ -540,6 +540,49 @@ fn an_offline_dictation_notifies_promptly_and_is_tagged_in_the_log() {
 }
 
 #[test]
+fn a_classified_engine_rejection_notifies_and_tags_its_cause_even_without_a_connect_budget() {
+    // Groq (and any other batch engine with no connect budget) can still name
+    // a specific, classified reason its one request failed — an invalid key,
+    // here — without ever satisfying `never_connected`'s connect-budget gate.
+    // The user still deserves the true reason, and the log still deserves the
+    // classified cause, so both must fire independently of `never_connected`.
+    let mut rig = rig();
+    rig.app.set_engine(Arc::new(RejectsKeyEngine));
+
+    let err = rig.dictate().expect_err("the key was rejected");
+    assert!(
+        err.to_string()
+            .contains("the configured API key was rejected"),
+        "{err}"
+    );
+
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].text.is_empty());
+    assert!(
+        !records[0].connection_failed,
+        "this engine never publishes a connect budget, so never_connected must stay false"
+    );
+    assert_eq!(
+        records[0].connection_cause.as_deref(),
+        Some("invalid_key"),
+        "the classified cause must still reach the log"
+    );
+
+    let calls = rig.notice.connection_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a classified failure must still notify, connect budget or not"
+    );
+    assert!(
+        calls[0].contains("the configured API key was rejected"),
+        "{}",
+        calls[0]
+    );
+}
+
+#[test]
 fn a_short_hold_against_a_slow_connect_still_gets_its_words_typed() {
     // The maintainer's two zero-audio dictations were connection failures. This
     // is the same shape that *succeeds*, late: the socket comes up after the
@@ -2547,6 +2590,27 @@ impl Engine for FailingEngine {
     fn open(&self) -> anyhow::Result<Box<dyn Session>> {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(TranscriptEvent::Error("no key".into())).unwrap();
+        Ok(Box::new(FixedSession { text: "", tx, rx }))
+    }
+}
+
+/// Models a batch engine (Groq's shape: `Connected` sent immediately at
+/// `open()`, no `connect_budget`) whose one request comes back rejected for a
+/// specific, classified reason rather than an unclassified one.
+struct RejectsKeyEngine;
+
+impl Engine for RejectsKeyEngine {
+    fn name(&self) -> &'static str {
+        "rejects-key"
+    }
+    fn open(&self) -> anyhow::Result<Box<dyn Session>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptEvent::Connected).unwrap();
+        tx.send(TranscriptEvent::Failed {
+            message: "the configured API key was rejected".into(),
+            cause: iris_core::engine::FailureCause::InvalidKey,
+        })
+        .unwrap();
         Ok(Box::new(FixedSession { text: "", tx, rx }))
     }
 }

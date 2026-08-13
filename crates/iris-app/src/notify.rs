@@ -30,11 +30,19 @@ pub trait FailureNotice: Send + Sync {
     fn injection_failed(&self, text: &str, error: &str, history_enabled: bool);
 
     /// Told that a dictation produced no words at all because the engine
-    /// never reached a real connection to the transcription service — see
-    /// `iris_core::dictation::DictationOutcome::never_connected`. There is no
-    /// text to preserve here, unlike [`FailureNotice::injection_failed`]:
-    /// nothing was ever transcribed, so `error` is the whole story. Called
-    /// once per such dictation, on the dictation thread, from `App::failed`.
+    /// either never reached a real connection to the transcription service
+    /// (`iris_core::dictation::DictationOutcome::never_connected`) or the
+    /// provider itself rejected the request for a specific, classified
+    /// reason (`DictationOutcome::failure_cause`) — a bad key, an exhausted
+    /// balance, a rate limit, an unreachable network, a timeout. `error` is
+    /// already the true, specific story in every case — see
+    /// `iris_core::engine::FailureCause::message` — so an implementation
+    /// should show it as-is rather than wrapping it in an assumption (e.g.
+    /// "check your internet connection") that may be wrong for the actual
+    /// cause. There is no text to preserve here, unlike
+    /// [`FailureNotice::injection_failed`]: nothing was ever transcribed.
+    /// Called once per such dictation, on the dictation thread, from
+    /// `App::failed`.
     fn connection_failed(&self, error: &str);
 }
 
@@ -72,9 +80,15 @@ impl FailureNotice for SystemFailureNotice {
     }
 
     fn connection_failed(&self, error: &str) {
+        // No blanket "check your internet connection" here: `error` already
+        // names the true, specific cause (an exhausted balance, a rejected
+        // key, a rate limit, or — when it really is a network problem — that
+        // too), and prepending an assumption that might be wrong is exactly
+        // the bug this exists to fix. See `FailureNotice::connection_failed`'s
+        // doc comment.
         crate::dialog::show(
             "Iris could not reach the transcription service",
-            &format!("Nothing was sent — check your internet connection and try again.\n\n{error}"),
+            &format!("Nothing was sent.\n\n{error}"),
         );
     }
 }

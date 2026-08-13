@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::{select, Receiver, Sender};
 use iris_core::dictation::{Dictation, DictationOutcome};
-use iris_core::engine::Engine;
+use iris_core::engine::{Engine, FailureCause};
 use iris_core::hotkey::{HotkeyEvent, Key};
 use iris_core::latency::{ms, Mark, Timeline};
 use iris_core::text;
@@ -1437,12 +1437,14 @@ impl<A: AudioSource> App<A> {
                         Err(e) => {
                             let message = format!("{e:#}");
                             let never_connected = e.never_connected;
+                            let failure_cause = e.failure_cause;
                             failed_outcome(
                                 engine_name,
                                 &*notice,
                                 e.timeline,
                                 message,
                                 never_connected,
+                                failure_cause,
                             )
                         }
                     };
@@ -1473,7 +1475,8 @@ impl<A: AudioSource> App<A> {
                 // captured anything.
                 let message = format!("{e:#}");
                 let never_connected = e.never_connected;
-                self.failed(e.timeline, message, never_connected)
+                let failure_cause = e.failure_cause;
+                self.failed(e.timeline, message, never_connected, failure_cause)
             }
         };
         // Always, even when the hold went on to produce a transcript: what came
@@ -1529,13 +1532,27 @@ impl<A: AudioSource> App<A> {
     /// [`FailureNotice::connection_failed`], the same dialog/clipboard
     /// mechanism [`App::deliver`] already uses for a failed injection — not a
     /// second, invented channel.
-    fn failed(&self, timeline: Timeline, message: String, never_connected: bool) -> Dictated {
+    ///
+    /// `failure_cause` (see [`DictationOutcome::failure_cause`]) triggers the
+    /// same notice independently of `never_connected`: a batch engine like
+    /// Groq can name a specific, classified reason (a rejected key, an
+    /// exhausted balance, a rate limit) without ever satisfying
+    /// `never_connected`'s connect-budget gate, and the user deserves the
+    /// true reason either way.
+    fn failed(
+        &self,
+        timeline: Timeline,
+        message: String,
+        never_connected: bool,
+        failure_cause: Option<FailureCause>,
+    ) -> Dictated {
         failed_outcome(
             self.engine.name(),
             &*self.notice,
             timeline,
             message,
             never_connected,
+            failure_cause,
         )
     }
 
@@ -1555,9 +1572,12 @@ impl<A: AudioSource> App<A> {
             timeline,
             cause: salvage_cause,
             never_connected,
+            failure_cause,
         } = outcome;
-        let never_connected = never_connected && text.trim().is_empty();
-        let mut dictated = self.failed(timeline, cause, never_connected);
+        let empty = text.trim().is_empty();
+        let never_connected = never_connected && empty;
+        let failure_cause = failure_cause.filter(|_| empty);
+        let mut dictated = self.failed(timeline, cause, never_connected, failure_cause);
         dictated.record.text = text.trim().to_string();
         note_salvage(dictated, salvage_cause)
     }
@@ -1644,12 +1664,18 @@ fn deliver_outcome(
         mut timeline,
         cause,
         never_connected,
+        failure_cause,
     } = outcome;
-    // `Dictation::finish` only ever produces `never_connected: true` on the
-    // branch with nothing to salvage, which returns `Err` and never reaches
-    // here — see `DictationOutcome::never_connected`'s doc. `failed_outcome`
-    // is the path that actually has to act on it.
+    // `Dictation::finish` only ever produces `never_connected: true` — or a
+    // classified `failure_cause` — on the branch with nothing to salvage,
+    // which returns `Err` and never reaches here; see
+    // `DictationOutcome::never_connected`'s and `::failure_cause`'s docs.
+    // `failed_outcome` is the path that actually has to act on either.
     debug_assert!(!never_connected, "a delivered outcome must have connected");
+    debug_assert!(
+        failure_cause.is_none(),
+        "a delivered outcome must have connected"
+    );
     let raw = raw.trim().to_string();
 
     let mut record = DictationRecord::now(engine_name, &raw);
@@ -1718,12 +1744,21 @@ fn failed_outcome(
     timeline: Timeline,
     message: String,
     never_connected: bool,
+    failure_cause: Option<FailureCause>,
 ) -> Dictated {
     let mut record = DictationRecord::now(engine_name, "");
     record.error = Some(message.clone());
     record.connection_failed = never_connected;
+    record.connection_cause = failure_cause.map(|cause| cause.label().to_string());
     record.latency = LatencyBreakdown::from_timeline(&timeline);
-    if never_connected {
+    // Either signal is reason enough to tell the user promptly: `never_connected`
+    // is "no real network connection was ever reached" (see its own doc);
+    // `failure_cause` is "the provider itself named a specific reason", which
+    // a batch engine like Groq can report without ever satisfying
+    // `never_connected`'s connect-budget gate. One dialog either way — see
+    // `FailureNotice::connection_failed`'s doc for why this is not a second,
+    // invented notification path.
+    if never_connected || failure_cause.is_some() {
         notice.connection_failed(&message);
     }
     Dictated { record, timeline }

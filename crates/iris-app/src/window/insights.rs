@@ -409,6 +409,7 @@ mod tests {
             injected,
             error: error.map(str::to_string),
             connection_failed: false,
+            connection_cause: None,
             latency: LatencyBreakdown::default(),
         }
     }
