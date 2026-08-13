@@ -270,14 +270,15 @@ pub fn spawn(
     outcomes: crossbeam_channel::Receiver<(crate::app::CommandId, crate::app::CommandOutcome)>,
     startup: Startup,
     quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    balance: std::sync::Arc<crate::balance::BalanceMonitor>,
 ) -> anyhow::Result<Box<dyn WindowSink>> {
     #[cfg(windows)]
     {
-        shell::spawn(config_path, commands, outcomes, startup, quit_flag)
+        shell::spawn(config_path, commands, outcomes, startup, quit_flag, balance)
     }
     #[cfg(not(windows))]
     {
-        let _ = (config_path, commands, outcomes, startup, quit_flag);
+        let _ = (config_path, commands, outcomes, startup, quit_flag, balance);
         Ok(Box::new(NoopWindow))
     }
 }
@@ -297,8 +298,16 @@ pub fn spawn_or_editor(
     outcomes: crossbeam_channel::Receiver<(crate::app::CommandId, crate::app::CommandOutcome)>,
     startup: Startup,
     quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    balance: std::sync::Arc<crate::balance::BalanceMonitor>,
 ) -> Box<dyn WindowSink> {
-    let spawned = spawn(config_path.clone(), commands, outcomes, startup, quit_flag);
+    let spawned = spawn(
+        config_path.clone(),
+        commands,
+        outcomes,
+        startup,
+        quit_flag,
+        balance,
+    );
     or_editor(spawned, config_path, open_config_file)
 }
 

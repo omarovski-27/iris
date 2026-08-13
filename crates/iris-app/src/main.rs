@@ -275,6 +275,12 @@ struct Resident {
     // a later launch checks. Declared after `app` so they outlive it.
     _listener: iris_core::hotkey::Listener,
     _tray: iris_app::tray::Tray,
+    // Dropping this disconnects the balance monitor's refresh channel, which
+    // is what ends its background thread — see `iris_app::balance`'s module
+    // docs. The window holds its own clone for the life of its own thread;
+    // this is the one that keeps it alive for the life of the process even
+    // while the window is closed.
+    _balance: Arc<iris_app::balance::BalanceMonitor>,
     // `None` only when `single_instance::acquire` itself failed (logged at
     // the call site in `run`) — a degraded mode with no second-launch
     // detection, not a startup failure.
@@ -383,6 +389,16 @@ fn start_resident(
     let quit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tray, commands) = tray::spawn(&config, config_path, devices, Arc::clone(&quit_flag))?;
 
+    // Independent of `App` and of every window open/close cycle, mirroring
+    // the tray/overlay/window threads above — see `iris_app::balance`'s
+    // module docs. `None` (nothing spawned, the feature reads as
+    // unconfigured everywhere) unless the user opted in with a
+    // `deepgram_management` key.
+    let balance = Arc::new(iris_app::balance::BalanceMonitor::spawn(
+        iris_core::engine::deepgram_balance::key_from_env(),
+        Arc::clone(&notice),
+    ));
+
     let (listener, keys) = iris_core::hotkey::listen(config.hotkey, config.suppress_hotkey)
         .context("installing the push-to-talk hook")?;
 
@@ -423,6 +439,7 @@ fn start_resident(
         window_outcomes_rx,
         startup,
         Arc::clone(&quit_flag),
+        Arc::clone(&balance),
     );
 
     let app = App::new(config, config_path, audio, injector, pill)?
@@ -442,6 +459,7 @@ fn start_resident(
         _listener: listener,
         _tray: tray,
         _single_instance: single_instance,
+        _balance: balance,
     })
 }
 
@@ -686,6 +704,13 @@ fn demo_window() -> Result<()> {
         // `Command::apply_to` does (`Quit` writes no field), same as every
         // other command this demo cannot really apply.
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // No management key in the demo, so the balance card shows nothing
+        // but the "how to opt in" hint — the same as any real install that
+        // has not configured one.
+        Arc::new(iris_app::balance::BalanceMonitor::spawn(
+            None,
+            Arc::new(iris_app::NoopFailureNotice),
+        )),
     )?;
     handle.open();
 

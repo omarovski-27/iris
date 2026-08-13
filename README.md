@@ -102,6 +102,27 @@ prompt instead. Empty by default, which changes nothing; a very long list is
 trimmed to whatever the active engine allows rather than failing the
 dictation.
 
+### Deepgram balance (optional)
+
+If you fund Iris from your own Deepgram balance, Settings can show what's
+left and warn you once before it runs out — a **second**, separate key, since
+reading a balance needs Deepgram's Management API (`billing:read` scope, an
+Admin- or Owner-role key — the ordinary transcription key above cannot do
+this):
+
+```bash
+export IRIS_DEEPGRAM_MANAGEMENT_KEY=…
+# or, under the same [keys] table in config.toml:
+#   deepgram_management = "…"
+```
+
+Leave it unset and nothing changes — no balance shown, no error, no change to
+transcription. With it set, Iris checks on startup and every few hours (never
+per dictation, never on the capture path), shows the balance and when it was
+last checked in Settings with a manual **Refresh**, and warns once when it
+drops to $5 or below. Get a key with the right scope at
+<https://console.deepgram.com>.
+
 ### Offline smoke (any platform)
 
 ```bash

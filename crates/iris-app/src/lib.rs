@@ -59,6 +59,7 @@
 
 pub mod app;
 pub mod audio;
+pub mod balance;
 pub mod config;
 pub mod dialog;
 pub mod engines;

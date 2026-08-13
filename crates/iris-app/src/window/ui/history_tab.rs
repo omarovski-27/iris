@@ -229,7 +229,11 @@ fn status_chip(ui: &mut Ui, theme: &iris_overlay::Theme, record: &DictationRecor
 ///
 /// A stamp that will not parse is shown as it was written and labelled UTC,
 /// rather than moved by an offset that may not apply to it.
-fn friendly_timestamp(ts: &str, utc_offset_seconds: i32) -> String {
+///
+/// `pub(super)` (not private) because `settings_tab`'s balance card reuses it
+/// for `crate::balance::BalanceView::checked_at`, which is stamped the same
+/// UTC-RFC-3339 way for the same reason.
+pub(super) fn friendly_timestamp(ts: &str, utc_offset_seconds: i32) -> String {
     let parsed = time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339);
     let offset = time::UtcOffset::from_whole_seconds(utc_offset_seconds);
     match (parsed, offset) {

@@ -126,6 +126,31 @@ for you — but if you ever open the file by hand, this is what it looks like:
 vocabulary = ["Deepgram", "Zipformer", "Kubernetes"]
 ```
 
+## Seeing your remaining Deepgram balance (optional)
+
+If you are paying for Deepgram out of your own balance, Iris can show what is
+left in the Settings tab, and warn you once before it runs out — but only if
+you give it a **second**, separate Deepgram key: your ordinary `deepgram` key
+above cannot read this, because Deepgram's balance lookup needs a key with the
+`billing:read` permission (an Admin- or Owner-role key; the Member role does
+not carry it).
+
+Create one at <https://console.deepgram.com> — your project's API keys page,
+same place as your ordinary key — then add it as `deepgram_management` in the
+same `[keys]` table at the bottom of `config.toml`, alongside `deepgram`:
+
+```
+[keys]
+deepgram = "paste-your-key-here"
+deepgram_management = "paste-your-billing-key-here"
+```
+
+This is entirely optional. Leave it out and nothing changes: no balance shown,
+no warning, no error, and your dictation key keeps working exactly as before.
+With it set, the Settings tab shows the balance and when it was last checked,
+with a **Refresh** button, and Iris warns you once when it drops to $5 or
+below.
+
 ## Downgrading to an older Iris
 
 Going *back* to a release older than this one needs one edit first. Iris stamps

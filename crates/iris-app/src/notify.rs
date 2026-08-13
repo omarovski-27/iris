@@ -44,6 +44,19 @@ pub trait FailureNotice: Send + Sync {
     /// Called once per such dictation, on the dictation thread, from
     /// `App::failed`.
     fn connection_failed(&self, error: &str);
+
+    /// Told that the optional Deepgram account balance (see `crate::balance`)
+    /// has dropped to or below `crate::balance::LOW_BALANCE_THRESHOLD_USD`.
+    /// `message` is already the full, actionable sentence (see
+    /// `crate::balance`'s own `low_balance_message`) — show it as-is, the
+    /// same rule [`FailureNotice::connection_failed`] already follows for
+    /// `error`. Unlike both other methods on this trait, this is never about
+    /// a dictation that failed — it fires from `crate::balance`'s own
+    /// background thread, independent of `App` and of whether a dictation is
+    /// even happening, and `crate::balance::run`'s own warn-once-per-dip
+    /// state keeps it from firing on every periodic check while the balance
+    /// stays low.
+    fn low_balance(&self, message: &str);
 }
 
 /// The real thing: the clipboard when history is off, and a visible dialog
@@ -91,6 +104,10 @@ impl FailureNotice for SystemFailureNotice {
             &format!("Nothing was sent.\n\n{error}"),
         );
     }
+
+    fn low_balance(&self, message: &str) {
+        crate::dialog::show("Iris: your Deepgram balance is low", message);
+    }
 }
 
 /// Remembers every call, for tests. Never touches a real clipboard or shows a
@@ -99,6 +116,7 @@ impl FailureNotice for SystemFailureNotice {
 pub struct RecordingFailureNotice {
     calls: std::sync::Mutex<Vec<(String, String, bool)>>,
     connection_calls: std::sync::Mutex<Vec<String>>,
+    low_balance_calls: std::sync::Mutex<Vec<String>>,
 }
 
 impl RecordingFailureNotice {
@@ -117,6 +135,11 @@ impl RecordingFailureNotice {
     pub fn connection_calls(&self) -> Vec<String> {
         self.connection_calls.lock().expect("notice mutex").clone()
     }
+
+    /// Every [`FailureNotice::low_balance`] call so far, in order.
+    pub fn low_balance_calls(&self) -> Vec<String> {
+        self.low_balance_calls.lock().expect("notice mutex").clone()
+    }
 }
 
 impl FailureNotice for RecordingFailureNotice {
@@ -134,6 +157,13 @@ impl FailureNotice for RecordingFailureNotice {
             .expect("notice mutex")
             .push(error.to_string());
     }
+
+    fn low_balance(&self, message: &str) {
+        self.low_balance_calls
+            .lock()
+            .expect("notice mutex")
+            .push(message.to_string());
+    }
 }
 
 /// Does nothing. [`crate::App::new`]'s default until `main` opts the
@@ -146,6 +176,7 @@ pub struct NoopFailureNotice;
 impl FailureNotice for NoopFailureNotice {
     fn injection_failed(&self, _text: &str, _error: &str, _history_enabled: bool) {}
     fn connection_failed(&self, _error: &str) {}
+    fn low_balance(&self, _message: &str) {}
 }
 
 #[cfg(test)]
@@ -181,8 +212,20 @@ mod tests {
     }
 
     #[test]
+    fn recording_notice_collects_low_balance_warnings_separately_from_everything_else() {
+        let notice = RecordingFailureNotice::new();
+        notice.low_balance("your balance is low");
+        notice.connection_failed("could not resolve host");
+
+        assert_eq!(notice.low_balance_calls(), ["your balance is low"]);
+        assert_eq!(notice.connection_calls(), ["could not resolve host"]);
+        assert!(notice.calls().is_empty());
+    }
+
+    #[test]
     fn noop_notice_does_not_panic() {
         NoopFailureNotice.injection_failed("hello", "boom", false);
         NoopFailureNotice.connection_failed("boom");
+        NoopFailureNotice.low_balance("boom");
     }
 }
