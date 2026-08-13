@@ -108,6 +108,7 @@ pub fn spawn(
     outcomes: Receiver<(CommandId, CommandOutcome)>,
     startup: Startup,
     quit_flag: Arc<AtomicBool>,
+    balance: Arc<crate::balance::BalanceMonitor>,
 ) -> Result<Box<dyn WindowSink>> {
     let (open_tx, open_rx) = crossbeam_channel::unbounded::<()>();
     let ctx: SharedContext = Arc::new(Mutex::new(None));
@@ -135,6 +136,7 @@ pub fn spawn(
                     startup,
                     &thread_ctx,
                     Arc::clone(&quit_flag),
+                    Arc::clone(&balance),
                 ) {
                     // The window this thread just ran was the other reader of
                     // this channel. A click it never got to drain — one that
@@ -171,6 +173,7 @@ pub fn spawn(
 
 /// Build and run one window instance until it is closed. An error here is the
 /// window proving it cannot run on this machine at all.
+#[allow(clippy::too_many_arguments)]
 fn run_window(
     reopen_signal: Receiver<()>,
     config_path: PathBuf,
@@ -179,6 +182,7 @@ fn run_window(
     startup: Startup,
     ctx: &SharedContext,
     quit_flag: Arc<AtomicBool>,
+    balance: Arc<crate::balance::BalanceMonitor>,
 ) -> Result<()> {
     // Best-effort: a config that fails to load just draws the default-theme
     // icon rather than blocking the window from opening at all.
@@ -221,6 +225,7 @@ fn run_window(
         ctx: Arc::clone(ctx),
         state: None,
         quit_flag,
+        balance,
     };
 
     let result = eframe::run_native(
@@ -255,6 +260,10 @@ struct SettingsApp {
     state: Option<WindowState>,
     /// The flag this window's close button flips — see [`super::Env::request_quit`].
     quit_flag: Arc<AtomicBool>,
+    /// The background balance monitor — see [`crate::balance`]. Owned by
+    /// `main` for the life of the process; this window only ever reads its
+    /// cached view or asks it to refresh, never fetches directly.
+    balance: Arc<crate::balance::BalanceMonitor>,
 }
 
 impl eframe::App for SettingsApp {
@@ -262,6 +271,10 @@ impl eframe::App for SettingsApp {
         if self.state.is_none() {
             *self.ctx.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx.clone());
         }
+        let balance_monitor = Arc::clone(&self.balance);
+        let balance_view = || balance_monitor.view();
+        let refresh_monitor = Arc::clone(&self.balance);
+        let refresh_balance = || refresh_monitor.request_refresh();
         let env = Env {
             config_path: &self.config_path,
             commands: &self.commands,
@@ -279,6 +292,8 @@ impl eframe::App for SettingsApp {
                 at_startup: self.startup.saved_overlay_enabled,
             },
             quit_flag: Arc::clone(&self.quit_flag),
+            balance: &balance_view,
+            refresh_balance: &refresh_balance,
         };
         let state = self.state.get_or_insert_with(|| WindowState::new(&env));
         ui::draw_root(ctx, state, &env);

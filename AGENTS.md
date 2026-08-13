@@ -239,6 +239,46 @@ Load-bearing beyond that crate:
   not wired to anything: Iris has no automatic retry anywhere in its capture
   path today, so a permanent cause (`InvalidKey`/`ExhaustedCredit`) is never
   retried by construction, not by a check that could be gotten wrong.
+- **Warning about an exhausted balance *before* it happens is a background
+  feature, deliberately kept off the dictation path entirely.**
+  `iris_core::engine::deepgram_balance` (`crates/iris-core/src/engine/`)
+  reads a Deepgram account's remaining balance from Deepgram's **Management
+  API** — a different surface, and a different, project-scoped credential
+  (`billing:read` scope; an Admin- or Owner-role key, confirmed against
+  Deepgram's own role docs 2026-08-13 — the Member role does not carry it),
+  from the transcription key `DeepgramEngine` uses. It authenticates with
+  `Authorization: Token <key>`, not `Bearer` — confirmed against Deepgram's
+  docs; the wrong scheme silently produces a `401` on every call. There is no
+  "my balance" endpoint that takes only a key: `fetch` resolves the account's
+  project via `GET /v1/projects` and takes the *first* entry (Iris has no
+  concept of "which project"), then sums every entry `GET
+  /v1/projects/{id}/balances` returns — an account can carry more than one
+  outstanding balance, and the total is what the user actually wants to know.
+  `iris_app::balance::BalanceMonitor` (`crates/iris-app/src/balance.rs`) owns
+  the one background thread that ever calls this — mirroring
+  `tray::spawn`/`iris_overlay::spawn`/`window::spawn`, independent of `App`
+  and of the settings window's own lifecycle — fetching once at startup, then
+  on a 6-hour timer or a manual "Refresh" in Settings, never per dictation and
+  never anywhere that could block one. A failed fetch is quiet by design: it
+  marks `BalanceView::check_failed` and keeps the last known amount, with no
+  dialog and no change to transcription — a billing lookup failing must never
+  look like or be mistaken for a transcription failure. The one thing that
+  *does* reach the user proactively is `FailureNotice::low_balance` (the same
+  trait/dialog `connection_failed` already uses, third method on it — same
+  pattern as that entry above), fired once per dip below
+  `balance::LOW_BALANCE_THRESHOLD_USD` ($5, reasoned from Deepgram's own
+  published Nova-3 streaming price — see the constant's doc comment — not
+  picked arbitrarily) and not again until the balance recovers above it, so a
+  balance stuck low does not repeat the warning on every periodic check. The
+  whole feature is opt-in and additive: absent `config.toml`'s
+  `[keys].deepgram_management` (or `$IRIS_DEEPGRAM_MANAGEMENT_KEY`), no
+  thread starts, the Settings card shows only how to opt in, and nothing
+  about transcription changes. Both keys get the same redaction discipline
+  (`Keys`'s hand-written `Debug`, `to_redacted_toml`) and the same
+  never-log-the-key testing `deepgram.rs`/`groq.rs` already have —
+  `deepgram_balance.rs`'s own tests include a worst-case adversarial server
+  that echoes the raw request (key included) back in a `401` body, proving
+  the classifier never reads it.
 - **The settings window's close (`X`, Alt+F4, the taskbar's "Close window")
   hides the window and leaves Iris running in the tray — it does not quit
   the app.** This is the 2026-08-11 state, and it reverses part of an

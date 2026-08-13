@@ -11,14 +11,21 @@
 //! editor: the keys stay hand-edited, exactly as they were when the tray's
 //! `Settings` item opened the file directly, and nothing in this process
 //! ever reads one back to render it.
+//!
+//! [`balance_section`] is the one card that shows a number derived from a
+//! key rather than nothing at all — the remaining Deepgram balance, never
+//! the `deepgram_management` key itself, which stays exactly as unreadable
+//! here as every other key. See `crate::balance`'s module docs.
 
 use egui::{RichText, Ui};
 use iris_core::hotkey::Key;
 
+use crate::balance::BalanceView;
 use crate::config::{EngineChoice, Theme};
 use crate::window::{Env, WindowState};
 
 use super::chrome;
+use super::history_tab::friendly_timestamp;
 
 pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overlay::Theme) {
     ui.label(
@@ -41,6 +48,8 @@ pub fn draw(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris_overla
             cleanup_section(ui, state, env, theme);
             ui.add_space(12.0);
             overlay_section(ui, state, env, theme);
+            ui.add_space(12.0);
+            balance_section(ui, env, theme);
             ui.add_space(12.0);
             config_file_section(ui, state, env, theme);
         });
@@ -241,6 +250,78 @@ fn overlay_section(ui: &mut Ui, state: &mut WindowState, env: &Env, theme: &iris
         });
         caption(ui, theme, "The small on-screen indicator that appears while you hold the hotkey. Changing this needs a restart of Iris.");
     });
+}
+
+/// The optional Deepgram balance readout — see `crate::balance`'s module
+/// docs for the background fetch this only ever reads a cached view of, and
+/// `crate::config::Keys::deepgram_management` for how a user opts in. Never
+/// more than this one card: no history, no chart, no spend-rate projection —
+/// the brief this was built from is explicit that this is a readout, not a
+/// billing dashboard.
+fn balance_section(ui: &mut Ui, env: &Env, theme: &iris_overlay::Theme) {
+    let view = (env.balance)();
+    chrome::card(theme).show(ui, |ui| {
+        chrome::section_label(ui, theme, "Deepgram balance");
+        ui.add_space(8.0);
+
+        if !view.configured {
+            caption(
+                ui,
+                theme,
+                "Optional: add a deepgram_management key to your config file's [keys] table to \
+                 see your remaining Deepgram balance here, with a warning before it runs out. See \
+                 the repo README for how to create one.",
+            );
+            return;
+        }
+
+        match balance_line(&view) {
+            Some((text, warn)) => {
+                let text = RichText::new(text).size(14.0);
+                ui.label(if warn {
+                    text.strong().color(chrome::warn(theme))
+                } else {
+                    text.color(chrome::ink(theme))
+                });
+            }
+            None => caption(ui, theme, "Checking…"),
+        }
+
+        ui.horizontal(|ui| {
+            if let Some(checked_at) = &view.checked_at {
+                caption(
+                    ui,
+                    theme,
+                    &format!(
+                        "Checked {}{}",
+                        friendly_timestamp(checked_at, env.utc_offset_seconds),
+                        if view.check_failed {
+                            " (last check failed — showing the last known balance)"
+                        } else {
+                            ""
+                        },
+                    ),
+                );
+            }
+            if ui.small_button("Refresh").clicked() {
+                (env.refresh_balance)();
+            }
+        });
+    });
+}
+
+/// The main balance line's text and whether it should read as a warning —
+/// `None` before the very first fetch has finished, so the view can show
+/// "Checking…" instead of a blank line.
+fn balance_line(view: &BalanceView) -> Option<(String, bool)> {
+    match view.amount {
+        Some(amount) => {
+            let warn = amount <= crate::balance::LOW_BALANCE_THRESHOLD_USD;
+            Some((crate::balance::format_amount(amount, &view.units), warn))
+        }
+        None if view.check_failed => Some(("Balance unknown (check failed)".to_string(), true)),
+        None => None,
+    }
 }
 
 /// The one place this window points at `config.toml` itself.

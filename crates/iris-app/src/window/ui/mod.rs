@@ -337,6 +337,8 @@ mod tests {
                 at_startup: true,
             },
             quit_flag: Arc::clone(&quit_flag),
+            balance: &crate::balance::BalanceView::default,
+            refresh_balance: &|| {},
         };
         let mut state = WindowState::new(&env);
 

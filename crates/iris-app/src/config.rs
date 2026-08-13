@@ -72,6 +72,14 @@ const HEADER: &str = "\
 # over anything set here. Either way, Iris never prints a key back — see
 # --print-config.
 #
+# Optional: to see your remaining Deepgram balance in Settings, with a warning
+# before it runs out, add a deepgram_management key to that same [keys] table
+# — a separate key with the billing:read scope (an Admin- or Owner-role key;
+# Deepgram's Member role does not carry it), created at
+# https://console.deepgram.com under your project's API keys (not the same
+# key as deepgram above). Leave it out and nothing about the balance feature
+# or transcription changes. Environment override: IRIS_DEEPGRAM_MANAGEMENT_KEY.
+#
 # `version` records which Iris schema last wrote this file. Leave it alone;
 # it exists so a changed default can reach a file that predates it.
 ";
@@ -343,6 +351,20 @@ pub struct Keys {
     /// Environment: `IRIS_LLM_KEY`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<String>,
+    /// A **separate**, optional Deepgram key for the account-management API
+    /// this crate's `balance` module reads to show the remaining balance in
+    /// Settings. Environment: `IRIS_DEEPGRAM_MANAGEMENT_KEY`.
+    ///
+    /// Deliberately not `deepgram` above: Deepgram's Management API needs a
+    /// key scoped with `billing:read`, a project-scoped permission the
+    /// ordinary transcription key above should not need and usually will not
+    /// have — see `iris_core::engine::deepgram_balance`'s module docs for
+    /// why the two are unrelated credentials, and the repo README for how to
+    /// create one. Entirely optional: absent (the default), the balance
+    /// feature is off end to end — no fetch, no UI, no warning — and nothing
+    /// about transcription changes either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepgram_management: Option<String>,
 }
 
 impl fmt::Debug for Keys {
@@ -352,6 +374,7 @@ impl fmt::Debug for Keys {
             .field("deepgram", &mark(&self.deepgram))
             .field("groq", &mark(&self.groq))
             .field("llm", &mark(&self.llm))
+            .field("deepgram_management", &mark(&self.deepgram_management))
             .finish()
     }
 }
@@ -368,6 +391,10 @@ impl Keys {
             ("IRIS_DEEPGRAM_KEY", self.deepgram.as_deref()),
             ("IRIS_GROQ_KEY", self.groq.as_deref()),
             ("IRIS_LLM_KEY", self.llm.as_deref()),
+            (
+                iris_core::engine::deepgram_balance::KEY_ENV,
+                self.deepgram_management.as_deref(),
+            ),
         ]
         .into_iter()
         .filter_map(|(var, key)| {
@@ -510,6 +537,7 @@ impl Config {
             &mut redacted.keys.deepgram,
             &mut redacted.keys.groq,
             &mut redacted.keys.llm,
+            &mut redacted.keys.deepgram_management,
         ] {
             *key = key
                 .as_deref()
@@ -1050,6 +1078,7 @@ mod tests {
                 deepgram: Some("dg_super_secret".into()),
                 groq: Some("gsk_super_secret".into()),
                 llm: Some("llm_super_secret".into()),
+                deepgram_management: Some("mgmt_super_secret".into()),
             },
             ..Config::default()
         };
@@ -1065,14 +1094,19 @@ mod tests {
         let mut config = Config::default();
         config.keys.deepgram = Some("dg_super_secret".into());
         config.keys.groq = Some("gsk_super_secret".into());
+        config.keys.deepgram_management = Some("mgmt_super_secret".into());
 
         let rendered = config.to_redacted_toml().unwrap();
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(rendered.contains("deepgram = \"<redacted>\""), "{rendered}");
         assert!(rendered.contains("groq = \"<redacted>\""), "{rendered}");
+        assert!(
+            rendered.contains("deepgram_management = \"<redacted>\""),
+            "{rendered}"
+        );
         // The unset llm key is simply absent, so the output still says which
         // keys are configured.
-        assert_eq!(rendered.matches("<redacted>").count(), 2, "{rendered}");
+        assert_eq!(rendered.matches("<redacted>").count(), 3, "{rendered}");
 
         // The file, unlike the print path, must carry the real values.
         let dir = tempfile::tempdir().unwrap();
@@ -1237,6 +1271,7 @@ mod tests {
             deepgram: Some("  dg  ".into()),
             groq: Some("   ".into()),
             llm: None,
+            deepgram_management: None,
         };
         let pairs: Vec<_> = keys.pairs().collect();
         assert_eq!(pairs, vec![("IRIS_DEEPGRAM_KEY", "dg")]);

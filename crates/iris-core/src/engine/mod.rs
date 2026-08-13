@@ -36,6 +36,7 @@ use anyhow::{bail, Result};
 use crossbeam_channel::Receiver;
 
 pub mod deepgram;
+pub mod deepgram_balance;
 mod failure;
 pub mod groq;
 pub mod mock;

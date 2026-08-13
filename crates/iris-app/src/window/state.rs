@@ -118,6 +118,15 @@ pub struct Env<'a> {
     /// the process, the same way `tray::spawn` does. See
     /// [`Env::request_quit`].
     pub quit_flag: Arc<AtomicBool>,
+    /// The optional Deepgram balance monitor's current view — see
+    /// `crate::balance` for why this is a background thread's cached state
+    /// rather than a fetch made from this frame. `configured: false` (the
+    /// default when no `deepgram_management` key exists) is what the
+    /// Settings tab reads to show nothing but how to opt in.
+    pub balance: &'a dyn Fn() -> crate::balance::BalanceView,
+    /// Ask the balance monitor to check again now, for a "Refresh" control in
+    /// Settings. A no-op if the feature is not configured.
+    pub refresh_balance: &'a dyn Fn(),
 }
 
 impl Env<'_> {
@@ -807,6 +816,12 @@ mod tests {
         Err(anyhow::anyhow!("no desktop in a test")).context("launching the editor")
     }
 
+    /// The default "no `deepgram_management` key configured" view every test
+    /// that does not exercise the balance feature specifically should see.
+    fn no_balance() -> crate::balance::BalanceView {
+        crate::balance::BalanceView::default()
+    }
+
     fn env_with<'a>(
         config_path: &'a Path,
         commands: &'a Sender<(CommandId, Command)>,
@@ -831,6 +846,8 @@ mod tests {
                 at_startup: true,
             },
             quit_flag: Arc::new(AtomicBool::new(false)),
+            balance: &no_balance,
+            refresh_balance: &|| {},
         }
     }
 
