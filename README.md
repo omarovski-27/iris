@@ -1,42 +1,40 @@
 # Iris
 
-**Fast, minimal, open-source voice dictation.** Hold a key, speak, release — your words appear in whatever app you're using. Named for the Greek goddess of the rainbow, the swift messenger of the gods.
+**Fast, minimal, open-source voice dictation for Windows.** Hold a key, speak,
+release, and Iris types into the app you were already using.
 
-Iris is built around one obsession: **latency and smoothness**. Audio is transcribed while you speak, so text lands the instant you stop.
+Iris is built for low latency. Audio streams while you speak, so the transcript
+can land as soon as you let go.
 
-## Goals
+## What it does
 
-- **Fast** — streaming transcription; target well under 300 ms from key-release to text.
-- **Smooth** — instant visual feedback, fluid overlay, zero jank.
-- **Minimal** — a pill, a tray icon, one small settings window over a plain config file. Nothing else.
-- **Yours** — pluggable engines: bring a cloud API key for maximum speed, or run a local model for full privacy. Open source, MIT.
+- **Streaming dictation** — target: under 300 ms from key release to inserted text.
+- **Push-to-talk or hands-free** — hold Right-Ctrl, or double-tap it to latch recording on.
+- **Small desktop surface** — tray icon, pill overlay, and one settings window.
+- **Engine choice** — mock, Deepgram, Groq, and an experimental local path.
+- **Plain files** — config and history live in your user profile. No account required.
 
 ## Install (Windows)
 
-For someone who just wants to run Iris — no Rust, no build tools: get
-`iris-<version>-windows-x64.zip` (build one yourself with
-`scripts/package-windows.sh`, or take one someone already built), extract it,
-and follow the `README.md` inside.
+If you just want to run Iris, download `iris-<version>-windows-x64.zip` from
+the [latest release](https://github.com/omarovski-27/iris/releases/latest),
+extract it, and follow the `README.md` inside. No Rust or build tools needed.
 
-That document —
-[`packaging/windows/README.md`](packaging/windows/README.md), staged into the
-zip — is the single source of truth for the end-user path: the SmartScreen
-"Windows protected your PC" prompt, running `install.ps1` (and its `-Desktop`
-/ `-RunAtLogin` flags), where `%LOCALAPPDATA%\IrisConfig\iris\config.toml`
-lives, and how to switch off the mock engine and add a Deepgram or Groq key. A
-recipient never needs this repository. The rest of this README is the
-developer path.
+The zip README is staged from
+[`packaging/windows/README.md`](packaging/windows/README.md). It covers
+SmartScreen, `install.ps1`, optional Desktop / run-at-login shortcuts, the
+config path, and adding a Deepgram or Groq key. This repository README is for
+development.
 
 ### Why a zip and not an installer
 
 Building an MSI/EXE installer needs either MSVC or the WiX toolset, both of
-which pull in tooling this project deliberately avoids (see
-[`docs/dev-windows.md`](docs/dev-windows.md) "Why gnu and not msvc") — the
-whole point of the `x86_64-pc-windows-gnu` target is a cross-compile that
-needs nothing but `mingw-w64`. A portable zip plus a per-user PowerShell
-installer gets a Start Menu entry and a real `%LOCALAPPDATA%` install without
-trading that away. A native Windows build (real MSVC on the machine, not
-cross-compiled) would unlock a proper MSI if that's ever wanted.
+which pull in tooling this project avoids (see
+[`docs/dev-windows.md`](docs/dev-windows.md) "Why gnu and not msvc"). The
+`x86_64-pc-windows-gnu` target keeps the release path to a `mingw-w64`
+cross-compile. The zip plus per-user PowerShell installer still gives users a
+Start Menu entry and a real `%LOCALAPPDATA%` install. A native Windows build
+with MSVC could support an MSI later.
 
 ### Building the zip yourself
 
@@ -59,23 +57,22 @@ cargo build --release --target x86_64-pc-windows-gnu -p iris-app
 ./target/x86_64-pc-windows-gnu/release/iris.exe
 ```
 
-First dictation:
+First run:
 
 1. A tray icon appears (prism triangle). Right-click for engine / theme / polish, or "Open settings…" for the settings window (history, settings, insights).
 2. Hold **Right-Ctrl**, speak, release.
-3. The Prism pill appears bottom-centre while you talk — a quiet glass capsule that pulses with your voice (set `show_live_text = true` to also open a ribbon showing your words as they are heard); text is polished and injected into the focused window.
+3. The pill overlay appears bottom-centre while you talk. Set `show_live_text = true` to show live transcript text in the overlay.
 4. Session history lands in `history.jsonl` beside the config.
 
 ### Hands-free dictation
 
-Double-tap **Right-Ctrl** (within 400 ms) instead of holding it, and Iris
-keeps listening with the key up — no need to keep your finger down. Tap
-**Right-Ctrl** once more to stop; the text is inserted exactly as it would be
-on a normal release. While latched, the pill's core dot changes colour and
-gains a ring around it, so a live microphone is obvious at a glance even from
-across the room. Forget to stop it and Iris stops itself after 5 minutes,
-finalising normally rather than discarding anything captured. Ordinary
-hold-to-talk is unchanged if you never double-tap.
+Double-tap **Right-Ctrl** (within 400 ms) and Iris keeps listening with the key
+up. Tap **Right-Ctrl** once more to stop; the text is inserted exactly as it
+would be on a normal release. While latched, the pill's core dot changes colour
+and gains a ring around it, so a live microphone is obvious at a glance even
+from across the room. If you forget to stop it, Iris stops itself after 5
+minutes and inserts what it captured. Hold-to-talk is unchanged if you never
+double-tap.
 
 ### Config location
 
@@ -104,7 +101,7 @@ Set `engine = "deepgram"` / `"groq"` / `"mock"` / `"local"` in the config (or `-
 
 ### Custom vocabulary
 
-Names, jargon and acronyms Iris keeps mishearing go in the Settings window's
+Names, jargon, and acronyms Iris keeps mishearing go in the Settings window's
 **Vocabulary** card — one term per line — or directly in `config.toml` as
 `vocabulary = ["Term", "Another term"]`. Deepgram gets these as `keyterm`
 hints (nova-3's keyterm prompting); Groq and the local Whisper engine have no
@@ -115,11 +112,10 @@ dictation.
 
 ### Deepgram balance (optional)
 
-If you fund Iris from your own Deepgram balance, Settings can show what's
-left and warn you once before it runs out — a **second**, separate key, since
-reading a balance needs Deepgram's Management API (`billing:read` scope, an
-Admin- or Owner-role key — the ordinary transcription key above cannot do
-this):
+If you use your own Deepgram balance, Settings can show what's left and warn
+you once before it runs out. This needs a **second**, separate key for
+Deepgram's Management API (`billing:read` scope, an Admin- or Owner-role key);
+the ordinary transcription key cannot read billing data.
 
 ```bash
 export IRIS_DEEPGRAM_MANAGEMENT_KEY=…
@@ -127,11 +123,9 @@ export IRIS_DEEPGRAM_MANAGEMENT_KEY=…
 #   deepgram_management = "…"
 ```
 
-Leave it unset and nothing changes — no balance shown, no error, no change to
-transcription. With it set, Iris checks on startup and every few hours (never
-per dictation, never on the capture path), shows the balance and when it was
-last checked in Settings with a manual **Refresh**, and warns once when it
-drops to $5 or below. Get a key with the right scope at
+Leave it unset and nothing changes. With it set, Iris checks on startup and
+every few hours, shows the balance and last check time in Settings, and warns
+once when it drops to $5 or below. Get a key with the right scope at
 <https://console.deepgram.com>.
 
 ### Offline smoke (any platform)

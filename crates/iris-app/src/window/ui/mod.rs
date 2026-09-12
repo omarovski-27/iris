@@ -55,7 +55,7 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 /// about this at all; the hotkey, the tray and dictation itself keep running
 /// exactly as if the window had never been open. An earlier revision showed
 /// a one-time "still running" notification the first time this happened;
-/// removed 2026-08-12 at the captain's request (see `AGENTS.md`) — the hide
+/// removed 2026-08-12 at the maintainer's request (see `AGENTS.md`) — the hide
 /// itself is unchanged, only the popup is gone.
 ///
 /// This reverses part of an earlier fix that made every one of these three
@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    /// Regression for the captain's 2026-08-11 request: closing the settings
+    /// Regression for the maintainer's 2026-08-11 request: closing the settings
     /// window ("click the X button") must leave Iris running in the tray,
     /// the way Wispr Flow behaves, rather than quitting the whole app (which
     /// is what an earlier fix, in response to a different report, made every

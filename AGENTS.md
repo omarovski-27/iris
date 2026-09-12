@@ -196,7 +196,7 @@ Load-bearing beyond that crate:
   message.** `never_connected` above only ever says *that* the service was
   unreachable; it says nothing about *why*, so an exhausted Deepgram balance
   used to produce the identical message as a dead wifi connection (the
-  captain would check their router while the real problem was billing).
+  maintainer would check their router while the real problem was billing).
   `iris_core::engine::FailureCause` (`iris-core/src/engine/failure.rs`) is
   the fix: `InvalidKey` / `ExhaustedCredit` / `RateLimited` /
   `NetworkUnreachable` / `Timeout` / `Unknown`, each with its own actionable,
@@ -234,7 +234,7 @@ Load-bearing beyond that crate:
   no-connect-budget engine through the real loop
   (`a_classified_engine_rejection_notifies_and_tags_its_cause_even_without_a_connect_budget`,
   `iris-app/tests/loop.rs`) — none of it against a real failing key, which
-  this sandbox cannot reach (see "The captain's real `history.jsonl`" below).
+  this sandbox cannot reach (see "A real Windows `history.jsonl`" below).
   `retryable()` exists so the classification is complete and testable but is
   not wired to anything: Iris has no automatic retry anywhere in its capture
   path today, so a permanent cause (`InvalidKey`/`ExhaustedCredit`) is never
@@ -284,7 +284,7 @@ Load-bearing beyond that crate:
   the app.** This is the 2026-08-11 state, and it reverses part of an
   intermediate fix described below for the historical record: for one day
   (2026-08-10) every close path *did* quit the whole app, built in direct
-  response to a report read as "cannot be closed". The captain's next
+  response to a report read as "cannot be closed". The maintainer's next
   message ("I want it such that when I close the app it still runs in the
   background, just like Wispr Flow") made the actual complaint clear in
   hindsight — the 2026-08-10 report was about the app *freezing and lagging*
@@ -302,8 +302,8 @@ Load-bearing beyond that crate:
   earlier revision of this same feature added a one-time "Iris is still
   running" hint on the first close (`crate::dialog::show_info`,
   `Config::tray_close_hint_shown`, `Command::AcknowledgeTrayHint`) —
-  firstmate's own addition, not something the captain asked for. Removed
-  2026-08-12 at the captain's explicit request ("remove the windows
+  an earlier agent addition, not something the maintainer asked for. Removed
+  2026-08-12 at the maintainer's explicit request ("remove the windows
   notification that pops up when i close it"); do not reintroduce it. The
   hide-to-tray behaviour itself is unchanged, only the popup is gone.
   `dialog::show_info` (the mechanism the hint used) was removed with it,
@@ -607,7 +607,7 @@ duplicate at the seam — `strip_seam_duplicate` (`deepgram.rs`) closes that
 specific gap, separately from the keep/suppress decision above.** A
 2026-08-04 report of garbled multi-sentence dictation (several final
 segments, each one an extra seam) traced — by code inspection and synthetic
-reproduction, not the captain's real log; see below — to exactly the case the
+reproduction, not the real log cited in the report; see below — to exactly the case the
 containment module doc already named as its own accepted cost: `[0.0, 1.5]
 "the quick brown fox"` followed by `[1.4, 5.0] "fox jumps over the lazy
 dog"` is correctly kept whole (dropping it would lose six real words), but
@@ -624,10 +624,10 @@ Deepgram traffic this sandboxed environment cannot obtain, which is exactly
 re-emission that *reworks* the overlapping words rather than repeating them
 verbatim is still unaddressed by either mechanism.
 
-**The captain's real `history.jsonl` is not reachable from a Linux dev
+**A real Windows `history.jsonl` is not reachable from a Linux dev
 sandbox — treat any task that leans on it as needing a different diagnostic
-path.** It lives under `%LOCALAPPDATA%\IrisConfig\iris\` on the captain's own
-Windows machine; this repo's dev/CI environments have no Windows interop, so
+path.** It lives under `%LOCALAPPDATA%\IrisConfig\iris\` on the Windows
+machine that produced the report; this repo's dev/CI environments have no Windows interop, so
 a from-scratch filesystem search here finds nothing (confirmed, not merely
 assumed, while investigating the report above). When a task brief cites that
 log as the evidence source, expect to substitute code inspection plus a

@@ -158,7 +158,7 @@ pub enum CommandOutcome {
 /// window-driven quit and still exists for that purpose, but the settings
 /// window's own close button (`X`, Alt+F4, the taskbar's "Close window") no
 /// longer calls it — closing that window hides it and leaves Iris running,
-/// deliberately, per the captain's 2026-08-11 request; see
+/// deliberately, per the maintainer's 2026-08-11 request; see
 /// `window::ui::draw_root`'s doc comment for the full story and `AGENTS.md`.
 /// The tray's Quit item is today the only caller that actually ends the app.
 pub fn flip_quit_flag(quit_flag: &AtomicBool) {

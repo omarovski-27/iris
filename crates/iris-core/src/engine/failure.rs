@@ -4,8 +4,8 @@
 //! Before this module, a rejected API key, an exhausted balance, a rate
 //! limit and a dead network connection all produced the same shape of
 //! message — whatever `anyhow::Context` string happened to be on the `?` that
-//! failed — so a captain out of Deepgram credit saw the identical text a
-//! captain with no wifi would see, and went looking for a router problem
+//! failed — so a maintainer out of Deepgram credit saw the identical text a
+//! maintainer with no wifi would see, and went looking for a router problem
 //! that did not exist.
 //!
 //! [`FailureCause`] is the fix: a small, provider-agnostic classification
