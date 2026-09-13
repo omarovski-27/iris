@@ -1,7 +1,7 @@
 //! Streaming partials layer (ghost text).
 //!
 //! Preferred backend: sherpa-onnx streaming Zipformer transducer (int8) via the
-//! official first-party `sherpa-onnx` crate (feature `streaming`).
+//! upstream `sherpa-onnx` crate (feature `streaming`).
 //!
 //! Without the feature, only [`MockStreamingEngine`] is available — used by
 //! offline unit tests and as a stand-in when native deps are not built.

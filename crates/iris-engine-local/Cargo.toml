@@ -12,7 +12,7 @@ categories = ["multimedia::audio"]
 
 [features]
 default = []
-# Official first-party sherpa-onnx streaming Zipformer (ghost-text partials).
+# Upstream sherpa-onnx streaming Zipformer (ghost-text partials).
 streaming = ["dep:sherpa-onnx"]
 # whisper.cpp via whisper-rs (batch transcript of record) + Silero VAD gate.
 whisper = ["dep:whisper-rs"]

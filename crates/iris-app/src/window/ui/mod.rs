@@ -44,8 +44,8 @@ const AWAITING_LOOP_POLL: Duration = Duration::from_millis(100);
 /// own timer, apply the theme, then paint the background wash, the nav
 /// sidebar and the active tab.
 ///
-/// **The window's close hides it and leaves Iris running, the way Wispr Flow
-/// does — it does not quit the app.** `X`, Alt+F4, and the taskbar's "Close
+/// **The window's close hides it and leaves Iris running, like a tray-resident
+/// dictation app — it does not quit the app.** `X`, Alt+F4, and the taskbar's "Close
 /// window" all reach here as the same `close_requested` signal on the root
 /// viewport (there is exactly one), so all three take the same path: `egui`
 /// is told to cancel the close outright (`ViewportCommand::CancelClose`, or
@@ -284,7 +284,7 @@ mod tests {
 
     /// Regression for the maintainer's 2026-08-11 request: closing the settings
     /// window ("click the X button") must leave Iris running in the tray,
-    /// the way Wispr Flow behaves, rather than quitting the whole app (which
+    /// rather than quitting the whole app (which
     /// is what an earlier fix, in response to a different report, made every
     /// close path do — see `draw_root`'s doc comment for the full story).
     /// `draw_root` is portable `egui`, no `eframe` window required, so this

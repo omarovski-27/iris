@@ -117,7 +117,7 @@ function Get-RunningIrisProcesses {
 # manual "quit it first" step for the caller to follow, so this does it.
 # Killing a resident tray app is safe here: every dictation is written to the
 # session log and every setting change to config.toml as it happens (see
-# CLAUDE.md), so there is no in-memory state that a graceful shutdown would
+# AGENTS.md), so there is no in-memory state that a graceful shutdown would
 # have saved and a forceful one loses.
 function Stop-RunningIris {
     $running = Get-RunningIrisProcesses

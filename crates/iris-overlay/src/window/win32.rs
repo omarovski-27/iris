@@ -18,7 +18,7 @@
 //! `UpdateLayeredWindow`, so painting is driven by our frame loop rather than
 //! by invalidation.
 //!
-//! This module never synthesises input. See the repository's `CLAUDE.md`.
+//! This module never synthesises input. See the repository's `AGENTS.md`.
 
 use std::cell::Cell;
 use std::ffi::c_void;

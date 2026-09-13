@@ -3,16 +3,19 @@
 **Fast, minimal, open-source voice dictation for Windows.** Hold a key, speak,
 release, and Iris types into the app you were already using.
 
-Iris is built for low latency. Audio streams while you speak, so the transcript
-can land as soon as you let go.
+Iris is built around streaming dictation: audio is sent while you speak, so the
+post-release wait depends mostly on the engine's final flush instead of the
+length of the utterance.
 
 ## What it does
 
-- **Streaming dictation** — target: under 300 ms from key release to inserted text.
+- **Streaming dictation** — CI guards a modelled sub-300 ms key-release path;
+  real cloud latency depends on your engine, network, and target app.
 - **Push-to-talk or hands-free** — hold Right-Ctrl, or double-tap it to latch recording on.
 - **Small desktop surface** — tray icon, pill overlay, and one settings window.
 - **Engine choice** — mock, Deepgram, Groq, and an experimental local path.
-- **Plain files** — config and history live in your user profile. No account required.
+- **Plain files** — config and history live in your user profile. Iris has no
+  account system; cloud engines use your provider API key.
 
 ## Install (Windows)
 
@@ -179,4 +182,6 @@ platform-independent, so the tests and the latency harness run anywhere.
 
 ## License
 
-MIT
+Iris source code is MIT licensed. Bundled third-party assets and optional
+engine dependencies keep their own licenses; see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

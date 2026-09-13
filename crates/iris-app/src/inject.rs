@@ -5,7 +5,7 @@
 //! Windows delivers synthetic keystrokes to the *input desktop* — the one the
 //! user is looking at. There is no sandbox: an automated injection test types
 //! into whoever is using the machine, and it has already disrupted real work
-//! once during this project's development (see `CLAUDE.md`).
+//! once during this project's development (see `AGENTS.md`).
 //!
 //! So [`SystemInjector`] — the only implementation that reaches
 //! [`iris_core::inject`] — is constructed in `main` and nowhere else. Every

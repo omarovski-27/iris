@@ -5,12 +5,13 @@
 //! Two layered engines, matching the local-ASR evaluation report:
 //!
 //! 1. **Streaming partials** — sherpa-onnx streaming Zipformer transducer (int8).
-//!    Paints live "ghost text" while the user speaks; finalization after the last
-//!    frame is typically under 40 ms. Its own transcript is **never** the text of
-//!    record (no punctuation/casing, weaker accuracy).
+//!    Paints live "ghost text" while the user speaks. The local report measured
+//!    low finalization latency; verify on target hardware before quoting it. Its
+//!    own transcript is **never** the text of record (no punctuation/casing,
+//!    weaker accuracy).
 //! 2. **Transcript of record** — batch finalizer. v1 ships whisper.cpp
-//!    `base.en` q5_1 via `whisper-rs`, **always gated by Silero VAD** (Whisper
-//!    hallucinates on silence without it). Parakeet-TDT via whisper.cpp's new
+//!    `base.en` q5_1 via `whisper-rs`, **always gated by Silero VAD** (ungated
+//!    Whisper can hallucinate on silence). Parakeet-TDT via whisper.cpp's new
 //!    GGML backend is preferred long-term but has no Rust binding yet — see
 //!    the crate README for the tradeoff.
 //!

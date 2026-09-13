@@ -45,7 +45,7 @@
 //! sink as trait objects, so the whole state machine runs offline against a
 //! mock engine and a recording injector. **Real injection is never exercised by
 //! a test**: synthetic keystrokes go to whoever is using the machine (see the
-//! project's `CLAUDE.md`), so [`inject::SystemInjector`] is constructed by
+//! project's `AGENTS.md`), so [`inject::SystemInjector`] is constructed by
 //! `main` and nowhere else.
 
 // Deny rather than forbid: a few Win32 calls have no safe wrapper — the

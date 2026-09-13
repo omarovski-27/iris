@@ -1,12 +1,12 @@
 //! Batch finalizer — transcript of record.
 //!
 //! **v1 choice:** whisper.cpp `base.en` q5_1 via `whisper-rs` 0.16, with
-//! **mandatory Silero VAD gating**. Whisper hallucinates a word on pure silence
-//! 100% of the time when ungated (see the local-ASR evaluation report).
+//! **mandatory Silero VAD gating**. Ungated Whisper can hallucinate on pure
+//! silence (see the local-ASR evaluation report).
 //!
 //! **Deferred:** Parakeet-TDT 0.6B q8_0 via whisper.cpp's new GGML backend —
-//! preferred accuracy/hygiene, but no Rust binding exists yet (feature landed
-//! the same day as the evaluation). Options for a fast-follow: thin FFI against
+//! preferred by the evaluation report, but no Rust binding exists yet (feature
+//! landed the same day as the evaluation). Options for a fast-follow: thin FFI against
 //! `parakeet.h`, or wait for `whisper-rs` to expose it. Documented in README.
 
 use anyhow::Result;

@@ -314,7 +314,7 @@ struct Pace {
 /// Units per `SendInput` call once a burst needs pacing, and the pause
 /// between calls. Both are heuristics — the mechanism they answer to is a
 /// target's message loop falling behind, which this project cannot measure
-/// without the live injection `CLAUDE.md` forbids — chosen to be obviously
+/// without the live injection `AGENTS.md` forbids — chosen to be obviously
 /// on the safe side of the numbers it does have: a quarter of the batch the
 /// reported failure exceeded, with a gap several times an ordinary
 /// message-dispatch interval. The whole cost lands only on transcripts that
@@ -376,7 +376,7 @@ const BATCH: usize = 512;
 /// evidence of the failure [`effective_method`] guards against is a
 /// transcript that needed a second batch. Drawing the line anywhere past
 /// this would be a guess this project cannot verify without the live
-/// testing `CLAUDE.md` forbids.
+/// testing `AGENTS.md` forbids.
 ///
 /// Characters outside the BMP (astral — emoji, for instance) are a
 /// surrogate pair, two `KeyUnit`s, and so cross the same *event* threshold
@@ -507,7 +507,7 @@ fn imp(_text: &str, _method: Method, _hotkey: Key) -> Result<()> {
 /// down, but Iris's own hook says no real press is currently in progress.
 /// That disagreement is the actual signature of a desync, whatever produces
 /// it — which this project could not confirm without the live testing
-/// `CLAUDE.md` forbids, so this deliberately does not depend on a specific
+/// `AGENTS.md` forbids, so this deliberately does not depend on a specific
 /// theory of the mechanism to be correct. (`GetAsyncKeyState` and the hook's
 /// bookkeeping update via genuinely independent paths on different threads,
 /// so the two can also disagree for a narrow instant during a real repress;
@@ -742,7 +742,7 @@ mod win {
     /// this function with the right `hotkey`, or that the `INPUT` it builds
     /// carries the flags `super::modifier_to_release` and
     /// `Key::needs_extended_flag` imply. Verifying that would mean executing
-    /// a real `SendInput` call, which this repo's `CLAUDE.md` forbids — it
+    /// a real `SendInput` call, which this repo's `AGENTS.md` forbids — it
     /// types into whichever desktop the user is looking at, with no sandbox.
     /// The decision logic itself is fully covered by tests; this wiring is
     /// not, and cannot be without relaxing that constraint. This is
@@ -1844,7 +1844,7 @@ mod tests {
     /// One synthetic keyboard event, holding the fields of the `INPUT` that
     /// `win::key_event` fills in. `mod win` is `cfg(windows)` and its events
     /// can only ever be observed by calling `SendInput` for real — which this
-    /// project forbids (see the crate docs and `CLAUDE.md`) — so the two
+    /// project forbids (see the crate docs and `AGENTS.md`) — so the two
     /// `SendInput` calls below are reconstructed from the same portable
     /// decision functions the real code calls, exactly as `text.rs` already
     /// mirrors `send_keystrokes`'s batching loop. This proves the *decisions*
@@ -2183,7 +2183,7 @@ mod tests {
     /// `accepts_paste`, `pacing` and `paste_accelerator_survives` — so this is
     /// the real decision path, not a description of it. What it cannot show is
     /// `mod win` executing those decisions against Windows: that would mean
-    /// running the injection path, which `CLAUDE.md` forbids.
+    /// running the injection path, which `AGENTS.md` forbids.
     ///
     /// Run with
     /// `cargo test -p iris-core -- --nocapture escalated_delivery_transcript`.

@@ -8,9 +8,11 @@ without a microphone.
 
 - 5.38 s, 16 kHz, mono, 16-bit PCM (~168 kB)
 - Content: *"The quick brown fox jumps over the lazy dog. Iris turns speech into
-  text instantly."*
+  text instantly."* This is fixture text from the existing WAV, not a latency
+  claim.
 
-Synthesised locally with `espeak-ng`, so it carries no third-party licence:
+Synthesised locally with `espeak-ng`; the repository does not include a
+recorded human voice or any external audio sample:
 
 ```bash
 espeak-ng -v en-us -s 178 -p 45 -w raw.wav \

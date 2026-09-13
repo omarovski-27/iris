@@ -17,9 +17,9 @@ use crate::audio;
 
 use super::{Engine, Session, TranscriptEvent};
 
-/// What the mock pretends it heard. Matches `assets/speech-16k.wav`.
+/// What the mock pretends it heard for deterministic tests.
 pub const DEFAULT_TRANSCRIPT: &str =
-    "The quick brown fox jumps over the lazy dog. Iris turns speech into text instantly.";
+    "The quick brown fox jumps over the lazy dog. Iris turns speech into text.";
 
 #[derive(Debug, Clone)]
 pub struct MockConfig {

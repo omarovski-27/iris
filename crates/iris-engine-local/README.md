@@ -28,22 +28,23 @@ the merged core trait is intentionally a one-file follow-up.
 
 | Layer | Backend | Role |
 |-------|---------|------|
-| **Streaming partials** | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) streaming Zipformer transducer **int8**, via the **official first-party** `sherpa-onnx` crate (not archived `sherpa-rs`) | Live ghost text while the user speaks. Finalization after the last frame is typically **0–40 ms** (report measured ~4 ms). Output has **no punctuation/casing** and is **never** injected. |
-| **Transcript of record** | [whisper-rs](https://codeberg.org/tazz4843/whisper-rs) 0.16 → whisper.cpp `base.en` q5_1 | Punctuated, cased text. **Mandatory Silero VAD** (ggml) in front — Whisper hallucinates on pure silence 100% of the time when ungated. |
+| **Streaming partials** | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) streaming Zipformer transducer **int8**, via the upstream `sherpa-onnx` crate (not archived `sherpa-rs`) | Live ghost text while the user speaks. The local report measured ~4 ms finalization after the last frame; verify on target hardware before quoting latency. Output has **no punctuation/casing** and is **never** injected. |
+| **Transcript of record** | [whisper-rs](https://codeberg.org/tazz4843/whisper-rs) 0.16 → whisper.cpp `base.en` q5_1 | Punctuated, cased text. **Mandatory Silero VAD** (ggml) in front; ungated Whisper can hallucinate on pure silence. |
 
 ### Engine choice rationale (Parakeet vs whisper)
 
 The evaluation report’s preferred finalizer is **NVIDIA Parakeet-TDT 0.6B q8_0**
-through whisper.cpp’s new GGML backend: best accuracy + hygiene, zero silence
-hallucination, ~0.5 s load / ~0.8–2.4 s finalize. **There is no Rust binding yet**
-(the C feature landed the same day as the evaluation).
+through whisper.cpp’s new GGML backend: stronger accuracy/hygiene in that report,
+no silence hallucination in the tested cases, ~0.5 s load / ~0.8–2.4 s finalize.
+**There is no Rust binding yet** (the C feature landed the same day as the
+evaluation).
 
 | Option | Pros | Cons |
 |--------|------|------|
 | **(a) Thin FFI to `parakeet.h`** | Best model now | Own build of whisper.cpp `libparakeet`, no upstream Rust support, high maintenance for v1 |
-| **(b) whisper-rs + base.en + VAD (shipped)** | Mature crate, Windows docs, VAD already in whisper.cpp | Slightly weaker than Parakeet; *must* keep VAD |
+| **(b) whisper-rs + base.en + VAD (implemented)** | Mature crate, Windows docs, VAD already in whisper.cpp | Slightly weaker than Parakeet in the evaluation report; *must* keep VAD |
 
-**v1 choice: (b).** Do not let perfect block shipped. Parakeet is catalogued in
+**v1 choice: (b).** Parakeet is catalogued in
 `ModelId::ParakeetTdt06bQ8_0` for a fast-follow once `whisper-rs` (or a thin
 FFI) exposes `parakeet.h`.
 
@@ -171,4 +172,5 @@ model manager only) — this is the default CI surface.
 
 ## License
 
-MIT (Iris). Engine bindings: Apache-2.0 (`sherpa-onnx`), Unlicense (`whisper-rs`).
+Iris code is MIT licensed. Optional engine bindings keep their own licenses:
+Apache-2.0 for `sherpa-onnx`, Unlicense for `whisper-rs`.

@@ -286,7 +286,7 @@ Load-bearing beyond that crate:
   (2026-08-10) every close path *did* quit the whole app, built in direct
   response to a report read as "cannot be closed". The maintainer's next
   message ("I want it such that when I close the app it still runs in the
-  background, just like Wispr Flow") made the actual complaint clear in
+  background") made the actual complaint clear in
   hindsight — the 2026-08-10 report was about the app *freezing and lagging*
   on close, not about wanting it to quit; hiding to the tray was correct
   the whole time, and the freeze was the tray Quit finalise-race fixed

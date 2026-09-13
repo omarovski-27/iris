@@ -55,7 +55,7 @@ The full transition table is on `Model::apply`.
 ## The contract changed, and here is why
 
 Two things used to be true of this crate, stated plainly in this file and in
-`CLAUDE.md`: the API was "intended to stay stable", and the overlay "never
+`AGENTS.md`: the API was "intended to stay stable", and the overlay "never
 holds transcript text… nothing to read over the user's shoulder and nothing
 in a crash dump." Both changed with this design.
 
@@ -129,7 +129,7 @@ The maintainer's decision, recorded 2026-07-31: orb → live-text ribbon, "make 
 exceptionally beautiful", live text on by default with a config opt-out (round
 3 kept the feature and flipped that default to off — see "Round 3", below). It
 supersedes the earlier maintainer-locked pill geometry (168×34 fixed capsule,
-28-bar spectrum, listening-only telemetry chip) recorded in `CLAUDE.md`'s
+28-bar spectrum, listening-only telemetry chip) recorded in `AGENTS.md`'s
 history — that geometry is gone from this crate; the Prism/Porcelain palettes
 and the motion budget are not.
 

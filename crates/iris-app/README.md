@@ -172,7 +172,7 @@ real:
   it** — if you run one, assume it captures anything Iris pastes, and check its
   own settings if that matters to you.
 - Iris cannot verify it from inside the app. This path only runs during real
-  injection, which this project does not execute unattended (see `CLAUDE.md`),
+  injection, which this project does not execute unattended (see `AGENTS.md`),
   so the opt-out is the documented Windows mechanism applied as documented,
   not something a test on your machine has confirmed.
 
